@@ -14,6 +14,7 @@ import time
 class RealTimeDataStream:
     """
     Manages real-time WebSocket connection to Polygon/Massive API
+    Supports options and index data streaming
     """
     
     def __init__(self, api_key: str):
@@ -23,18 +24,23 @@ class RealTimeDataStream:
         self.is_connected = False
         self.thread = None
         self.latest_prices = {}
+        self.latest_options = {}  # Track options data
+        self.latest_indices = {}  # Track index data
         self.trade_count = 0
         self.quote_count = 0
+        self.options_count = 0
+        self.index_count = 0
         self.error_message = None  # Store errors for main thread to display
         self.connection_status = "disconnected"
         self.tickers = []
         
-    def connect(self, tickers: List[str], callback: Callable = None):
+    def connect(self, tickers: List[str], stream_type: str = "all", callback: Callable = None):
         """
         Connect to WebSocket and subscribe to tickers
         
         Args:
-            tickers: List of ticker symbols to subscribe to (e.g., ['SPY', 'QQQ'])
+            tickers: List of ticker symbols (for indices: SPX, NDX, DJI, RUT)
+            stream_type: Type of stream - "indices", "options", or "all"
             callback: Optional callback function to process messages
         """
         try:
@@ -42,8 +48,12 @@ class RealTimeDataStream:
             
             # Define message handlers
             def handle_message(msg):
-                # Process message
+                # Process message with timestamp
                 try:
+                    # Add timestamp to message if not present
+                    if not hasattr(msg, 'timestamp'):
+                        msg.timestamp = datetime.now()
+                    
                     self.data_queue.put_nowait(msg)
                 except queue.Full:
                     # Drop oldest message and add new one
@@ -53,30 +63,70 @@ class RealTimeDataStream:
                     except:
                         pass
                 
-                # Update latest prices based on message type
-                if hasattr(msg, 'symbol'):
-                    symbol = msg.symbol
-                    price = None
-                    
-                    # Extract price from different message types
-                    if hasattr(msg, 'price'):
-                        price = msg.price
-                    elif hasattr(msg, 'close'):
-                        price = msg.close
-                    
-                    if price:
-                        self.latest_prices[symbol] = {
-                            'price': price,
-                            'timestamp': datetime.now(),
-                            'type': msg.__class__.__name__
-                        }
-                    
-                    # Track counts
-                    msg_type = msg.__class__.__name__
-                    if 'Trade' in msg_type:
-                        self.trade_count += 1
-                    elif 'Quote' in msg_type:
-                        self.quote_count += 1
+                # Determine message type and update appropriate tracker
+                msg_type = msg.__class__.__name__
+                
+                # Handle index data
+                if 'Index' in msg_type or 'Indices' in msg_type:
+                    if hasattr(msg, 'ticker') or hasattr(msg, 'symbol'):
+                        symbol = msg.ticker if hasattr(msg, 'ticker') else msg.symbol
+                        value = None
+                        
+                        if hasattr(msg, 'value'):
+                            value = msg.value
+                        elif hasattr(msg, 'close'):
+                            value = msg.close
+                        
+                        if value:
+                            self.latest_indices[symbol] = {
+                                'value': value,
+                                'timestamp': getattr(msg, 'timestamp', datetime.now()),
+                                'type': msg_type
+                            }
+                        self.index_count += 1
+                
+                # Handle options data
+                elif 'Option' in msg_type:
+                    if hasattr(msg, 'symbol'):
+                        symbol = msg.symbol
+                        price = None
+                        
+                        if hasattr(msg, 'price'):
+                            price = msg.price
+                        elif hasattr(msg, 'close'):
+                            price = msg.close
+                        
+                        if price:
+                            self.latest_options[symbol] = {
+                                'price': price,
+                                'timestamp': getattr(msg, 'timestamp', datetime.now()),
+                                'type': msg_type
+                            }
+                        self.options_count += 1
+                
+                # Handle stock/general data
+                else:
+                    if hasattr(msg, 'symbol'):
+                        symbol = msg.symbol
+                        price = None
+                        
+                        if hasattr(msg, 'price'):
+                            price = msg.price
+                        elif hasattr(msg, 'close'):
+                            price = msg.close
+                        
+                        if price:
+                            self.latest_prices[symbol] = {
+                                'price': price,
+                                'timestamp': getattr(msg, 'timestamp', datetime.now()),
+                                'type': msg_type
+                            }
+                        
+                        # Track counts
+                        if 'Trade' in msg_type:
+                            self.trade_count += 1
+                        elif 'Quote' in msg_type:
+                            self.quote_count += 1
                 
                 # Call custom callback if provided
                 if callback:
@@ -97,18 +147,26 @@ class RealTimeDataStream:
             # Initialize StreamClient with socket.massive.com
             self.client = StreamClient(
                 api_key=self.api_key,
-                cluster='stocks',
+                cluster='stocks',  # Use stocks cluster for all data types
                 host='socket.massive.com',
                 on_message=handle_message,
                 on_error=handle_error,
                 on_close=handle_close
             )
             
-            # Subscribe to trades, quotes, and minute aggregates for each ticker
+            # Subscribe based on stream type
             for ticker in tickers:
-                self.client.subscribe_stock_trades(ticker)
-                self.client.subscribe_stock_quotes(ticker)
-                self.client.subscribe_stock_minute_aggregates(ticker)
+                if stream_type in ["indices", "all"]:
+                    # Subscribe to index value and minute aggregates
+                    self.client.subscribe_index_value(ticker)
+                    self.client.subscribe_indices_minute_aggregates(ticker)
+                
+                if stream_type in ["options", "all"]:
+                    # Subscribe to options for the ticker
+                    # Note: This subscribes to all options for the underlying
+                    self.client.subscribe_option_trades(ticker)
+                    self.client.subscribe_option_quotes(ticker)
+                    self.client.subscribe_option_minute_aggregates(ticker)
             
             # Start streaming in background thread
             self.client.start_stream_thread()
@@ -156,6 +214,10 @@ class RealTimeDataStream:
             'connected': self.is_connected,
             'trade_count': self.trade_count,
             'quote_count': self.quote_count,
+            'options_count': self.options_count,
+            'index_count': self.index_count,
+            'indices_tracked': len(self.latest_indices),
+            'options_tracked': len(self.latest_options),
             'tickers_tracked': len(self.latest_prices),
             'queue_size': self.data_queue.qsize()
         }
@@ -199,13 +261,14 @@ def format_websocket_message(msg) -> str:
         return f"Message: {str(msg)[:100]}"
 
 
-def start_streaming_session(api_key: str, tickers: List[str]) -> RealTimeDataStream:
+def start_streaming_session(api_key: str, tickers: List[str], stream_type: str = "all") -> RealTimeDataStream:
     """
     Start a new streaming session
     
     Args:
         api_key: Polygon/Massive API key
-        tickers: List of tickers to stream
+        tickers: List of tickers to stream (actual index tickers: SPX, NDX, DJI, RUT)
+        stream_type: Type of stream - "indices", "options", or "all"
     
     Returns:
         RealTimeDataStream instance
@@ -216,7 +279,7 @@ def start_streaming_session(api_key: str, tickers: List[str]) -> RealTimeDataStr
         # Optional: Add custom processing here
         pass
     
-    if stream.connect(tickers, callback=message_callback):
+    if stream.connect(tickers, stream_type=stream_type, callback=message_callback):
         return stream
     return None
 
@@ -229,18 +292,24 @@ def get_streaming_recommendations() -> str:
     **Market Status**: {market_status}
     
     **WebSocket Streaming (24/7 Available)**:
-    - ✅ Streaming works after hours via wss://socket.massive.com/stocks
-    - ✅ During market hours: Live trades, quotes, and minute aggregates
-    - ✅ After hours: Extended hours trading data and delayed quotes
-    - ✅ Subscribe to specific tickers to reduce data volume
-    - ✅ Minute aggregates (AM.*) are best for charts and predictions
-    - ✅ Trades (T.*) show every transaction (high volume)
-    - ✅ Quotes (Q.*) show bid/ask updates (very high volume)
+    - ✅ Streaming works after hours via wss://socket.massive.com
+    - ✅ Real-time **Index Data**: SPX, NDX, DJI, RUT values and minute aggregates
+    - ✅ Real-time **Options Data**: Trades, quotes, and minute aggregates with timestamps
+    - ✅ During market hours: Live index values and options flow
+    - ✅ After hours: Extended hours data with timestamps for all events
+    - ✅ All messages include timestamps for accurate after-hours tracking
+    
+    **Data Types Available**:
+    - **Index Values**: Real-time index price movements
+    - **Index Minute Aggregates**: OHLCV data for charts
+    - **Options Trades**: Every options transaction with timestamp
+    - **Options Quotes**: Bid/ask updates for options
+    - **Options Aggregates**: Minute bars for options analysis
     
     **Best Practices**:
-    - Use ETF proxies: SPY, QQQ, DIA, IWM (lower volume than indexes)
-    - For predictions: Subscribe to AM.* (minute bars) for updating charts
-    - For monitoring: Subscribe to Q.* for real-time price tracking
+    - Use actual index tickers: SPX, NDX, DJI, RUT
+    - Timestamps preserved for all after-hours data
+    - Options data includes full chain for selected indices
     - Backup method: Snapshot API available if streaming fails
     """
     

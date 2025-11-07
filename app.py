@@ -796,20 +796,21 @@ with st.sidebar:
         # Start streaming
         if st.button("🚀 Start Streaming", type="secondary"):
             if selected_indexes and st.session_state.api_key:
-                # Get ETF tickers for selected indexes
-                tickers_to_stream = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                # Get actual index tickers (not ETF proxies) for streaming
+                tickers_to_stream = [INDEXES[idx] for idx in selected_indexes]
                 
-                with st.spinner("Connecting to WebSocket..."):
-                    stream = start_streaming_session(st.session_state.api_key, tickers_to_stream)
+                with st.spinner("Connecting to WebSocket for indices and options..."):
+                    # Stream both indices and options data
+                    stream = start_streaming_session(st.session_state.api_key, tickers_to_stream, stream_type="all")
                     
                     if stream:
                         st.session_state.ws_stream = stream
                         st.session_state.streaming_active = True
-                        st.success(f"✅ Streaming started for {', '.join(tickers_to_stream)}")
+                        st.success(f"✅ Streaming started for indices: {', '.join(tickers_to_stream)} (with options)")
                         time.sleep(2)
                         st.rerun()
                     else:
-                        st.error("Failed to start streaming. Check your API key and subscription.")
+                        st.error("Failed to start streaming. Check your API key and options/index data subscription.")
             else:
                 st.warning("Please enter API key and select indexes first!")
     
@@ -828,15 +829,19 @@ with st.sidebar:
                 
                 # Show connection status
                 if st.session_state.ws_stream.connection_status == "connected":
-                    st.success(f"✅ Streaming Active ({stats['tickers_tracked']} tickers)")
+                    st.success(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options")
                 else:
                     st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
             
             # Streaming stats
-            stats_col1, stats_col2 = st.columns(2)
+            stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
             with stats_col1:
-                st.metric("Trades", stats['trade_count'])
+                st.metric("Index Updates", stats['index_count'])
             with stats_col2:
+                st.metric("Options Updates", stats['options_count'])
+            with stats_col3:
+                st.metric("Trades", stats['trade_count'])
+            with stats_col4:
                 st.metric("Quotes", stats['quote_count'])
             
             # Stop streaming button
