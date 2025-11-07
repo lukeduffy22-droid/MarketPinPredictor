@@ -7,13 +7,7 @@ from polygon import RESTClient
 from datetime import datetime, timedelta
 import time
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from database import init_db, save_prediction, get_predictions_by_ticker, get_all_predictions, save_alert, get_active_alerts, get_prediction_accuracy_stats
-from models import train_linear_regression, train_random_forest
-
-# Initialize database
-init_db()
 
 # Page configuration
 st.set_page_config(
@@ -35,12 +29,6 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = ''
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
-if 'selected_model' not in st.session_state:
-    st.session_state.selected_model = 'Linear Regression'
-if 'timeframe' not in st.session_state:
-    st.session_state.timeframe = '1-day'
-if 'alerts' not in st.session_state:
-    st.session_state.alerts = []
 
 def calculate_technical_indicators(df):
     """Calculate technical indicators for prediction"""
@@ -138,7 +126,7 @@ def get_current_price(api_key, ticker):
         st.error(f"Error fetching current price: {str(e)}")
         return None
 
-def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
+def predict_eod_price(df):
     """Predict end-of-day price using technical indicators and ML"""
     if df is None or len(df) < 30:
         return None, None, None, None
@@ -157,22 +145,12 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
                        'RSI', 'MACD', 'Signal_Line', 'Momentum', 'ROC', 
                        'Volume_Ratio', 'BB_Upper', 'BB_Lower']
     
-    # Determine shift based on timeframe
-    if timeframe == '1-day':
-        shift_days = 1
-    elif timeframe == '5-day':
-        shift_days = 5
-    elif timeframe == '1-week':
-        shift_days = 7
-    else:
-        shift_days = 1
-    
     # Create feature matrix (X) and target vector (y)
-    # Shift target by shift_days to predict future close
-    df_clean['next_close'] = df_clean['close'].shift(-shift_days)
+    # CRITICAL: Shift target by 1 to predict NEXT day's close
+    df_clean['next_close'] = df_clean['close'].shift(-1)
     
-    # Remove rows with NaN for next_close
-    df_model = df_clean[:-shift_days].dropna().copy()
+    # Remove the last row (which has NaN for next_close) and any remaining NaNs
+    df_model = df_clean[:-1].dropna().copy()
     
     if len(df_model) < 20:
         return None, None, None, None
@@ -185,18 +163,25 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
     
-    # Train model based on selected type
-    if model_type == 'Linear Regression':
-        model, scaler, accuracy = train_linear_regression(X_train, y_train, X_test, y_test)
-    elif model_type == 'Random Forest':
-        model, scaler, accuracy = train_random_forest(X_train, y_train, X_test, y_test)
-    else:
-        model, scaler, accuracy = train_linear_regression(X_train, y_train, X_test, y_test)
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Train model to predict next day's close
+    model = LinearRegression()
+    model.fit(X_train_scaled, y_train)
+    
+    # Calculate accuracy on test set
+    test_predictions = model.predict(X_test_scaled)
+    mape = np.mean(np.abs((y_test - test_predictions) / y_test)) * 100
+    accuracy = max(0, 100 - mape)
     
     # Get current price (last known close)
     current_price = df_clean['close'].iloc[-1]
     
-    # Predict future price using the most recent features
+    # Predict NEXT day's price using the most recent features
+    # Use the second-to-last row of df_clean for features (last complete feature set)
     latest_features = df_clean[feature_columns].iloc[-1].values.reshape(1, -1)
     latest_scaled = scaler.transform(latest_features)
     predicted_price = model.predict(latest_scaled)[0]
@@ -339,50 +324,6 @@ with st.sidebar:
         help="More data can improve prediction accuracy"
     )
     
-    st.divider()
-    
-    st.header("🤖 Model Settings")
-    selected_model = st.selectbox(
-        "ML Model",
-        options=["Linear Regression", "Random Forest"],
-        index=0,
-        help="Choose the machine learning model for predictions"
-    )
-    st.session_state.selected_model = selected_model
-    
-    selected_timeframe = st.selectbox(
-        "Prediction Timeframe",
-        options=["1-day", "5-day", "1-week"],
-        index=0,
-        help="Select how far ahead to predict"
-    )
-    st.session_state.timeframe = selected_timeframe
-    
-    st.divider()
-    
-    st.header("🔔 Alert Settings")
-    enable_alerts = st.checkbox("Enable Price Alerts", value=False)
-    
-    if enable_alerts:
-        alert_threshold = st.slider(
-            "Movement Threshold (%)",
-            min_value=1.0,
-            max_value=10.0,
-            value=3.0,
-            step=0.5,
-            help="Alert when predicted change exceeds this percentage"
-        )
-        confidence_threshold = st.slider(
-            "Confidence Threshold (%)",
-            min_value=50,
-            max_value=90,
-            value=70,
-            step=5,
-            help="Alert only when confidence is above this level"
-        )
-    
-    st.divider()
-    
     analyze_button = st.button("🔄 Analyze & Predict", type="primary", use_container_width=True)
     
     st.divider()
@@ -419,62 +360,18 @@ else:
             df = fetch_market_data(st.session_state.api_key, ticker, days_history)
             
             if df is not None and len(df) > 0:
-                # Predict EOD price using selected model and timeframe
-                predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
-                    df, 
-                    model_type=st.session_state.selected_model,
-                    timeframe=st.session_state.timeframe
-                )
+                # Predict EOD price (returns predicted price, confidence, df with indicators, and current price)
+                predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(df)
                 
                 if predicted_price and current_price:
-                    change_pct = ((predicted_price - current_price) / current_price) * 100
-                    
                     st.session_state.predictions[index_name] = {
                         'ticker': ticker,
                         'current_price': current_price,
                         'predicted_price': predicted_price,
                         'confidence': confidence,
                         'df': df_with_indicators,
-                        'change_pct': change_pct,
-                        'model_type': st.session_state.selected_model,
-                        'timeframe': st.session_state.timeframe
+                        'change_pct': ((predicted_price - current_price) / current_price) * 100
                     }
-                    
-                    # Save prediction to database
-                    try:
-                        if st.session_state.timeframe == '1-day':
-                            target_date = datetime.now() + timedelta(days=1)
-                        elif st.session_state.timeframe == '5-day':
-                            target_date = datetime.now() + timedelta(days=5)
-                        else:
-                            target_date = datetime.now() + timedelta(days=7)
-                        
-                        save_prediction(
-                            ticker=ticker,
-                            index_name=index_name,
-                            current_price=current_price,
-                            predicted_price=predicted_price,
-                            confidence=confidence,
-                            model_type=st.session_state.selected_model,
-                            change_pct=change_pct,
-                            target_date=target_date
-                        )
-                        
-                        # Check alerts if enabled
-                        if enable_alerts and abs(change_pct) >= alert_threshold and confidence >= confidence_threshold:
-                            direction = "increase" if change_pct > 0 else "decrease"
-                            message = f"{index_name} predicted to {direction} by {abs(change_pct):.2f}% (Confidence: {confidence:.1f}%)"
-                            save_alert(
-                                ticker=ticker,
-                                index_name=index_name,
-                                alert_type="price_movement",
-                                threshold=alert_threshold,
-                                current_value=abs(change_pct),
-                                message=message
-                            )
-                            st.session_state.alerts.append(message)
-                    except Exception as e:
-                        st.warning(f"Could not save prediction: {str(e)}")
             
             progress_bar.progress((idx + 1) / len(selected_indexes))
         
@@ -553,117 +450,3 @@ else:
     
     elif selected_indexes and not st.session_state.predictions:
         st.info("👆 Click 'Analyze & Predict' to generate predictions for selected indexes")
-    
-    # Add tabs for additional features
-    if st.session_state.api_key:
-        st.divider()
-        
-        tab1, tab2, tab3 = st.tabs(["📜 Prediction History", "🔔 Alerts", "📊 Performance Stats"])
-        
-        with tab1:
-            st.subheader("Prediction History")
-            
-            try:
-                all_predictions = get_all_predictions(limit=50)
-                
-                if all_predictions:
-                    history_data = []
-                    for p in all_predictions:
-                        history_data.append({
-                            'Date': p.prediction_date.strftime('%Y-%m-%d %H:%M'),
-                            'Index': p.index_name,
-                            'Ticker': p.ticker,
-                            'Current Price': f"${p.current_price:.2f}",
-                            'Predicted': f"${p.predicted_price:.2f}",
-                            'Change %': f"{p.change_pct:.2f}%",
-                            'Confidence': f"{p.confidence:.1f}%",
-                            'Model': p.model_type,
-                            'Actual Price': f"${p.actual_price:.2f}" if p.actual_price else 'Pending',
-                            'Accuracy': f"{p.accuracy:.1f}%" if p.accuracy else 'N/A'
-                        })
-                    
-                    df_history = pd.DataFrame(history_data)
-                    st.dataframe(df_history, use_container_width=True, hide_index=True)
-                    
-                    st.caption(f"Showing {len(all_predictions)} most recent predictions")
-                else:
-                    st.info("No prediction history available yet. Make your first prediction!")
-            except Exception as e:
-                st.error(f"Error loading prediction history: {str(e)}")
-        
-        with tab2:
-            st.subheader("Active Alerts")
-            
-            # Display session alerts
-            if st.session_state.alerts:
-                st.success(f"🔔 {len(st.session_state.alerts)} alert(s) triggered this session:")
-                for alert in st.session_state.alerts:
-                    st.warning(alert)
-            else:
-                st.info("No alerts triggered in this session")
-            
-            try:
-                active_alerts = get_active_alerts()
-                
-                if active_alerts:
-                    st.divider()
-                    st.subheader("All Active Alerts")
-                    
-                    alert_data = []
-                    for a in active_alerts:
-                        alert_data.append({
-                            'Created': a.created_at.strftime('%Y-%m-%d %H:%M'),
-                            'Index': a.index_name,
-                            'Type': a.alert_type,
-                            'Message': a.message,
-                            'Threshold': f"{a.threshold:.1f}%",
-                            'Current Value': f"{a.current_value:.1f}%"
-                        })
-                    
-                    df_alerts = pd.DataFrame(alert_data)
-                    st.dataframe(df_alerts, use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error(f"Error loading alerts: {str(e)}")
-        
-        with tab3:
-            st.subheader("Model Performance Statistics")
-            
-            try:
-                overall_stats = get_prediction_accuracy_stats()
-                
-                if overall_stats:
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("Total Predictions", overall_stats['count'])
-                    with col2:
-                        st.metric("Average Accuracy", f"{overall_stats['avg_accuracy']:.1f}%")
-                    with col3:
-                        st.metric("Best Accuracy", f"{overall_stats['max_accuracy']:.1f}%")
-                    with col4:
-                        st.metric("Worst Accuracy", f"{overall_stats['min_accuracy']:.1f}%")
-                    
-                    st.divider()
-                    
-                    # Per-ticker stats
-                    st.subheader("Performance by Index")
-                    ticker_stats = []
-                    for index_name, ticker in INDEXES.items():
-                        stats = get_prediction_accuracy_stats(ticker=ticker)
-                        if stats:
-                            ticker_stats.append({
-                                'Index': index_name,
-                                'Ticker': ticker,
-                                'Predictions': stats['count'],
-                                'Avg Accuracy': f"{stats['avg_accuracy']:.1f}%",
-                                'Best': f"{stats['max_accuracy']:.1f}%",
-                                'Worst': f"{stats['min_accuracy']:.1f}%"
-                            })
-                    
-                    if ticker_stats:
-                        df_stats = pd.DataFrame(ticker_stats)
-                        st.dataframe(df_stats, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No completed predictions yet. Accuracy statistics will appear once predictions are verified with actual prices.")
-            except Exception as e:
-                st.error(f"Error loading statistics: {str(e)}")
