@@ -129,7 +129,7 @@ def get_current_price(api_key, ticker):
 def predict_eod_price(df):
     """Predict end-of-day price using technical indicators and ML"""
     if df is None or len(df) < 30:
-        return None, None, None
+        return None, None, None, None
     
     # Calculate technical indicators
     df = calculate_technical_indicators(df)
@@ -138,17 +138,27 @@ def predict_eod_price(df):
     df_clean = df.dropna().copy()
     
     if len(df_clean) < 20:
-        return None, None, None
+        return None, None, None, None
     
     # Prepare features for prediction
     feature_columns = ['SMA_5', 'SMA_10', 'SMA_20', 'EMA_5', 'EMA_10', 
                        'RSI', 'MACD', 'Signal_Line', 'Momentum', 'ROC', 
                        'Volume_Ratio', 'BB_Upper', 'BB_Lower']
     
-    X = df_clean[feature_columns].values
-    y = df_clean['close'].values
+    # Create feature matrix (X) and target vector (y)
+    # CRITICAL: Shift target by 1 to predict NEXT day's close
+    df_clean['next_close'] = df_clean['close'].shift(-1)
     
-    # Use last 80% for training
+    # Remove the last row (which has NaN for next_close) and any remaining NaNs
+    df_model = df_clean[:-1].dropna().copy()
+    
+    if len(df_model) < 20:
+        return None, None, None, None
+    
+    X = df_model[feature_columns].values
+    y = df_model['next_close'].values
+    
+    # Split: use earlier data for training, recent data for testing
     train_size = int(len(X) * 0.8)
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
@@ -158,7 +168,7 @@ def predict_eod_price(df):
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Train model
+    # Train model to predict next day's close
     model = LinearRegression()
     model.fit(X_train_scaled, y_train)
     
@@ -167,21 +177,26 @@ def predict_eod_price(df):
     mape = np.mean(np.abs((y_test - test_predictions) / y_test)) * 100
     accuracy = max(0, 100 - mape)
     
-    # Predict next price using latest data
-    latest_features = X[-1].reshape(1, -1)
+    # Get current price (last known close)
+    current_price = df_clean['close'].iloc[-1]
+    
+    # Predict NEXT day's price using the most recent features
+    # Use the second-to-last row of df_clean for features (last complete feature set)
+    latest_features = df_clean[feature_columns].iloc[-1].values.reshape(1, -1)
     latest_scaled = scaler.transform(latest_features)
     predicted_price = model.predict(latest_scaled)[0]
     
-    # Calculate confidence based on recent trend consistency
+    # Calculate confidence based on recent trend consistency and model performance
     recent_prices = df_clean['close'].tail(10).values
     price_std = np.std(recent_prices)
     price_mean = np.mean(recent_prices)
     volatility = (price_std / price_mean) * 100
     
-    # Confidence decreases with volatility
-    confidence = max(40, min(95, accuracy - (volatility * 2)))
+    # Confidence decreases with volatility and poor accuracy
+    base_confidence = min(accuracy, 85)
+    confidence = max(40, base_confidence - (volatility * 2))
     
-    return predicted_price, confidence, df_clean
+    return predicted_price, confidence, df_clean, current_price
 
 def create_price_chart(df, predicted_price, ticker_name):
     """Create interactive price chart with prediction"""
@@ -345,13 +360,10 @@ else:
             df = fetch_market_data(st.session_state.api_key, ticker, days_history)
             
             if df is not None and len(df) > 0:
-                # Get current price
-                current_price = df['close'].iloc[-1]
+                # Predict EOD price (returns predicted price, confidence, df with indicators, and current price)
+                predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(df)
                 
-                # Predict EOD price
-                predicted_price, confidence, df_with_indicators = predict_eod_price(df)
-                
-                if predicted_price:
+                if predicted_price and current_price:
                     st.session_state.predictions[index_name] = {
                         'ticker': ticker,
                         'current_price': current_price,
