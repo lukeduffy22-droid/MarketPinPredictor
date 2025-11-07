@@ -8,7 +8,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from polygon import StocksClient, OptionsClient
 import streamlit as st
-from database import save_prediction, get_prediction_history
+from database import save_prediction
 from options_gamma import get_gamma_analysis, fetch_options_chain, calculate_gamma_exposure
 
 def fetch_historical_index_data(api_key, ticker, date, lookback_days=60):
