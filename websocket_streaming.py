@@ -4,16 +4,7 @@ Uses Polygon/Massive.com WebSocket API for real-time updates
 """
 
 import streamlit as st
-from polygon import WebSocketClient, RESTClient
-from polygon.websocket.models import WebSocketMessage
-try:
-    from polygon.websocket.models import Market
-except ImportError:
-    # Fallback if Market enum doesn't exist
-    class Market:
-        STOCKS = "stocks"
-        FOREX = "forex"
-        CRYPTO = "crypto"
+from polygon import StreamClient, StocksClient
 from typing import List, Dict, Callable, Optional
 import threading
 import queue
@@ -36,6 +27,7 @@ class RealTimeDataStream:
         self.quote_count = 0
         self.error_message = None  # Store errors for main thread to display
         self.connection_status = "disconnected"
+        self.tickers = []
         
     def connect(self, tickers: List[str], callback: Callable = None):
         """
@@ -46,73 +38,82 @@ class RealTimeDataStream:
             callback: Optional callback function to process messages
         """
         try:
-            # Create subscriptions for trades and quotes
-            subscriptions = []
-            for ticker in tickers:
-                subscriptions.append(f"T.{ticker}")  # Trades
-                subscriptions.append(f"Q.{ticker}")  # Quotes
-                subscriptions.append(f"AM.{ticker}")  # Minute aggregates
+            self.tickers = tickers
             
-            # Initialize WebSocket client
-            self.client = WebSocketClient(
+            # Define message handlers
+            def handle_message(msg):
+                # Process message
+                try:
+                    self.data_queue.put_nowait(msg)
+                except queue.Full:
+                    # Drop oldest message and add new one
+                    try:
+                        self.data_queue.get_nowait()
+                        self.data_queue.put_nowait(msg)
+                    except:
+                        pass
+                
+                # Update latest prices based on message type
+                if hasattr(msg, 'symbol'):
+                    symbol = msg.symbol
+                    price = None
+                    
+                    # Extract price from different message types
+                    if hasattr(msg, 'price'):
+                        price = msg.price
+                    elif hasattr(msg, 'close'):
+                        price = msg.close
+                    
+                    if price:
+                        self.latest_prices[symbol] = {
+                            'price': price,
+                            'timestamp': datetime.now(),
+                            'type': msg.__class__.__name__
+                        }
+                    
+                    # Track counts
+                    msg_type = msg.__class__.__name__
+                    if 'Trade' in msg_type:
+                        self.trade_count += 1
+                    elif 'Quote' in msg_type:
+                        self.quote_count += 1
+                
+                # Call custom callback if provided
+                if callback:
+                    try:
+                        callback(msg)
+                    except:
+                        pass
+            
+            def handle_error(e):
+                self.error_message = f"WebSocket error: {str(e)}"
+                self.connection_status = "error"
+                self.is_connected = False
+            
+            def handle_close():
+                self.is_connected = False
+                self.connection_status = "disconnected"
+            
+            # Initialize StreamClient with socket.massive.com
+            self.client = StreamClient(
                 api_key=self.api_key,
-                feed="realtime",
-                market=Market.STOCKS,  # Use STOCKS (all caps) not Stocks
-                subscriptions=subscriptions,
-                verbose=False
+                cluster='stocks',
+                host='socket.massive.com',
+                on_message=handle_message,
+                on_error=handle_error,
+                on_close=handle_close
             )
             
-            # Define message handler
-            def handle_messages(msgs: List[WebSocketMessage]):
-                for msg in msgs:
-                    # Process based on event type
-                    if hasattr(msg, 'event_type'):
-                        # Use put_nowait to avoid blocking on high-volume feeds
-                        try:
-                            self.data_queue.put_nowait(msg)
-                        except queue.Full:
-                            # Drop oldest message and add new one
-                            try:
-                                self.data_queue.get_nowait()
-                                self.data_queue.put_nowait(msg)
-                            except:
-                                pass  # If we can't add, just drop the message
-                        
-                        # Update latest prices
-                        if hasattr(msg, 'symbol') and hasattr(msg, 'price'):
-                            self.latest_prices[msg.symbol] = {
-                                'price': msg.price,
-                                'timestamp': datetime.now(),
-                                'event_type': msg.event_type
-                            }
-                        
-                        # Track counts
-                        if msg.event_type == 'T':  # Trade
-                            self.trade_count += 1
-                        elif msg.event_type == 'Q':  # Quote
-                            self.quote_count += 1
-                        
-                        # Call custom callback if provided
-                        if callback:
-                            try:
-                                callback(msg)
-                            except:
-                                pass  # Don't let callback errors crash the stream
+            # Subscribe to trades, quotes, and minute aggregates for each ticker
+            for ticker in tickers:
+                self.client.subscribe_stock_trades(ticker)
+                self.client.subscribe_stock_quotes(ticker)
+                self.client.subscribe_stock_minute_aggregates(ticker)
             
             # Start streaming in background thread
-            def run_stream():
-                try:
-                    self.is_connected = True
-                    self.connection_status = "connected"
-                    self.client.run(handle_messages)
-                except Exception as e:
-                    # Store error for main thread to display
-                    self.error_message = f"WebSocket error: {str(e)}"
-                    self.is_connected = False
-                    self.connection_status = "error"
-            
-            self.thread = threading.Thread(target=run_stream, daemon=True)
-            self.thread.start()
+            self.client.start_stream_thread()
+            self.is_connected = True
+            self.connection_status = "connected"
             
             # Give it a moment to connect
             time.sleep(1)
@@ -129,12 +130,11 @@ class RealTimeDataStream:
         """Disconnect from WebSocket"""
         try:
             if self.client:
-                self.client.close()
+                self.client.close_stream()
             self.is_connected = False
-            if self.thread:
-                self.thread.join(timeout=2)
+            self.connection_status = "disconnected"
         except Exception as e:
-            st.warning(f"Error disconnecting: {str(e)}")
+            pass  # Don't call st.warning from here - not thread safe
     
     def get_latest_price(self, ticker: str) -> Dict:
         """Get latest price for a ticker"""
@@ -182,7 +182,7 @@ def is_market_open() -> bool:
     return market_open <= now_et <= market_close
 
 
-def format_websocket_message(msg: WebSocketMessage) -> str:
+def format_websocket_message(msg) -> str:
     """Format a WebSocket message for display"""
     try:
         if hasattr(msg, 'event_type'):
@@ -259,13 +259,13 @@ def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Di
         Dictionary mapping ticker to snapshot data (price, volume, etc.)
     """
     try:
-        client = RESTClient(api_key)
+        client = StocksClient(api_key)
         snapshot_data = {}
         
         for ticker in tickers:
             try:
-                # Get snapshot for ticker (correct argument order)
-                snapshot = client.get_snapshot_ticker(ticker, market="stocks")
+                # Get snapshot for ticker
+                snapshot = client.get_snapshot(ticker)
                 
                 if snapshot and hasattr(snapshot, 'ticker'):
                     # Extract relevant price data
