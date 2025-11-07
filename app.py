@@ -701,6 +701,18 @@ with st.sidebar:
     
     st.divider()
     
+    # WebSocket streaming control
+    st.header("🔌 Real-time Streaming")
+    enable_streaming = st.checkbox("Enable WebSocket streaming", value=False, 
+                                  help="Connect to real-time data feed (requires paid Polygon subscription)")
+    
+    if enable_streaming:
+        if st.button("Start Streaming", type="secondary"):
+            st.info("WebSocket streaming would connect to wss://socket.polygon.io/stocks")
+            st.caption("Note: Real-time streaming requires implementation in production environment")
+    
+    st.divider()
+    
     analyze_button = st.button("🔄 Analyze & Predict", type="primary", use_container_width=True)
     
     st.divider()
@@ -733,6 +745,19 @@ else:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # Fetch VIX data once (shared across all indexes)
+        status_text.text("Fetching VIX data...")
+        vix_df = fetch_vix_data(st.session_state.api_key, days_history)
+        
+        # Check if we're in critical window for intraday data
+        if is_near_market_close():
+            st.warning("🔴 Critical window detected! Using intraday data for enhanced predictions.")
+            data_timespan = 'minute'
+            data_multiplier = 5  # 5-minute bars
+        else:
+            data_timespan = 'day'
+            data_multiplier = 1
+        
         for idx, index_name in enumerate(selected_indexes):
             ticker = INDEXES[index_name]
             status_text.text(f"Analyzing {index_name}...")
@@ -741,6 +766,17 @@ else:
             df = fetch_market_data(st.session_state.api_key, ticker, days_history)
             
             if df is not None and len(df) > 0:
+                # Merge VIX data if available
+                if vix_df is not None and len(vix_df) > 0:
+                    df = pd.merge(df, vix_df, on='timestamp', how='left')
+                    df['vix_close'] = df['vix_close'].fillna(method='ffill')
+                
+                # Get current price for GEX calculation
+                current_price = df['close'].iloc[-1]
+                
+                # Calculate GEX levels
+                gex_data = calculate_gex(st.session_state.api_key, ticker, current_price)
+                
                 # Predict EOD price using selected model and timeframe
                 predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
                     df, 
@@ -759,7 +795,9 @@ else:
                         'df': df_with_indicators,
                         'change_pct': change_pct,
                         'model_type': st.session_state.selected_model,
-                        'timeframe': st.session_state.timeframe
+                        'timeframe': st.session_state.timeframe,
+                        'gex_data': gex_data,  # Add GEX data
+                        'has_vix': vix_df is not None  # Track VIX availability
                     }
                     
                     # Save prediction to database
@@ -907,6 +945,49 @@ else:
                     st.metric("Momentum", f"{latest_data['Momentum']:.2f}")
                     mom_signal = "Positive" if latest_data['Momentum'] > 0 else "Negative"
                     st.caption(mom_signal)
+                
+                # Display GEX data if available
+                if 'gex_data' in pred and pred['gex_data']:
+                    st.subheader("🎯 Gamma Exposure (GEX) Analysis")
+                    gex_col1, gex_col2, gex_col3 = st.columns(3)
+                    
+                    gex = pred['gex_data']
+                    with gex_col1:
+                        st.metric("Total GEX", f"${gex['total_gex']/1e9:.2f}B")
+                        st.caption("Market maker exposure")
+                    
+                    with gex_col2:
+                        st.metric("Zero Gamma", f"${gex['zero_gamma']:.2f}")
+                        st.caption("Key flip level")
+                    
+                    with gex_col3:
+                        net_gex = gex['call_gex'] - gex['put_gex']
+                        st.metric("Net GEX", f"${net_gex/1e9:.2f}B")
+                        st.caption("Call - Put exposure")
+                    
+                    # Key levels
+                    if gex.get('key_levels'):
+                        st.info(f"Key Support/Resistance: ${gex['key_levels'][0]:.2f} / ${gex['key_levels'][1]:.2f}")
+                
+                # Display VWAP and AMA
+                st.subheader("📊 Advanced Indicators")
+                adv_col1, adv_col2, adv_col3 = st.columns(3)
+                
+                with adv_col1:
+                    st.metric("VWAP", f"${latest_data['VWAP']:.2f}")
+                    vwap_signal = "Above" if pred['current_price'] > latest_data['VWAP'] else "Below"
+                    st.caption(f"Price {vwap_signal}")
+                
+                with adv_col2:
+                    st.metric("AMA (Adaptive)", f"${latest_data['AMA']:.2f}")
+                    ama_signal = "Above" if pred['current_price'] > latest_data['AMA'] else "Below"
+                    st.caption(f"Price {ama_signal}")
+                
+                with adv_col3:
+                    if 'vix_close' in latest_data:
+                        st.metric("VIX", f"{latest_data['vix_close']:.2f}")
+                        vix_level = "High Vol" if latest_data['vix_close'] > 20 else "Low Vol"
+                        st.caption(vix_level)
     
     elif selected_indexes and not st.session_state.predictions:
         st.info("👆 Click 'Analyze & Predict' to generate predictions for selected indexes")

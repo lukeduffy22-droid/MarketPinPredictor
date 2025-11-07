@@ -2,7 +2,9 @@
 
 ## Overview
 
-This is a Streamlit-based web application that predicts stock index prices using technical analysis and machine learning. The application fetches real-time market data via the Polygon.io API and uses linear regression models with technical indicators to forecast price movements for major stock market indexes including S&P 500, Dow Jones, NASDAQ 100, and Russell 2000.
+This is an advanced Streamlit-based web application that predicts stock index prices using sophisticated technical analysis, options analytics, and machine learning. The application fetches real-time market data via the Polygon.io API (with WebSocket streaming support) and uses multiple ML models with advanced technical indicators to forecast price movements for major stock market indexes including S&P 500, Dow Jones, NASDAQ 100, and Russell 2000.
+
+**Key Focus**: Optimized for the critical 15-minutes-before-close window (3:45-4:00 PM ET) when predictions are most valuable for end-of-day positioning.
 
 ## User Preferences
 
