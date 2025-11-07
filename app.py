@@ -11,6 +11,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from database import init_db, save_prediction, get_predictions_by_ticker, get_all_predictions, save_alert, get_active_alerts, get_prediction_accuracy_stats
 from models import train_linear_regression, train_random_forest
+from options_gamma import get_gamma_analysis
 
 # Initialize database
 init_db()
@@ -22,12 +23,20 @@ st.set_page_config(
     layout="wide"
 )
 
-# Major stock indexes
+# Major stock indexes - Using actual index tickers
 INDEXES = {
-    "S&P 500": "SPY",
-    "Dow Jones": "DIA",
-    "NASDAQ 100": "QQQ",
-    "Russell 2000": "IWM"
+    "S&P 500 (SPX)": "SPX",
+    "NASDAQ 100 (NDX)": "NDX", 
+    "Dow Jones (DJI)": "DJI",
+    "Russell 2000 (RUT)": "RUT"
+}
+
+# ETF proxies for data fetching (indexes don't have direct price data)
+INDEX_ETFS = {
+    "SPX": "SPY",
+    "NDX": "QQQ",
+    "DJI": "DIA",
+    "RUT": "IWM"
 }
 
 # Initialize session state
@@ -206,31 +215,48 @@ def fetch_vix_data(api_key, days=60):
         return None
 
 def calculate_gex(api_key, ticker, spot_price):
-    """Calculate Gamma Exposure (GEX) for options"""
+    """Calculate real Gamma Exposure (GEX) for options using gamma analysis"""
     try:
-        # For demonstration, using simplified GEX calculation
-        # In production, would fetch full option chain data
+        # Use the real gamma analysis from options_gamma module
+        gex_analysis = get_gamma_analysis(api_key, ticker, spot_price)
         
-        # Placeholder GEX values - would be calculated from option chain
-        # This is a simplified version; real implementation would fetch option data
-        
-        # Mock GEX levels for demonstration
-        gex_levels = {
-            'total_gex': spot_price * 1000000 * np.random.uniform(0.8, 1.2),  # Total GEX
-            'call_gex': spot_price * 500000 * np.random.uniform(0.9, 1.1),   # Call GEX
-            'put_gex': spot_price * 500000 * np.random.uniform(0.9, 1.1),    # Put GEX
-            'zero_gamma': spot_price * np.random.uniform(0.98, 1.02),        # Zero gamma level
-            'gex_profile': {}  # Would contain strike-level GEX
-        }
-        
-        # Add key support/resistance levels based on GEX
-        gex_levels['key_levels'] = [
-            spot_price * 0.98,  # Major put support
-            spot_price * 1.02,  # Major call resistance
-            gex_levels['zero_gamma']
-        ]
-        
-        return gex_levels
+        if gex_analysis:
+            # Convert to the expected format for the app
+            gex_levels = {
+                'total_gex': gex_analysis['total_gex'],
+                'net_gex': gex_analysis['net_gex'],
+                'pin_strike': gex_analysis['pin_strike'],
+                'pin_expiry': gex_analysis['pin_expiry'],
+                'zero_gamma': gex_analysis['zero_gamma'],
+                'direction': gex_analysis['direction'],
+                'pull_strength': gex_analysis['pull_strength'],
+                'summary': gex_analysis['summary'],
+                'gamma_walls': gex_analysis['gamma_walls'],
+                'gex_by_strike': gex_analysis['gex_by_strike']
+            }
+            
+            # Add key support/resistance levels from gamma walls
+            if not gex_analysis['gamma_walls'].empty:
+                key_levels = gex_analysis['gamma_walls']['strike'].tolist()[:3]
+            else:
+                key_levels = [spot_price * 0.98, spot_price * 1.02, gex_analysis['zero_gamma']]
+            
+            gex_levels['key_levels'] = key_levels
+            
+            return gex_levels
+        else:
+            # Fallback to simple calculation if real data not available
+            return {
+                'total_gex': 0,
+                'net_gex': 0,
+                'pin_strike': spot_price,
+                'pin_expiry': datetime.now(),
+                'zero_gamma': spot_price,
+                'direction': 'at',
+                'pull_strength': 0,
+                'summary': 'Gamma data unavailable',
+                'key_levels': [spot_price * 0.98, spot_price * 1.02]
+            }
     except Exception as e:
         st.warning(f"Could not calculate GEX: {str(e)}")
         return None
@@ -796,11 +822,12 @@ else:
             data_multiplier = 1
         
         for idx, index_name in enumerate(selected_indexes):
-            ticker = INDEXES[index_name]
+            index_ticker = INDEXES[index_name]  # Actual index ticker (SPX, NDX, etc.)
+            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)  # ETF for price data
             status_text.text(f"Analyzing {index_name}...")
             
-            # Fetch data
-            df = fetch_market_data(st.session_state.api_key, ticker, days_history)
+            # Fetch price data using ETF proxy
+            df = fetch_market_data(st.session_state.api_key, etf_ticker, days_history)
             
             if df is not None and len(df) > 0:
                 # Merge VIX data if available
@@ -811,8 +838,8 @@ else:
                 # Get current price for GEX calculation
                 current_price = df['close'].iloc[-1]
                 
-                # Calculate GEX levels
-                gex_data = calculate_gex(st.session_state.api_key, ticker, current_price)
+                # Calculate GEX levels using actual index ticker for options
+                gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
                 # Predict EOD price using selected model and timeframe
                 predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
@@ -936,6 +963,19 @@ else:
                 # Confidence bar
                 conf_color = "green" if pred['confidence'] > 70 else "orange" if pred['confidence'] > 50 else "red"
                 st.markdown(f"<div style='background-color: #f0f0f0; border-radius: 5px; padding: 2px;'><div style='background-color: {conf_color}; width: {pred['confidence']:.0f}%; height: 10px; border-radius: 5px;'></div></div>", unsafe_allow_html=True)
+                
+                # Display gamma pinning info if available
+                if 'gex_data' in pred and pred['gex_data']:
+                    gex = pred['gex_data']
+                    if 'pin_strike' in gex:
+                        pin_symbol = "📍"
+                        direction_arrow = "⬆️" if gex['direction'] == 'above' else "⬇️" if gex['direction'] == 'below' else "↔️"
+                        st.markdown(f"**{pin_symbol} Gamma Pin:** ${gex['pin_strike']:.0f} {direction_arrow}")
+                        if 'pin_expiry' in gex and gex['pin_expiry']:
+                            expiry_str = gex['pin_expiry'].strftime('%m/%d') if hasattr(gex['pin_expiry'], 'strftime') else str(gex['pin_expiry'])
+                            st.caption(f"Expires: {expiry_str}")
+                        if 'summary' in gex:
+                            st.caption(gex['summary'])
         
         st.divider()
         
@@ -983,24 +1023,105 @@ else:
                     mom_signal = "Positive" if latest_data['Momentum'] > 0 else "Negative"
                     st.caption(mom_signal)
                 
-                # Display GEX data if available
+                # Display Gamma Exposure Analysis if available
                 if 'gex_data' in pred and pred['gex_data']:
-                    st.subheader("🎯 Gamma Exposure (GEX) Analysis")
-                    gex_col1, gex_col2, gex_col3 = st.columns(3)
-                    
                     gex = pred['gex_data']
-                    with gex_col1:
-                        st.metric("Total GEX", f"${gex['total_gex']/1e9:.2f}B")
-                        st.caption("Market maker exposure")
+                    st.divider()
+                    st.subheader("🎯 Gamma Exposure Analysis")
                     
-                    with gex_col2:
-                        st.metric("Zero Gamma", f"${gex['zero_gamma']:.2f}")
-                        st.caption("Key flip level")
+                    # Main gamma pin information
+                    gamma_col1, gamma_col2, gamma_col3 = st.columns(3)
                     
-                    with gex_col3:
-                        net_gex = gex['call_gex'] - gex['put_gex']
-                        st.metric("Net GEX", f"${net_gex/1e9:.2f}B")
-                        st.caption("Call - Put exposure")
+                    with gamma_col1:
+                        if 'pin_strike' in gex:
+                            st.metric("📍 Primary Gamma Pin", f"${gex['pin_strike']:.0f}")
+                            if 'pin_expiry' in gex and gex['pin_expiry']:
+                                expiry_str = gex['pin_expiry'].strftime('%m/%d') if hasattr(gex['pin_expiry'], 'strftime') else str(gex['pin_expiry'])
+                                st.caption(f"Expires: {expiry_str}")
+                    
+                    with gamma_col2:
+                        if 'total_gex' in gex:
+                            st.metric("Total GEX", f"${gex['total_gex']:.1f}B")
+                            if 'net_gex' in gex:
+                                net_sign = "+" if gex['net_gex'] > 0 else ""
+                                st.caption(f"Net: {net_sign}${gex['net_gex']:.1f}B")
+                    
+                    with gamma_col3:
+                        if 'zero_gamma' in gex:
+                            st.metric("Zero Gamma Level", f"${gex['zero_gamma']:.0f}")
+                            if 'direction' in gex and 'pull_strength' in gex:
+                                st.caption(f"Pull: {gex['direction'].upper()} ({gex['pull_strength']:.1f}%)")
+                    
+                    # Show gamma walls table if available
+                    if 'gamma_walls' in gex and not gex['gamma_walls'].empty:
+                        st.write("**Major Gamma Walls (Top Strike Levels):**")
+                        
+                        # Format the gamma walls dataframe
+                        gamma_walls_display = gex['gamma_walls'].copy()
+                        gamma_walls_display['strike'] = gamma_walls_display['strike'].apply(lambda x: f"${x:.0f}")
+                        gamma_walls_display['net_gex'] = gamma_walls_display['net_gex'].apply(lambda x: f"${x:.2f}B")
+                        gamma_walls_display['total_gex'] = gamma_walls_display['total_gex'].apply(lambda x: f"${x:.2f}B")
+                        gamma_walls_display['days_to_expiry'] = gamma_walls_display['days_to_expiry'].apply(lambda x: f"{x:.0f} days")
+                        
+                        gamma_walls_display = gamma_walls_display.rename(columns={
+                            'strike': 'Strike Price',
+                            'net_gex': 'Net GEX',
+                            'total_gex': 'Total GEX',
+                            'days_to_expiry': 'Days to Expiry'
+                        })
+                        
+                        st.dataframe(gamma_walls_display, use_container_width=True)
+                    
+                    # Create gamma exposure bar chart if we have strike-level data
+                    if 'gex_by_strike' in gex and not gex['gex_by_strike'].empty:
+                        import plotly.graph_objects as go
+                        
+                        gex_df = gex['gex_by_strike']
+                        
+                        # Create bar chart showing gamma exposure by strike
+                        fig_gex = go.Figure()
+                        
+                        # Add net GEX bars
+                        fig_gex.add_trace(go.Bar(
+                            x=gex_df['strike'],
+                            y=gex_df['net_gex'],
+                            name='Net GEX',
+                            marker_color=['green' if x > 0 else 'red' for x in gex_df['net_gex']],
+                            text=[f"${abs(x):.1f}B" for x in gex_df['net_gex']],
+                            textposition='outside'
+                        ))
+                        
+                        # Add current price line
+                        if 'current_price' in pred:
+                            fig_gex.add_vline(
+                                x=pred['current_price'],
+                                line_dash="dash",
+                                line_color="blue",
+                                annotation_text=f"Current: ${pred['current_price']:.0f}"
+                            )
+                        
+                        # Add pin strike line
+                        if 'pin_strike' in gex:
+                            fig_gex.add_vline(
+                                x=gex['pin_strike'],
+                                line_dash="solid",
+                                line_color="orange",
+                                line_width=2,
+                                annotation_text=f"Pin: ${gex['pin_strike']:.0f}"
+                            )
+                        
+                        fig_gex.update_layout(
+                            title="Gamma Exposure by Strike Price",
+                            xaxis_title="Strike Price",
+                            yaxis_title="Net Gamma Exposure (Billions)",
+                            showlegend=False,
+                            height=300
+                        )
+                        
+                        st.plotly_chart(fig_gex, use_container_width=True)
+                    
+                    if 'summary' in gex:
+                        st.info(f"💡 {gex['summary']}")
                     
                     # Key levels
                     if gex.get('key_levels'):
