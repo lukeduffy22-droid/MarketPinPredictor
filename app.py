@@ -178,11 +178,25 @@ def fetch_vix_data(api_key, days=60):
         
         # Convert to DataFrame
         data = []
-        for agg in aggs:
-            data.append({
-                'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
-                'vix_close': agg['c']
-            })
+        # Handle the response format from polygon library
+        if isinstance(aggs, dict):
+            # If it's a dict, the data is likely in a 'results' key or similar
+            if 'results' in aggs:
+                aggs_list = aggs['results']
+            elif len(aggs) > 0:
+                # Try to get the first value if it's a list
+                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
+            else:
+                aggs_list = []
+        else:
+            aggs_list = aggs
+        
+        for agg in aggs_list:
+            if isinstance(agg, dict):
+                data.append({
+                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
+                    'vix_close': agg['c']
+                })
         
         df = pd.DataFrame(data)
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -244,15 +258,29 @@ def fetch_market_data(api_key, ticker, days=60):
         
         # Convert to DataFrame
         data = []
-        for agg in aggs:
-            data.append({
-                'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
-                'open': agg['o'],
-                'high': agg['h'],
-                'low': agg['l'],
-                'close': agg['c'],
-                'volume': agg['v']
-            })
+        # Handle the response format from polygon library
+        if isinstance(aggs, dict):
+            # If it's a dict, the data is likely in a 'results' key or similar
+            if 'results' in aggs:
+                aggs_list = aggs['results']
+            elif len(aggs) > 0:
+                # Try to get the first value if it's a list
+                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
+            else:
+                aggs_list = []
+        else:
+            aggs_list = aggs
+        
+        for agg in aggs_list:
+            if isinstance(agg, dict):
+                data.append({
+                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
+                    'open': agg['o'],
+                    'high': agg['h'],
+                    'low': agg['l'],
+                    'close': agg['c'],
+                    'volume': agg['v']
+                })
         
         df = pd.DataFrame(data)
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -282,8 +310,17 @@ def get_current_price(api_key, ticker):
             limit=1
         )
         
-        if aggs and len(aggs) > 0:
-            return aggs[0]['c']
+        if aggs:
+            # Handle the response format
+            if isinstance(aggs, dict):
+                if 'results' in aggs and len(aggs['results']) > 0:
+                    return aggs['results'][0]['c']
+                elif len(aggs) > 0:
+                    aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
+                    if aggs_list and len(aggs_list) > 0:
+                        return aggs_list[0]['c']
+            elif isinstance(aggs, list) and len(aggs) > 0:
+                return aggs[0]['c']
         return None
     except Exception as e:
         st.error(f"Error fetching current price: {str(e)}")
