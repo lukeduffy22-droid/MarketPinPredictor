@@ -4,7 +4,7 @@ Uses Polygon/Massive.com WebSocket API for real-time updates
 """
 
 import streamlit as st
-from polygon import WebSocketClient
+from polygon import WebSocketClient, RESTClient
 from polygon.websocket.models import WebSocketMessage
 try:
     from polygon.websocket.models import Market
@@ -14,7 +14,7 @@ except ImportError:
         STOCKS = "stocks"
         FOREX = "forex"
         CRYPTO = "crypto"
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Optional
 import threading
 import queue
 from datetime import datetime
@@ -228,10 +228,12 @@ def get_streaming_recommendations() -> str:
     recommendations = f"""
     **Market Status**: {market_status}
     
-    **WebSocket Streaming Tips**:
-    - ✅ Data only flows during market hours (9:30 AM - 4:00 PM ET)
-    - ✅ Subscribe to specific tickers instead of all (T.*) to reduce data volume
-    - ✅ Minute aggregates (AM.*) are good for charts and predictions
+    **WebSocket Streaming (24/7 Available)**:
+    - ✅ Streaming works after hours via wss://socket.massive.com/stocks
+    - ✅ During market hours: Live trades, quotes, and minute aggregates
+    - ✅ After hours: Extended hours trading data and delayed quotes
+    - ✅ Subscribe to specific tickers to reduce data volume
+    - ✅ Minute aggregates (AM.*) are best for charts and predictions
     - ✅ Trades (T.*) show every transaction (high volume)
     - ✅ Quotes (Q.*) show bid/ask updates (very high volume)
     
@@ -239,6 +241,50 @@ def get_streaming_recommendations() -> str:
     - Use ETF proxies: SPY, QQQ, DIA, IWM (lower volume than indexes)
     - For predictions: Subscribe to AM.* (minute bars) for updating charts
     - For monitoring: Subscribe to Q.* for real-time price tracking
+    - Backup method: Snapshot API available if streaming fails
     """
     
     return recommendations
+
+
+def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Dict]]:
+    """
+    Get snapshot data for tickers as a backup method when streaming is unavailable
+    
+    Args:
+        api_key: Polygon/Massive API key
+        tickers: List of tickers to fetch
+    
+    Returns:
+        Dictionary mapping ticker to snapshot data (price, volume, etc.)
+    """
+    try:
+        client = RESTClient(api_key)
+        snapshot_data = {}
+        
+        for ticker in tickers:
+            try:
+                # Get snapshot for ticker (correct argument order)
+                snapshot = client.get_snapshot_ticker(ticker, market="stocks")
+                
+                if snapshot and hasattr(snapshot, 'ticker'):
+                    # Extract relevant price data
+                    snapshot_data[ticker] = {
+                        'ticker': snapshot.ticker.ticker if hasattr(snapshot.ticker, 'ticker') else ticker,
+                        'price': snapshot.ticker.day.c if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'c') else None,
+                        'open': snapshot.ticker.day.o if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'o') else None,
+                        'high': snapshot.ticker.day.h if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'h') else None,
+                        'low': snapshot.ticker.day.l if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'l') else None,
+                        'volume': snapshot.ticker.day.v if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'v') else None,
+                        'prev_close': snapshot.ticker.prev_day.c if hasattr(snapshot.ticker, 'prev_day') and hasattr(snapshot.ticker.prev_day, 'c') else None,
+                        'timestamp': datetime.now(),
+                        'source': 'snapshot'
+                    }
+            except Exception as e:
+                # Continue with other tickers if one fails
+                continue
+        
+        return snapshot_data if snapshot_data else None
+        
+    except Exception as e:
+        return None

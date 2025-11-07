@@ -15,7 +15,7 @@ from options_gamma import get_gamma_analysis
 from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
 from websocket_streaming import (
     RealTimeDataStream, is_market_open, format_websocket_message, 
-    start_streaming_session, get_streaming_recommendations
+    start_streaming_session, get_streaming_recommendations, get_snapshot_data
 )
 
 # Initialize database
@@ -776,19 +776,19 @@ with st.sidebar:
     # WebSocket streaming control
     st.header("🔌 Real-time Streaming")
     
-    # Check market status
+    # Check market status (informational only)
     market_is_open = is_market_open()
     market_status_color = "🟢" if market_is_open else "🔴"
     market_status_text = "OPEN" if market_is_open else "CLOSED"
     st.info(f"Market Status: {market_status_color} {market_status_text}")
     
     if not market_is_open:
-        st.warning("⚠️ Live data only available during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)")
+        st.info("ℹ️ Market closed - streaming available 24/7 for after-hours data")
     
     enable_streaming = st.checkbox(
         "Enable WebSocket Streaming", 
         value=st.session_state.streaming_active,
-        help="Connect to real-time data feed from Massive.com (wss://socket.massive.com/stocks)",
+        help="Connect to real-time data feed from Massive.com - works 24/7, including after hours",
         key="streaming_checkbox"
     )
     
@@ -858,6 +858,34 @@ with st.sidebar:
     # Show recommendations
     with st.expander("💡 Streaming Tips", expanded=False):
         st.markdown(get_streaming_recommendations())
+    
+    # Snapshot data fallback
+    if not st.session_state.streaming_active:
+        st.caption("**Snapshot Data (Backup Method)**")
+        if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via REST API"):
+            if selected_indexes and st.session_state.api_key:
+                tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                with st.spinner("Fetching snapshot data..."):
+                    snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
+                    if snapshot_data:
+                        st.success(f"✅ Fetched prices for {len(snapshot_data)} tickers")
+                        # Display snapshot data
+                        cols = st.columns(len(snapshot_data))
+                        for i, (ticker, data) in enumerate(snapshot_data.items()):
+                            with cols[i]:
+                                if data['price']:
+                                    change = ((data['price'] - data['prev_close']) / data['prev_close'] * 100) if data['prev_close'] else 0
+                                    st.metric(
+                                        ticker, 
+                                        f"${data['price']:.2f}",
+                                        f"{change:+.2f}%"
+                                    )
+                                else:
+                                    st.metric(ticker, "N/A")
+                    else:
+                        st.error("Failed to fetch snapshot data. Check your API key.")
+            else:
+                st.warning("Please enter API key and select indexes first!")
     
     st.divider()
     
