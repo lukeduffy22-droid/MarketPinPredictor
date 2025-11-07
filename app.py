@@ -41,42 +41,60 @@ if 'timeframe' not in st.session_state:
     st.session_state.timeframe = '1-day'
 if 'alerts' not in st.session_state:
     st.session_state.alerts = []
+if 'indicator_params' not in st.session_state:
+    st.session_state.indicator_params = {
+        'sma_short': 5,
+        'sma_medium': 10,
+        'sma_long': 20,
+        'ema_short': 5,
+        'ema_long': 10,
+        'rsi_period': 14,
+        'macd_fast': 12,
+        'macd_slow': 26,
+        'macd_signal': 9,
+        'bb_period': 20,
+        'bb_std': 2,
+        'momentum_period': 10
+    }
 
-def calculate_technical_indicators(df):
-    """Calculate technical indicators for prediction"""
+def calculate_technical_indicators(df, params=None):
+    """Calculate technical indicators for prediction with customizable parameters"""
+    if params is None:
+        params = st.session_state.indicator_params
+    
     # Simple Moving Averages
-    df['SMA_5'] = df['close'].rolling(window=5).mean()
-    df['SMA_10'] = df['close'].rolling(window=10).mean()
-    df['SMA_20'] = df['close'].rolling(window=20).mean()
+    df['SMA_5'] = df['close'].rolling(window=params['sma_short']).mean()
+    df['SMA_10'] = df['close'].rolling(window=params['sma_medium']).mean()
+    df['SMA_20'] = df['close'].rolling(window=params['sma_long']).mean()
     
     # Exponential Moving Averages
-    df['EMA_5'] = df['close'].ewm(span=5, adjust=False).mean()
-    df['EMA_10'] = df['close'].ewm(span=10, adjust=False).mean()
+    df['EMA_5'] = df['close'].ewm(span=params['ema_short'], adjust=False).mean()
+    df['EMA_10'] = df['close'].ewm(span=params['ema_long'], adjust=False).mean()
     
     # Relative Strength Index (RSI)
     delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(window=params['rsi_period']).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=params['rsi_period']).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
     # MACD
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    exp1 = df['close'].ewm(span=params['macd_fast'], adjust=False).mean()
+    exp2 = df['close'].ewm(span=params['macd_slow'], adjust=False).mean()
     df['MACD'] = exp1 - exp2
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['Signal_Line'] = df['MACD'].ewm(span=params['macd_signal'], adjust=False).mean()
     
     # Bollinger Bands
-    df['BB_Middle'] = df['close'].rolling(window=20).mean()
-    bb_std = df['close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
-    df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+    df['BB_Middle'] = df['close'].rolling(window=params['bb_period']).mean()
+    bb_std = df['close'].rolling(window=params['bb_period']).std()
+    df['BB_Upper'] = df['BB_Middle'] + (bb_std * params['bb_std'])
+    df['BB_Lower'] = df['BB_Middle'] - (bb_std * params['bb_std'])
     
     # Momentum
-    df['Momentum'] = df['close'] - df['close'].shift(10)
+    df['Momentum'] = df['close'] - df['close'].shift(params['momentum_period'])
     
     # Rate of Change
-    df['ROC'] = ((df['close'] - df['close'].shift(10)) / df['close'].shift(10)) * 100
+    df['ROC'] = ((df['close'] - df['close'].shift(params['momentum_period'])) / df['close'].shift(params['momentum_period'])) * 100
     
     # Volume indicators
     df['Volume_SMA'] = df['volume'].rolling(window=20).mean()
@@ -380,6 +398,73 @@ with st.sidebar:
             step=5,
             help="Alert only when confidence is above this level"
         )
+    
+    st.divider()
+    
+    # Advanced indicator settings
+    with st.expander("⚙️ Advanced: Technical Indicator Parameters"):
+        st.caption("Customize technical indicator calculation parameters")
+        
+        # Get current params
+        params = st.session_state.indicator_params
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Moving Averages")
+            sma_short = st.number_input("SMA Short Period", min_value=3, max_value=20, value=params['sma_short'], key='sma_short')
+            sma_medium = st.number_input("SMA Medium Period", min_value=5, max_value=30, value=params['sma_medium'], key='sma_medium')
+            sma_long = st.number_input("SMA Long Period", min_value=10, max_value=50, value=params['sma_long'], key='sma_long')
+            ema_short = st.number_input("EMA Short Period", min_value=3, max_value=20, value=params['ema_short'], key='ema_short')
+            ema_long = st.number_input("EMA Long Period", min_value=5, max_value=30, value=params['ema_long'], key='ema_long')
+        
+        with col2:
+            st.subheader("Oscillators & Bands")
+            rsi_period = st.number_input("RSI Period", min_value=7, max_value=30, value=params['rsi_period'], key='rsi_period')
+            macd_fast = st.number_input("MACD Fast", min_value=8, max_value=20, value=params['macd_fast'], key='macd_fast')
+            macd_slow = st.number_input("MACD Slow", min_value=20, max_value=35, value=params['macd_slow'], key='macd_slow')
+            macd_signal = st.number_input("MACD Signal", min_value=5, max_value=15, value=params['macd_signal'], key='macd_signal')
+            bb_period = st.number_input("Bollinger Bands Period", min_value=10, max_value=30, value=params['bb_period'], key='bb_period')
+            bb_std = st.number_input("Bollinger Bands Std Dev", min_value=1.0, max_value=3.0, value=float(params['bb_std']), step=0.5, key='bb_std')
+            momentum_period = st.number_input("Momentum Period", min_value=5, max_value=20, value=params['momentum_period'], key='momentum_period')
+        
+        # Update session state from widget values
+        st.session_state.indicator_params = {
+            'sma_short': st.session_state.sma_short,
+            'sma_medium': st.session_state.sma_medium,
+            'sma_long': st.session_state.sma_long,
+            'ema_short': st.session_state.ema_short,
+            'ema_long': st.session_state.ema_long,
+            'rsi_period': st.session_state.rsi_period,
+            'macd_fast': st.session_state.macd_fast,
+            'macd_slow': st.session_state.macd_slow,
+            'macd_signal': st.session_state.macd_signal,
+            'bb_period': st.session_state.bb_period,
+            'bb_std': st.session_state.bb_std,
+            'momentum_period': st.session_state.momentum_period
+        }
+        
+        if st.button("Reset to Defaults"):
+            # Reset both indicator_params and widget keys
+            defaults = {
+                'sma_short': 5,
+                'sma_medium': 10,
+                'sma_long': 20,
+                'ema_short': 5,
+                'ema_long': 10,
+                'rsi_period': 14,
+                'macd_fast': 12,
+                'macd_slow': 26,
+                'macd_signal': 9,
+                'bb_period': 20,
+                'bb_std': 2.0,
+                'momentum_period': 10
+            }
+            st.session_state.indicator_params = defaults
+            # Also reset widget state
+            for key, value in defaults.items():
+                st.session_state[key] = value
+            st.rerun()
     
     st.divider()
     
