@@ -13,6 +13,10 @@ from database import init_db, save_prediction, get_predictions_by_ticker, get_al
 from models import train_linear_regression, train_random_forest
 from options_gamma import get_gamma_analysis
 from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
+from websocket_streaming import (
+    RealTimeDataStream, is_market_open, format_websocket_message, 
+    start_streaming_session, get_streaming_recommendations
+)
 
 # Initialize database
 init_db()
@@ -47,6 +51,10 @@ if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
     st.session_state.selected_model = 'Linear Regression'
+if 'ws_stream' not in st.session_state:
+    st.session_state.ws_stream = None
+if 'streaming_active' not in st.session_state:
+    st.session_state.streaming_active = False
 if 'timeframe' not in st.session_state:
     st.session_state.timeframe = '1-day'
 if 'alerts' not in st.session_state:
@@ -767,13 +775,89 @@ with st.sidebar:
     
     # WebSocket streaming control
     st.header("🔌 Real-time Streaming")
-    enable_streaming = st.checkbox("Enable WebSocket streaming", value=False, 
-                                  help="Connect to real-time data feed (requires paid Polygon subscription)")
     
-    if enable_streaming:
-        if st.button("Start Streaming", type="secondary"):
-            st.info("WebSocket streaming would connect to wss://socket.polygon.io/stocks")
-            st.caption("Note: Real-time streaming requires implementation in production environment")
+    # Check market status
+    market_is_open = is_market_open()
+    market_status_color = "🟢" if market_is_open else "🔴"
+    market_status_text = "OPEN" if market_is_open else "CLOSED"
+    st.info(f"Market Status: {market_status_color} {market_status_text}")
+    
+    if not market_is_open:
+        st.warning("⚠️ Live data only available during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)")
+    
+    enable_streaming = st.checkbox(
+        "Enable WebSocket Streaming", 
+        value=st.session_state.streaming_active,
+        help="Connect to real-time data feed from Massive.com (wss://socket.massive.com/stocks)",
+        key="streaming_checkbox"
+    )
+    
+    if enable_streaming and not st.session_state.streaming_active:
+        # Start streaming
+        if st.button("🚀 Start Streaming", type="secondary"):
+            if selected_indexes and st.session_state.api_key:
+                # Get ETF tickers for selected indexes
+                tickers_to_stream = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                
+                with st.spinner("Connecting to WebSocket..."):
+                    stream = start_streaming_session(st.session_state.api_key, tickers_to_stream)
+                    
+                    if stream:
+                        st.session_state.ws_stream = stream
+                        st.session_state.streaming_active = True
+                        st.success(f"✅ Streaming started for {', '.join(tickers_to_stream)}")
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error("Failed to start streaming. Check your API key and subscription.")
+            else:
+                st.warning("Please enter API key and select indexes first!")
+    
+    elif st.session_state.streaming_active:
+        # Show streaming status
+        if st.session_state.ws_stream:
+            # Check for errors
+            if st.session_state.ws_stream.error_message:
+                st.error(st.session_state.ws_stream.error_message)
+                # Clean up connection
+                st.session_state.ws_stream.disconnect()
+                st.session_state.ws_stream = None
+                st.session_state.streaming_active = False
+            else:
+                stats = st.session_state.ws_stream.get_stats()
+                
+                # Show connection status
+                if st.session_state.ws_stream.connection_status == "connected":
+                    st.success(f"✅ Streaming Active ({stats['tickers_tracked']} tickers)")
+                else:
+                    st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
+            
+            # Streaming stats
+            stats_col1, stats_col2 = st.columns(2)
+            with stats_col1:
+                st.metric("Trades", stats['trade_count'])
+            with stats_col2:
+                st.metric("Quotes", stats['quote_count'])
+            
+            # Stop streaming button
+            if st.button("⏹ Stop Streaming", type="secondary"):
+                st.session_state.ws_stream.disconnect()
+                st.session_state.ws_stream = None
+                st.session_state.streaming_active = False
+                st.rerun()
+            
+            # Show recent messages
+            with st.expander("📡 Recent Messages", expanded=False):
+                recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
+                if recent_msgs:
+                    for msg in recent_msgs:
+                        st.caption(format_websocket_message(msg))
+                else:
+                    st.caption("No messages yet...")
+    
+    # Show recommendations
+    with st.expander("💡 Streaming Tips", expanded=False):
+        st.markdown(get_streaming_recommendations())
     
     st.divider()
     
