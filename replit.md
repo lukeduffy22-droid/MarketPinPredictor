@@ -29,14 +29,16 @@ Preferred communication style: Simple, everyday language.
 **Technology Stack**: Python-based data processing pipeline
 
 **Core Components**:
-1. **Data Acquisition**: Polygon REST client for fetching historical market data
-2. **Feature Engineering**: Technical indicator calculation module (SMA, EMA, RSI)
-3. **Prediction Engine**: scikit-learn linear regression with standardized features
-4. **Visualization**: Plotly for interactive time-series charting
+1. **Data Acquisition**: Polygon REST client for fetching historical market data and options chains
+2. **Feature Engineering**: Technical indicator calculation module (SMA, EMA, RSI, MACD, VWAP, AMA)
+3. **Prediction Engine**: scikit-learn models (Linear Regression, Random Forest) with standardized features
+4. **Gamma Exposure Analysis**: Real options gamma calculation using Black-Scholes for strike price pinning
+5. **Backtesting System**: Historical validation using Polygon data to measure prediction accuracy
+6. **Visualization**: Plotly for interactive time-series charting and gamma exposure displays
 
 **Design Pattern**: Pipeline architecture where data flows from API → feature engineering → prediction → visualization
 
-**Rationale**: Linear pipeline simplifies data flow and makes the prediction process transparent. Technical indicators (moving averages, RSI) serve as features because they capture market momentum and trend patterns that inform price predictions.
+**Rationale**: Linear pipeline simplifies data flow and makes the prediction process transparent. Technical indicators (moving averages, RSI) serve as features because they capture market momentum and trend patterns that inform price predictions. Gamma exposure analysis identifies key price levels where market makers hedge options, creating "pinning" effects.
 
 ### Data Processing
 
@@ -90,10 +92,35 @@ Preferred communication style: Simple, everyday language.
 **API Client**:
 - `polygon`: Official Python client for Polygon.io API
 
+### Backtesting System
+
+**Purpose**: Validate prediction accuracy using historical data from Polygon API
+
+**Implementation** (`backtesting.py`):
+1. **Historical Data Fetching**: Retrieves past market data for specified date ranges
+2. **Date Alignment**: Uses T-1 data to predict T, comparing against actual T EOD prices
+3. **Metrics Calculation**: 
+   - Direction accuracy (% of correct up/down predictions)
+   - Mean absolute error percentage
+   - Root mean squared error (RMSE)
+   - Best/worst prediction analysis
+4. **Model Optimization**: Analyzes accuracy by confidence levels to identify improvement opportunities
+
+**Key Features**:
+- Works with real Polygon data for both index ETFs and options
+- Generates predicted vs. actual charts for visual validation
+- Provides confidence-level breakdown (high/medium/low)
+- Suggests model improvements based on backtest results
+
+**Rationale**: Backtesting provides empirical evidence of model performance, helping users understand prediction reliability and identify when the model performs best. Date alignment ensures predictions are forward-looking (using only past data to predict future prices).
+
 ### Data Storage
 
-**Current Implementation**: In-memory storage using Streamlit session state
+**Current Implementation**: PostgreSQL database for prediction history and alerts
 
-**Rationale**: For a prediction tool with user-specific sessions, in-memory storage is sufficient. No persistent storage required as predictions are generated on-demand.
+**Schema**:
+- `predictions`: Stores historical predictions with actual outcomes
+- `alerts`: Tracks significant movement alerts
+- Supports accuracy tracking and performance analysis over time
 
-**Future Consideration**: If historical prediction tracking or multi-user analytics are needed, a database layer (PostgreSQL with time-series optimizations) could be added.
+**Rationale**: Database storage enables long-term tracking of prediction accuracy, historical analysis, and model performance evaluation across different market conditions.

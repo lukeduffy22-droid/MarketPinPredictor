@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from database import init_db, save_prediction, get_predictions_by_ticker, get_all_predictions, save_alert, get_active_alerts, get_prediction_accuracy_stats
 from models import train_linear_regression, train_random_forest
 from options_gamma import get_gamma_analysis
+from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
 
 # Initialize database
 init_db()
@@ -779,6 +780,40 @@ with st.sidebar:
     analyze_button = st.button("🔄 Analyze & Predict", type="primary", use_container_width=True)
     
     st.divider()
+    
+    # Backtesting section
+    st.header("📊 Backtesting")
+    run_backtest_btn = st.checkbox("Enable Backtesting Mode", value=False,
+                                   help="Test prediction accuracy using historical data")
+    
+    if run_backtest_btn:
+        st.subheader("Backtest Configuration")
+        
+        # Date range for backtest
+        col1, col2 = st.columns(2)
+        with col1:
+            backtest_start = st.date_input(
+                "Start Date",
+                value=datetime.now() - timedelta(days=30),
+                max_value=datetime.now()
+            )
+        with col2:
+            backtest_end = st.date_input(
+                "End Date",
+                value=datetime.now() - timedelta(days=1),
+                max_value=datetime.now()
+            )
+        
+        # Model selection for backtest
+        backtest_model = st.selectbox(
+            "Backtest Model",
+            ["linear_regression", "random_forest"],
+            help="Model to use for backtesting"
+        )
+        
+        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", use_container_width=True)
+    
+    st.divider()
     st.caption("💡 This tool uses technical indicators and machine learning to predict closing prices. Predictions are estimates and should not be used as financial advice.")
 
 # Main content
@@ -1149,6 +1184,150 @@ else:
     
     elif selected_indexes and not st.session_state.predictions:
         st.info("👆 Click 'Analyze & Predict' to generate predictions for selected indexes")
+    
+    # Backtesting execution
+    if run_backtest_btn and 'run_backtest_analysis' in locals() and run_backtest_analysis and selected_indexes:
+        st.header("📊 Backtest Results")
+        
+        # Initialize session state for backtest results
+        if 'backtest_results' not in st.session_state:
+            st.session_state.backtest_results = {}
+        
+        backtest_progress = st.progress(0)
+        backtest_status = st.empty()
+        
+        all_backtest_results = []
+        
+        for idx, index_name in enumerate(selected_indexes):
+            index_ticker = INDEXES[index_name]
+            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)
+            
+            backtest_status.text(f"Running backtest for {index_name}...")
+            
+            # Run backtest
+            backtest_df = run_backtest(
+                st.session_state.api_key,
+                index_name,
+                index_ticker,
+                etf_ticker,
+                datetime.combine(backtest_start, datetime.min.time()),
+                datetime.combine(backtest_end, datetime.min.time()),
+                backtest_model
+            )
+            
+            if not backtest_df.empty:
+                all_backtest_results.append(backtest_df)
+                
+                # Calculate metrics
+                metrics = calculate_backtest_metrics(backtest_df)
+                
+                if metrics:
+                    # Display metrics
+                    st.subheader(f"📈 {index_name} Backtest Results")
+                    
+                    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                    
+                    with metric_col1:
+                        st.metric("Total Predictions", f"{metrics['total_predictions']}")
+                    
+                    with metric_col2:
+                        st.metric("Direction Accuracy", f"{metrics['direction_accuracy']:.1f}%")
+                    
+                    with metric_col3:
+                        st.metric("Mean Error", f"{metrics['mean_error_pct']:.2f}%")
+                    
+                    with metric_col4:
+                        st.metric("RMSE", f"${metrics['rmse']:.2f}")
+                    
+                    # Show detailed results
+                    with st.expander(f"📊 Detailed Backtest Data for {index_name}", expanded=False):
+                        # Format the dataframe for display
+                        display_df = backtest_df.copy()
+                        display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+                        display_df['current_price'] = display_df['current_price'].apply(lambda x: f"${x:.2f}")
+                        display_df['predicted_eod'] = display_df['predicted_eod'].apply(lambda x: f"${x:.2f}")
+                        display_df['actual_eod'] = display_df['actual_eod'].apply(lambda x: f"${x:.2f}")
+                        display_df['predicted_change_pct'] = display_df['predicted_change_pct'].apply(lambda x: f"{x:.2f}%")
+                        display_df['actual_change_pct'] = display_df['actual_change_pct'].apply(lambda x: f"{x:.2f}%")
+                        display_df['error_pct'] = display_df['error_pct'].apply(lambda x: f"{x:.2f}%")
+                        display_df['direction_correct'] = display_df['direction_correct'].apply(lambda x: "✓" if x else "✗")
+                        
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    
+                    # Create accuracy chart
+                    import plotly.graph_objects as go
+                    
+                    fig_acc = go.Figure()
+                    
+                    # Add predicted vs actual lines
+                    fig_acc.add_trace(go.Scatter(
+                        x=backtest_df['date'],
+                        y=backtest_df['predicted_eod'],
+                        mode='lines+markers',
+                        name='Predicted EOD',
+                        line=dict(color='blue', width=2)
+                    ))
+                    
+                    fig_acc.add_trace(go.Scatter(
+                        x=backtest_df['date'],
+                        y=backtest_df['actual_eod'],
+                        mode='lines+markers',
+                        name='Actual EOD',
+                        line=dict(color='green', width=2)
+                    ))
+                    
+                    fig_acc.update_layout(
+                        title=f"{index_name} - Predicted vs Actual EOD Prices",
+                        xaxis_title="Date",
+                        yaxis_title="Price",
+                        hovermode='x unified',
+                        height=400
+                    )
+                    
+                    st.plotly_chart(fig_acc, use_container_width=True)
+                    
+                    # Show best and worst predictions
+                    st.write("**Best & Worst Predictions:**")
+                    best_worst_col1, best_worst_col2 = st.columns(2)
+                    
+                    with best_worst_col1:
+                        st.success(f"✨ Best: {metrics['best_prediction']['date'].strftime('%Y-%m-%d')} (Error: {metrics['best_prediction']['error_pct']:.2f}%)")
+                    
+                    with best_worst_col2:
+                        st.error(f"⚠️ Worst: {metrics['worst_prediction']['date'].strftime('%Y-%m-%d')} (Error: {metrics['worst_prediction']['error_pct']:.2f}%)")
+                    
+                    st.divider()
+            
+            backtest_progress.progress((idx + 1) / len(selected_indexes))
+        
+        backtest_status.text("Backtest complete!")
+        time.sleep(0.5)
+        backtest_status.empty()
+        backtest_progress.empty()
+        
+        # Model optimization suggestions
+        if all_backtest_results:
+            combined_results = pd.concat(all_backtest_results, ignore_index=True)
+            optimization = optimize_model_features(combined_results)
+            
+            if optimization:
+                st.header("🎯 Model Optimization Insights")
+                
+                opt_col1, opt_col2, opt_col3 = st.columns(3)
+                
+                with opt_col1:
+                    st.metric("High Confidence Accuracy", f"{optimization['high_confidence_accuracy']:.1f}%")
+                    st.caption("Predictions with confidence > 70%")
+                
+                with opt_col2:
+                    st.metric("Medium Confidence Accuracy", f"{optimization['medium_confidence_accuracy']:.1f}%")
+                    st.caption("Predictions with confidence 50-70%")
+                
+                with opt_col3:
+                    st.metric("Low Confidence Accuracy", f"{optimization['low_confidence_accuracy']:.1f}%")
+                    st.caption("Predictions with confidence < 50%")
+                
+                st.info(f"💡 Recommendation: {optimization['recommendation']}")
     
     # Add tabs for additional features
     if st.session_state.api_key:
