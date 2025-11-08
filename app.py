@@ -721,8 +721,17 @@ with st.sidebar:
         }
         
         if st.button("Reset to Defaults"):
-            # Reset both indicator_params and widget keys
-            defaults = {
+            # Delete widget keys from session state - Streamlit will recreate them with default values on rerun
+            widget_keys = ['sma_short', 'sma_medium', 'sma_long', 'ema_short', 'ema_long', 
+                          'rsi_period', 'macd_fast', 'macd_slow', 'macd_signal',  
+                          'bb_period', 'bb_std', 'momentum_period']
+            
+            for key in widget_keys:
+                if key in st.session_state:
+                    del st.session_state[key]
+            
+            # Reset indicator_params to defaults
+            st.session_state.indicator_params = {
                 'sma_short': 5,
                 'sma_medium': 10,
                 'sma_long': 20,
@@ -736,10 +745,6 @@ with st.sidebar:
                 'bb_std': 2.0,
                 'momentum_period': 10
             }
-            st.session_state.indicator_params = defaults
-            # Also reset widget state
-            for key, value in defaults.items():
-                st.session_state[key] = value
             st.rerun()
     
     st.divider()
