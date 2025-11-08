@@ -1,4 +1,4 @@
-modules = ["python-3.11", "web", "r-4.5", "python-3.9", "nodejs-24", "nix", "dotnet-10.0", "nodejs-with-prybar-18"]
+modules = ["python-3.11", "web", "r-4.5", "python-3.9", "nodejs-24", "nix", "dotnet-10.0", "nodejs-with-prybar-18", "postgresql-16"]
 
 [nix]
 channel = "stable-25_05"
@@ -35,6 +35,10 @@ outputType = "webview"
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[[ports]]
+localPort = 33457
+externalPort = 4200
 
 [[ports]]
 localPort = 35649

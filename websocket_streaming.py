@@ -186,7 +186,7 @@ class RealTimeDataStream:
             
             self.client = WebSocketClient(
                 api_key=self.api_key,
-                feed='socket.polygon.io',  # Real-time feed
+                feed='delayed.polygon.io',  # Use delayed feed (15-min delay)
                 market=market,
                 subscriptions=subscriptions,
                 verbose=True,
