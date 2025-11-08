@@ -46,7 +46,9 @@ INDEX_ETFS = {
 
 # Initialize session state
 if 'api_key' not in st.session_state:
-    st.session_state.api_key = ''
+    # Load API key from environment variable (Replit Secrets)
+    import os
+    st.session_state.api_key = os.getenv('POLYGON_API_KEY', '')
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
