@@ -1,8 +1,8 @@
-modules = ["python-3.11"]
+modules = ["python-3.11", "web", "r-4.5", "python-3.9", "nodejs-24", "nix", "dotnet-10.0", "nodejs-with-prybar-18"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales"]
+packages = ["glibcLocales", "libxcrypt", "perl540Packages.DateTimeFormatDateParse", "pkg-config", "xsimd"]
 
 [deployment]
 deploymentTarget = "autoscale"
@@ -39,6 +39,10 @@ externalPort = 80
 [[ports]]
 localPort = 35649
 externalPort = 3000
+
+[[ports]]
+localPort = 36839
+externalPort = 3003
 
 [[ports]]
 localPort = 45363

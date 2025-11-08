@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from scipy.stats import norm
-from polygon import OptionsClient
+from polygon import RESTClient
 import streamlit as st
 
 def black_scholes_gamma(S, K, T, r, sigma):
@@ -34,7 +34,7 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
     Returns DataFrame with strike, expiry, type, OI, volume, IV, gamma
     """
     try:
-        client = OptionsClient(api_key)
+        client = RESTClient(api_key)
         
         # Get options chain for the underlying
         end_date = datetime.now() + timedelta(days=days_ahead)

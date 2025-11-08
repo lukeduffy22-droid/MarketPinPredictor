@@ -6,7 +6,7 @@ Uses historical Polygon data to test prediction accuracy
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from polygon import StocksClient, OptionsClient
+from polygon import RESTClient
 import streamlit as st
 from database import save_prediction
 from options_gamma import get_gamma_analysis, fetch_options_chain, calculate_gamma_exposure
@@ -25,7 +25,7 @@ def fetch_historical_index_data(api_key, ticker, date, lookback_days=60):
         DataFrame with OHLCV data
     """
     try:
-        client = StocksClient(api_key)
+        client = RESTClient(api_key)
         
         # Calculate date range
         end_date = date.strftime('%Y-%m-%d')
@@ -88,7 +88,7 @@ def get_actual_eod_price(api_key, ticker, date):
         float: Closing price
     """
     try:
-        client = StocksClient(api_key)
+        client = RESTClient(api_key)
         
         date_str = date.strftime('%Y-%m-%d')
         

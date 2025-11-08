@@ -4,7 +4,7 @@ Uses Polygon/Massive.com WebSocket API for real-time updates
 """
 
 import streamlit as st
-from polygon import StreamClient, StocksClient
+from polygon import WebSocketClient, RESTClient
 from typing import List, Dict, Callable, Optional
 import threading
 import queue
@@ -144,8 +144,8 @@ class RealTimeDataStream:
                 self.is_connected = False
                 self.connection_status = "disconnected"
             
-            # Initialize StreamClient with socket.massive.com
-            self.client = StreamClient(
+            # Initialize WebSocketClient with socket.massive.com
+            self.client = WebSocketClient(
                 api_key=self.api_key,
                 cluster='stocks',  # Use stocks cluster for all data types
                 host='socket.massive.com',
@@ -328,7 +328,7 @@ def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Di
         Dictionary mapping ticker to snapshot data (price, volume, etc.)
     """
     try:
-        client = StocksClient(api_key)
+        client = RESTClient(api_key)
         snapshot_data = {}
         
         for ticker in tickers:
