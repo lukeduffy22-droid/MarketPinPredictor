@@ -30,9 +30,13 @@ Preferred communication style: Simple, everyday language.
 
 **Core Components**:
 1. **Data Acquisition**: Polygon REST client for fetching historical market data and options chains
+   - Uses modern 2024 API: `list_aggs()` for price data, `list_options_contracts()` for options
+   - All index data uses I:SPX format (not ETF proxies)
 2. **Feature Engineering**: Technical indicator calculation module (SMA, EMA, RSI, MACD, VWAP, AMA)
 3. **Prediction Engine**: scikit-learn models (Linear Regression, Random Forest) with standardized features
-4. **Gamma Exposure Analysis**: Real options gamma calculation using Black-Scholes for strike price pinning
+4. **Gamma Exposure Analysis**: Options gamma calculation using Black-Scholes for strike price pinning
+   - Uses estimated OI/IV values (real-time requires higher API tier)
+   - Gracefully falls back to simulated data if API unavailable
 5. **Backtesting System**: Historical validation using Polygon data to measure prediction accuracy
 6. **Visualization**: Plotly for interactive time-series charting and gamma exposure displays
 

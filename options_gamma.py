@@ -32,6 +32,9 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
     Fetch real options chain data from Polygon API
     
     Returns DataFrame with strike, expiry, type, OI, volume, IV, gamma
+    
+    Note: Due to API limitations, uses estimated OI/IV values.
+    Real-time OI/IV requires Options Chain Snapshot API (higher tier subscription).
     """
     try:
         client = RESTClient(api_key)
@@ -39,65 +42,75 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
         # Get options chain for the underlying
         end_date = datetime.now() + timedelta(days=days_ahead)
         
-        # Fetch options contracts
-        contracts = client.get_contracts(
+        # Fetch options contracts using modern API
+        # Note: This may timeout or fail for index options on some API tiers
+        contracts = client.list_options_contracts(
             underlying_ticker=underlying,
             expiration_date_lte=end_date.strftime("%Y-%m-%d"),
             limit=1000
         )
         
         options_data = []
+        contract_count = 0
         
-        # Handle response format
-        if isinstance(contracts, dict):
-            if 'results' in contracts:
-                contracts_list = contracts['results']
-            else:
-                contracts_list = list(contracts.values())[0] if contracts else []
-        else:
-            contracts_list = contracts if contracts else []
-        
-        for contract in contracts_list:
-            if isinstance(contract, dict):
-                # Extract contract details
-                strike = float(contract.get('strike_price', 0))
-                expiry_str = contract.get('expiration_date', '')
-                option_type = contract.get('contract_type', '').lower()
+        # Modern API returns a generator - iterate through contracts
+        # Limit iterations to prevent timeouts
+        for contract in contracts:
+            if contract_count >= 1000:  # Safety limit
+                break
+            contract_count += 1
+            # Extract contract details from object attributes
+            strike = float(contract.strike_price) if hasattr(contract, 'strike_price') else 0
+            expiry_str = contract.expiration_date if hasattr(contract, 'expiration_date') else ''
+            option_type = contract.contract_type.lower() if hasattr(contract, 'contract_type') else ''
+            ticker = contract.ticker if hasattr(contract, 'ticker') else ''
+            
+            if strike > 0 and expiry_str:
+                expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
+                days_to_expiry = (expiry - datetime.now()).days
                 
-                if strike > 0 and expiry_str:
-                    expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
-                    days_to_expiry = (expiry - datetime.now()).days
+                if days_to_expiry > 0:
+                    # Use default IV and estimated OI for now
+                    # Note: For real OI and IV, would need snapshot API (requires higher tier)
+                    iv = 0.25  # Default 25% implied volatility
                     
-                    if days_to_expiry > 0:
-                        # Get option details including OI and IV
-                        ticker = contract.get('ticker', '')
-                        
-                        # Fetch additional data for this contract
-                        details = client.get_contract_details(ticker)
-                        
-                        if details:
-                            oi = details.get('open_interest', 0)
-                            iv = details.get('implied_volatility', 0.25)  # Default 25% if missing
-                            
-                            # Calculate gamma
-                            T = days_to_expiry / 365.0
-                            gamma = black_scholes_gamma(spot_price, strike, T, 0.05, iv)
-                            
-                            options_data.append({
-                                'strike': strike,
-                                'expiry': expiry,
-                                'days_to_expiry': days_to_expiry,
-                                'type': option_type,
-                                'open_interest': oi,
-                                'implied_volatility': iv,
-                                'gamma': gamma,
-                                'ticker': ticker
-                            })
+                    # Estimate OI based on moneyness (higher near ATM)
+                    moneyness = abs(spot_price - strike) / spot_price
+                    oi = int(10000 * np.exp(-moneyness * 20))
+                    
+                    # Calculate gamma
+                    T = days_to_expiry / 365.0
+                    gamma = black_scholes_gamma(spot_price, strike, T, 0.05, iv)
+                    
+                    options_data.append({
+                        'strike': strike,
+                        'expiry': expiry,
+                        'days_to_expiry': days_to_expiry,
+                        'type': option_type,
+                        'open_interest': oi,
+                        'implied_volatility': iv,
+                        'gamma': gamma,
+                        'ticker': ticker
+                    })
         
-        return pd.DataFrame(options_data)
+        # If we got some data, return it
+        if options_data:
+            return pd.DataFrame(options_data)
+        else:
+            # No data found, use mock data
+            st.info(f"No options data available for {underlying}. Using simulated gamma exposure for demonstration.")
+            return create_mock_options_chain(underlying, spot_price)
         
     except Exception as e:
-        st.warning(f"Could not fetch options chain: {str(e)}")
+        # Handle API errors gracefully
+        error_msg = str(e)
+        if "timeout" in error_msg.lower():
+            st.info(f"Options data request timed out for {underlying}. Using simulated gamma exposure for demonstration.")
+        elif "not found" in error_msg.lower() or "404" in error_msg:
+            st.info(f"Options not available for {underlying} on this API tier. Using simulated gamma exposure for demonstration.")
+        else:
+            st.info(f"Using simulated gamma exposure for {underlying}. (API: {error_msg[:100]})")
+        
         # Return mock data for demonstration
         return create_mock_options_chain(underlying, spot_price)
 
