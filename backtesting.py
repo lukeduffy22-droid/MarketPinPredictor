@@ -53,8 +53,7 @@ def fetch_historical_index_data(api_key, ticker, date, lookback_days=60):
                 'open': bar.open,
                 'high': bar.high,
                 'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume
+                'close': bar.close
             })
         
         df = pd.DataFrame(data)
@@ -138,9 +137,11 @@ def calculate_technical_indicators(df):
     # Momentum
     df['Momentum'] = df['close'] - df['close'].shift(10)
     
-    # Volume-based indicators
-    df['Volume_SMA'] = df['volume'].rolling(window=20).mean()
-    df['Volume_Ratio'] = df['volume'] / df['Volume_SMA']
+    # ROC (Rate of Change)
+    df['ROC'] = ((df['close'] - df['close'].shift(10)) / df['close'].shift(10)) * 100
+    
+    # AMA (Adaptive Moving Average) - simplified version
+    df['AMA'] = df['close'].ewm(span=10).mean()
     
     return df
 
@@ -160,9 +161,10 @@ def make_backtest_prediction(df, model_type='linear_regression'):
     from sklearn.preprocessing import StandardScaler
     
     try:
-        # Prepare features
+        # Prepare features (no volume indicators for indices)
         feature_cols = ['SMA_5', 'SMA_10', 'SMA_20', 'EMA_5', 'EMA_10', 
-                       'RSI', 'MACD', 'Signal_Line', 'Momentum', 'Volume_Ratio']
+                       'RSI', 'MACD', 'Signal_Line', 'Momentum', 'ROC', 
+                       'BB_Upper', 'BB_Lower', 'AMA']
         
         # Drop NaN values
         df_clean = df[feature_cols + ['close']].dropna()

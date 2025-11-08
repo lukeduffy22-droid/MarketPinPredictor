@@ -504,13 +504,26 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
 
 def create_price_chart(df, predicted_price, ticker_name):
     """Create interactive price chart with prediction"""
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI', 'Volume'),
-        row_heights=[0.6, 0.2, 0.2]
-    )
+    # Check if volume data exists (indices don't have volume)
+    has_volume = 'volume' in df.columns and df['volume'].notna().any()
+    
+    if has_volume:
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI', 'Volume'),
+            row_heights=[0.6, 0.2, 0.2]
+        )
+    else:
+        # No volume data for indices - only 2 rows
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI'),
+            row_heights=[0.7, 0.3]
+        )
     
     # Candlestick chart
     fig.add_trace(
@@ -571,14 +584,15 @@ def create_price_chart(df, predicted_price, ticker_name):
     fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
     
-    # Volume
-    colors = ['red' if close < open else 'green' 
-              for close, open in zip(df['close'], df['open'])]
-    fig.add_trace(
-        go.Bar(x=df['timestamp'], y=df['volume'], 
-               name='Volume', marker_color=colors),
-        row=3, col=1
-    )
+    # Volume (only if data exists)
+    if has_volume:
+        colors = ['red' if close < open else 'green' 
+                  for close, open in zip(df['close'], df['open'])]
+        fig.add_trace(
+            go.Bar(x=df['timestamp'], y=df['volume'], 
+                   name='Volume', marker_color=colors),
+            row=3, col=1
+        )
     
     fig.update_layout(
         height=800,
@@ -589,7 +603,8 @@ def create_price_chart(df, predicted_price, ticker_name):
     
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1)
-    fig.update_yaxes(title_text="Volume", row=3, col=1)
+    if has_volume:
+        fig.update_yaxes(title_text="Volume", row=3, col=1)
     
     return fig
 
