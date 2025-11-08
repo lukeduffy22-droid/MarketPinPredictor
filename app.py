@@ -627,10 +627,10 @@ with st.sidebar:
     
     days_history = st.slider(
         "Historical Data (days)",
-        min_value=30,
-        max_value=90,
-        value=60,
-        help="More data can improve prediction accuracy"
+        min_value=90,
+        max_value=365,
+        value=120,
+        help="More data improves prediction accuracy. Minimum 90 days required for technical indicators."
     )
     
     st.divider()
