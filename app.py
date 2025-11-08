@@ -129,11 +129,6 @@ def calculate_technical_indicators(df, params=None):
     df['EMA_5'] = df['close'].ewm(span=params['ema_short'], adjust=False).mean()
     df['EMA_10'] = df['close'].ewm(span=params['ema_long'], adjust=False).mean()
     
-    # VWAP (Volume Weighted Average Price)
-    df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
-    df['PV'] = df['Typical_Price'] * df['volume']
-    df['VWAP'] = df['PV'].cumsum() / df['volume'].cumsum()
-    
     # Kaufman's Adaptive Moving Average (AMA/KAMA)
     df['AMA'] = calculate_kama(df['close'], n_period=10, fast_period=2, slow_period=30)
     
@@ -161,10 +156,6 @@ def calculate_technical_indicators(df, params=None):
     
     # Rate of Change
     df['ROC'] = ((df['close'] - df['close'].shift(params['momentum_period'])) / df['close'].shift(params['momentum_period'])) * 100
-    
-    # Volume indicators
-    df['Volume_SMA'] = df['volume'].rolling(window=20).mean()
-    df['Volume_Ratio'] = df['volume'] / df['Volume_SMA']
     
     return df
 
@@ -436,6 +427,10 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     """Predict end-of-day price using technical indicators and ML"""
     if df is None or len(df) < 30:
         return None, None, None, None
+    
+    # Drop volume column (indices have no volume data - all None)
+    if 'volume' in df.columns:
+        df = df.drop(columns=['volume'])
     
     # Calculate technical indicators
     df = calculate_technical_indicators(df)
