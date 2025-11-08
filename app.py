@@ -36,13 +36,19 @@ INDEXES = {
     "Russell 2000 (RUT)": "RUT"
 }
 
-# ETF proxies for data fetching (indexes don't have direct price data)
+# ETF proxies for data fetching (kept for reference, but we now use actual index data)
+# NOTE: We now fetch actual index data using I:SPX, I:NDX, etc. format
 INDEX_ETFS = {
     "SPX": "SPY",
     "NDX": "QQQ",
     "DJI": "DIA",
     "RUT": "IWM"
 }
+
+# Polygon API ticker format for actual indices
+def get_index_ticker(index_symbol):
+    """Convert index symbol to Polygon API format (e.g., SPX -> I:SPX)"""
+    return f"I:{index_symbol}"
 
 # Initialize session state
 if 'api_key' not in st.session_state:
@@ -834,7 +840,8 @@ with st.sidebar:
         st.caption("**Snapshot Data (Backup Method)**")
         if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via REST API"):
             if selected_indexes and st.session_state.api_key:
-                tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                # Use actual index tickers (I:SPX format) instead of ETFs
+                tickers_to_fetch = [get_index_ticker(INDEXES[idx]) for idx in selected_indexes]
                 with st.spinner("Fetching snapshot data..."):
                     snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
                     if snapshot_data:
@@ -940,11 +947,11 @@ else:
         
         for idx, index_name in enumerate(selected_indexes):
             index_ticker = INDEXES[index_name]  # Actual index ticker (SPX, NDX, etc.)
-            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)  # ETF for price data
+            polygon_ticker = get_index_ticker(index_ticker)  # Format for Polygon API (I:SPX)
             status_text.text(f"Analyzing {index_name}...")
             
-            # Fetch price data using ETF proxy
-            df = fetch_market_data(st.session_state.api_key, etf_ticker, days_history)
+            # Fetch price data using actual index ticker (I:SPX format)
+            df = fetch_market_data(st.session_state.api_key, polygon_ticker, days_history)
             
             if df is not None and len(df) > 0:
                 # Merge VIX data if available
@@ -969,7 +976,7 @@ else:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
                     st.session_state.predictions[index_name] = {
-                        'ticker': ticker,
+                        'ticker': index_ticker,  # Actual index ticker (SPX, NDX, etc.)
                         'current_price': current_price,
                         'predicted_price': predicted_price,
                         'confidence': confidence,
@@ -991,7 +998,7 @@ else:
                             target_date = datetime.now() + timedelta(days=7)
                         
                         save_prediction(
-                            ticker=ticker,
+                            ticker=index_ticker,
                             index_name=index_name,
                             current_price=current_price,
                             predicted_price=predicted_price,
@@ -1006,7 +1013,7 @@ else:
                             direction = "increase" if change_pct > 0 else "decrease"
                             message = f"{index_name} predicted to {direction} by {abs(change_pct):.2f}% (Confidence: {confidence:.1f}%)"
                             save_alert(
-                                ticker=ticker,
+                                ticker=index_ticker,
                                 index_name=index_name,
                                 alert_type="price_movement",
                                 threshold=alert_threshold,
@@ -1282,16 +1289,16 @@ else:
         
         for idx, index_name in enumerate(selected_indexes):
             index_ticker = INDEXES[index_name]
-            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)
+            polygon_ticker = get_index_ticker(index_ticker)  # Use actual index (I:SPX format)
             
             backtest_status.text(f"Running backtest for {index_name}...")
             
-            # Run backtest
+            # Run backtest with actual index ticker (I:SPX format)
             backtest_df = run_backtest(
                 st.session_state.api_key,
                 index_name,
                 index_ticker,
-                etf_ticker,
+                polygon_ticker,  # Use actual index ticker instead of ETF
                 datetime.combine(backtest_start, datetime.min.time()),
                 datetime.combine(backtest_end, datetime.min.time()),
                 backtest_model

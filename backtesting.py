@@ -203,7 +203,7 @@ def make_backtest_prediction(df, model_type='linear_regression'):
         st.warning(f"Error making backtest prediction: {str(e)}")
         return None, 0.0
 
-def run_backtest(api_key, ticker_name, index_ticker, etf_ticker, start_date, end_date, model_type='linear_regression'):
+def run_backtest(api_key, ticker_name, index_ticker, polygon_ticker, start_date, end_date, model_type='linear_regression'):
     """
     Run backtest for a specific ticker over a date range
     
@@ -211,7 +211,7 @@ def run_backtest(api_key, ticker_name, index_ticker, etf_ticker, start_date, end
         api_key: Polygon API key
         ticker_name: Display name (e.g., "S&P 500 (SPX)")
         index_ticker: Actual index ticker (e.g., "SPX")
-        etf_ticker: ETF proxy for price data (e.g., "SPY")
+        polygon_ticker: Polygon API ticker format for actual index data (e.g., "I:SPX")
         start_date: Start date for backtest
         end_date: End date for backtest
         model_type: Type of model to use
@@ -230,7 +230,7 @@ def run_backtest(api_key, ticker_name, index_ticker, etf_ticker, start_date, end
             # Fetch historical data up to PREVIOUS day (T-1)
             # This simulates having data only up to the previous day's close
             previous_date = current_date - timedelta(days=1)
-            df = fetch_historical_index_data(api_key, etf_ticker, previous_date, lookback_days=60)
+            df = fetch_historical_index_data(api_key, polygon_ticker, previous_date, lookback_days=60)
             
             if df is not None and len(df) > 20:
                 # Calculate indicators
@@ -244,7 +244,7 @@ def run_backtest(api_key, ticker_name, index_ticker, etf_ticker, start_date, end
                 
                 if predicted_price is not None:
                     # Get actual EOD price for TODAY (current_date)
-                    actual_eod = get_actual_eod_price(api_key, etf_ticker, current_date)
+                    actual_eod = get_actual_eod_price(api_key, polygon_ticker, current_date)
                     
                     if actual_eod is not None:
                         # Calculate metrics

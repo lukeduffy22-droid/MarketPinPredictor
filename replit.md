@@ -70,8 +70,9 @@ Preferred communication style: Simple, everyday language.
 
 **Polygon.io REST API**
 - Purpose: Real-time and historical stock market data
-- Authentication: API key-based
-- Data Retrieved: OHLCV (Open, High, Low, Close, Volume) data for index ETFs
+- Authentication: API key-based (stored securely in Replit Secrets)
+- Data Retrieved: OHLCV (Open, High, Low, Close, Volume) data for **actual indices** using Polygon ticker format (I:SPX, I:NDX, I:DJI, I:RUT)
+- **Important**: App now fetches actual index data (SPX ~$6,700) instead of ETF proxies (SPY ~$670)
 - Rate Limiting: Handled through caching in session state
 
 ### Python Libraries
@@ -107,10 +108,15 @@ Preferred communication style: Simple, everyday language.
 4. **Model Optimization**: Analyzes accuracy by confidence levels to identify improvement opportunities
 
 **Key Features**:
-- Works with real Polygon data for both index ETFs and options
+- Works with real Polygon data for **actual indices** (I:SPX format) and options
 - Generates predicted vs. actual charts for visual validation
 - Provides confidence-level breakdown (high/medium/low)
 - Suggests model improvements based on backtest results
+
+**Data Accuracy**:
+- **Before**: Used ETF proxies (SPY ~$670 for S&P 500)
+- **Now**: Uses actual index data (SPX ~$6,700 for S&P 500)
+- All predictions, charts, and backtests now use real index values
 
 **Rationale**: Backtesting provides empirical evidence of model performance, helping users understand prediction reliability and identify when the model performs best. Date alignment ensures predictions are forward-looking (using only past data to predict future prices).
 
