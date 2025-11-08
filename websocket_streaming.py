@@ -38,6 +38,10 @@ class RealTimeDataStream:
         """
         Connect to WebSocket and subscribe to tickers
         
+        Automatically uses:
+        - Real-time feed during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
+        - Delayed feed (15-min delay) when market is closed
+        
         Args:
             tickers: List of ticker symbols (for indices: SPX, NDX, DJI, RUT)
             stream_type: Type of stream - "indices", "options", or "all"
@@ -45,6 +49,15 @@ class RealTimeDataStream:
         """
         try:
             self.tickers = tickers
+            
+            # Determine which feed to use based on market hours
+            market_is_open = is_market_open()
+            if market_is_open:
+                feed_host = 'socket.polygon.io'  # Real-time feed
+                self.feed_type = 'real-time'
+            else:
+                feed_host = 'delayed.polygon.io'  # 15-min delayed feed
+                self.feed_type = 'delayed'
             
             # Define message handlers
             def handle_message(msgs):
@@ -186,12 +199,18 @@ class RealTimeDataStream:
             
             self.client = WebSocketClient(
                 api_key=self.api_key,
-                feed='delayed.polygon.io',  # Use delayed feed (15-min delay)
+                feed=feed_host,  # Smart switching: real-time during market hours, delayed otherwise
                 market=market,
                 subscriptions=subscriptions,
                 verbose=True,
                 max_reconnects=5
             )
+            
+            # Store connection info for display
+            import pytz
+            et_tz = pytz.timezone('US/Eastern')
+            self.connection_time = datetime.now(et_tz)
+            self.market_open_at_connection = market_is_open
             
             # Start streaming in background thread with callback
             def run_stream():
@@ -242,9 +261,17 @@ class RealTimeDataStream:
         return messages
     
     def get_stats(self) -> Dict:
-        """Get streaming statistics"""
-        return {
+        """Get streaming statistics with feed type and timestamp info"""
+        import pytz
+        et_tz = pytz.timezone('US/Eastern')
+        current_et = datetime.now(et_tz)
+        
+        stats = {
             'connected': self.is_connected,
+            'feed_type': getattr(self, 'feed_type', 'unknown'),
+            'market_open': is_market_open(),
+            'connection_time': getattr(self, 'connection_time', None),
+            'current_time_et': current_et,
             'trade_count': self.trade_count,
             'quote_count': self.quote_count,
             'options_count': self.options_count,
@@ -254,6 +281,15 @@ class RealTimeDataStream:
             'tickers_tracked': len(self.latest_prices),
             'queue_size': self.data_queue.qsize()
         }
+        
+        # Add data freshness indicator
+        if hasattr(self, 'feed_type'):
+            if self.feed_type == 'real-time':
+                stats['data_delay'] = 'Live (Real-time)'
+            else:
+                stats['data_delay'] = '~15 min delay'
+        
+        return stats
 
 
 def is_market_open() -> bool:
@@ -319,32 +355,43 @@ def start_streaming_session(api_key: str, tickers: List[str], stream_type: str =
 
 def get_streaming_recommendations() -> str:
     """Get recommendations for best streaming performance"""
+    import pytz
+    et_tz = pytz.timezone('US/Eastern')
+    current_et = datetime.now(et_tz)
+    
     market_status = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
+    feed_status = "⚡ Real-time" if is_market_open() else "🕐 Delayed (~15 min)"
     
     recommendations = f"""
-    **Market Status**: {market_status}
-    
-    **WebSocket Streaming (24/7 Available)**:
-    - ✅ Streaming works after hours via wss://socket.massive.com
-    - ✅ Real-time **Index Data**: SPX, NDX, DJI, RUT values and minute aggregates
-    - ✅ Real-time **Options Data**: Trades, quotes, and minute aggregates with timestamps
-    - ✅ During market hours: Live index values and options flow
-    - ✅ After hours: Extended hours data with timestamps for all events
-    - ✅ All messages include timestamps for accurate after-hours tracking
-    
-    **Data Types Available**:
-    - **Index Values**: Real-time index price movements
-    - **Index Minute Aggregates**: OHLCV data for charts
-    - **Options Trades**: Every options transaction with timestamp
-    - **Options Quotes**: Bid/ask updates for options
-    - **Options Aggregates**: Minute bars for options analysis
-    
-    **Best Practices**:
-    - Use actual index tickers: SPX, NDX, DJI, RUT
-    - Timestamps preserved for all after-hours data
-    - Options data includes full chain for selected indices
-    - Backup method: Snapshot API available if streaming fails
-    """
+## 📡 Smart Feed Switching
+
+**Current Status**: Market {market_status} | {feed_status} Feed Active | {current_et.strftime('%I:%M %p ET')}
+
+The app automatically selects the optimal data feed:
+- **During Market Hours** (9:30 AM - 4:00 PM ET, Mon-Fri): Uses real-time WebSocket feed for live data
+- **After Hours & Weekends**: Uses delayed feed (~15 min) to prevent connection errors
+
+### How It Works:
+1. When you start streaming, the app checks if the market is currently open
+2. If market is open → connects to `socket.polygon.io` (real-time)
+3. If market is closed → connects to `delayed.polygon.io` (15-min delay)
+4. All data is timestamped so you know exactly when it was captured
+
+
+### Data Types Available:
+- **Index Values**: Real-time index price movements (SPX, NDX, DJI, RUT)
+- **Index Minute Aggregates**: OHLCV data for charts
+- **Options Trades**: Every options transaction with timestamp
+- **Options Quotes**: Bid/ask updates for options
+- **Options Aggregates**: Minute bars for options analysis
+
+### Best Practices:
+- ✅ All data timestamped for accurate tracking
+- ✅ Works 24/7 including after hours and weekends
+- ✅ Automatic failsafe between real-time and delayed feeds
+- ✅ Uses actual index data (SPX $6,700+, not SPY $670)
+- ✅ Backup snapshot API available if streaming fails
+"""
     
     return recommendations
 

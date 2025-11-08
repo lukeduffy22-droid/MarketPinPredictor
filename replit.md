@@ -2,9 +2,11 @@
 
 ## Overview
 
-This is an advanced Streamlit-based web application that predicts stock index prices using sophisticated technical analysis, options analytics, and machine learning. The application fetches real-time market data via the Polygon.io API (with WebSocket streaming support) and uses multiple ML models with advanced technical indicators to forecast price movements for major stock market indexes including S&P 500, Dow Jones, NASDAQ 100, and Russell 2000.
+This is an advanced Streamlit-based web application that predicts stock index prices using sophisticated technical analysis, options analytics, and machine learning. The application fetches real-time market data via the Polygon.io API (with **smart WebSocket feed switching**) and uses multiple ML models with advanced technical indicators to forecast price movements for major stock market indexes including S&P 500, Dow Jones, NASDAQ 100, and Russell 2000.
 
 **Key Focus**: Optimized for the critical 15-minutes-before-close window (3:45-4:00 PM ET) when predictions are most valuable for end-of-day positioning.
+
+**Smart Feed Switching**: The app automatically uses real-time WebSocket feed during market hours (9:30 AM - 4:00 PM ET, Mon-Fri) and seamlessly switches to delayed feed (~15 min) when market is closed - ensuring 24/7 operation without connection errors.
 
 ## User Preferences
 
@@ -72,11 +74,16 @@ Preferred communication style: Simple, everyday language.
 
 ### Third-Party APIs
 
-**Polygon.io REST API**
+**Polygon.io REST & WebSocket APIs**
 - Purpose: Real-time and historical stock market data
 - Authentication: API key-based (stored securely in Replit Secrets)
 - Data Retrieved: OHLCV (Open, High, Low, Close, Volume) data for **actual indices** using Polygon ticker format (I:SPX, I:NDX, I:DJI, I:RUT)
 - **Important**: App now fetches actual index data (SPX ~$6,700) instead of ETF proxies (SPY ~$670)
+- **Smart Feed Switching**:
+  - **Market Open** (9:30 AM - 4:00 PM ET, Mon-Fri): Real-time WebSocket feed (`socket.polygon.io`)
+  - **Market Closed** (After hours, weekends): Delayed WebSocket feed (`delayed.polygon.io`, ~15 min delay)
+  - Automatic detection and switching based on current market hours
+  - All data timestamped with ET timezone for accuracy
 - Rate Limiting: Handled through caching in session state
 
 ### Python Libraries

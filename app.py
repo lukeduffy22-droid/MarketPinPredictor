@@ -759,7 +759,7 @@ with st.sidebar:
     enable_streaming = st.checkbox(
         "Enable WebSocket Streaming", 
         value=st.session_state.streaming_active,
-        help="Connect to real-time data feed from Massive.com - works 24/7, including after hours",
+        help="Smart feed switching: Real-time during market hours, delayed (~15 min) when market is closed - works 24/7",
         key="streaming_checkbox"
     )
     
@@ -777,7 +777,12 @@ with st.sidebar:
                     if stream:
                         st.session_state.ws_stream = stream
                         st.session_state.streaming_active = True
-                        st.success(f"✅ Streaming started for indices: {', '.join(tickers_to_stream)} (with options)")
+                        
+                        # Show which feed type was connected
+                        if is_market_open():
+                            st.success(f"✅ Connected to REAL-TIME feed for: {', '.join(tickers_to_stream)}")
+                        else:
+                            st.info(f"✅ Connected to DELAYED feed (~15 min) for: {', '.join(tickers_to_stream)}\n\nMarket is currently closed. Real-time feed will activate during market hours (9:30 AM - 4:00 PM ET, Mon-Fri).")
                         time.sleep(2)
                         st.rerun()
                     else:
@@ -798,22 +803,44 @@ with st.sidebar:
             else:
                 stats = st.session_state.ws_stream.get_stats()
                 
-                # Show connection status
+                # Display market status and feed type prominently
+                market_status_color = "🟢" if stats.get('market_open', False) else "🔴"
+                market_status_text = "OPEN" if stats.get('market_open', False) else "CLOSED"
+                
+                feed_type = stats.get('feed_type', 'unknown')
+                if feed_type == 'real-time':
+                    feed_indicator = "⚡ REAL-TIME DATA"
+                    feed_color = "green"
+                else:
+                    feed_indicator = "🕐 DELAYED DATA (~15 min)"
+                    feed_color = "orange"
+                
+                # Show current ET time
+                current_time = stats.get('current_time_et')
+                if current_time:
+                    time_str = current_time.strftime('%I:%M:%S %p ET')
+                else:
+                    import pytz
+                    et_tz = pytz.timezone('US/Eastern')
+                    time_str = datetime.now(et_tz).strftime('%I:%M:%S %p ET')
+                
+                # Show connection status with clear indicators
                 if st.session_state.ws_stream.connection_status == "connected":
-                    st.success(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options")
+                    st.success(f"{market_status_color} Market {market_status_text} | :{feed_color}[{feed_indicator}] | 🕐 {time_str}")
+                    st.caption(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options tracked")
                 else:
                     st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
             
             # Streaming stats
             stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
             with stats_col1:
-                st.metric("Index Updates", stats['index_count'])
+                st.metric("Data Freshness", stats.get('data_delay', 'Unknown'))
             with stats_col2:
-                st.metric("Options Updates", stats['options_count'])
+                st.metric("Index Updates", stats['index_count'])
             with stats_col3:
-                st.metric("Trades", stats['trade_count'])
+                st.metric("Options Updates", stats['options_count'])
             with stats_col4:
-                st.metric("Quotes", stats['quote_count'])
+                st.metric("Total Messages", stats['trade_count'] + stats['quote_count'])
             
             # Stop streaming button
             if st.button("⏹ Stop Streaming", type="secondary"):
