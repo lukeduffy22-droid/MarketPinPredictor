@@ -999,13 +999,19 @@ else:
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
                 # Predict EOD price using selected model and timeframe
-                predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
-                    df, 
-                    model_type=st.session_state.selected_model,
-                    timeframe=st.session_state.timeframe
-                )
+                try:
+                    predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
+                        df, 
+                        model_type=st.session_state.selected_model,
+                        timeframe=st.session_state.timeframe
+                    )
+                except Exception as e:
+                    st.error(f"Prediction error for {index_name}: {str(e)}")
+                    predicted_price = None
+                    confidence = None
+                    df_with_indicators = None
                 
-                if predicted_price and current_price:
+                if predicted_price is not None and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
                     st.session_state.predictions[index_name] = {
@@ -1055,7 +1061,11 @@ else:
                             )
                             st.session_state.alerts.append(message)
                     except Exception as e:
-                        st.warning(f"Could not save prediction: {str(e)}")
+                        st.warning(f"Could not save prediction to database: {str(e)}")
+                else:
+                    st.warning(f"⚠️ Unable to generate prediction for {index_name}. Insufficient data or model error.")
+            else:
+                st.error(f"❌ Failed to fetch market data for {index_name} ({polygon_ticker})")
             
             progress_bar.progress((idx + 1) / len(selected_indexes))
         
