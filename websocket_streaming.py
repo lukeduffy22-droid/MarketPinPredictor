@@ -47,93 +47,98 @@ class RealTimeDataStream:
             self.tickers = tickers
             
             # Define message handlers
-            def handle_message(msg):
-                # Process message with timestamp
-                try:
-                    # Add timestamp to message if not present
-                    if not hasattr(msg, 'timestamp'):
-                        msg.timestamp = datetime.now()
-                    
-                    self.data_queue.put_nowait(msg)
-                except queue.Full:
-                    # Drop oldest message and add new one
+            def handle_message(msgs):
+                # Modern API passes a list of messages
+                if not isinstance(msgs, list):
+                    msgs = [msgs]
+                
+                for msg in msgs:
+                    # Process message with timestamp
                     try:
-                        self.data_queue.get_nowait()
+                        # Add timestamp to message if not present
+                        if not hasattr(msg, 'timestamp'):
+                            msg.timestamp = datetime.now()
+                        
                         self.data_queue.put_nowait(msg)
-                    except:
-                        pass
-                
-                # Determine message type and update appropriate tracker
-                msg_type = msg.__class__.__name__
-                
-                # Handle index data
-                if 'Index' in msg_type or 'Indices' in msg_type:
-                    if hasattr(msg, 'ticker') or hasattr(msg, 'symbol'):
-                        symbol = msg.ticker if hasattr(msg, 'ticker') else msg.symbol
-                        value = None
-                        
-                        if hasattr(msg, 'value'):
-                            value = msg.value
-                        elif hasattr(msg, 'close'):
-                            value = msg.close
-                        
-                        if value:
-                            self.latest_indices[symbol] = {
-                                'value': value,
-                                'timestamp': getattr(msg, 'timestamp', datetime.now()),
-                                'type': msg_type
-                            }
-                        self.index_count += 1
-                
-                # Handle options data
-                elif 'Option' in msg_type:
-                    if hasattr(msg, 'symbol'):
-                        symbol = msg.symbol
-                        price = None
-                        
-                        if hasattr(msg, 'price'):
-                            price = msg.price
-                        elif hasattr(msg, 'close'):
-                            price = msg.close
-                        
-                        if price:
-                            self.latest_options[symbol] = {
-                                'price': price,
-                                'timestamp': getattr(msg, 'timestamp', datetime.now()),
-                                'type': msg_type
-                            }
-                        self.options_count += 1
-                
-                # Handle stock/general data
-                else:
-                    if hasattr(msg, 'symbol'):
-                        symbol = msg.symbol
-                        price = None
-                        
-                        if hasattr(msg, 'price'):
-                            price = msg.price
-                        elif hasattr(msg, 'close'):
-                            price = msg.close
-                        
-                        if price:
-                            self.latest_prices[symbol] = {
-                                'price': price,
-                                'timestamp': getattr(msg, 'timestamp', datetime.now()),
-                                'type': msg_type
-                            }
-                        
-                        # Track counts
-                        if 'Trade' in msg_type:
-                            self.trade_count += 1
-                        elif 'Quote' in msg_type:
-                            self.quote_count += 1
-                
-                # Call custom callback if provided
-                if callback:
-                    try:
-                        callback(msg)
-                    except:
-                        pass
+                    except queue.Full:
+                        # Drop oldest message and add new one
+                        try:
+                            self.data_queue.get_nowait()
+                            self.data_queue.put_nowait(msg)
+                        except:
+                            pass
+                    
+                    # Determine message type and update appropriate tracker
+                    msg_type = msg.__class__.__name__
+                    
+                    # Handle index data
+                    if 'Index' in msg_type or 'Indices' in msg_type or 'Value' in msg_type:
+                        if hasattr(msg, 'ticker') or hasattr(msg, 'symbol'):
+                            symbol = msg.ticker if hasattr(msg, 'ticker') else msg.symbol
+                            value = None
+                            
+                            if hasattr(msg, 'value'):
+                                value = msg.value
+                            elif hasattr(msg, 'close'):
+                                value = msg.close
+                            
+                            if value:
+                                self.latest_indices[symbol] = {
+                                    'value': value,
+                                    'timestamp': getattr(msg, 'timestamp', datetime.now()),
+                                    'type': msg_type
+                                }
+                            self.index_count += 1
+                    
+                    # Handle options data
+                    elif 'Option' in msg_type:
+                        if hasattr(msg, 'symbol'):
+                            symbol = msg.symbol
+                            price = None
+                            
+                            if hasattr(msg, 'price'):
+                                price = msg.price
+                            elif hasattr(msg, 'close'):
+                                price = msg.close
+                            
+                            if price:
+                                self.latest_options[symbol] = {
+                                    'price': price,
+                                    'timestamp': getattr(msg, 'timestamp', datetime.now()),
+                                    'type': msg_type
+                                }
+                            self.options_count += 1
+                    
+                    # Handle stock/general data
+                    else:
+                        if hasattr(msg, 'symbol'):
+                            symbol = msg.symbol
+                            price = None
+                            
+                            if hasattr(msg, 'price'):
+                                price = msg.price
+                            elif hasattr(msg, 'close'):
+                                price = msg.close
+                            
+                            if price:
+                                self.latest_prices[symbol] = {
+                                    'price': price,
+                                    'timestamp': getattr(msg, 'timestamp', datetime.now()),
+                                    'type': msg_type
+                                }
+                            
+                            # Track counts
+                            if 'Trade' in msg_type:
+                                self.trade_count += 1
+                            elif 'Quote' in msg_type:
+                                self.quote_count += 1
+                    
+                    # Call custom callback if provided
+                    if callback:
+                        try:
+                            callback(msg)
+                        except:
+                            pass
             
             def handle_error(e):
                 self.error_message = f"WebSocket error: {str(e)}"
@@ -144,32 +149,60 @@ class RealTimeDataStream:
                 self.is_connected = False
                 self.connection_status = "disconnected"
             
-            # Initialize WebSocketClient with socket.massive.com
-            self.client = WebSocketClient(
-                api_key=self.api_key,
-                cluster='stocks',  # Use stocks cluster for all data types
-                host='socket.massive.com',
-                on_message=handle_message,
-                on_error=handle_error,
-                on_close=handle_close
-            )
+            # Build subscription list based on stream type and tickers
+            subscriptions = []
             
-            # Subscribe based on stream type
             for ticker in tickers:
+                # Format ticker with I: prefix for indices
+                index_ticker = f"I:{ticker}" if not ticker.startswith('I:') else ticker
+                
                 if stream_type in ["indices", "all"]:
-                    # Subscribe to index value and minute aggregates
-                    self.client.subscribe_index_value(ticker)
-                    self.client.subscribe_indices_minute_aggregates(ticker)
+                    # Subscribe to index value and minute aggregates (official channel names)
+                    subscriptions.extend([
+                        f"VI.{index_ticker}",   # Index value updates (VI not XV)
+                        f"AM.{index_ticker}"    # Minute aggregates (AM not XA)
+                    ])
                 
                 if stream_type in ["options", "all"]:
-                    # Subscribe to options for the ticker
-                    # Note: This subscribes to all options for the underlying
-                    self.client.subscribe_option_trades(ticker)
-                    self.client.subscribe_option_quotes(ticker)
-                    self.client.subscribe_option_minute_aggregates(ticker)
+                    # Subscribe to options trades and aggregates for indices
+                    # Format: O:SPX for options on SPX index
+                    option_ticker = f"O:{ticker}" if not ticker.startswith('O:') else ticker
+                    subscriptions.extend([
+                        f"T.{option_ticker}*",    # Option trades
+                        f"AM.{option_ticker}*"    # Option minute aggregates
+                    ])
             
-            # Start streaming in background thread
-            self.client.start_stream_thread()
+            # Initialize modern WebSocketClient (2024 API)
+            from polygon.websocket.models import Market
+            
+            # Determine market type based on stream_type
+            if stream_type == "indices":
+                market = Market.Indices
+            elif stream_type == "options":
+                market = Market.Options
+            else:
+                # For "all", use stocks market which can handle multiple types
+                market = Market.Stocks
+            
+            self.client = WebSocketClient(
+                api_key=self.api_key,
+                feed='socket.polygon.io',  # Real-time feed
+                market=market,
+                subscriptions=subscriptions,
+                verbose=True,
+                max_reconnects=5
+            )
+            
+            # Start streaming in background thread with callback
+            def run_stream():
+                try:
+                    self.client.run(handle_message)
+                except Exception as e:
+                    handle_error(e)
+            
+            self.thread = threading.Thread(target=run_stream, daemon=True)
+            self.thread.start()
+            
             self.is_connected = True
             self.connection_status = "connected"
             
@@ -188,7 +221,7 @@ class RealTimeDataStream:
         """Disconnect from WebSocket"""
         try:
             if self.client:
-                self.client.close_stream()
+                self.client.close()
             self.is_connected = False
             self.connection_status = "disconnected"
         except Exception as e:

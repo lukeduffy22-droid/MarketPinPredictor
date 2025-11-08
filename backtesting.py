@@ -32,38 +32,30 @@ def fetch_historical_index_data(api_key, ticker, date, lookback_days=60):
         start_date = (date - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
         
         # Fetch aggregates
-        aggs = client.get_aggregate_bars(
-            ticker,
-            start_date,
-            end_date,
+        aggs = list(client.list_aggs(
+            ticker=ticker,
+            multiplier=1,
             timespan='day',
+            from_=start_date,
+            to=end_date,
+            adjusted=True,
             limit=50000
-        )
+        ))
         
-        # Handle response format
-        if isinstance(aggs, dict):
-            if 'results' in aggs:
-                aggs_list = aggs['results']
-            else:
-                return None
-        else:
-            aggs_list = aggs
-        
-        if not aggs_list:
+        if not aggs:
             return None
         
         # Convert to DataFrame
         data = []
-        for bar in aggs_list:
-            if isinstance(bar, dict):
-                data.append({
-                    'timestamp': pd.to_datetime(bar['t'], unit='ms'),
-                    'open': bar['o'],
-                    'high': bar['h'],
-                    'low': bar['l'],
-                    'close': bar['c'],
-                    'volume': bar['v']
-                })
+        for bar in aggs:
+            data.append({
+                'timestamp': pd.to_datetime(bar.timestamp, unit='ms'),
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume
+            })
         
         df = pd.DataFrame(data)
         df.set_index('timestamp', inplace=True)
@@ -93,18 +85,19 @@ def get_actual_eod_price(api_key, ticker, date):
         date_str = date.strftime('%Y-%m-%d')
         
         # Get daily bar for that specific date
-        aggs = client.get_aggregate_bars(
-            ticker,
-            date_str,
-            date_str,
+        aggs = list(client.list_aggs(
+            ticker=ticker,
+            multiplier=1,
             timespan='day',
+            from_=date_str,
+            to=date_str,
+            adjusted=True,
             limit=1
-        )
+        ))
         
-        # Handle response format
-        if isinstance(aggs, dict):
-            if 'results' in aggs and len(aggs['results']) > 0:
-                return aggs['results'][0]['c']
+        # Return the closing price
+        if aggs and len(aggs) > 0:
+            return aggs[0].close
         
         return None
         

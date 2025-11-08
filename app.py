@@ -172,51 +172,37 @@ def fetch_vix_data(api_key, days=60):
         start_date = end_date - timedelta(days=days)
         
         # Fetch VIX data (using VXX ETF as proxy)
-        aggs = client.get_aggregate_bars(
-            symbol='VIX:INDEXCBOE',  # Try direct VIX index
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d"),
-            timespan='day',
-            multiplier=1,
-            adjusted=True,
-            sort='asc',
-            limit=50000
-        )
-        
-        if not aggs:
-            # Fallback to VXX ETF if VIX index not available
-            aggs = client.get_aggregate_bars(
-                symbol='VXX',
-                from_date=start_date.strftime("%Y-%m-%d"),
-                to_date=end_date.strftime("%Y-%m-%d"),
-                timespan='day',
+        try:
+            aggs = list(client.list_aggs(
+                ticker='I:VIX',  # Polygon index ticker format
                 multiplier=1,
+                timespan='day',
+                from_=start_date.strftime("%Y-%m-%d"),
+                to=end_date.strftime("%Y-%m-%d"),
                 adjusted=True,
                 sort='asc',
                 limit=50000
-            )
+            ))
+        except:
+            # Fallback to VXX ETF if VIX index not available
+            aggs = list(client.list_aggs(
+                ticker='VXX',
+                multiplier=1,
+                timespan='day',
+                from_=start_date.strftime("%Y-%m-%d"),
+                to=end_date.strftime("%Y-%m-%d"),
+                adjusted=True,
+                sort='asc',
+                limit=50000
+            ))
         
         # Convert to DataFrame
         data = []
-        # Handle the response format from polygon library
-        if isinstance(aggs, dict):
-            # If it's a dict, the data is likely in a 'results' key or similar
-            if 'results' in aggs:
-                aggs_list = aggs['results']
-            elif len(aggs) > 0:
-                # Try to get the first value if it's a list
-                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
-            else:
-                aggs_list = []
-        else:
-            aggs_list = aggs
-        
-        for agg in aggs_list:
-            if isinstance(agg, dict):
-                data.append({
-                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
-                    'vix_close': agg['c']
-                })
+        for agg in aggs:
+            data.append({
+                'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
+                'vix_close': agg.close
+            })
         
         df = pd.DataFrame(data)
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -282,42 +268,28 @@ def fetch_market_data(api_key, ticker, days=60):
         start_date = end_date - timedelta(days=days)
         
         # Fetch aggregates (daily bars)
-        aggs = client.get_aggregate_bars(
-            symbol=ticker,
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d"),
-            timespan='day',
+        aggs = list(client.list_aggs(
+            ticker=ticker,
             multiplier=1,
+            timespan='day',
+            from_=start_date.strftime("%Y-%m-%d"),
+            to=end_date.strftime("%Y-%m-%d"),
             adjusted=True,
             sort='asc',
             limit=50000
-        )
+        ))
         
         # Convert to DataFrame
         data = []
-        # Handle the response format from polygon library
-        if isinstance(aggs, dict):
-            # If it's a dict, the data is likely in a 'results' key or similar
-            if 'results' in aggs:
-                aggs_list = aggs['results']
-            elif len(aggs) > 0:
-                # Try to get the first value if it's a list
-                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
-            else:
-                aggs_list = []
-        else:
-            aggs_list = aggs
-        
-        for agg in aggs_list:
-            if isinstance(agg, dict):
-                data.append({
-                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
-                    'open': agg['o'],
-                    'high': agg['h'],
-                    'low': agg['l'],
-                    'close': agg['c'],
-                    'volume': agg['v']
-                })
+        for agg in aggs:
+            data.append({
+                'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
+                'open': agg.open,
+                'high': agg.high,
+                'low': agg.low,
+                'close': agg.close,
+                'volume': agg.volume
+            })
         
         df = pd.DataFrame(data)
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -336,28 +308,19 @@ def get_current_price(api_key, ticker):
         end_date = datetime.now()
         start_date = end_date - timedelta(days=5)
         
-        aggs = client.get_aggregate_bars(
-            symbol=ticker,
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d"),
-            timespan='day',
+        aggs = list(client.list_aggs(
+            ticker=ticker,
             multiplier=1,
+            timespan='day',
+            from_=start_date.strftime("%Y-%m-%d"),
+            to=end_date.strftime("%Y-%m-%d"),
             adjusted=True,
             sort='desc',
             limit=1
-        )
+        ))
         
-        if aggs:
-            # Handle the response format
-            if isinstance(aggs, dict):
-                if 'results' in aggs and len(aggs['results']) > 0:
-                    return aggs['results'][0]['c']
-                elif len(aggs) > 0:
-                    aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
-                    if aggs_list and len(aggs_list) > 0:
-                        return aggs_list[0]['c']
-            elif isinstance(aggs, list) and len(aggs) > 0:
-                return aggs[0]['c']
+        if aggs and len(aggs) > 0:
+            return aggs[0].close
         return None
     except Exception as e:
         st.error(f"Error fetching current price: {str(e)}")
