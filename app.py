@@ -902,6 +902,12 @@ with st.sidebar:
     run_backtest_btn = st.checkbox("Enable Backtesting Mode", value=False,
                                    help="Test prediction accuracy using historical data")
     
+    # Initialize backtest variables
+    run_backtest_analysis = False
+    backtest_start = None
+    backtest_end = None
+    backtest_model = "linear_regression"
+    
     if run_backtest_btn:
         st.subheader("Backtest Configuration")
         
@@ -984,7 +990,7 @@ else:
                 # Merge VIX data if available
                 if vix_df is not None and len(vix_df) > 0:
                     df = pd.merge(df, vix_df, on='timestamp', how='left')
-                    df['vix_close'] = df['vix_close'].fillna(method='ffill')
+                    df['vix_close'] = df['vix_close'].ffill()
                 
                 # Get current price for GEX calculation
                 current_price = df['close'].iloc[-1]
@@ -1302,7 +1308,7 @@ else:
         st.info("👆 Click 'Analyze & Predict' to generate predictions for selected indexes")
     
     # Backtesting execution
-    if run_backtest_btn and 'run_backtest_analysis' in locals() and run_backtest_analysis and selected_indexes:
+    if run_backtest_analysis and selected_indexes and backtest_start and backtest_end:
         st.header("📊 Backtest Results")
         
         # Initialize session state for backtest results
