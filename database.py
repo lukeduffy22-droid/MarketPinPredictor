@@ -3,12 +3,24 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+import time
 
 # Get database URL from environment
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Create engine
-engine = create_engine(DATABASE_URL)
+# Create engine with connection pooling and retry settings
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,  # Verify connections before using them
+    pool_recycle=3600,   # Recycle connections after 1 hour
+    connect_args={
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -44,8 +56,23 @@ class Alert(Base):
     message = Column(Text)
 
 def init_db():
-    """Initialize database tables"""
-    Base.metadata.create_all(bind=engine)
+    """Initialize database tables with retry logic"""
+    max_retries = 3
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            else:
+                # Log error but don't crash the app
+                print(f"Warning: Database initialization failed after {max_retries} attempts: {str(e)}")
+                print("App will continue without database - some features may be limited")
+                return False
 
 def get_db():
     """Get database session"""
@@ -57,8 +84,8 @@ def get_db():
 
 def save_prediction(ticker, index_name, current_price, predicted_price, confidence, model_type, change_pct, target_date):
     """Save a prediction to the database"""
-    db = SessionLocal()
     try:
+        db = SessionLocal()
         prediction = Prediction(
             ticker=ticker,
             index_name=index_name,
@@ -73,8 +100,14 @@ def save_prediction(ticker, index_name, current_price, predicted_price, confiden
         db.commit()
         db.refresh(prediction)
         return prediction
+    except Exception as e:
+        print(f"Database error saving prediction: {str(e)}")
+        return None
     finally:
-        db.close()
+        try:
+            db.close()
+        except:
+            pass
 
 def update_prediction_actual(prediction_id, actual_price):
     """Update prediction with actual price and calculate accuracy"""
@@ -97,25 +130,37 @@ def update_prediction_actual(prediction_id, actual_price):
 
 def get_predictions_by_ticker(ticker, limit=50):
     """Get recent predictions for a ticker"""
-    db = SessionLocal()
     try:
+        db = SessionLocal()
         predictions = db.query(Prediction).filter(
             Prediction.ticker == ticker
         ).order_by(Prediction.prediction_date.desc()).limit(limit).all()
         return predictions
+    except Exception as e:
+        print(f"Database error fetching predictions: {str(e)}")
+        return []
     finally:
-        db.close()
+        try:
+            db.close()
+        except:
+            pass
 
 def get_all_predictions(limit=100):
     """Get all recent predictions"""
-    db = SessionLocal()
     try:
+        db = SessionLocal()
         predictions = db.query(Prediction).order_by(
             Prediction.prediction_date.desc()
         ).limit(limit).all()
         return predictions
+    except Exception as e:
+        print(f"Database error fetching all predictions: {str(e)}")
+        return []
     finally:
-        db.close()
+        try:
+            db.close()
+        except:
+            pass
 
 def save_alert(ticker, index_name, alert_type, threshold, current_value, message):
     """Save an alert to the database"""
