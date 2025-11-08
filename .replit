@@ -23,6 +23,7 @@ args = "streamlit-app"
 [[workflows.workflow]]
 name = "streamlit-app"
 author = "agent"
+mode = "sequential"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
