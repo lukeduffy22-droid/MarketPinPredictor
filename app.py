@@ -446,10 +446,10 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     if len(df_clean) < 20:
         return None, None, None, None
     
-    # Prepare features for prediction - including new indicators
+    # Prepare features for prediction - excluding volume-based indicators (indices have no volume)
     feature_columns = ['SMA_5', 'SMA_10', 'SMA_20', 'EMA_5', 'EMA_10', 
                        'RSI', 'MACD', 'Signal_Line', 'Momentum', 'ROC', 
-                       'Volume_Ratio', 'BB_Upper', 'BB_Lower', 'VWAP', 'AMA']
+                       'BB_Upper', 'BB_Lower', 'AMA']
     
     # Determine shift based on timeframe
     if timeframe == '1-day':
