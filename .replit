@@ -20,22 +20,42 @@ author = "agent"
 task = "workflow.run"
 args = "streamlit-app"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "fastapi-backend"
+
 [[workflows.workflow]]
 name = "streamlit-app"
 author = "agent"
 mode = "sequential"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "streamlit run app.py --server.port 5000"
-waitForPort = 5000
-
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "streamlit run app_new.py --server.port 5000"
+waitForPort = 5000
+
+[[workflows.workflow]]
+name = "fastapi-backend"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python server.py"
+waitForPort = 8000
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
 
 [[ports]]
 localPort = 35649

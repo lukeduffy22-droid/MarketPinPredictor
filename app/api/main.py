@@ -182,7 +182,6 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
     )
 
 @app.get("/predict/close")
-@timed("predict_close")
 async def predict_close(symbol: str) -> PredictionResponse:
     """
     Predict EOD close price for symbol.
