@@ -18,10 +18,19 @@ async def poll_rest_data():
     """
     Fallback: Poll REST API for live quotes every second.
     Use when WebSocket connection fails.
+    Uses ETF proxies (SPY, QQQ, DIA, IWM) for index data.
     """
     client = RESTClient(settings.polygon_api_key)
     
-    log.info("Starting REST API fallback for live data")
+    # ETF proxies for indices (works with most API tiers)
+    ETF_PROXIES = {
+        "SPX": "SPY",
+        "NDX": "QQQ",
+        "DJI": "DIA",
+        "RUT": "IWM"
+    }
+    
+    log.info("Starting REST API fallback for live data (using ETF proxies)")
     
     while True:
         try:
@@ -29,30 +38,34 @@ async def poll_rest_data():
                 await asyncio.sleep(60)
                 continue
             
-            # Poll each index
-            for symbol in ("SPX", "NDX", "DJI", "RUT"):
+            # Poll each index via ETF proxy
+            for symbol, etf in ETF_PROXIES.items():
                 try:
-                    ticker = f"I:{symbol}"
-                    
-                    # Get latest quote
-                    quote = client.get_last_quote(ticker)
+                    # Get latest quote for ETF
+                    quote = client.get_last_quote(etf)
                     
                     if quote and hasattr(quote, 'ask_price'):
                         # Use mid price
                         price = (quote.ask_price + quote.bid_price) / 2 if hasattr(quote, 'bid_price') else quote.ask_price
+                        
+                        # Scale ETF price to index (approximate)
+                        # SPY ~= SPX/10, QQQ ~= NDX/10, DIA ~= DJI/100, IWM ~= RUT
+                        scale_factors = {"SPX": 10, "NDX": 10, "DJI": 100, "RUT": 1}
+                        scaled_price = price * scale_factors.get(symbol, 1)
+                        
                         ts = int(time.time())
                         
                         # Create tick
-                        tick = IndexTick(ts=ts, price=price, size=1.0)
+                        tick = IndexTick(ts=ts, price=scaled_price, size=1.0)
                         
                         # Add to ring buffer
                         INDEX_RINGS[symbol].add(ts, tick)
-                        update_session_vwap(symbol, price, 1.0)
+                        update_session_vwap(symbol, scaled_price, 1.0)
                         
-                        log.debug(f"{symbol}: ${price:.2f}")
+                        log.debug(f"{symbol} (via {etf}): ${scaled_price:.2f}")
                         
                 except Exception as e:
-                    log.error(f"Error polling {symbol}: {e}")
+                    log.error(f"Error polling {symbol} via {etf}: {e}")
             
             # Poll every second
             await asyncio.sleep(1.0)
