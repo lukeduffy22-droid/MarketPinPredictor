@@ -1309,25 +1309,36 @@ else:
                     if gex.get('key_levels'):
                         st.info(f"Key Support/Resistance: ${gex['key_levels'][0]:.2f} / ${gex['key_levels'][1]:.2f}")
                 
-                # Display VWAP and AMA
+                # Display VWAP and AMA (only if available)
                 st.subheader("📊 Advanced Indicators")
                 adv_col1, adv_col2, adv_col3 = st.columns(3)
                 
                 with adv_col1:
-                    st.metric("VWAP", f"${latest_data['VWAP']:.2f}")
-                    vwap_signal = "Above" if pred['current_price'] > latest_data['VWAP'] else "Below"
-                    st.caption(f"Price {vwap_signal}")
+                    if 'VWAP' in latest_data:
+                        st.metric("VWAP", f"${latest_data['VWAP']:.2f}")
+                        vwap_signal = "Above" if pred['current_price'] > latest_data['VWAP'] else "Below"
+                        st.caption(f"Price {vwap_signal}")
+                    else:
+                        st.metric("VWAP", "N/A")
+                        st.caption("Not available")
                 
                 with adv_col2:
-                    st.metric("AMA (Adaptive)", f"${latest_data['AMA']:.2f}")
-                    ama_signal = "Above" if pred['current_price'] > latest_data['AMA'] else "Below"
-                    st.caption(f"Price {ama_signal}")
+                    if 'AMA' in latest_data and pd.notna(latest_data['AMA']):
+                        st.metric("AMA (Adaptive)", f"${latest_data['AMA']:.2f}")
+                        ama_signal = "Above" if pred['current_price'] > latest_data['AMA'] else "Below"
+                        st.caption(f"Price {ama_signal}")
+                    else:
+                        st.metric("AMA (Adaptive)", "N/A")
+                        st.caption("Not available")
                 
                 with adv_col3:
-                    if 'vix_close' in latest_data:
+                    if 'vix_close' in latest_data and pd.notna(latest_data['vix_close']):
                         st.metric("VIX", f"{latest_data['vix_close']:.2f}")
                         vix_level = "High Vol" if latest_data['vix_close'] > 20 else "Low Vol"
                         st.caption(vix_level)
+                    else:
+                        st.metric("VIX", "N/A")
+                        st.caption("Not available")
     
     elif selected_indexes and not st.session_state.predictions:
         st.info("👆 Click 'Analyze & Predict' to generate predictions for selected indexes")
