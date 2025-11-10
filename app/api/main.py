@@ -103,7 +103,11 @@ async def startup():
     from app.ingest.websocket_aggregator import flush_aggregates
     asyncio.create_task(flush_aggregates())
     
-    log.info("API ready")
+    # Start WebSocket stream for data ingestion
+    from app.ingest.websocket_stream import start_websocket_stream
+    asyncio.create_task(start_websocket_stream())
+    
+    log.info("API ready - WebSocket stream starting")
 
 @app.get("/healthz")
 async def health_check():

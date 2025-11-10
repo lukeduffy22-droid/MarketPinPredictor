@@ -77,6 +77,13 @@ def get_metrics():
 st.title("📈 0-Day Index Price Predictor")
 st.markdown("*Institutional-grade predictions with time-adaptive accuracy*")
 
+# Check API key
+import os
+polygon_key = os.getenv("POLYGON_API_KEY", "")
+if not polygon_key:
+    st.error("⚠️ POLYGON_API_KEY not found in environment variables. Please add it to Replit Secrets.")
+    st.stop()
+
 # Sidebar
 with st.sidebar:
     st.header("Settings")
@@ -100,17 +107,44 @@ with st.sidebar:
     health = get_health()
     
     if health:
-        st.success(f"API: {health.get('status', 'unknown')}")
+        status_text = health.get('status', 'unknown')
+        if status_text == "ok":
+            st.success(f"✅ API: {status_text}")
+        else:
+            st.warning(f"⚠️ API: {status_text}")
         
         symbols_status = health.get("symbols", {})
+        
+        # Check if any data is available
+        any_data = any(s.get("index_seconds", 0) > 0 for s in symbols_status.values())
+        
+        if not any_data:
+            st.info("🔄 WebSocket connecting... Data will appear shortly.")
+            st.caption("The system automatically connects to Polygon.io WebSocket during market hours.")
+        
         for sym, status in symbols_status.items():
             fresh = status.get("fresh", False)
             data_secs = status.get("index_seconds", 0)
             
-            status_icon = "🟢" if fresh else "🔴"
-            st.caption(f"{status_icon} {sym}: {data_secs}s data")
+            if data_secs > 0:
+                status_icon = "🟢" if fresh else "🟡"
+                st.caption(f"{status_icon} {sym}: {data_secs}s data")
+            else:
+                st.caption(f"⚪ {sym}: waiting for data")
     else:
-        st.error("API unavailable")
+        st.error("❌ API unavailable")
+    
+    st.divider()
+    
+    # API Key Status
+    st.subheader("Configuration")
+    if polygon_key:
+        masked_key = polygon_key[:8] + "..." + polygon_key[-4:] if len(polygon_key) > 12 else "***"
+        st.success(f"🔑 API Key: {masked_key}")
+    else:
+        st.error("❌ No API key found")
+    
+    st.caption("WebSocket auto-connects during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)")
     
     st.divider()
     
