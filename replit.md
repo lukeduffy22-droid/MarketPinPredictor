@@ -55,9 +55,10 @@ Preferred communication style: Simple, everyday language.
 
 3. **Feature Calculators** (`app/features/calculators.py`):
    - **VWAP Deviation**: `(price - VWAP) / VWAP` as primary mean-reversion signal
-   - **Microtrend**: Ridge regression slope over last 300 seconds ($/second)
-   - **Gamma Pinning**: Black-Scholes gamma exposure + flip point detection
+   - **Microtrend**: Numpy polyfit slope over last 300 seconds ($/second) - <5ms latency
+   - **Gamma Pinning**: Black-Scholes with fast numpy PDF - <10ms latency (no scipy dependency)
    - **Flow Urgency**: Notional volume + directional bias from recent options trades
+   - **Circuit Breaker**: 150ms time budget enforced at API layer, 503 if exceeded
 
 4. **OI Cache Service** (`app/state/oi_cache.py`):
    - Background refresh at 09:35 ET and 13:00 ET
@@ -111,6 +112,7 @@ predicted_close = current_price +
 - Return 503 if latest index tick > 5 seconds old during RTH
 - Return 400 if market is closed
 - Require minimum 300 seconds of ring buffer data
+- Circuit breaker: 150ms time budget for feature computation, 503 if exceeded
 
 **Performance Monitoring** (`app/utils/metrics.py`):
 - `@timed` decorator logs functions >200ms
