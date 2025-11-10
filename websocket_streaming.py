@@ -194,8 +194,8 @@ class RealTimeDataStream:
             elif stream_type == "options":
                 market = Market.Options
             else:
-                # For "all", use stocks market which can handle multiple types
-                market = Market.Stocks
+                # For "all", use indices market since we're tracking indices + their options
+                market = Market.Indices
             
             self.client = WebSocketClient(
                 api_key=self.api_key,
