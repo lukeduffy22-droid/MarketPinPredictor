@@ -1,0 +1,93 @@
+# app/api/predict.py
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from datetime import datetime, timezone
+from app.state.ring_buffers import INDEX_RING, FLOW_RING
+from app.features.vwap import session_vwap
+from app.features.gamma_pin import pin_scores, signed_pull
+from app.features.microtrend import RidgeNowcaster, build_features
+from app.utils.time_et import minutes_to_close_et
+import math
+
+router = APIRouter()
+
+# Global microtrend model; load coefficients at startup or after nightly fit.
+NOWCAST = RidgeNowcaster()
+# Optionally set NOWCAST.theta from persisted coeffs here.
+
+class PredictReq(BaseModel):
+    symbol: str
+    horizon: str  # '0d'
+    asOf: datetime
+
+def tau_weights(tau_min: int) -> tuple[float, float, float, float]:
+    wv = min(1.0, tau_min/120.0)
+    wm = min(1.0, 60.0/(tau_min+1.0))
+    wg = min(1.0, 90.0/(tau_min+1.0))
+    wf = min(1.0, 180.0/(tau_min+1.0))
+    return wv, wm, wg, wf
+
+def flow_urgency(last_60):
+    net = 0.0
+    for _, t in last_60:
+        sgn = (1 if t.get("is_call") else -1) * t.get("aggressor", 0)
+        net += sgn * float(t.get("notional", 0.0))
+    # squash to [-1,1]
+    scale = 1e6  # tune from history
+    x = max(-1.0, min(1.0, net / (5*scale)))
+    return x, 50.0  # placeholder percentile until you wire rolling stats
+
+@router.post("/predict/close")
+def predict_close(req: PredictReq):
+    if req.horizon != "0d":
+        raise HTTPException(status_code=400, detail="only '0d' supported in this endpoint")
+    if not INDEX_RING.view():
+        raise HTTPException(status_code=503, detail="no price data")
+
+    now_utc = req.asOf.astimezone(timezone.utc)
+    tau = minutes_to_close_et(now_utc)
+    ticks = INDEX_RING.view()
+    price = ticks[-1][1]
+    vwap = session_vwap([(ts, p, 1.0) for ts, p in ticks])
+    s_vwap = vwap - price
+
+    # microtrend
+    x = build_features([(ts, p) for ts, p in ticks])
+    dp_micro = NOWCAST.predict_delta(x)
+
+    # pin pull using current OI snapshot provider you wire into levels
+    oi_calls, oi_puts = {}, {}
+    pull = signed_pull(price, pin_scores(price, oi_calls, oi_puts)) if (oi_calls or oi_puts) else 0.0
+
+    # flow urgency from last 60s
+    last_60 = [it for it in list(FLOW_RING.view())[-60:]]
+    flow_sig, inten = flow_urgency(last_60)
+
+    # weights
+    wv, wm, wg, wf = tau_weights(tau)
+    B_VWAP, B_GAMMA, B_FLOW = 1.0, 1.0, 1.0  # load from calibration store
+
+    num = wv*B_VWAP*s_vwap + wm*dp_micro + wg*B_GAMMA*pull + wf*B_FLOW*flow_sig
+    den = max(1e-9, wv + wm + wg + wf)
+    delta = num / den
+    pred = price + delta
+
+    # confidence from your RMSE bucket store; placeholder constant until wired
+    RMSE_MAX = 10.0
+    rmse_bucket = 5.0 if tau <= 15 else 7.5
+    conf = int(round(100 * (1 - rmse_bucket / RMSE_MAX)))
+    return {
+        "asOf": req.asOf.isoformat(),
+        "price_now": price,
+        "pred_close": pred,
+        "delta": delta,
+        "confidence": conf,
+        "risk_bands": {"one_sigma": rmse_bucket, "two_sigma": 2 * rmse_bucket},
+        "components": {
+            "vwap_pull": B_VWAP * s_vwap,
+            "microtrend": dp_micro,
+            "gamma_pin": B_GAMMA * pull,
+            "flow": B_FLOW * flow_sig,
+            "flow_intensity_pctile": inten,
+        },
+    }

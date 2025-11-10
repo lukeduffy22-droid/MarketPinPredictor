@@ -1,0 +1,56 @@
+# app/ingest/polygon_ws.py
+# Async Polygon WebSocket client → fills ring buffers for index and options flow.
+import asyncio, json, logging, time
+import websockets
+from typing import Callable, Dict, Any
+from app.utils.settings import settings
+from app.state.ring_buffers import INDEX_RING, FLOW_RING
+
+log = logging.getLogger("polygon_ws")
+
+INDEX_CHANNEL = "XA.*"   # Adjust to your licensed index stream (e.g., XA.SPX)
+OPTIONS_TRADES = "T.*"   # Filter client-side to 0DTE and near-ATM
+
+def _is_0dte_near_atm(trade: Dict[str, Any], spot: float) -> bool:
+    # Expect trade has fields: sym, strike, exp, cf (call/put), notional, aggressor, price, size
+    # Implement your own parsing based on Polygon payload schema.
+    exp = trade.get("exp")
+    if exp != time.strftime("%Y-%m-%d", time.localtime()):  # naive same-day check
+        return False
+    K = trade.get("strike")
+    if not K or not spot:
+        return False
+    return abs(K - spot) / spot <= 0.03
+
+async def run_polygon_ws(get_spot: Callable[[], float]):
+    url = "wss://socket.polygon.io/stocks"  # or options/indices per your plan
+    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+        await ws.send(json.dumps({"action": "auth", "params": settings.polygon_api_key}))
+        await ws.send(json.dumps({"action": "subscribe", "params": f"{INDEX_CHANNEL},{OPTIONS_TRADES}"}))
+        log.info("Subscribed to %s", f"{INDEX_CHANNEL},{OPTIONS_TRADES}")
+        async for msg in ws:
+            data = json.loads(msg)
+            for ev in data:
+                evt = ev.get("eventType") or ev.get("ev")
+                if evn := ev.get("T"):
+                    ev = ev  # polygon format variations
+                if ev.get("ev") in ("XA", "AM", "A", "Q", "T"):  # normalize as needed
+                    # Index last trade/agg → push price only
+                    if ev.get("ev") in ("XA", "AM"):  # index aggregate
+                        ts = ev.get("t") or ev.get("SIPTimestamp") or int(time.time() * 1000)
+                        price = ev.get("c") or ev.get("price") or ev.get("p")
+                        if price:
+                            INDEX_RING.add(ts, float(price))
+                    # Options trade → push flow candidate if 0DTE & near-ATM
+                    elif ev.get("ev") == "T":  # trade
+                        spot = get_spot() or 0.0
+                        trade = {
+                            "strike": ev.get("strike"),
+                            "exp": ev.get("expiration"),
+                            "is_call": True if ev.get("type") == "C" else False,
+                            "notional": float(ev.get("p", 0.0)) * float(ev.get("s", 0.0)),
+                            "aggressor": 1 if ev.get("side") == "B" else -1,
+                            "ts": ev.get("t")
+                        }
+                        if _is_0dte_near_atm(trade, spot) and trade["notional"] > 0:
+                            FLOW_RING.add(trade["ts"], trade)

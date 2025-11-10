@@ -1,0 +1,100 @@
+Correct overall. Gaps and fixes below. Implement these before build.
+
+# Mandatory corrections
+
+* **Namespace split:** Do not use single `INDEX_RING`/`FLOW_RING` globals. Use per-symbol rings and per-root option flow.
+
+  * `INDEX_RINGS: dict[str, Ring1s]`
+  * `FLOW_RINGS: dict[str, Ring1s]` keyed by index root (`SPX`,`NDX`,`DJI`,`RUT`).
+* **Predict API contract:** Require `symbol` and validate it exists in `INDEX_RINGS`. Reject if ring < 300 seconds.
+* **OI loader boundary:** `options_gamma.py` must expose a pure function:
+
+  * `get_oi(symbol:str)->tuple[dict[int,float],dict[int,float]]` returning today’s OI snapshot only. No REST inside endpoint path.
+* **Early close/holidays:** Fill `EARLY_CLOSE_ET_DATES` and a US holiday calendar. Prediction must use actual close time, not 16:00 fixed.
+* **Schema normalization:** Normalize Polygon payloads once (ingest layer), not in features. Create a typed struct:
+
+  * `IndexTick{ts:int, price:float, size:float}`; `OptTrade{ts:int, root:str, K:int, is_call:bool, exp:date, notional:float, aggressor:int}`.
+* **Backpressure:** Aggregate index prints to 1-second bars in ingest. Drop sub-second bursts. For options, keep only last 60 s near-ATM 0DTE.
+* **Timebase:** Persist and compute in UTC. Convert to ET only for timer/output.
+* **Model state:** Load `NOWCAST.theta` and `B_VWAP/B_GAMMA/B_FLOW` from DB at startup. Fail fast if missing.
+* **Confidence:** Replace placeholder with bucketed RMSE from DB. If bucket empty, fall back to broader bucket, else return `confidence:null`.
+
+# Multi-index enablement
+
+* Subscribe to all licensed indices and 0DTE option roots.
+* Maintain per-index calibration stores and RMSE buckets.
+* `POST /predict/close` works for SPX, NDX, DJI, RUT with same logic. No UI changes beyond symbol selector.
+
+# Ingest wiring (changes)
+
+* **websocket_streaming.py → polygon_ws.py:**
+
+  * On each message, map to `IndexTick` or `OptTrade`.
+  * Route to `INDEX_RINGS[symbol].add(ts, price)` and `FLOW_RINGS[root].add(ts, trade)` if `_is_0dte_near_atm`.
+* **Session VWAP:** Compute from the per-symbol tick deque only. If sizes unknown, treat `size=1`.
+
+# API behavior (hard rules)
+
+* 429 if recompute frequency is below minimum interval for current τ bucket.
+* 503 if ring is stale (`now - last_ts > 5s` inside RTH).
+* 400 if called outside RTH with `horizon="0d"`.
+
+# Streamlit coexistence
+
+* Keep Streamlit as a client to the FastAPI service. Do not mix in-process state with `st.session_state`. The UI polls `/predict/close` and `/levels/eod`.
+
+# Testing and SLAs
+
+* **Latency:** p99 recompute ≤200 ms after 15:45 ET. Enforce with `@timed`.
+* **Memory:** ΔRSS < 100 MB per session; snapshot every 5 min.
+* **Accuracy gate:** Backtest harness must write MAE by τ-bucket to DB; server refuses “green” badge until ≥15% MAE improvement vs VWAP-only on 15–0 bucket.
+
+# Concrete edits to your summary
+
+* **Directory:** add `/app/ingest/normalize.py` for payload normalization.
+* **state/shared.py:** not needed. Prefer explicit dict singletons exported from `ring_buffers.py`.
+* **levels.py:** must accept `symbol` and pull that symbol’s ring and OI snapshot.
+* **flow_urgency.py:** compute percentile vs rolling 5-day distribution per root; store compact hist in DB.
+
+# Minimal per-symbol state (drop-in)
+
+```python
+# app/state/ring_buffers.py
+from collections import deque
+from typing import Deque, Tuple, Any
+
+class Ring1s:
+    def __init__(self, capacity:int=5400): self.q: Deque[Tuple[int, Any]] = deque(maxlen=capacity)
+    def add(self, ts:int, v:Any): self.q.append((ts,v))
+    def view(self): return self.q
+
+INDEX_RINGS: dict[str, Ring1s] = {s: Ring1s() for s in ("SPX","NDX","DJI","RUT")}
+FLOW_RINGS:  dict[str, Ring1s] = {r: Ring1s() for r in ("SPX","NDX","DJI","RUT")}
+```
+
+# Predict endpoint adjustments
+
+* Resolve rings by symbol. Use symbol-specific betas and RMSE buckets.
+* Validate ring freshness and length. Enforce cadence.
+
+# OI snapshot service
+
+* Background job at 09:35 ET and 13:00 ET ET loads OI into a cache keyed by `(symbol, date)`.
+* Endpoints read OI from the cache only.
+
+# Build order
+
+1. Replace globals with per-symbol rings.
+2. Normalize ingest payloads and route by symbol/root.
+3. Wire `get_oi(symbol)` cache and levels endpoint to accept `symbol`.
+4. Load coefficients and RMSE from DB at startup; abort if missing.
+5. Enforce cadence and freshness in predict route.
+6. Run backtest to populate RMSE buckets per symbol.
+7. Turn on Streamlit UI backed by FastAPI endpoints only.
+
+# Extension to other indices
+
+* Works as is if Polygon streams are available for them and you provide OI per index options root.
+* Keep separate coefficients per index; do not share betas or RMSE across symbols.
+
+Proceed with these changes, then build.
