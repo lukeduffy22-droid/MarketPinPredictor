@@ -1,0 +1,213 @@
+"""
+Feature calculators for 0-day prediction model.
+All features computed from ring buffer data with <50ms latency target.
+"""
+import numpy as np
+from typing import Optional, Tuple
+from collections import deque
+import logging
+
+log = logging.getLogger("features")
+
+def calc_vwap_deviation(symbol: str) -> float:
+    """
+    Calculate (current_price - VWAP) / VWAP as percentage.
+    Primary mean-reversion signal.
+    """
+    from app.state.ring_buffers import INDEX_RINGS, get_session_vwap, IndexTick
+    
+    ring = INDEX_RINGS.get(symbol)
+    if not ring or not ring.q:
+        return 0.0
+    
+    # Get latest price
+    _, latest_tick = ring.q[-1]
+    if not isinstance(latest_tick, IndexTick):
+        return 0.0
+    
+    current_price = latest_tick.price
+    vwap = get_session_vwap(symbol)
+    
+    if vwap == 0:
+        return 0.0
+    
+    return (current_price - vwap) / vwap
+
+def calc_microtrend(symbol: str, lookback_seconds: int = 300) -> float:
+    """
+    Ridge regression slope over last N seconds.
+    Captures short-term momentum for final hour predictions.
+    Returns slope in $/second.
+    """
+    from app.state.ring_buffers import INDEX_RINGS, IndexTick
+    
+    ring = INDEX_RINGS.get(symbol)
+    if not ring or len(ring.q) < 10:
+        return 0.0
+    
+    # Get recent data
+    recent = list(ring.q)[-lookback_seconds:]
+    if len(recent) < 10:
+        return 0.0
+    
+    # Extract timestamps and prices
+    times = []
+    prices = []
+    
+    for ts, tick in recent:
+        if isinstance(tick, IndexTick):
+            times.append(ts)
+            prices.append(tick.price)
+    
+    if len(times) < 10:
+        return 0.0
+    
+    # Normalize time to start at 0
+    t0 = times[0]
+    x = np.array([t - t0 for t in times])
+    y = np.array(prices)
+    
+    # Ridge regression with minimal regularization
+    from sklearn.linear_model import Ridge
+    
+    model = Ridge(alpha=0.1)
+    model.fit(x.reshape(-1, 1), y)
+    
+    # Return slope ($/second)
+    return float(model.coef_[0])
+
+def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
+    """
+    Calculate gamma exposure and pinning effect.
+    Returns (gamma_pin_strength, flip_distance).
+    
+    gamma_pin_strength: 0-1, higher means stronger pinning
+    flip_distance: dollars to nearest gamma flip point
+    """
+    from app.state.oi_cache import oi_cache
+    from app.state.ring_buffers import get_latest_price
+    from scipy.stats import norm
+    import math
+    
+    current_price = get_latest_price(symbol)
+    if not current_price:
+        return 0.0, 0.0
+    
+    strikes = oi_cache.get_all_strikes(symbol)
+    if not strikes:
+        return 0.0, 0.0
+    
+    # Calculate gamma exposure for each strike
+    total_gamma_exposure = 0.0
+    gamma_by_strike = {}
+    
+    for K, snapshot in strikes.items():
+        # Black-Scholes gamma (simplified)
+        S = current_price
+        T = 1/365  # 0DTE approximation
+        sigma = (snapshot.iv_call + snapshot.iv_put) / 2
+        
+        if sigma <= 0:
+            continue
+        
+        # d1 for Black-Scholes
+        d1 = (math.log(S/K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+        
+        # Gamma = N'(d1) / (S * sigma * sqrt(T))
+        gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
+        
+        # Gamma exposure = gamma * OI * 100 (per contract)
+        net_oi = snapshot.oi_call - snapshot.oi_put
+        gex = gamma * net_oi * 100
+        
+        gamma_by_strike[K] = gex
+        total_gamma_exposure += abs(gex)
+    
+    if not gamma_by_strike:
+        return 0.0, 0.0
+    
+    # Find strike with max gamma exposure (likely pin point)
+    max_gex_strike = max(gamma_by_strike, key=lambda k: abs(gamma_by_strike[k]))
+    max_gex = gamma_by_strike[max_gex_strike]
+    
+    # Pin strength: normalized gamma exposure
+    pin_strength = min(1.0, abs(max_gex) / (total_gamma_exposure + 1e-9))
+    
+    # Distance to pin point
+    flip_distance = abs(current_price - max_gex_strike)
+    
+    return pin_strength, flip_distance
+
+def calc_flow_urgency(symbol: str, lookback_seconds: int = 60) -> float:
+    """
+    Calculate options flow urgency score.
+    High urgency = large aggressors in recent window.
+    Returns normalized score 0-1.
+    """
+    from app.state.ring_buffers import FLOW_RINGS, OptTrade
+    
+    ring = FLOW_RINGS.get(symbol)
+    if not ring or not ring.q:
+        return 0.0
+    
+    # Get recent trades
+    import time
+    cutoff = time.time() - lookback_seconds
+    
+    recent_trades = [
+        (ts, trade) for ts, trade in ring.q 
+        if ts >= cutoff and isinstance(trade, OptTrade)
+    ]
+    
+    if not recent_trades:
+        return 0.0
+    
+    # Calculate flow metrics
+    total_notional = sum(trade.notional for _, trade in recent_trades)
+    buy_notional = sum(
+        trade.notional for _, trade in recent_trades 
+        if trade.aggressor > 0
+    )
+    
+    # Urgency score based on:
+    # 1. Total flow volume
+    # 2. Directional bias (buy vs sell)
+    volume_score = min(1.0, total_notional / 1e8)  # Normalize by $100M
+    
+    if total_notional > 0:
+        directional_bias = abs(buy_notional / total_notional - 0.5) * 2  # 0-1
+    else:
+        directional_bias = 0.0
+    
+    # Combine metrics
+    urgency = (volume_score * 0.7 + directional_bias * 0.3)
+    
+    return urgency
+
+def compute_all_features(symbol: str) -> dict:
+    """
+    Compute all features for a symbol.
+    Used by prediction endpoint.
+    """
+    try:
+        vwap_dev = calc_vwap_deviation(symbol)
+        microtrend = calc_microtrend(symbol)
+        gamma_pin, flip_dist = calc_gamma_pinning(symbol)
+        flow_urgency = calc_flow_urgency(symbol)
+        
+        return {
+            "vwap_deviation": vwap_dev,
+            "microtrend": microtrend,
+            "gamma_pin_strength": gamma_pin,
+            "gamma_flip_distance": flip_dist,
+            "flow_urgency": flow_urgency
+        }
+    except Exception as e:
+        log.error(f"Error computing features for {symbol}: {e}")
+        return {
+            "vwap_deviation": 0.0,
+            "microtrend": 0.0,
+            "gamma_pin_strength": 0.0,
+            "gamma_flip_distance": 0.0,
+            "flow_urgency": 0.0
+        }
