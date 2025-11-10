@@ -222,8 +222,21 @@ async def predict_close(symbol: str) -> PredictionResponse:
     if not current_price:
         raise HTTPException(503, f"No price data for {symbol}")
     
-    # Compute features
-    features = compute_all_features(symbol)
+    # Circuit breaker: enforce time budget for feature computation
+    feature_deadline = time.perf_counter() + 0.15  # 150ms budget
+    
+    # Compute features with timeout protection
+    try:
+        features = compute_all_features(symbol)
+        
+        # Check if we exceeded time budget
+        if time.perf_counter() > feature_deadline:
+            log.warning(f"Feature computation exceeded 150ms budget for {symbol}")
+            raise HTTPException(503, "Feature computation too slow")
+            
+    except Exception as e:
+        log.error(f"Feature computation failed for {symbol}: {e}")
+        raise HTTPException(503, f"Feature computation error: {str(e)}")
     
     # Get coefficients
     coeffs = _coefficients_cache.get(symbol, {})

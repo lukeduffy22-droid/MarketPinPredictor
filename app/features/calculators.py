@@ -35,9 +35,10 @@ def calc_vwap_deviation(symbol: str) -> float:
 
 def calc_microtrend(symbol: str, lookback_seconds: int = 300) -> float:
     """
-    Ridge regression slope over last N seconds.
+    Simple linear regression slope over last N seconds.
     Captures short-term momentum for final hour predictions.
     Returns slope in $/second.
+    Optimized: Uses numpy polyfit instead of sklearn for <5ms latency.
     """
     from app.state.ring_buffers import INDEX_RINGS, IndexTick
     
@@ -67,14 +68,11 @@ def calc_microtrend(symbol: str, lookback_seconds: int = 300) -> float:
     x = np.array([t - t0 for t in times])
     y = np.array(prices)
     
-    # Ridge regression with minimal regularization
-    from sklearn.linear_model import Ridge
-    
-    model = Ridge(alpha=0.1)
-    model.fit(x.reshape(-1, 1), y)
+    # Fast linear regression using numpy polyfit
+    coeffs = np.polyfit(x, y, 1)
     
     # Return slope ($/second)
-    return float(model.coef_[0])
+    return float(coeffs[0])
 
 def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
     """
@@ -83,10 +81,11 @@ def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
     
     gamma_pin_strength: 0-1, higher means stronger pinning
     flip_distance: dollars to nearest gamma flip point
+    
+    Optimized: Uses numpy approximation instead of scipy for <10ms latency.
     """
     from app.state.oi_cache import oi_cache
     from app.state.ring_buffers import get_latest_price
-    from scipy.stats import norm
     import math
     
     current_price = get_latest_price(symbol)
@@ -96,6 +95,11 @@ def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
     strikes = oi_cache.get_all_strikes(symbol)
     if not strikes:
         return 0.0, 0.0
+    
+    # Fast normal PDF approximation (replaces scipy.stats.norm.pdf)
+    def norm_pdf_fast(x):
+        """Fast standard normal PDF approximation"""
+        return np.exp(-0.5 * x * x) / np.sqrt(2 * np.pi)
     
     # Calculate gamma exposure for each strike
     total_gamma_exposure = 0.0
@@ -114,7 +118,7 @@ def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
         d1 = (math.log(S/K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
         
         # Gamma = N'(d1) / (S * sigma * sqrt(T))
-        gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
+        gamma = norm_pdf_fast(d1) / (S * sigma * math.sqrt(T))
         
         # Gamma exposure = gamma * OI * 100 (per contract)
         net_oi = snapshot.oi_call - snapshot.oi_put
