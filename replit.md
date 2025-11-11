@@ -1,26 +1,31 @@
-# Stock Index Price Predictor - Institutional-Grade 0-Day System
+# Stock Index Price Predictor - Dual-Model Prediction System
 
 ## Overview
 
-This is an **institutional-grade 0-day prediction system** for major stock indices (SPX, NDX, DJI, RUT) using FastAPI backend + Streamlit frontend architecture. The system features time-adaptive accuracy that increases approaching market close, Ridge regression ML models, gamma exposure analytics, and real-time WebSocket streaming with intelligent feed switching.
+This is a **dual-model stock market prediction system** for major stock indices (SPX, NDX, DJI, RUT) combining:
+1. **Time-Adaptive Ridge Regression** - Optimized for final trading hour (3:00-4:00 PM ET) with time-weighted features
+2. **Traditional ML Models** - Linear Regression/Random Forest for early-day predictions
 
-**Key Focus**: Competitive advantage through sub-200ms prediction latency in the final 15 minutes before close (3:45-4:00 PM ET) with 15%+ MAE improvement over VWAP-only predictions.
+The system features adaptive model selection, gamma exposure analytics, real-time WebSocket streaming, and comprehensive technical analysis.
+
+**Key Focus**: Smart model selection based on time-to-close, with Time-Adaptive Ridge excelling in final 30 minutes (15%+ MAE improvement over VWAP-only baseline) and Traditional ML handling early-day forecasts.
 
 ## User Preferences
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (Nov 10, 2025)
+## Recent Changes (Nov 11, 2025)
 
-**Major Architectural Overhaul**:
-- Migrated from monolithic Streamlit app to **FastAPI + Streamlit microservices architecture**
-- Implemented **per-symbol ring buffers** (INDEX_RINGS, FLOW_RINGS) for proper multi-index isolation
-- Added **1-second aggregation** to prevent CPU overload from sub-second WebSocket bursts
-- Built **time-adaptive prediction system** with 15s/30s/60s refresh rates based on τ (minutes-to-close)
-- Created **OI cache service** (loads at 9:35 AM and 1:00 PM ET) to eliminate REST calls in prediction path
-- Implemented **strict validation**: 503 if stale data (>5s), 429 if rate limited, 400 if outside market hours
-- Added **performance SLAs**: p99 latency <200ms after 3:45 PM, memory growth <100MB, 15% MAE improvement
-- Completed **backtesting calibration** - all symbols meet 15% improvement target (SPX: 27.8%, NDX: 25.6%, DJI: 21.3%, RUT: 15.3%)
+**Dual-Model System Integration**:
+- Created **`app/models/ridge_predictor.py`** - Dedicated Time-Adaptive Ridge regression module
+- Implemented **dual-model prediction** - Both models run, Time-Adaptive as primary
+- Added **sidebar toggle** - "Show Traditional ML alongside Time-Adaptive" for model comparison
+- Built **smart recommendation system** - Auto-suggests best model based on minutes-to-close
+- Created **model comparison UI** - Side-by-side display with spread analysis
+- Added **adaptive features display** - Shows VWAP deviation, microtrend, gamma pin, flow urgency
+- Implemented **automatic fallback** - Falls back to Traditional ML if Time-Adaptive fails
+- Added **time-to-close counter** - Real-time countdown to market close in sidebar
+- **Calibrated coefficients** from backtesting built into ridge_predictor module
 
 ## System Architecture
 

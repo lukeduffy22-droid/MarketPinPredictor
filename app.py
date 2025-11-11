@@ -1209,14 +1209,29 @@ else:
         
         for col, (index_name, pred) in zip(cols, st.session_state.predictions.items()):
             with col:
+                # Time-Adaptive prediction (primary)
                 change_color = "🟢" if pred['change_pct'] >= 0 else "🔴"
                 st.metric(
                     label=f"{change_color} {index_name}",
                     value=f"${pred['predicted_price']:.2f}",
                     delta=f"{pred['change_pct']:.2f}%"
                 )
+                st.caption(f"⚡ Time-Adaptive Ridge")
                 st.caption(f"Current: ${pred['current_price']:.2f}")
                 st.caption(f"Confidence: {pred['confidence']:.1f}%")
+                
+                # Show traditional model if toggle enabled and available
+                if pred.get('show_both_models') and pred.get('traditional_pred'):
+                    trad = pred['traditional_pred']
+                    trad_change = ((trad['predicted_price'] - trad['current_price']) / trad['current_price']) * 100
+                    trad_color = "🟢" if trad_change >= 0 else "🔴"
+                    st.markdown("---")
+                    st.metric(
+                        label=f"{trad_color} Traditional ML",
+                        value=f"${trad['predicted_price']:.2f}",
+                        delta=f"{trad_change:.2f}%"
+                    )
+                    st.caption(f"Confidence: {trad['confidence']:.1f}%")
                 
                 # Confidence bar
                 conf_color = "green" if pred['confidence'] > 70 else "orange" if pred['confidence'] > 50 else "red"
@@ -1242,12 +1257,54 @@ else:
         
         for index_name, pred in st.session_state.predictions.items():
             with st.expander(f"📊 {index_name} ({pred['ticker']}) - Detailed Chart", expanded=True):
+                # Display model comparison if both models are shown
+                if pred.get('show_both_models') and pred.get('traditional_pred'):
+                    st.subheader("🔀 Model Comparison")
+                    comp_col1, comp_col2, comp_col3, comp_col4 = st.columns(4)
+                    
+                    with comp_col1:
+                        st.metric("Current Price", f"${pred['current_price']:.2f}")
+                    
+                    with comp_col2:
+                        st.metric("⚡ Time-Adaptive", f"${pred['predicted_price']:.2f}")
+                        st.caption(f"{pred['change_pct']:+.2f}% | {pred['confidence']:.0f}% conf")
+                    
+                    with comp_col3:
+                        trad = pred['traditional_pred']
+                        trad_change = ((trad['predicted_price'] - trad['current_price']) / trad['current_price']) * 100
+                        st.metric("📊 Traditional ML", f"${trad['predicted_price']:.2f}")
+                        st.caption(f"{trad_change:+.2f}% | {trad['confidence']:.0f}% conf")
+                    
+                    with comp_col4:
+                        diff = pred['predicted_price'] - trad['predicted_price']
+                        diff_pct = (diff / trad['predicted_price']) * 100
+                        st.metric("Δ Difference", f"${abs(diff):.2f}")
+                        st.caption(f"{diff_pct:+.2f}% spread")
+                    
+                    # Show adaptive model features
+                    if pred.get('adaptive_features'):
+                        st.markdown("**⚡ Time-Adaptive Features:**")
+                        feat_cols = st.columns(4)
+                        features = pred['adaptive_features']
+                        with feat_cols[0]:
+                            st.caption(f"VWAP Dev: {features.get('vwap_deviation', 0)*100:.2f}%")
+                        with feat_cols[1]:
+                            st.caption(f"Microtrend: {features.get('microtrend', 0):.3f}")
+                        with feat_cols[2]:
+                            st.caption(f"Gamma Pin: {features.get('gamma_pin', 0):.2f}")
+                        with feat_cols[3]:
+                            st.caption(f"Flow: {features.get('flow_urgency', 0):.2f}")
+                    
+                    st.divider()
+                
+                # Standard metrics display
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
                     st.metric("Last Close", f"${pred['current_price']:.2f}")
                 with col2:
                     st.metric("Predicted EOD", f"${pred['predicted_price']:.2f}")
+                    st.caption(f"⚡ {pred.get('model_type', 'Time-Adaptive Ridge')}")
                 with col3:
                     st.metric("Expected Change", f"{pred['change_pct']:.2f}%")
                 
