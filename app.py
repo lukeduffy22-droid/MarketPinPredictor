@@ -1085,12 +1085,56 @@ else:
                         st.error(f"Both models failed for {index_name}: {str(e)}")
                     traditional_success = False
                 
+                # Import ensemble functions
+                from models import blended_eod, pin_nudge, calculate_realized_volatility
+                from app.models.ridge_predictor import get_minutes_to_close
+                
+                # Get minutes to close for blending
+                minutes_to_close = get_minutes_to_close()
+                
+                # Apply ensemble blending if both models succeeded
+                if adaptive_success and traditional_success:
+                    # Calculate realized volatility for guardrail
+                    price_series = df_with_indicators['close'].values
+                    realized_vol = calculate_realized_volatility(price_series, window=5)
+                    
+                    # Blend the predictions
+                    blended_price = blended_eod(
+                        last_price=current_price,
+                        pred_trad=traditional_price,
+                        pred_ta=predicted_price,  # Time-adaptive prediction
+                        minutes_to_close=minutes_to_close,
+                        realized_vol_5d=realized_vol
+                    )
+                    
+                    # Apply pin nudging in final 15 minutes
+                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
+                        pin_adjustment = pin_nudge(
+                            last_price=blended_price,
+                            pin=gex_data['pin_strike'],
+                            minutes_to_close=minutes_to_close
+                        )
+                        blended_price += pin_adjustment
+                    
+                    # Final conservative clamp at ±3%
+                    max_change = current_price * 0.03
+                    blended_price = min(max(blended_price, current_price - max_change), current_price + max_change)
+                    
+                    # Use blended prediction as the final prediction
+                    predicted_price = blended_price
+                    # Confidence is weighted average based on time
+                    w = min(max((60 - minutes_to_close) / 60.0, 0.0), 1.0)
+                    confidence = (1 - w) * traditional_conf + w * confidence
+                    
                 # Fallback logic: Use adaptive if available, otherwise fall back to traditional
-                if not adaptive_success and traditional_success:
+                elif not adaptive_success and traditional_success:
                     st.info(f"ℹ️ {index_name}: Using Traditional ML (Time-Adaptive unavailable)")
                     predicted_price = traditional_price
                     confidence = traditional_conf
                     current_price = trad_current
+                elif adaptive_success and not traditional_success:
+                    st.info(f"ℹ️ {index_name}: Using Time-Adaptive Ridge (Traditional ML unavailable)")
+                    # Already have predicted_price from adaptive
                 elif not adaptive_success and not traditional_success:
                     predicted_price = None
                     confidence = None
@@ -1099,22 +1143,26 @@ else:
                 if predicted_price is not None and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
+                    # Store all model results
                     st.session_state.predictions[index_name] = {
                         'ticker': index_ticker,  # Actual index ticker (SPX, NDX, etc.)
                         'current_price': current_price,
-                        'predicted_price': predicted_price,  # Time-Adaptive prediction (primary)
+                        'predicted_price': predicted_price,  # Final blended prediction
                         'confidence': confidence,
                         'df': df_with_indicators,
                         'change_pct': change_pct,
-                        'model_type': 'Time-Adaptive Ridge',  # Primary model name
+                        'model_type': 'Blended',  # Now using blended model
                         'timeframe': st.session_state.timeframe,
                         'gex_data': gex_data,  # Add GEX data
                         'has_vix': vix_df is not None,  # Track VIX availability
-                        # Add adaptive model features
-                        'adaptive_features': adaptive_pred.features if adaptive_pred else {},
-                        'time_to_close_min': adaptive_pred.time_to_close_minutes if adaptive_pred else None,
-                        # Add traditional model results if available
+                        # Store individual model predictions for comparison
+                        'adaptive_pred': {
+                            'predicted_price': adaptive_pred.predicted_price if adaptive_pred else None,
+                            'confidence': adaptive_pred.confidence if adaptive_pred else None,
+                            'features': adaptive_pred.features if adaptive_pred else {}
+                        } if adaptive_success else None,
                         'traditional_pred': traditional_pred,
+                        'time_to_close_min': minutes_to_close,
                         'show_both_models': st.session_state.show_traditional_model
                     }
                     
@@ -1216,22 +1264,26 @@ else:
                     value=f"${pred['predicted_price']:.2f}",
                     delta=f"{pred['change_pct']:.2f}%"
                 )
-                st.caption(f"⚡ Time-Adaptive Ridge")
+                st.caption(f"🔮 Blended Prediction")
                 st.caption(f"Current: ${pred['current_price']:.2f}")
                 st.caption(f"Confidence: {pred['confidence']:.1f}%")
                 
-                # Show traditional model if toggle enabled and available
-                if pred.get('show_both_models') and pred.get('traditional_pred'):
-                    trad = pred['traditional_pred']
-                    trad_change = ((trad['predicted_price'] - trad['current_price']) / trad['current_price']) * 100
-                    trad_color = "🟢" if trad_change >= 0 else "🔴"
+                # Show individual models if toggle enabled and available
+                if pred.get('show_both_models'):
                     st.markdown("---")
-                    st.metric(
-                        label=f"{trad_color} Traditional ML",
-                        value=f"${trad['predicted_price']:.2f}",
-                        delta=f"{trad_change:.2f}%"
-                    )
-                    st.caption(f"Confidence: {trad['confidence']:.1f}%")
+                    st.caption("**Individual Models:**")
+                    
+                    # Show Time-Adaptive if available
+                    if pred.get('adaptive_pred') and pred['adaptive_pred']['predicted_price']:
+                        adaptive = pred['adaptive_pred']
+                        adaptive_change = ((adaptive['predicted_price'] - pred['current_price']) / pred['current_price']) * 100
+                        st.caption(f"⚡ Time-Adaptive: ${adaptive['predicted_price']:.2f} ({adaptive_change:+.2f}%)")
+                    
+                    # Show Traditional if available
+                    if pred.get('traditional_pred'):
+                        trad = pred['traditional_pred']
+                        trad_change = ((trad['predicted_price'] - trad['current_price']) / trad['current_price']) * 100
+                        st.caption(f"📊 Traditional ML: ${trad['predicted_price']:.2f} ({trad_change:+.2f}%)")
                 
                 # Confidence bar
                 conf_color = "green" if pred['confidence'] > 70 else "orange" if pred['confidence'] > 50 else "red"
