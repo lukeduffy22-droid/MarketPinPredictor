@@ -175,6 +175,27 @@ def create_mock_options_chain(underlying, spot_price):
     
     return pd.DataFrame(data)
 
+def choose_effective_expiry(now_et, expiries, total_oi_by_expiry, oi_min=50_000):
+    """
+    Choose the most relevant expiry for gamma calculations.
+    Prefers 0DTE during market hours, otherwise next expiry with sufficient OI.
+    """
+    from datetime import time
+    
+    # Prefer same-day 0DTE during cash session
+    same_day = [e for e in expiries if e.date() == now_et.date()]
+    if same_day and now_et.time() <= time(16, 0) and total_oi_by_expiry.get(same_day[0], 0) >= oi_min:
+        return same_day[0]
+    
+    # Otherwise pick earliest future expiry with OI above threshold
+    future = sorted([e for e in expiries if e.date() >= now_et.date()])
+    for e in future:
+        if total_oi_by_expiry.get(e, 0) >= oi_min:
+            return e
+    
+    # Fallback to earliest expiry if none meet OI threshold
+    return min(future) if future else None
+
 def calculate_gamma_exposure(options_df, spot_price):
     """
     Calculate net gamma exposure by strike and identify pin levels
@@ -204,8 +225,26 @@ def calculate_gamma_exposure(options_df, spot_price):
         axis=1
     )
     
-    # Aggregate by strike
-    gex_by_strike = options_df.groupby('strike').agg({
+    # Get current time in ET
+    import pytz
+    et_tz = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et_tz)
+    
+    # Calculate total OI by expiry
+    oi_by_expiry = options_df.groupby('expiry')['open_interest'].sum()
+    
+    # Choose effective expiry (prefer 0DTE during market hours)
+    expiries = options_df['expiry'].unique()
+    effective_expiry = choose_effective_expiry(now_et, expiries, oi_by_expiry)
+    
+    # Filter to effective expiry if found
+    if effective_expiry:
+        filtered_df = options_df[options_df['expiry'] == effective_expiry]
+    else:
+        filtered_df = options_df
+    
+    # Aggregate by strike for the selected expiry
+    gex_by_strike = filtered_df.groupby('strike').agg({
         'signed_gex': 'sum',
         'gex': lambda x: abs(x).sum(),  # Total absolute GEX
         'expiry': 'first',
