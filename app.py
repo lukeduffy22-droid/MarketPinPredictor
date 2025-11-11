@@ -1049,11 +1049,21 @@ else:
                 # Predict EOD price using TIME-ADAPTIVE RIDGE model (primary)
                 adaptive_pred = None
                 adaptive_success = False
+                adaptive_original_price = None
+                adaptive_original_conf = None
+                adaptive_constrained = None
+                
                 try:
                     adaptive_pred = predict_adaptive(index_ticker, df_with_indicators, gex_data)
-                    predicted_price = adaptive_pred.predicted_price
-                    confidence = adaptive_pred.confidence
+                    # Store ORIGINAL Time-Adaptive prediction before any modifications
+                    adaptive_original_price = adaptive_pred.predicted_price
+                    adaptive_original_conf = adaptive_pred.confidence
                     current_price = adaptive_pred.current_price
+                    
+                    # Apply conservative bounds (±2.5%) to Time-Adaptive prediction
+                    max_change_ta = current_price * 0.025
+                    adaptive_constrained = min(max(adaptive_original_price, current_price - max_change_ta), current_price + max_change_ta)
+                    
                     adaptive_success = True
                 except Exception as e:
                     st.warning(f"Time-Adaptive model error for {index_name}: {str(e)}")
@@ -1061,25 +1071,23 @@ else:
                 
                 # Run TRADITIONAL ML model (always as backup, and for comparison if toggle enabled)
                 traditional_pred = None
-                traditional_price = None
-                traditional_conf = None
+                traditional_original_price = None
+                traditional_original_conf = None
+                traditional_constrained = None
                 traditional_success = False
                 
                 try:
-                    traditional_price, traditional_conf, df_with_indicators, trad_current = predict_eod_price(
+                    traditional_original_price, traditional_original_conf, df_with_indicators, trad_current = predict_eod_price(
                         df_with_indicators, 
                         model_type=st.session_state.selected_model,
                         timeframe=st.session_state.timeframe
                     )
-                    traditional_success = True
                     
-                    # Store traditional prediction for comparison
-                    if st.session_state.show_traditional_model or not adaptive_success:
-                        traditional_pred = {
-                            'predicted_price': traditional_price,
-                            'confidence': traditional_conf,
-                            'current_price': trad_current
-                        }
+                    # Apply conservative bounds (±2.5%) to Traditional prediction
+                    max_change_trad = trad_current * 0.025
+                    traditional_constrained = min(max(traditional_original_price, trad_current - max_change_trad), trad_current + max_change_trad)
+                    
+                    traditional_success = True
                 except Exception as e:
                     if not adaptive_success:
                         st.error(f"Both models failed for {index_name}: {str(e)}")
