@@ -937,7 +937,7 @@ with st.sidebar:
     
     st.divider()
     
-    analyze_button = st.button("🔄 Analyze & Predict", type="primary", use_container_width=True)
+    analyze_button = st.button("🔄 Analyze & Predict", type="primary", width='stretch')
     
     st.divider()
     
@@ -977,7 +977,7 @@ with st.sidebar:
             help="Model to use for backtesting"
         )
         
-        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", use_container_width=True)
+        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", width='stretch')
     
     st.divider()
     st.caption("💡 This tool uses technical indicators and machine learning to predict closing prices. Predictions are estimates and should not be used as financial advice.")
@@ -1310,7 +1310,7 @@ else:
                 
                 # Create and display chart
                 fig = create_price_chart(pred['df'], pred['predicted_price'], index_name)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
                 
                 # Technical indicators summary
                 st.subheader("Technical Indicators Summary")
@@ -1385,7 +1385,7 @@ else:
                             'days_to_expiry': 'Days to Expiry'
                         })
                         
-                        st.dataframe(gamma_walls_display, use_container_width=True)
+                        st.dataframe(gamma_walls_display, width='stretch')
                     
                     # Create gamma exposure bar chart if we have strike-level data
                     if 'gex_by_strike' in gex and not gex['gex_by_strike'].empty:
@@ -1433,7 +1433,7 @@ else:
                             height=300
                         )
                         
-                        st.plotly_chart(fig_gex, use_container_width=True)
+                        st.plotly_chart(fig_gex, width='stretch')
                     
                     if 'summary' in gex:
                         st.info(f"💡 {gex['summary']}")
@@ -1543,7 +1543,7 @@ else:
                         display_df['error_pct'] = display_df['error_pct'].apply(lambda x: f"{x:.2f}%")
                         display_df['direction_correct'] = display_df['direction_correct'].apply(lambda x: "✓" if x else "✗")
                         
-                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        st.dataframe(display_df, width='stretch', hide_index=True)
                     
                     # Create accuracy chart
                     import plotly.graph_objects as go
@@ -1575,7 +1575,7 @@ else:
                         height=400
                     )
                     
-                    st.plotly_chart(fig_acc, use_container_width=True)
+                    st.plotly_chart(fig_acc, width='stretch')
                     
                     # Show best and worst predictions
                     st.write("**Best & Worst Predictions:**")
@@ -1649,7 +1649,7 @@ else:
                         })
                     
                     df_history = pd.DataFrame(history_data)
-                    st.dataframe(df_history, use_container_width=True, hide_index=True)
+                    st.dataframe(df_history, width='stretch', hide_index=True)
                     
                     st.caption(f"Showing {len(all_predictions)} most recent predictions")
                 else:
@@ -1687,7 +1687,7 @@ else:
                         })
                     
                     df_alerts = pd.DataFrame(alert_data)
-                    st.dataframe(df_alerts, use_container_width=True, hide_index=True)
+                    st.dataframe(df_alerts, width='stretch', hide_index=True)
             except Exception as e:
                 st.error(f"Error loading alerts: {str(e)}")
         
@@ -1728,7 +1728,7 @@ else:
                     
                     if ticker_stats:
                         df_stats = pd.DataFrame(ticker_stats)
-                        st.dataframe(df_stats, use_container_width=True, hide_index=True)
+                        st.dataframe(df_stats, width='stretch', hide_index=True)
                 else:
                     st.info("No completed predictions yet. Accuracy statistics will appear once predictions are verified with actual prices.")
             except Exception as e:
