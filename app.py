@@ -1148,12 +1148,33 @@ else:
                 # Fallback logic: Use adaptive if available, otherwise fall back to traditional
                 elif not adaptive_success and traditional_success:
                     st.info(f"ℹ️ {index_name}: Using Traditional ML (Time-Adaptive unavailable)")
-                    predicted_price = traditional_price
-                    confidence = traditional_conf
+                    # Apply pin nudging to traditional if in final 15 minutes
+                    traditional_final = traditional_constrained
+                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
+                        traditional_pin_adjust = pin_nudge(
+                            last_price=traditional_constrained,
+                            pin=gex_data['pin_strike'],
+                            minutes_to_close=minutes_to_close
+                        )
+                        traditional_final = traditional_constrained + traditional_pin_adjust
+                    
+                    predicted_price = traditional_final
+                    confidence = traditional_original_conf
                     current_price = trad_current
                 elif adaptive_success and not traditional_success:
                     st.info(f"ℹ️ {index_name}: Using Time-Adaptive Ridge (Traditional ML unavailable)")
-                    # Already have predicted_price from adaptive
+                    # Apply pin nudging to adaptive if in final 15 minutes
+                    adaptive_final = adaptive_constrained
+                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
+                        adaptive_pin_adjust = pin_nudge(
+                            last_price=adaptive_constrained,
+                            pin=gex_data['pin_strike'],
+                            minutes_to_close=minutes_to_close
+                        )
+                        adaptive_final = adaptive_constrained + adaptive_pin_adjust
+                    
+                    predicted_price = adaptive_final
+                    confidence = adaptive_original_conf
                 elif not adaptive_success and not traditional_success:
                     predicted_price = None
                     confidence = None
@@ -1174,13 +1195,17 @@ else:
                         'timeframe': st.session_state.timeframe,
                         'gex_data': gex_data,  # Add GEX data
                         'has_vix': vix_df is not None,  # Track VIX availability
-                        # Store individual model predictions for comparison
+                        # Store ORIGINAL individual model predictions for comparison (before constraints)
                         'adaptive_pred': {
-                            'predicted_price': adaptive_pred.predicted_price if adaptive_pred else None,
-                            'confidence': adaptive_pred.confidence if adaptive_pred else None,
+                            'predicted_price': adaptive_original_price,  # Use ORIGINAL value
+                            'confidence': adaptive_original_conf,  # Use ORIGINAL confidence
                             'features': adaptive_pred.features if adaptive_pred else {}
                         } if adaptive_success else None,
-                        'traditional_pred': traditional_pred,
+                        'traditional_pred': {
+                            'predicted_price': traditional_original_price,  # Use ORIGINAL value
+                            'confidence': traditional_original_conf,  # Use ORIGINAL confidence  
+                            'current_price': trad_current if traditional_success else None
+                        } if traditional_success else None,
                         'time_to_close_min': minutes_to_close,
                         'show_both_models': st.session_state.show_traditional_model
                     }
