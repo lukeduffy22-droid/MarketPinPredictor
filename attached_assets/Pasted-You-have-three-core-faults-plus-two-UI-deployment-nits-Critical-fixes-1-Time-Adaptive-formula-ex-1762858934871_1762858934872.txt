@@ -1,0 +1,149 @@
+You have three core faults plus two UI/deployment nits.
+
+Critical fixes
+	1.	Time-Adaptive formula explodes
+Cause: seconds scaling and after-hours minutes.
+Fix: remove * 60, cap horizon to max(minutes_to_close, 0), bound prediction to a tight band around last price, and weight features to sum to a small delta.
+
+# ridge_predictor.py (replace your compute block)
+def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, last_price: float) -> float:
+    minutes_to_close = max(int((close_et - now_et).total_seconds() // 60), 0)
+
+    # normalized feature taps
+    vwap_dev = float(features.get("vwap_deviation", 0.0))           # fraction, e.g., +0.003 = +0.3%
+    micro = float(features.get("microtrend", 0.0))                  # $/bar on your shortest window
+    gamma_pull = float(features.get("gamma_pull", 0.0))             # $ target toward pin
+    flow_urg = float(features.get("flow_urgency", 0.0))             # 0..1
+
+    # horizon scalers — intraday decay
+    t = min(minutes_to_close, 60) / 60.0                            # 0..1, last hour emphasized
+
+    # conservative coefficients
+    k_vwap   = 0.35
+    k_micro  = 0.20
+    k_gamma  = 0.35
+    k_flow   = 0.10
+
+    delta_from_vwap  = k_vwap  * (vwap_dev * last_price) * t
+    delta_from_micro = k_micro * micro * min(minutes_to_close, 20)  # assume micro in $/5min or $/bar; no seconds
+    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.15 + 0.35 * t))  # 15–50% of gap
+    delta_from_flow  = k_flow  * (flow_urg - 0.5) * 0.006 * last_price           # ~±0.6% max
+
+    pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow
+
+    # sanity clamp: keep within ±2.5% intraday unless circuit-breaker day
+    lo = last_price * 0.975
+    hi = last_price * 1.025
+    return min(max(pred, lo), hi)
+
+	2.	Wrong expiry for gamma pin (showing 11/21 near the close)
+Cause: picking the next weekly by calendar, not by nearest trading session with non-trivial OI.
+Fix: choose the earliest expiry ≥ today with total index option OI > threshold and, after 3:40 pm ET, prefer same-day 0DTE if still trading; otherwise roll to the next session.
+
+# options_gamma.py
+def choose_effective_expiry(now_et, expiries, total_oi_by_expiry, oi_min=50_000):
+    # prefer same-day 0DTE during cash session
+    same_day = [e for e in expiries if e.date() == now_et.date()]
+    if same_day and now_et.time() <= time(16,0) and total_oi_by_expiry.get(same_day[0],0) >= oi_min:
+        return same_day[0]
+    # else pick earliest with OI above threshold
+    future = sorted([e for e in expiries if e.date() >= now_et.date()])
+    for e in future:
+        if total_oi_by_expiry.get(e, 0) >= oi_min:
+            return e
+    return min(future) if future else None
+
+	3.	Minutes-to-close after hours
+Cause: negative or next-day jump.
+Fix: floor at 0 outside market hours and compute close_et for today only.
+
+# time_et.py
+def minutes_to_close_et(now_et: datetime) -> int:
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now_et >= market_close:
+        return 0
+    if now_et.weekday() >= 5:
+        return 0
+    return int((market_close - now_et).total_seconds() // 60)
+
+Model ensemble without feature loss
+
+Keep both models. Add a time-aware blend that tilts toward the Time-Adaptive model in the last hour and otherwise favors the Traditional model. Include a guardrail based on live spread/vol.
+
+# models.py
+def blended_eod(last_price, pred_trad, pred_ta, minutes_to_close, realized_vol_5d):
+    w = min(max((60 - minutes_to_close)/60.0, 0.0), 1.0)  # 0 far from close -> 1 at close
+    base = (1 - w) * pred_trad + w * pred_ta
+    # volatility guardrail: clamp blend to ±k * RV
+    k = 1.2  # allow 120% of recent 1-day RV
+    band = last_price * realized_vol_5d * k
+    return min(max(base, last_price - band), last_price + band)
+
+“6755.31” and “pulled to 6835”
+	•	6755.31 came from the exploding microtrend term and after-hours minutes; the seconds multiplier created million-dollar deltas. Fixed by the formula above.
+	•	Pulled to 6835 is your gamma equilibrium level. Treat it as a gravitational target, not a hard cap. With five minutes left, price tends to drift toward the pin but may finish under/over depending on order flow and dealer hedging. Use the blend plus a pin proximity rule: if abs(pin - last) < 0.15% * last, bias the prediction 50–70% of that remaining gap.
+
+# small nudge toward pin in final minutes
+def pin_nudge(last_price, pin, minutes_to_close):
+    if minutes_to_close > 15 or pin is None:
+        return 0.0
+    gap = pin - last_price
+    if abs(gap) <= 0.0015 * last_price:  # within 0.15%
+        return 0.6 * gap
+    if abs(gap) <= 0.0030 * last_price:  # within 0.30%
+        return 0.35 * gap
+    return 0.15 * gap
+
+Integrate into the final predictor:
+
+pred = blended_eod(last, pred_trad, pred_ta, minutes_to_close, realized_vol_5d)
+pred += pin_nudge(last, gamma_pin, minutes_to_close)
+# final clamp
+pred = max(min(pred, last*1.03), last*0.97)
+
+Streamlit deprecation fix
+
+You’re hitting:
+
+“Please replace use_container_width with width … use width='stretch'”
+
+Search/replace:
+
+# before
+st.dataframe(df, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True)
+
+# after
+st.dataframe(df, width='stretch')
+st.plotly_chart(fig, width='stretch')
+
+Dual-model UI toggle (concise)
+
+# app.py (sidebar)
+show_compare = st.sidebar.toggle("Compare models", value=False)
+# header cards
+if show_compare:
+    col1, col2, col3, col4 = st.columns([1,1,1,1])
+    with col1: st.metric("Last", f"{last_price:,.2f}")
+    with col2: st.metric("Time-Adaptive", f"{pred_ta:,.2f}")
+    with col3: st.metric("Traditional", f"{pred_trad:,.2f}")
+    with col4: st.metric("Blend", f"{pred_final:,.2f}")
+else:
+    st.metric("Predicted Close", f"{pred_final:,.2f}")
+
+“Allow more messages for better accuracy?”
+
+No. Model context tokens won’t fix this. Your accuracy lever is data and feature discipline:
+	•	Expand intraday window to 30–60 minutes of 1-min bars for microtrend/VWAP.
+	•	Recompute gamma pin on the chosen effective expiry every 2–3 minutes in the last 30 minutes.
+	•	Enforce tight clamps and pin-nudge only when within 0.15–0.30%.
+	•	Log per-minute MAE for both models and the blend; adapt weights by recent MAE.
+
+Final checklist
+	•	Replace the time-adaptive block with the scaled version above.
+	•	Fix expiry selection to prefer 0DTE and OI-qualified next expiry.
+	•	Use the blend + pin-nudge + clamps in the last 15 minutes.
+	•	Replace use_container_width with width='stretch'.
+	•	Add per-session MAE logging to auto-tune k_* and blend weight.
+
+This preserves every feature you like, adds a side-by-side view, and eliminates the runaway predictions.
