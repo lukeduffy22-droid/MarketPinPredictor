@@ -237,24 +237,42 @@ def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> P
     
     # Get time-adaptive weights
     minutes_to_close = get_minutes_to_close()
+    
+    # If market is closed (0 minutes), use small default to avoid issues
+    if minutes_to_close == 0:
+        minutes_to_close = 1
+    
     micro_weight, flow_weight = get_time_adaptive_weights(minutes_to_close)
     
-    # Ridge regression formula with time-adaptive weights:
-    # predicted_close = current_price + 
-    #   β_vwap × vwap_dev × current_price +
-    #   β_microtrend × microtrend × τ × 60 × micro_weight +
-    #   β_gamma × gamma_pin × 10 +
-    #   β_flow × flow_urgency × 5 × flow_weight +
-    #   intercept
+    # FIXED Ridge regression formula with proper scaling:
+    # The old formula multiplied by minutes*60 (seconds) which created massive predictions.
+    # New formula uses percentage-based components for sensible predictions.
     
-    vwap_component = coeffs["beta_vwap"] * features["vwap_deviation"] * current_price
-    micro_component = coeffs["beta_microtrend"] * features["microtrend"] * minutes_to_close * 60 * micro_weight
-    gamma_component = coeffs["beta_gamma"] * features["gamma_pin"] * 10
-    flow_component = coeffs["beta_flow"] * features["flow_urgency"] * 5 * flow_weight
+    # VWAP component: Pull toward/away from VWAP (max ±0.5% of price)
+    vwap_component = coeffs["beta_vwap"] * features["vwap_deviation"] * current_price * 0.01
+    
+    # Microtrend component: Project recent momentum forward (scaled properly)
+    # Microtrend is $/bar, so multiply by estimated bars until close, not seconds
+    bars_to_close = max(1, minutes_to_close / 5)  # Assume 5-minute bars
+    micro_component = coeffs["beta_microtrend"] * features["microtrend"] * bars_to_close * micro_weight
+    
+    # Gamma component: Pull toward pin strike (max ±$50 effect)
+    gamma_component = coeffs["beta_gamma"] * features["gamma_pin"] * 50.0
+    
+    # Flow component: Urgency modifier (max ±$30 effect)
+    flow_component = coeffs["beta_flow"] * features["flow_urgency"] * 30.0 * flow_weight
+    
     intercept = coeffs["intercept"]
     
     # Final prediction
     predicted_close = current_price + vwap_component + micro_component + gamma_component + flow_component + intercept
+    
+    # SANITY CHECK: Predictions should be within ±10% of current price
+    max_change = current_price * 0.10  # 10% max movement
+    if predicted_close > current_price + max_change:
+        predicted_close = current_price + max_change
+    elif predicted_close < current_price - max_change:
+        predicted_close = current_price - max_change
     
     # Calculate confidence based on time to close
     # Confidence increases as we approach close (more certainty)
