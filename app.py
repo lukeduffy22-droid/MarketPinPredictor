@@ -17,6 +17,7 @@ from websocket_streaming import (
     RealTimeDataStream, is_market_open, format_websocket_message, 
     start_streaming_session, get_streaming_recommendations, get_snapshot_data
 )
+from app.models.ridge_predictor import predict as predict_adaptive, get_minutes_to_close
 
 # Initialize database
 init_db()
@@ -67,6 +68,8 @@ if 'timeframe' not in st.session_state:
     st.session_state.timeframe = '1-day'
 if 'alerts' not in st.session_state:
     st.session_state.alerts = []
+if 'show_traditional_model' not in st.session_state:
+    st.session_state.show_traditional_model = True
 if 'indicator_params' not in st.session_state:
     st.session_state.indicator_params = {
         'sma_short': 5,
@@ -662,6 +665,32 @@ with st.sidebar:
     )
     st.session_state.timeframe = selected_timeframe
     
+    st.markdown("---")
+    st.subheader("⚡ Dual-Model System")
+    
+    # Calculate minutes to close
+    try:
+        minutes_left = get_minutes_to_close()
+        if minutes_left > 0:
+            st.caption(f"⏰ Market closes in {minutes_left} minutes")
+        else:
+            st.caption("🔴 Market is closed")
+    except:
+        minutes_left = 999
+    
+    # Show recommendation
+    if minutes_left <= 30:
+        st.info("💡 **Recommended**: Time-Adaptive model (optimal for final 30 min)")
+    else:
+        st.info("💡 **Recommended**: Traditional ML model (better for early trading)")
+    
+    # Toggle for showing both models
+    st.session_state.show_traditional_model = st.checkbox(
+        "Show Traditional ML alongside Time-Adaptive",
+        value=st.session_state.show_traditional_model,
+        help="Display both prediction models side-by-side for comparison"
+    )
+    
     st.divider()
     
     st.header("🔔 Alert Settings")
@@ -1013,18 +1042,59 @@ else:
                 # Calculate GEX levels using actual index ticker for options
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
-                # Predict EOD price using selected model and timeframe
+                # Always calculate technical indicators for chart rendering
+                # (regardless of which model is used)
+                df_with_indicators = calculate_technical_indicators(df)
+                
+                # Predict EOD price using TIME-ADAPTIVE RIDGE model (primary)
+                adaptive_pred = None
+                adaptive_success = False
                 try:
-                    predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
-                        df, 
+                    adaptive_pred = predict_adaptive(index_ticker, df_with_indicators, gex_data)
+                    predicted_price = adaptive_pred.predicted_price
+                    confidence = adaptive_pred.confidence
+                    current_price = adaptive_pred.current_price
+                    adaptive_success = True
+                except Exception as e:
+                    st.warning(f"Time-Adaptive model error for {index_name}: {str(e)}")
+                    adaptive_success = False
+                
+                # Run TRADITIONAL ML model (always as backup, and for comparison if toggle enabled)
+                traditional_pred = None
+                traditional_price = None
+                traditional_conf = None
+                traditional_success = False
+                
+                try:
+                    traditional_price, traditional_conf, df_with_indicators, trad_current = predict_eod_price(
+                        df_with_indicators, 
                         model_type=st.session_state.selected_model,
                         timeframe=st.session_state.timeframe
                     )
+                    traditional_success = True
+                    
+                    # Store traditional prediction for comparison
+                    if st.session_state.show_traditional_model or not adaptive_success:
+                        traditional_pred = {
+                            'predicted_price': traditional_price,
+                            'confidence': traditional_conf,
+                            'current_price': trad_current
+                        }
                 except Exception as e:
-                    st.error(f"Prediction error for {index_name}: {str(e)}")
+                    if not adaptive_success:
+                        st.error(f"Both models failed for {index_name}: {str(e)}")
+                    traditional_success = False
+                
+                # Fallback logic: Use adaptive if available, otherwise fall back to traditional
+                if not adaptive_success and traditional_success:
+                    st.info(f"ℹ️ {index_name}: Using Traditional ML (Time-Adaptive unavailable)")
+                    predicted_price = traditional_price
+                    confidence = traditional_conf
+                    current_price = trad_current
+                elif not adaptive_success and not traditional_success:
                     predicted_price = None
                     confidence = None
-                    df_with_indicators = None
+                    current_price = None
                 
                 if predicted_price is not None and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
@@ -1032,14 +1102,20 @@ else:
                     st.session_state.predictions[index_name] = {
                         'ticker': index_ticker,  # Actual index ticker (SPX, NDX, etc.)
                         'current_price': current_price,
-                        'predicted_price': predicted_price,
+                        'predicted_price': predicted_price,  # Time-Adaptive prediction (primary)
                         'confidence': confidence,
                         'df': df_with_indicators,
                         'change_pct': change_pct,
-                        'model_type': st.session_state.selected_model,
+                        'model_type': 'Time-Adaptive Ridge',  # Primary model name
                         'timeframe': st.session_state.timeframe,
                         'gex_data': gex_data,  # Add GEX data
-                        'has_vix': vix_df is not None  # Track VIX availability
+                        'has_vix': vix_df is not None,  # Track VIX availability
+                        # Add adaptive model features
+                        'adaptive_features': adaptive_pred.features if adaptive_pred else {},
+                        'time_to_close_min': adaptive_pred.time_to_close_minutes if adaptive_pred else None,
+                        # Add traditional model results if available
+                        'traditional_pred': traditional_pred,
+                        'show_both_models': st.session_state.show_traditional_model
                     }
                     
                     # Save prediction to database
