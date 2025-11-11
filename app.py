@@ -1102,29 +1102,40 @@ else:
                 
                 # Apply ensemble blending if both models succeeded
                 if adaptive_success and traditional_success:
+                    # Apply pin nudging to INDIVIDUAL constrained predictions first
+                    adaptive_final = adaptive_constrained
+                    traditional_final = traditional_constrained
+                    
+                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
+                        # Pin nudge each model individually
+                        adaptive_pin_adjust = pin_nudge(
+                            last_price=adaptive_constrained,
+                            pin=gex_data['pin_strike'],
+                            minutes_to_close=minutes_to_close
+                        )
+                        adaptive_final = adaptive_constrained + adaptive_pin_adjust
+                        
+                        traditional_pin_adjust = pin_nudge(
+                            last_price=traditional_constrained,
+                            pin=gex_data['pin_strike'],
+                            minutes_to_close=minutes_to_close
+                        )
+                        traditional_final = traditional_constrained + traditional_pin_adjust
+                    
                     # Calculate realized volatility for guardrail
                     price_series = df_with_indicators['close'].values
                     realized_vol = calculate_realized_volatility(price_series, window=5)
                     
-                    # Blend the predictions
+                    # Blend the pin-nudged, constrained predictions
                     blended_price = blended_eod(
                         last_price=current_price,
-                        pred_trad=traditional_price,
-                        pred_ta=predicted_price,  # Time-adaptive prediction
+                        pred_trad=traditional_final,
+                        pred_ta=adaptive_final,
                         minutes_to_close=minutes_to_close,
                         realized_vol_5d=realized_vol
                     )
                     
-                    # Apply pin nudging in final 15 minutes
-                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
-                        pin_adjustment = pin_nudge(
-                            last_price=blended_price,
-                            pin=gex_data['pin_strike'],
-                            minutes_to_close=minutes_to_close
-                        )
-                        blended_price += pin_adjustment
-                    
-                    # Final conservative clamp at ±3%
+                    # Final conservative clamp at ±3% for the blend
                     max_change = current_price * 0.03
                     blended_price = min(max(blended_price, current_price - max_change), current_price + max_change)
                     
@@ -1132,7 +1143,7 @@ else:
                     predicted_price = blended_price
                     # Confidence is weighted average based on time
                     w = min(max((60 - minutes_to_close) / 60.0, 0.0), 1.0)
-                    confidence = (1 - w) * traditional_conf + w * confidence
+                    confidence = (1 - w) * traditional_original_conf + w * adaptive_original_conf
                     
                 # Fallback logic: Use adaptive if available, otherwise fall back to traditional
                 elif not adaptive_success and traditional_success:
