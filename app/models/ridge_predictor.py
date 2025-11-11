@@ -54,18 +54,24 @@ class PredictionResult:
     recommendation: Optional[str] = None
 
 def get_minutes_to_close() -> int:
-    """Calculate minutes until market close (4:00 PM ET)"""
+    """Calculate minutes until market close (4:00 PM ET) with proper bounds"""
     et_tz = pytz.timezone('US/Eastern')
     now_et = datetime.now(et_tz)
     
     # Market close time
     market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     
+    # Floor at 0 for after hours, weekends, holidays
+    if now_et >= market_close:
+        return 0
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return 0
+    
     # Calculate difference
     diff = market_close - now_et
     minutes = int(diff.total_seconds() / 60)
     
-    # Return 0 if market is closed or negative
+    # Cap at 0 minimum
     return max(0, minutes)
 
 def load_coefficients(symbol: str) -> Dict[str, float]:
@@ -216,9 +222,40 @@ def get_time_adaptive_weights(minutes_to_close: int) -> Tuple[float, float]:
     else:
         return 1.0, 1.0
 
+def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, last_price: float) -> float:
+    """Conservative Time-Adaptive formula with tight bounds"""
+    minutes_to_close = max(int((close_et - now_et).total_seconds() // 60), 0)
+    
+    # Normalized feature taps
+    vwap_dev = float(features.get("vwap_deviation", 0.0))        # fraction, e.g., +0.003 = +0.3%
+    micro = float(features.get("microtrend", 0.0))               # $/bar on shortest window
+    gamma_pull = float(features.get("gamma_pull", 0.0))          # $ target toward pin
+    flow_urg = float(features.get("flow_urgency", 0.0))          # 0..1
+    
+    # Horizon scalers — intraday decay
+    t = min(minutes_to_close, 60) / 60.0                         # 0..1, last hour emphasized
+    
+    # Conservative coefficients
+    k_vwap = 0.35
+    k_micro = 0.20
+    k_gamma = 0.35
+    k_flow = 0.10
+    
+    delta_from_vwap = k_vwap * (vwap_dev * last_price) * t
+    delta_from_micro = k_micro * micro * min(minutes_to_close, 20)  # assume micro in $/5min or $/bar; no seconds
+    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.15 + 0.35 * t))  # 15–50% of gap
+    delta_from_flow = k_flow * (flow_urg - 0.5) * 0.006 * last_price  # ~±0.6% max
+    
+    pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow
+    
+    # Sanity clamp: keep within ±2.5% intraday unless circuit-breaker day
+    lo = last_price * 0.975
+    hi = last_price * 1.025
+    return min(max(pred, lo), hi)
+
 def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> PredictionResult:
     """
-    Generate time-adaptive Ridge regression prediction.
+    Generate time-adaptive Ridge regression prediction using conservative formula.
     
     Args:
         symbol: Index symbol (SPX, NDX, DJI, RUT)
@@ -228,51 +265,26 @@ def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> P
     Returns:
         PredictionResult with prediction and metadata
     """
-    # Load coefficients
-    coeffs = load_coefficients(symbol)
-    
     # Compute features
     features = compute_features(df, gex_data)
     current_price = features["current_price"]
     
-    # Get time-adaptive weights
+    # Get time context
+    et_tz = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et_tz)
+    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    # Get gamma pull price if available
+    if gex_data and 'pin_strike' in gex_data:
+        features["gamma_pull"] = gex_data['pin_strike']
+    else:
+        features["gamma_pull"] = current_price  # No pull if no gamma data
+    
+    # Use conservative prediction formula
+    predicted_close = predict_time_adaptive(features, now_et, close_et, current_price)
+    
+    # Calculate minutes to close for confidence
     minutes_to_close = get_minutes_to_close()
-    
-    # If market is closed (0 minutes), use small default to avoid issues
-    if minutes_to_close == 0:
-        minutes_to_close = 1
-    
-    micro_weight, flow_weight = get_time_adaptive_weights(minutes_to_close)
-    
-    # FIXED Ridge regression formula with proper scaling:
-    # The old formula multiplied by minutes*60 (seconds) which created massive predictions.
-    # New formula uses percentage-based components for sensible predictions.
-    
-    # VWAP component: Pull toward/away from VWAP (max ±0.5% of price)
-    vwap_component = coeffs["beta_vwap"] * features["vwap_deviation"] * current_price * 0.01
-    
-    # Microtrend component: Project recent momentum forward (scaled properly)
-    # Microtrend is $/bar, so multiply by estimated bars until close, not seconds
-    bars_to_close = max(1, minutes_to_close / 5)  # Assume 5-minute bars
-    micro_component = coeffs["beta_microtrend"] * features["microtrend"] * bars_to_close * micro_weight
-    
-    # Gamma component: Pull toward pin strike (max ±$50 effect)
-    gamma_component = coeffs["beta_gamma"] * features["gamma_pin"] * 50.0
-    
-    # Flow component: Urgency modifier (max ±$30 effect)
-    flow_component = coeffs["beta_flow"] * features["flow_urgency"] * 30.0 * flow_weight
-    
-    intercept = coeffs["intercept"]
-    
-    # Final prediction
-    predicted_close = current_price + vwap_component + micro_component + gamma_component + flow_component + intercept
-    
-    # SANITY CHECK: Predictions should be within ±10% of current price
-    max_change = current_price * 0.10  # 10% max movement
-    if predicted_close > current_price + max_change:
-        predicted_close = current_price + max_change
-    elif predicted_close < current_price - max_change:
-        predicted_close = current_price - max_change
     
     # Calculate confidence based on time to close
     # Confidence increases as we approach close (more certainty)
@@ -286,7 +298,6 @@ def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> P
         base_confidence = 55
     
     # Adjust confidence based on feature agreement
-    # If VWAP and microtrend point same direction, increase confidence
     vwap_direction = 1 if features["vwap_deviation"] > 0 else -1
     micro_direction = 1 if features["microtrend"] > 0 else -1
     
