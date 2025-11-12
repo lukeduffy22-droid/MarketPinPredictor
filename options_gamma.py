@@ -128,14 +128,19 @@ def create_mock_options_chain(underlying, spot_price):
     
     # Generate options data for next 3 expirations
     expiry_dates = [
-        datetime.now() + timedelta(days=1),   # 0DTE
+        datetime.now(),                       # 0DTE (today)
         datetime.now() + timedelta(days=7),   # Weekly
         datetime.now() + timedelta(days=30),  # Monthly
     ]
     
     for expiry in expiry_dates:
-        days_to_exp = (expiry - datetime.now()).days
-        T = days_to_exp / 365.0
+        days_to_exp = max(0, (expiry - datetime.now()).days)  # Floor at 0
+        # For 0DTE, use fractional day (hours remaining)
+        if days_to_exp == 0:
+            hours_remaining = max(1, 16 - datetime.now().hour)  # Assume 4 PM close
+            T = hours_remaining / (365.0 * 24.0)  # Convert to years
+        else:
+            T = days_to_exp / 365.0
         
         for strike in strikes:
             moneyness = spot_price / strike
