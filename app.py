@@ -1395,6 +1395,37 @@ else:
                         with feat_cols[3]:
                             st.caption(f"Flow: {features.get('flow_urgency', 0):.2f}")
                     
+                    # Show gamma pin influence if available
+                    if 'gex_data' in pred and pred['gex_data'] and 'pin_strike' in pred['gex_data']:
+                        gex = pred['gex_data']
+                        pin_strike = gex['pin_strike']
+                        current = pred['current_price']
+                        prediction = pred['predicted_price']
+                        
+                        # Calculate how much the pin is pulling the prediction
+                        distance_to_pin = pin_strike - current
+                        distance_to_pin_pct = (distance_to_pin / current) * 100
+                        prediction_movement = prediction - current
+                        prediction_movement_pct = (prediction_movement / current) * 100
+                        
+                        # Calculate influence percentage (how much of the gap to pin did we move)
+                        if abs(distance_to_pin) > 0.01:  # Avoid division by zero
+                            influence_pct = (prediction_movement / distance_to_pin) * 100
+                        else:
+                            influence_pct = 0
+                        
+                        st.markdown("**🧲 Gamma Pin Influence:**")
+                        inf_cols = st.columns(4)
+                        with inf_cols[0]:
+                            st.caption(f"Pin @ ${pin_strike:.2f}")
+                        with inf_cols[1]:
+                            st.caption(f"Distance: {distance_to_pin_pct:+.2f}%")
+                        with inf_cols[2]:
+                            st.caption(f"Prediction Pull: {prediction_movement_pct:+.2f}%")
+                        with inf_cols[3]:
+                            influence_color = "🟢" if abs(influence_pct) > 50 else "🟡" if abs(influence_pct) > 25 else "🔴"
+                            st.caption(f"{influence_color} Influence: {influence_pct:.0f}%")
+                    
                     st.divider()
                 
                 # Standard metrics display
