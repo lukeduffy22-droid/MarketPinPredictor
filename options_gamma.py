@@ -146,7 +146,11 @@ def create_mock_options_chain(underlying, spot_price):
             moneyness = spot_price / strike
             
             # Higher OI near the money
-            base_oi = 10000 * np.exp(-abs(moneyness - 1) * 20)
+            # Boost 0DTE significantly to ensure it's selected
+            if days_to_exp == 0:
+                base_oi = 50000 * np.exp(-abs(moneyness - 1) * 15)  # Much higher for 0DTE
+            else:
+                base_oi = 10000 * np.exp(-abs(moneyness - 1) * 20)
             
             # Calls
             call_oi = int(base_oi * np.random.uniform(0.8, 1.2))
