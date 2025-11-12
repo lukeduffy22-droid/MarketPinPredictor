@@ -14,9 +14,19 @@ The system features adaptive model selection, gamma exposure analytics, real-tim
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (Nov 11, 2025)
+## Recent Changes (Nov 12, 2025)
 
-**Dual-Model System Integration**:
+**WebSocket Connection Optimization**:
+- Implemented **connection pooling** - Prevents duplicate WebSocket connections via class-level `_active_connections` dict
+- Added **connection reuse** - Returns existing instance when connection_id matches (tickers + stream_type)
+- Built **stale connection cleanup** - `cleanup_stale_connections()` removes dead connections before creating new ones
+- Reduced **max reconnection attempts** - From 5 to 2 to prevent connection spam
+- Fixed **connection reuse bug** - Now properly returns existing instance with live data_queue and thread
+- Added **thread-safe locking** - All pool operations protected by `_connection_lock`
+- Disabled verbose logging - Reduces noise in production environment
+- **Result**: Eliminated "Maximum connections exceeded" errors during streaming
+
+**Previous Changes (Nov 11, 2025)**:
 - Created **`app/models/ridge_predictor.py`** - Dedicated Time-Adaptive Ridge regression module
 - Implemented **dual-model prediction** - Both models run, Time-Adaptive as primary
 - Added **sidebar toggle** - "Show Traditional ML alongside Time-Adaptive" for model comparison
