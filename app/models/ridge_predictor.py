@@ -232,8 +232,9 @@ def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, 
     gamma_pull = float(features.get("gamma_pull", 0.0))          # $ target toward pin
     flow_urg = float(features.get("flow_urgency", 0.0))          # 0..1
     
-    # Horizon scalers — intraday decay
+    # Horizon scalers
     t = min(minutes_to_close, 60) / 60.0                         # 0..1, last hour emphasized
+    t_gamma = 1.0 - t  # INVERTED for gamma - strongest at close (0 min = 1.0, 60 min = 0.0)
     
     # Coefficients with stronger gamma influence
     k_vwap = 0.30  # Slightly reduced to make room for gamma
@@ -243,7 +244,7 @@ def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, 
     
     delta_from_vwap = k_vwap * (vwap_dev * last_price) * t
     delta_from_micro = k_micro * micro * min(minutes_to_close, 20)  # assume micro in $/5min or $/bar; no seconds
-    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.30 + 0.70 * t))  # 30–100% of gap (DOUBLED from 15-50%)
+    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.30 + 0.70 * t_gamma))  # 30–100% of gap, STRONGEST at close
     delta_from_flow = k_flow * (flow_urg - 0.5) * 0.006 * last_price  # ~±0.6% max
     
     pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow
