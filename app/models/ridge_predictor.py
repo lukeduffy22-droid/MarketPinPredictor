@@ -235,22 +235,33 @@ def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, 
     # Horizon scalers — intraday decay
     t = min(minutes_to_close, 60) / 60.0                         # 0..1, last hour emphasized
     
-    # Conservative coefficients
-    k_vwap = 0.35
+    # Coefficients with stronger gamma influence
+    k_vwap = 0.30  # Slightly reduced to make room for gamma
     k_micro = 0.20
-    k_gamma = 0.35
+    k_gamma = 0.70  # DOUBLED from 0.35 to increase gamma influence
     k_flow = 0.10
     
     delta_from_vwap = k_vwap * (vwap_dev * last_price) * t
     delta_from_micro = k_micro * micro * min(minutes_to_close, 20)  # assume micro in $/5min or $/bar; no seconds
-    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.15 + 0.35 * t))  # 15–50% of gap
+    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.30 + 0.70 * t))  # 30–100% of gap (DOUBLED from 15-50%)
     delta_from_flow = k_flow * (flow_urg - 0.5) * 0.006 * last_price  # ~±0.6% max
     
     pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow
     
-    # Sanity clamp: keep within ±2.5% intraday unless circuit-breaker day
-    lo = last_price * 0.975
-    hi = last_price * 1.025
+    # Conditional bounds: widen when strong gamma pinning is detected
+    # Strong pinning = gamma_pull is >2.5% away AND we're within final hour
+    distance_to_pin_pct = abs(gamma_pull - last_price) / last_price
+    
+    if distance_to_pin_pct > 0.025 and minutes_to_close <= 60:
+        # Widen bounds to allow reaching the gamma pin (up to ±5%)
+        max_move = min(distance_to_pin_pct * 1.2, 0.05)  # Cap at 5%
+        lo = last_price * (1 - max_move)
+        hi = last_price * (1 + max_move)
+    else:
+        # Default conservative bounds: ±2.5% intraday
+        lo = last_price * 0.975
+        hi = last_price * 1.025
+    
     return min(max(pred, lo), hi)
 
 def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> PredictionResult:
