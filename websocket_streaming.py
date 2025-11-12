@@ -14,8 +14,12 @@ import time
 class RealTimeDataStream:
     """
     Manages real-time WebSocket connection to Polygon/Massive API
-    Supports options and index data streaming
+    Supports options and index data streaming with connection pooling
     """
+    
+    # Class-level connection pool to prevent duplicates
+    _active_connections = {}
+    _connection_lock = threading.Lock()
     
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -33,6 +37,9 @@ class RealTimeDataStream:
         self.error_message = None  # Store errors for main thread to display
         self.connection_status = "disconnected"
         self.tickers = []
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
+        self.connection_id = None
         
     def connect(self, tickers: List[str], stream_type: str = "all", callback: Callable = None):
         """
@@ -48,6 +55,22 @@ class RealTimeDataStream:
             callback: Optional callback function to process messages
         """
         try:
+            # Create connection ID based on tickers and stream type
+            self.connection_id = f"{'-'.join(sorted(tickers))}_{stream_type}"
+            
+            # Check if connection already exists - return existing instance
+            with self._connection_lock:
+                if self.connection_id in self._active_connections:
+                    existing = self._active_connections[self.connection_id]
+                    if existing.is_connected:
+                        # Return the existing connection instance via special flag
+                        # The caller should check for this and use the existing instance
+                        self._reuse_existing = existing
+                        return True
+                    else:
+                        # Clean up dead connection
+                        del self._active_connections[self.connection_id]
+            
             self.tickers = tickers
             
             # Determine which feed to use based on market hours
@@ -202,8 +225,8 @@ class RealTimeDataStream:
                 feed=feed_host,  # Smart switching: real-time during market hours, delayed otherwise
                 market=market,
                 subscriptions=subscriptions,
-                verbose=True,
-                max_reconnects=5
+                verbose=False,  # Reduce logging noise
+                max_reconnects=2  # Reduce from 5 to prevent connection spam
             )
             
             # Store connection info for display
@@ -225,8 +248,12 @@ class RealTimeDataStream:
             self.is_connected = True
             self.connection_status = "connected"
             
+            # Register in connection pool
+            with self._connection_lock:
+                self._active_connections[self.connection_id] = self
+            
             # Give it a moment to connect
-            time.sleep(1)
+            time.sleep(0.5)  # Reduced from 1 second
             
             return True
             
@@ -237,14 +264,38 @@ class RealTimeDataStream:
             return False
     
     def disconnect(self):
-        """Disconnect from WebSocket"""
+        """Disconnect from WebSocket and clean up connection pool"""
         try:
+            # Remove from connection pool
+            if self.connection_id:
+                with self._connection_lock:
+                    if self.connection_id in self._active_connections:
+                        del self._active_connections[self.connection_id]
+            
+            # Close client connection
             if self.client:
                 self.client.close()
             self.is_connected = False
             self.connection_status = "disconnected"
         except Exception as e:
             pass  # Don't call st.warning from here - not thread safe
+    
+    @classmethod
+    def cleanup_stale_connections(cls):
+        """Clean up disconnected connections from the pool"""
+        with cls._connection_lock:
+            stale_ids = [
+                conn_id for conn_id, conn in cls._active_connections.items()
+                if not conn.is_connected
+            ]
+            for conn_id in stale_ids:
+                del cls._active_connections[conn_id]
+    
+    @classmethod
+    def get_active_connection_count(cls) -> int:
+        """Get the number of active connections"""
+        with cls._connection_lock:
+            return len(cls._active_connections)
     
     def get_latest_price(self, ticker: str) -> Dict:
         """Get latest price for a ticker"""
@@ -332,7 +383,7 @@ def format_websocket_message(msg) -> str:
 
 def start_streaming_session(api_key: str, tickers: List[str], stream_type: str = "all") -> RealTimeDataStream:
     """
-    Start a new streaming session
+    Start a new streaming session or return existing one if already connected
     
     Args:
         api_key: Polygon/Massive API key
@@ -340,7 +391,7 @@ def start_streaming_session(api_key: str, tickers: List[str], stream_type: str =
         stream_type: Type of stream - "indices", "options", or "all"
     
     Returns:
-        RealTimeDataStream instance
+        RealTimeDataStream instance (new or reused)
     """
     stream = RealTimeDataStream(api_key)
     
@@ -349,6 +400,9 @@ def start_streaming_session(api_key: str, tickers: List[str], stream_type: str =
         pass
     
     if stream.connect(tickers, stream_type=stream_type, callback=message_callback):
+        # Check if connection was reused - return existing instance
+        if hasattr(stream, '_reuse_existing'):
+            return stream._reuse_existing
         return stream
     return None
 

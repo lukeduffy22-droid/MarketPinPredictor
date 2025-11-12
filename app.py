@@ -811,6 +811,9 @@ with st.sidebar:
         # Start streaming
         if st.button("🚀 Start Streaming", type="secondary"):
             if selected_indexes and st.session_state.api_key:
+                # Clean up any stale connections first
+                RealTimeDataStream.cleanup_stale_connections()
+                
                 # Get actual index tickers (not ETF proxies) for streaming
                 tickers_to_stream = [INDEXES[idx] for idx in selected_indexes]
                 
