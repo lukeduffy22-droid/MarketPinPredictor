@@ -17,6 +17,7 @@ Preferred communication style: Simple, everyday language.
 ## Recent Changes (Nov 12, 2025)
 
 **Gamma Pin Influence Optimization** (Latest):
+- **Fixed real data API call** - Now uses correct `list_snapshot_options_chain()` method to fetch actual OI/IV from Polygon
 - Fixed **simulated data detection** - Added `is_mock_data` flag to clearly indicate when estimated OI/IV is used
 - Added **prominent warning banner** - UI displays "⚠️ SIMULATED GAMMA DATA" when real Polygon data unavailable
 - **Doubled gamma influence** - Increased k_gamma from 0.35 to 0.70 for stronger pin pull
@@ -26,7 +27,7 @@ Preferred communication style: Simple, everyday language.
   - At 60 min to close: 21% pull toward pin
 - **Conditional bounds widening** - Loosens ±2.5% to ±5% when pin >2.5% away in final hour
 - **Gamma influence indicator** - UI shows pin distance, prediction pull, and influence % with color coding
-- **Result**: Predictions now move meaningfully toward gamma pins instead of staying far away
+- **Result**: With highest-tier API key, now fetches real open interest and implied volatility for accurate gamma pins
 
 **WebSocket Connection Optimization**:
 - Implemented **connection pooling** - Prevents duplicate WebSocket connections via class-level `_active_connections` dict

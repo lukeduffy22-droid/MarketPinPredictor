@@ -40,7 +40,7 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
         
         # Use Options Chain Snapshot API to get REAL OI and IV
         # This endpoint returns actual market data for all contracts on the underlying
-        snapshot = client.get_snapshot_option_chain(underlying)
+        snapshot = client.list_snapshot_options_chain(underlying)
         
         options_data = []
         
