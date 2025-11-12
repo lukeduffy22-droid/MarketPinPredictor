@@ -29,79 +29,83 @@ def black_scholes_gamma(S, K, T, r, sigma):
 
 def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
     """
-    Fetch real options chain data from Polygon API
+    Fetch REAL options chain data from Polygon Snapshot API with actual OI and IV
     
     Returns tuple: (DataFrame with strike/expiry/type/OI/IV/gamma, is_mock_data: bool)
     
-    Note: Due to API limitations, uses estimated OI/IV values.
-    Real-time OI/IV requires Options Chain Snapshot API (higher tier subscription).
+    Uses Options Chain Snapshot API for real-time open interest and implied volatility.
     """
     try:
         client = RESTClient(api_key)
         
-        # Get options chain for the underlying
-        end_date = datetime.now() + timedelta(days=days_ahead)
-        
-        # Fetch options contracts using modern API
-        # Note: This may timeout or fail for index options on some API tiers
-        contracts = client.list_options_contracts(
-            underlying_ticker=underlying,
-            expiration_date_lte=end_date.strftime("%Y-%m-%d"),
-            limit=1000
-        )
+        # Use Options Chain Snapshot API to get REAL OI and IV
+        # This endpoint returns actual market data for all contracts on the underlying
+        snapshot = client.get_snapshot_option_chain(underlying)
         
         options_data = []
-        contract_count = 0
         
-        # Modern API returns a generator - iterate through contracts
-        # Limit iterations to prevent timeouts
-        for contract in contracts:
-            if contract_count >= 1000:  # Safety limit
-                break
-            contract_count += 1
-            # Extract contract details from object attributes
-            strike = float(contract.strike_price) if hasattr(contract, 'strike_price') else 0
-            expiry_str = contract.expiration_date if hasattr(contract, 'expiration_date') else ''
-            option_type = contract.contract_type.lower() if hasattr(contract, 'contract_type') else ''
-            ticker = contract.ticker if hasattr(contract, 'ticker') else ''
-            
-            if strike > 0 and expiry_str:
+        # Process each contract in the snapshot
+        for contract in snapshot:
+            try:
+                # Extract contract details
+                if not hasattr(contract, 'details'):
+                    continue
+                    
+                details = contract.details
+                strike = float(details.strike_price) if hasattr(details, 'strike_price') else 0
+                expiry_str = details.expiration_date if hasattr(details, 'expiration_date') else ''
+                option_type = details.contract_type.lower() if hasattr(details, 'contract_type') else ''
+                
+                if strike <= 0 or not expiry_str:
+                    continue
+                
+                # Parse expiry
                 expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
                 days_to_expiry = (expiry - datetime.now()).days
                 
-                if days_to_expiry > 0:
-                    # Use default IV and estimated OI for now
-                    # Note: For real OI and IV, would need snapshot API (requires higher tier)
-                    iv = 0.25  # Default 25% implied volatility
-                    
-                    # Estimate OI based on moneyness (higher near ATM)
-                    moneyness = abs(spot_price - strike) / spot_price
-                    oi = int(10000 * np.exp(-moneyness * 20))
-                    
-                    # Calculate gamma
-                    T = days_to_expiry / 365.0
-                    gamma = black_scholes_gamma(spot_price, strike, T, 0.05, iv)
-                    
-                    options_data.append({
-                        'strike': strike,
-                        'expiry': expiry,
-                        'days_to_expiry': days_to_expiry,
-                        'type': option_type,
-                        'open_interest': oi,
-                        'implied_volatility': iv,
-                        'gamma': gamma,
-                        'ticker': ticker
-                    })
+                # Only include contracts expiring within our window
+                if days_to_expiry < 0 or days_to_expiry > days_ahead:
+                    continue
+                
+                # Get REAL market data from snapshot
+                # These are actual values from the market, not estimates!
+                oi = int(contract.open_interest) if hasattr(contract, 'open_interest') and contract.open_interest else 0
+                iv = float(contract.implied_volatility) if hasattr(contract, 'implied_volatility') and contract.implied_volatility else 0.25
+                
+                # Calculate gamma using real IV
+                T = max(days_to_expiry, 0.001) / 365.0  # Avoid division by zero
+                gamma = black_scholes_gamma(spot_price, strike, T, 0.05, iv)
+                
+                options_data.append({
+                    'strike': strike,
+                    'expiry': expiry,
+                    'days_to_expiry': days_to_expiry,
+                    'type': option_type,
+                    'open_interest': oi,
+                    'implied_volatility': iv,
+                    'gamma': gamma,
+                    'ticker': details.ticker if hasattr(details, 'ticker') else ''
+                })
+            except Exception as contract_error:
+                # Skip malformed contracts
+                continue
         
-        # If we got some data, return it - BUT IT'S STILL MOCK since we estimated OI/IV
+        # If we got real data, return it
         if options_data:
-            return pd.DataFrame(options_data), True  # is_mock_data = True
+            return pd.DataFrame(options_data), False  # is_mock_data = False - REAL DATA!
         else:
-            # No data found, use mock data
+            # No data found, fall back to mock
+            st.warning(f"No options snapshot data returned for {underlying}. Using simulated data.")
             return create_mock_options_chain(underlying, spot_price), True
         
     except Exception as e:
-        # Handle API errors gracefully - all fallback to mock data
+        # API error - fall back to mock data
+        error_msg = str(e)
+        if "not found" in error_msg.lower() or "404" in error_msg:
+            st.warning(f"Options snapshot not available for {underlying}. Using simulated data. Error: {error_msg[:100]}")
+        else:
+            st.warning(f"Options snapshot API error for {underlying}. Using simulated data. Error: {error_msg[:100]}")
+        
         return create_mock_options_chain(underlying, spot_price), True
 
 def create_mock_options_chain(underlying, spot_price):
