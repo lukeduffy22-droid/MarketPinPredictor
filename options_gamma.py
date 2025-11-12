@@ -31,7 +31,7 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
     """
     Fetch real options chain data from Polygon API
     
-    Returns DataFrame with strike, expiry, type, OI, volume, IV, gamma
+    Returns tuple: (DataFrame with strike/expiry/type/OI/IV/gamma, is_mock_data: bool)
     
     Note: Due to API limitations, uses estimated OI/IV values.
     Real-time OI/IV requires Options Chain Snapshot API (higher tier subscription).
@@ -93,26 +93,16 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
                         'ticker': ticker
                     })
         
-        # If we got some data, return it
+        # If we got some data, return it - BUT IT'S STILL MOCK since we estimated OI/IV
         if options_data:
-            return pd.DataFrame(options_data)
+            return pd.DataFrame(options_data), True  # is_mock_data = True
         else:
             # No data found, use mock data
-            st.info(f"No options data available for {underlying}. Using simulated gamma exposure for demonstration.")
-            return create_mock_options_chain(underlying, spot_price)
+            return create_mock_options_chain(underlying, spot_price), True
         
     except Exception as e:
-        # Handle API errors gracefully
-        error_msg = str(e)
-        if "timeout" in error_msg.lower():
-            st.info(f"Options data request timed out for {underlying}. Using simulated gamma exposure for demonstration.")
-        elif "not found" in error_msg.lower() or "404" in error_msg:
-            st.info(f"Options not available for {underlying} on this API tier. Using simulated gamma exposure for demonstration.")
-        else:
-            st.info(f"Using simulated gamma exposure for {underlying}. (API: {error_msg[:100]})")
-        
-        # Return mock data for demonstration
-        return create_mock_options_chain(underlying, spot_price)
+        # Handle API errors gracefully - all fallback to mock data
+        return create_mock_options_chain(underlying, spot_price), True
 
 def create_mock_options_chain(underlying, spot_price):
     """
@@ -303,15 +293,20 @@ def calculate_gamma_exposure(options_df, spot_price):
 def get_gamma_analysis(api_key, underlying, spot_price):
     """
     Main function to get complete gamma analysis for an index
+    
+    Returns gamma analysis dict with is_mock_data flag
     """
     # Fetch options chain
-    options_df = fetch_options_chain(api_key, underlying, spot_price)
+    options_df, is_mock_data = fetch_options_chain(api_key, underlying, spot_price)
     
     if options_df.empty:
         return None
     
     # Calculate gamma exposure
     gex_analysis = calculate_gamma_exposure(options_df, spot_price)
+    
+    # Add is_mock_data flag to the analysis
+    gex_analysis['is_mock_data'] = is_mock_data
     
     # Add summary message
     pin_strike = gex_analysis['pin_strike']

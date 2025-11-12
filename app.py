@@ -229,7 +229,8 @@ def calculate_gex(api_key, ticker, spot_price):
                 'pull_strength': gex_analysis['pull_strength'],
                 'summary': gex_analysis['summary'],
                 'gamma_walls': gex_analysis['gamma_walls'],
-                'gex_by_strike': gex_analysis['gex_by_strike']
+                'gex_by_strike': gex_analysis['gex_by_strike'],
+                'is_mock_data': gex_analysis.get('is_mock_data', True)  # Flag for mock data
             }
             
             # Add key support/resistance levels from gamma walls
@@ -1442,6 +1443,14 @@ else:
                     gex = pred['gex_data']
                     st.divider()
                     st.subheader("🎯 Gamma Exposure Analysis")
+                    
+                    # WARNING: Display prominent banner if using mock data
+                    if gex.get('is_mock_data', True):
+                        st.warning(
+                            "⚠️ **SIMULATED GAMMA DATA** - Using estimated options data. "
+                            "Real open interest and implied volatility require a higher Polygon API tier. "
+                            "Gamma pins and exposure levels shown are for demonstration only and may not reflect actual market dynamics."
+                        )
                     
                     # Main gamma pin information
                     gamma_col1, gamma_col2, gamma_col3 = st.columns(3)
