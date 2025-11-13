@@ -8,7 +8,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from scipy.stats import norm
 from polygon import RESTClient
-import streamlit as st
 
 def black_scholes_gamma(S, K, T, r, sigma):
     """
@@ -95,16 +94,16 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
             return pd.DataFrame(options_data), False  # is_mock_data = False - REAL DATA!
         else:
             # No data found, fall back to mock
-            st.warning(f"No options snapshot data returned for {underlying}. Using simulated data.")
+            print(f"Warning: No options snapshot data returned for {underlying}. Using simulated data.")
             return create_mock_options_chain(underlying, spot_price), True
         
     except Exception as e:
         # API error - fall back to mock data
         error_msg = str(e)
         if "not found" in error_msg.lower() or "404" in error_msg:
-            st.warning(f"Options snapshot not available for {underlying}. Using simulated data. Error: {error_msg[:100]}")
+            print(f"Warning: Options snapshot not available for {underlying}. Using simulated data. Error: {error_msg[:100]}")
         else:
-            st.warning(f"Options snapshot API error for {underlying}. Using simulated data. Error: {error_msg[:100]}")
+            print(f"Warning: Options snapshot API error for {underlying}. Using simulated data. Error: {error_msg[:100]}")
         
         return create_mock_options_chain(underlying, spot_price), True
 
