@@ -1040,18 +1040,31 @@ else:
                     df = pd.merge(df, vix_df, on='timestamp', how='left')
                     df['vix_close'] = df['vix_close'].ffill()
                 
-                # Get current price using SNAPSHOT API (real-time) instead of historical close
-                # This ensures we're using the most recent price, not yesterday's close
+                # Get current price - prioritize real-time sources over historical close
+                # Priority: 1) WebSocket streaming, 2) Snapshot API, 3) Historical close
                 current_price = df['close'].iloc[-1]  # Fallback to historical
-                try:
-                    snapshot = get_snapshot_data(st.session_state.api_key, [polygon_ticker])
-                    if snapshot and polygon_ticker in snapshot and snapshot[polygon_ticker]['price']:
-                        current_price = snapshot[polygon_ticker]['price']
-                        # Update df with current price for accurate calculations
-                        df.loc[df.index[-1], 'close'] = current_price
-                except Exception as snap_err:
-                    # If snapshot fails, use historical close (already set above)
-                    pass
+                
+                # Try WebSocket streaming first (true real-time if active)
+                if st.session_state.streaming_active and st.session_state.ws_stream:
+                    try:
+                        stream_price = st.session_state.ws_stream.get_latest_price(polygon_ticker)
+                        if stream_price and 'price' in stream_price:
+                            current_price = stream_price['price']
+                            # Update df with streaming price for accurate calculations
+                            df.loc[df.index[-1], 'close'] = current_price
+                    except Exception as stream_err:
+                        pass  # Fall through to snapshot
+                
+                # If streaming not available, try snapshot API (real-time on highest-tier plans)
+                if current_price == df['close'].iloc[-1]:  # Still using historical fallback
+                    try:
+                        snapshot = get_snapshot_data(st.session_state.api_key, [polygon_ticker])
+                        if snapshot and polygon_ticker in snapshot and snapshot[polygon_ticker]['price']:
+                            current_price = snapshot[polygon_ticker]['price']
+                            # Update df with snapshot price for accurate calculations
+                            df.loc[df.index[-1], 'close'] = current_price
+                    except Exception as snap_err:
+                        pass  # Use historical close (already set above)
                 
                 # Calculate GEX levels using actual index ticker for options
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
