@@ -84,10 +84,15 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90):
                 
                 # Parse expiry
                 expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
-                days_to_expiry = (expiry - datetime.now()).days
                 
-                # IMPORTANT: Include 0DTE (same-day) options - they show as -1 due to time comparison
-                # Only exclude if expiry date is before today's date (not just earlier time)
+                # IMPORTANT: Include 0DTE (same-day) options
+                # Calculate days properly - 0DTE should show as 0, not -1
+                if expiry.date() == datetime.now().date():
+                    days_to_expiry = 0  # Same day = 0 days
+                else:
+                    days_to_expiry = (expiry.date() - datetime.now().date()).days
+                
+                # Only exclude if expiry date is before today's date
                 if expiry.date() < datetime.now().date() or days_to_expiry > days_ahead:
                     skipped_expiry += 1
                     continue

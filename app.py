@@ -1040,8 +1040,18 @@ else:
                     df = pd.merge(df, vix_df, on='timestamp', how='left')
                     df['vix_close'] = df['vix_close'].ffill()
                 
-                # Get current price for GEX calculation
-                current_price = df['close'].iloc[-1]
+                # Get current price using SNAPSHOT API (real-time) instead of historical close
+                # This ensures we're using the most recent price, not yesterday's close
+                current_price = df['close'].iloc[-1]  # Fallback to historical
+                try:
+                    snapshot = get_snapshot_data(st.session_state.api_key, [polygon_ticker])
+                    if snapshot and polygon_ticker in snapshot and snapshot[polygon_ticker]['price']:
+                        current_price = snapshot[polygon_ticker]['price']
+                        # Update df with current price for accurate calculations
+                        df.loc[df.index[-1], 'close'] = current_price
+                except Exception as snap_err:
+                    # If snapshot fails, use historical close (already set above)
+                    pass
                 
                 # Calculate GEX levels using actual index ticker for options
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
