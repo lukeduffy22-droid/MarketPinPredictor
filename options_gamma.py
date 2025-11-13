@@ -51,6 +51,10 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
         options_data = []
         contract_count = 0
         max_contracts = 200  # Reduced limit for faster processing
+        skipped_no_details = 0
+        skipped_invalid = 0
+        skipped_expiry = 0
+        errors = 0
         
         # Process each contract in the snapshot
         for contract in snapshot:
@@ -66,6 +70,7 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
             try:
                 # Extract contract details
                 if not hasattr(contract, 'details'):
+                    skipped_no_details += 1
                     continue
                     
                 details = contract.details
@@ -74,6 +79,7 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
                 option_type = details.contract_type.lower() if hasattr(details, 'contract_type') else ''
                 
                 if strike <= 0 or not expiry_str:
+                    skipped_invalid += 1
                     continue
                 
                 # Parse expiry
@@ -82,6 +88,7 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
                 
                 # Only include contracts expiring within our window
                 if days_to_expiry < 0 or days_to_expiry > days_ahead:
+                    skipped_expiry += 1
                     continue
                 
                 # Get REAL market data from snapshot
@@ -105,7 +112,12 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
                 })
             except Exception as contract_error:
                 # Skip malformed contracts
+                errors += 1
+                if errors <= 3:  # Only print first few errors
+                    print(f"Contract processing error: {str(contract_error)[:100]}")
                 continue
+        
+        print(f"Processed {contract_count} contracts: {len(options_data)} valid, {skipped_no_details} no details, {skipped_invalid} invalid, {skipped_expiry} expired/far, {errors} errors")
         
         # If we got real data, return it
         if options_data:
