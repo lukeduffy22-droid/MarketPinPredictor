@@ -1041,8 +1041,9 @@ else:
                     df['vix_close'] = df['vix_close'].ffill()
                 
                 # Get current price - prioritize real-time sources over historical close
-                # Priority: 1) WebSocket streaming, 2) Snapshot API, 3) Historical close
+                # Priority: 1) WebSocket streaming, 2) Snapshot API (real-time on $300+ plan), 3) Historical close
                 current_price = df['close'].iloc[-1]  # Fallback to historical
+                price_source = "Historical Close"  # Track data source for display
                 
                 # Try WebSocket streaming first (true real-time if active)
                 if st.session_state.streaming_active and st.session_state.ws_stream:
@@ -1052,6 +1053,7 @@ else:
                             current_price = stream_price['price']
                             # Update df with streaming price for accurate calculations
                             df.loc[df.index[-1], 'close'] = current_price
+                            price_source = "🟢 WebSocket Streaming (Real-Time)"
                     except Exception as stream_err:
                         pass  # Fall through to snapshot
                 
@@ -1063,6 +1065,7 @@ else:
                             current_price = snapshot[polygon_ticker]['price']
                             # Update df with snapshot price for accurate calculations
                             df.loc[df.index[-1], 'close'] = current_price
+                            price_source = "🟢 Premium Snapshot API (Real-Time)"
                     except Exception as snap_err:
                         pass  # Use historical close (already set above)
                 
@@ -1222,6 +1225,7 @@ else:
                         'timeframe': st.session_state.timeframe,
                         'gex_data': gex_data,  # Add GEX data
                         'has_vix': vix_df is not None,  # Track VIX availability
+                        'price_source': price_source,  # Show which data source is being used
                         # Store ORIGINAL individual model predictions for comparison (before constraints)
                         'adaptive_pred': {
                             'predicted_price': adaptive_original_price,  # Use ORIGINAL value
@@ -1337,6 +1341,9 @@ else:
                 )
                 st.caption(f"🔮 Blended Prediction")
                 st.caption(f"Current: ${pred['current_price']:.2f}")
+                # Show premium data source indicator
+                if pred.get('price_source'):
+                    st.caption(f"📡 {pred['price_source']}")
                 st.caption(f"Confidence: {pred['confidence']:.1f}%")
                 
                 # Show individual models if toggle enabled and available
