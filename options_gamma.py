@@ -34,17 +34,35 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
     
     Uses Options Chain Snapshot API for real-time open interest and implied volatility.
     """
+    import time
+    
     try:
         client = RESTClient(api_key)
         
         # Use Options Chain Snapshot API to get REAL OI and IV
         # This endpoint returns actual market data for all contracts on the underlying
+        # Add timeout protection by limiting iteration
+        print(f"Fetching options chain snapshot for {underlying}...")
+        start_time = time.time()
+        timeout_seconds = 10  # Maximum 10 seconds to fetch options data
+        
         snapshot = client.list_snapshot_options_chain(underlying)
         
         options_data = []
+        contract_count = 0
+        max_contracts = 200  # Reduced limit for faster processing
         
         # Process each contract in the snapshot
         for contract in snapshot:
+            # Check timeout
+            if time.time() - start_time > timeout_seconds:
+                print(f"Warning: Timeout after {timeout_seconds}s, processed {contract_count} contracts. Using what we have.")
+                break
+            
+            contract_count += 1
+            if contract_count > max_contracts:
+                print(f"Warning: Processed {max_contracts} contracts, stopping to prevent timeout")
+                break
             try:
                 # Extract contract details
                 if not hasattr(contract, 'details'):
