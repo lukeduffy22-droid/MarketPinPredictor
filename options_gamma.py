@@ -26,7 +26,7 @@ def black_scholes_gamma(S, K, T, r, sigma):
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
 
-def fetch_options_chain(api_key, underlying, spot_price, days_ahead=30):
+def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90):
     """
     Fetch REAL options chain data from Polygon Snapshot API with actual OI and IV
     
