@@ -86,12 +86,9 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90):
                 expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
                 days_to_expiry = (expiry - datetime.now()).days
                 
-                # Debug: Print first few expiry dates to see what we're getting
-                if skipped_expiry < 3:
-                    print(f"Contract expiry: {expiry_str}, days_to_expiry: {days_to_expiry}, days_ahead limit: {days_ahead}")
-                
-                # Only include contracts expiring within our window
-                if days_to_expiry < 0 or days_to_expiry > days_ahead:
+                # IMPORTANT: Include 0DTE (same-day) options - they show as -1 due to time comparison
+                # Only exclude if expiry date is before today's date (not just earlier time)
+                if expiry.date() < datetime.now().date() or days_to_expiry > days_ahead:
                     skipped_expiry += 1
                     continue
                 
