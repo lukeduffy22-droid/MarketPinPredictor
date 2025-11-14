@@ -1620,7 +1620,7 @@ else:
                     
                     # Add Gamma Pin Evolution Chart (intraday history)
                     st.divider()
-                    show_gamma_evolution_section(index_ticker, index_name)
+                    show_gamma_evolution_section(pred['ticker'], index_name)
                 
                 # Display VWAP and AMA (only if available)
                 st.subheader("📊 Advanced Indicators")
