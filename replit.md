@@ -14,9 +14,22 @@ The system features adaptive model selection, gamma exposure analytics, real-tim
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (Nov 12, 2025)
+## Recent Changes (Nov 14, 2025)
 
-**Gamma Pin Influence Optimization** (Latest):
+**Gamma Pin Evolution Tracking** (Latest):
+- **Background auto-sampler** - Scheduler runs every 15 minutes during RTH (9:30 AM - 4:00 PM ET), samples all 4 indices
+- **Database persistence** - New `GammaPinSnapshot` model with UNIQUE constraint on (ticker, trading_date, interval_timestamp)
+- **Timezone-aware timestamps** - All samples normalized to ET→UTC with 15-minute boundary alignment (9:30, 9:45, 10:00, etc.)
+- **Intraday evolution chart** - Plotly visualization showing gamma pin vs spot price throughout trading day
+- **Real vs simulated clarity** - Solid lines for real Polygon data, dashed lines for estimated data, prominent warnings
+- **Rate limit protection** - Logs warnings after 3 consecutive API failures, ~26 calls/symbol/day within quota
+- **Automatic chart display** - Shows in prediction results section when gamma exposure data available
+- **Historical table view** - Expandable table with all 15-minute snapshots, summary statistics, data source column
+- **Result**: Complete audit trail of how gamma pins move throughout the day, helping traders understand market dynamics
+
+**Previous Changes (Nov 12, 2025)**:
+
+**Gamma Pin Influence Optimization**:
 - **Fixed real data API call** - Now uses correct `list_snapshot_options_chain()` method to fetch actual OI/IV from Polygon
 - Fixed **simulated data detection** - Added `is_mock_data` flag to clearly indicate when estimated OI/IV is used
 - Added **prominent warning banner** - UI displays "⚠️ SIMULATED GAMMA DATA" when real Polygon data unavailable
