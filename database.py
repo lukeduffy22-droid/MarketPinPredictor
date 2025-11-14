@@ -1,9 +1,10 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, Date, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, date
 import time
+import pytz
 
 # Get database URL from environment
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -54,6 +55,24 @@ class Alert(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     triggered_at = Column(DateTime, nullable=True)
     message = Column(Text)
+
+class GammaPinSnapshot(Base):
+    __tablename__ = 'gamma_pin_snapshots'
+    __table_args__ = (
+        UniqueConstraint('ticker', 'trading_date', 'interval_timestamp', name='uix_gamma_snapshot'),
+    )
+    
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    trading_date = Column(Date, nullable=False, index=True)  # Native DATE type
+    interval_timestamp = Column(DateTime, nullable=False, index=True)  # Rounded to 15-min boundary
+    pin_strike = Column(Float, nullable=False)
+    pull_strength = Column(Float, nullable=False)
+    spot_price = Column(Float, nullable=False)
+    total_gex = Column(Float, nullable=False)
+    net_gex = Column(Float, nullable=False)
+    is_mock_data = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 def init_db():
     """Initialize database tables with retry logic"""
@@ -230,3 +249,152 @@ def get_prediction_accuracy_stats(ticker=None):
         }
     finally:
         db.close()
+
+def round_to_15min(dt):
+    """
+    Round datetime to nearest 15-minute boundary in US/Eastern timezone.
+    
+    Ensures proper alignment with market intervals (9:30, 9:45, 10:00, etc.)
+    and handles timezone conversions correctly.
+    
+    Args:
+        dt: datetime object (can be naive or timezone-aware)
+    
+    Returns:
+        Timezone-aware datetime in US/Eastern, rounded to 15-min boundary
+    """
+    et_tz = pytz.timezone('US/Eastern')
+    
+    # Convert to ET timezone
+    if dt.tzinfo is None:
+        # Assume naive datetime is already in ET
+        dt_et = et_tz.localize(dt)
+    else:
+        # Convert to ET
+        dt_et = dt.astimezone(et_tz)
+    
+    # Round down to nearest 15 minutes
+    minutes = (dt_et.minute // 15) * 15
+    rounded_et = dt_et.replace(minute=minutes, second=0, microsecond=0)
+    
+    # Convert to UTC for database storage (best practice for multi-timezone apps)
+    return rounded_et.astimezone(pytz.UTC)
+
+def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, spot_price, total_gex, net_gex, is_mock_data=False):
+    """
+    Save a gamma pin snapshot to the database with automatic deduplication.
+    
+    Args:
+        ticker: Stock ticker (e.g., 'SPX')
+        interval_timestamp: Timestamp of the snapshot (will be rounded to 15-min boundary)
+        pin_strike: Gamma pin strike price
+        pull_strength: Pull strength toward pin
+        spot_price: Current spot price
+        total_gex: Total gamma exposure
+        net_gex: Net gamma exposure
+        is_mock_data: Whether this is simulated data (default False)
+    
+    Returns:
+        GammaPinSnapshot object or None on error
+    """
+    try:
+        db = SessionLocal()
+        
+        # CRITICAL: Normalize timestamp to 15-minute boundary to prevent duplicates
+        normalized_timestamp = round_to_15min(interval_timestamp)
+        
+        # Extract trading date from normalized timestamp
+        trading_date = normalized_timestamp.date()
+        
+        # Check if snapshot already exists (database UNIQUE constraint will also enforce this)
+        existing = db.query(GammaPinSnapshot).filter(
+            GammaPinSnapshot.ticker == ticker,
+            GammaPinSnapshot.trading_date == trading_date,
+            GammaPinSnapshot.interval_timestamp == normalized_timestamp
+        ).first()
+        
+        if existing:
+            # Update existing snapshot (upsert behavior)
+            existing.pin_strike = pin_strike
+            existing.pull_strength = pull_strength
+            existing.spot_price = spot_price
+            existing.total_gex = total_gex
+            existing.net_gex = net_gex
+            existing.is_mock_data = is_mock_data
+            db.commit()
+            db.refresh(existing)
+            return existing
+        else:
+            # Create new snapshot
+            snapshot = GammaPinSnapshot(
+                ticker=ticker,
+                trading_date=trading_date,
+                interval_timestamp=normalized_timestamp,
+                pin_strike=pin_strike,
+                pull_strength=pull_strength,
+                spot_price=spot_price,
+                total_gex=total_gex,
+                net_gex=net_gex,
+                is_mock_data=is_mock_data
+            )
+            db.add(snapshot)
+            db.commit()
+            db.refresh(snapshot)
+            return snapshot
+    except Exception as e:
+        print(f"Database error saving gamma snapshot: {str(e)}")
+        return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+def get_gamma_snapshots_for_day(ticker, trading_date_obj):
+    """
+    Get all gamma snapshots for a ticker on a specific trading day
+    
+    Args:
+        ticker: Stock ticker (e.g., 'SPX')
+        trading_date_obj: datetime.date object or datetime object
+    
+    Returns:
+        List of GammaPinSnapshot objects ordered by time
+    """
+    try:
+        db = SessionLocal()
+        
+        # Ensure we have a date object
+        if isinstance(trading_date_obj, datetime):
+            trading_date_obj = trading_date_obj.date()
+        
+        snapshots = db.query(GammaPinSnapshot).filter(
+            GammaPinSnapshot.ticker == ticker,
+            GammaPinSnapshot.trading_date == trading_date_obj
+        ).order_by(GammaPinSnapshot.interval_timestamp.asc()).all()
+        return snapshots
+    except Exception as e:
+        print(f"Database error fetching gamma snapshots: {str(e)}")
+        return []
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+def get_latest_gamma_snapshot(ticker):
+    """Get the most recent gamma snapshot for a ticker"""
+    try:
+        db = SessionLocal()
+        snapshot = db.query(GammaPinSnapshot).filter(
+            GammaPinSnapshot.ticker == ticker
+        ).order_by(GammaPinSnapshot.interval_timestamp.desc()).first()
+        return snapshot
+    except Exception as e:
+        print(f"Database error fetching latest gamma snapshot: {str(e)}")
+        return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass

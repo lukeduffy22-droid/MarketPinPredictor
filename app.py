@@ -18,9 +18,16 @@ from websocket_streaming import (
     start_streaming_session, get_streaming_recommendations, get_snapshot_data
 )
 from app.models.ridge_predictor import predict as predict_adaptive, get_minutes_to_close
+from gamma_scheduler import start_gamma_scheduler, is_scheduler_running
+from gamma_viz import show_gamma_evolution_section
 
 # Initialize database
 init_db()
+
+# Start background gamma sampling scheduler (runs every 15 minutes during market hours)
+if not is_scheduler_running():
+    start_gamma_scheduler()
+    print("✓ Background gamma sampling scheduler started")
 
 # Page configuration
 st.set_page_config(
@@ -1610,6 +1617,10 @@ else:
                     # Key levels
                     if gex.get('key_levels'):
                         st.info(f"Key Support/Resistance: ${gex['key_levels'][0]:.2f} / ${gex['key_levels'][1]:.2f}")
+                    
+                    # Add Gamma Pin Evolution Chart (intraday history)
+                    st.divider()
+                    show_gamma_evolution_section(index_ticker, index_name)
                 
                 # Display VWAP and AMA (only if available)
                 st.subheader("📊 Advanced Indicators")
