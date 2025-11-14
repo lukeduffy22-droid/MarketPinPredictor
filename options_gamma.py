@@ -291,8 +291,35 @@ def calculate_gamma_exposure(options_df, spot_price):
     
     gex_by_strike.columns = ['strike', 'net_gex', 'total_gex', 'expiry', 'days_to_expiry']
     
-    # Find pin strike (highest absolute GEX)
-    pin_row = gex_by_strike.loc[gex_by_strike['total_gex'].idxmax()]
+    # Find pin strike (highest absolute GEX NEAR current price)
+    # Filter to strikes within ±10% of spot (realistic pin range for indices)
+    # Gamma pinning only works when strikes are close to current price
+    price_range = 0.10  # 10% range
+    lower_bound = spot_price * (1 - price_range)
+    upper_bound = spot_price * (1 + price_range)
+    
+    nearby_strikes = gex_by_strike[
+        (gex_by_strike['strike'] >= lower_bound) & 
+        (gex_by_strike['strike'] <= upper_bound)
+    ]
+    
+    # If no strikes in range, widen to ±15%
+    if nearby_strikes.empty:
+        price_range = 0.15
+        lower_bound = spot_price * (1 - price_range)
+        upper_bound = spot_price * (1 + price_range)
+        nearby_strikes = gex_by_strike[
+            (gex_by_strike['strike'] >= lower_bound) & 
+            (gex_by_strike['strike'] <= upper_bound)
+        ]
+    
+    # Find pin within realistic range
+    if not nearby_strikes.empty:
+        pin_row = nearby_strikes.loc[nearby_strikes['total_gex'].idxmax()]
+    else:
+        # Fallback: use all strikes (should rarely happen)
+        pin_row = gex_by_strike.loc[gex_by_strike['total_gex'].idxmax()]
+    
     pin_strike = pin_row['strike']
     pin_expiry = pin_row['expiry']
     total_gex = pin_row['total_gex']
