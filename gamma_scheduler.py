@@ -81,9 +81,10 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             return False
         
         # Save to database (timestamp will be auto-rounded to 15-min boundary)
+        et_tz = pytz.timezone('US/Eastern')
         snapshot_result = save_gamma_snapshot(
             ticker=symbol,
-            interval_timestamp=datetime.now(),
+            interval_timestamp=datetime.now(et_tz),
             pin_strike=gex_analysis['pin_strike'],
             pull_strength=gex_analysis.get('pull_strength', 0.5),
             spot_price=current_price,

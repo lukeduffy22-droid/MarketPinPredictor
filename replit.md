@@ -8,6 +8,30 @@ This project is a dual-model stock market prediction system designed for major s
 
 Preferred communication style: Simple, everyday language.
 
+## Recent Changes (Nov 17, 2025)
+
+**CRITICAL BUG FIXES - Gamma Sampling System Fully Operational** (Latest):
+
+**Issue**: System was saving gamma data, but UI wasn't displaying it due to timezone/datetime bugs causing incorrect database timestamps.
+
+**Root Causes Fixed**:
+1. **Polygon snapshot API bug** - Changed from non-existent `client.get_snapshot()` to correct `client.get_snapshot_indices(ticker_any_of=[list])`
+2. **API parameter format bug** - API requires **list** parameter, not comma-separated string (was causing character-by-character parsing "I", ":", "S", "P", "X")
+3. **Numpy type conversion bug** - Added `float()` conversions in `save_gamma_snapshot()` to fix `psycopg2.ProgrammingError: can't adapt type 'numpy.int64'`
+4. **CRITICAL: Timezone bug in scheduler** - `gamma_scheduler.py` was passing naive `datetime.now()` (UTC) instead of `datetime.now(et_tz)` (ET), causing 5-hour timestamp offset
+5. **Trading date extraction bug** - `database.py` was extracting date from UTC timestamp instead of ET, causing date mismatch in queries
+
+**Implementation Details**:
+- Changed `gamma_scheduler.py` line 90: `datetime.now()` → `datetime.now(pytz.timezone('US/Eastern'))`
+- Changed `database.py` line 318: Added `trading_date = normalized_timestamp.astimezone(et_tz).date()` to extract date in ET timezone
+- SQL fix applied to correct existing records: `UPDATE gamma_pin_snapshots SET trading_date = DATE(interval_timestamp AT TIME ZONE 'America/New_York')`
+
+**Result**: All 4 indices (SPX, NDX, DJI, RUT) now successfully saving gamma snapshots every 15 minutes with **correct timestamps and UI display**:
+  - SPX, NDX, RUT: Real data from Polygon API ✅
+  - DJI: Simulated data (Polygon doesn't provide DJI options, gamma estimation still functional)
+  - Database storing correct UTC timestamps with matching ET trading_dates
+  - UI gamma evolution chart now displays historical data correctly
+
 ## System Architecture
 
 ### Frontend Architecture

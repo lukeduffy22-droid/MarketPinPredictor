@@ -310,8 +310,9 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
         # CRITICAL: Normalize timestamp to 15-minute boundary to prevent duplicates
         normalized_timestamp = round_to_15min(interval_timestamp)
         
-        # Extract trading date from normalized timestamp
-        trading_date = normalized_timestamp.date()
+        # Extract trading date in ET timezone (before UTC conversion for accurate date)
+        et_tz = pytz.timezone('US/Eastern')
+        trading_date = normalized_timestamp.astimezone(et_tz).date()
         
         # Check if snapshot already exists (database UNIQUE constraint will also enforce this)
         existing = db.query(GammaPinSnapshot).filter(
