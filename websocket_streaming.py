@@ -452,11 +452,11 @@ The app automatically selects the optimal data feed:
 
 def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Dict]]:
     """
-    Get snapshot data for tickers as a backup method when streaming is unavailable
+    Get snapshot data for index tickers as a backup method when streaming is unavailable
     
     Args:
         api_key: Polygon/Massive API key
-        tickers: List of tickers to fetch
+        tickers: List of index tickers to fetch (e.g., ['I:SPX', 'I:NDX'])
     
     Returns:
         Dictionary mapping ticker to snapshot data (price, volume, etc.)
@@ -465,29 +465,41 @@ def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Di
         client = RESTClient(api_key)
         snapshot_data = {}
         
-        for ticker in tickers:
-            try:
-                # Get snapshot for ticker
-                snapshot = client.get_snapshot(ticker)
-                
+        try:
+            # Get snapshot for indices using the correct API method
+            # Note: ticker_any_of expects a LIST, not a comma-separated string
+            results = client.get_snapshot_indices(ticker_any_of=tickers)
+            
+            # Process results - they come back as a list
+            for snapshot in results:
                 if snapshot and hasattr(snapshot, 'ticker'):
-                    # Extract relevant price data
+                    ticker = snapshot.ticker
+                    
+                    # Skip results with errors
+                    if hasattr(snapshot, 'error') and snapshot.error:
+                        print(f"  Warning: {ticker} returned error: {snapshot.error} - {getattr(snapshot, 'message', 'N/A')}")
+                        continue
+                    
+                    # Extract data from session object (not day object for indices)
                     snapshot_data[ticker] = {
-                        'ticker': snapshot.ticker.ticker if hasattr(snapshot.ticker, 'ticker') else ticker,
-                        'price': snapshot.ticker.day.c if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'c') else None,
-                        'open': snapshot.ticker.day.o if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'o') else None,
-                        'high': snapshot.ticker.day.h if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'h') else None,
-                        'low': snapshot.ticker.day.l if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'l') else None,
-                        'volume': snapshot.ticker.day.v if hasattr(snapshot.ticker, 'day') and hasattr(snapshot.ticker.day, 'v') else None,
-                        'prev_close': snapshot.ticker.prev_day.c if hasattr(snapshot.ticker, 'prev_day') and hasattr(snapshot.ticker.prev_day, 'c') else None,
+                        'ticker': ticker,
+                        'price': snapshot.value if hasattr(snapshot, 'value') else None,
+                        'open': snapshot.session.open if hasattr(snapshot, 'session') and hasattr(snapshot.session, 'open') else None,
+                        'high': snapshot.session.high if hasattr(snapshot, 'session') and hasattr(snapshot.session, 'high') else None,
+                        'low': snapshot.session.low if hasattr(snapshot, 'session') and hasattr(snapshot.session, 'low') else None,
+                        'volume': None,  # Indices don't have volume
+                        'prev_close': snapshot.session.previous_close if hasattr(snapshot, 'session') and hasattr(snapshot.session, 'previous_close') else None,
                         'timestamp': datetime.now(),
                         'source': 'snapshot'
                     }
-            except Exception as e:
-                # Continue with other tickers if one fails
-                continue
+                    
+        except Exception as e:
+            # Log the error for debugging
+            print(f"Error fetching snapshots for {tickers}: {type(e).__name__}: {str(e)}")
+            return None
         
         return snapshot_data if snapshot_data else None
         
     except Exception as e:
+        print(f"Error in get_snapshot_data: {type(e).__name__}: {str(e)}")
         return None

@@ -300,6 +300,13 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
     try:
         db = SessionLocal()
         
+        # Convert numpy types to Python native types (fixes psycopg2 adapter errors)
+        pin_strike = float(pin_strike)
+        pull_strength = float(pull_strength)
+        spot_price = float(spot_price)
+        total_gex = float(total_gex)
+        net_gex = float(net_gex)
+        
         # CRITICAL: Normalize timestamp to 15-minute boundary to prevent duplicates
         normalized_timestamp = round_to_15min(interval_timestamp)
         
