@@ -50,15 +50,20 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
     try:
         # Get current price using snapshot API
         polygon_ticker = f"I:{symbol}"
+        print(f"  Fetching snapshot for {polygon_ticker}...")
         snapshot = get_snapshot_data(api_key, [polygon_ticker])
         
-        if not snapshot or polygon_ticker not in snapshot:
-            print(f"Warning: Could not fetch snapshot data for {symbol}, skipping gamma sample")
+        if not snapshot:
+            print(f"  Warning: Snapshot API returned None for {symbol}")
+            return False
+        
+        if polygon_ticker not in snapshot:
+            print(f"  Warning: Ticker {polygon_ticker} not in snapshot response. Keys: {list(snapshot.keys())}")
             return False
         
         current_price = snapshot[polygon_ticker].get('price')
         if not current_price:
-            print(f"Warning: No price in snapshot for {symbol}, skipping gamma sample")
+            print(f"  Warning: No price in snapshot for {symbol}. Data: {snapshot[polygon_ticker]}")
             return False
         
         # Fetch options chain and calculate gamma exposure
@@ -113,6 +118,9 @@ def gamma_sampling_loop():
     consecutive_failures = 0
     max_consecutive_failures = 3
     
+    # Track last sample time to avoid duplicates
+    last_sample_time = None
+    
     while _scheduler_running:
         try:
             # Check market hours
@@ -120,10 +128,16 @@ def gamma_sampling_loop():
                 et_tz = pytz.timezone('US/Eastern')
                 current_time_et = datetime.now(et_tz)
                 
-                # Only sample on 15-minute boundaries (9:30, 9:45, 10:00, etc.)
+                # Calculate which 15-minute boundary we're in
                 current_minute = current_time_et.minute
-                if current_minute % 15 == 0:  # On a 15-minute boundary
-                    print(f"\n📊 Running gamma sampling at {current_time_et.strftime('%I:%M %p ET')}")
+                current_boundary = (current_minute // 15) * 15  # 0, 15, 30, 45
+                
+                # Create a timestamp for this boundary
+                boundary_time = current_time_et.replace(minute=current_boundary, second=0, microsecond=0)
+                
+                # Sample if we haven't sampled this boundary yet
+                if last_sample_time is None or boundary_time > last_sample_time:
+                    print(f"\n📊 Running gamma sampling at {current_time_et.strftime('%I:%M %p ET')} (boundary: {boundary_time.strftime('%I:%M %p')})")
                     
                     # Sample all tracked symbols
                     success_count = 0
@@ -137,6 +151,9 @@ def gamma_sampling_loop():
                     
                     print(f"✓ Gamma sampling cycle complete ({success_count}/{len(TRACKED_SYMBOLS)} successful)\n")
                     
+                    # Update last sample time
+                    last_sample_time = boundary_time
+                    
                     # Track failures for backoff
                     if failed_count == len(TRACKED_SYMBOLS):
                         consecutive_failures += 1
@@ -148,13 +165,14 @@ def gamma_sampling_loop():
             else:
                 # Market closed, don't sample
                 consecutive_failures = 0  # Reset failures when market closed
+                last_sample_time = None  # Reset for next day
             
-            # Sleep for 15 minutes before next sample
-            # Check every 30 seconds if scheduler should stop (for graceful shutdown)
-            for _ in range(30):  # 30 * 30 seconds = 15 minutes
+            # Sleep 1 minute between checks (more reasonable than 15 minutes)
+            # Check every 10 seconds if scheduler should stop (for graceful shutdown)
+            for _ in range(6):  # 6 * 10 seconds = 1 minute
                 if not _scheduler_running:
                     break
-                time.sleep(30)
+                time.sleep(10)
                 
         except Exception as e:
             print(f"Error in gamma sampling loop: {str(e)}")
