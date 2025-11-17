@@ -20,10 +20,12 @@ Preferred communication style: Simple, everyday language.
 3. **Numpy type conversion bug** - Added `float()` conversions in `save_gamma_snapshot()` to fix `psycopg2.ProgrammingError: can't adapt type 'numpy.int64'`
 4. **CRITICAL: Timezone bug in scheduler** - `gamma_scheduler.py` was passing naive `datetime.now()` (UTC) instead of `datetime.now(et_tz)` (ET), causing 5-hour timestamp offset
 5. **Trading date extraction bug** - `database.py` was extracting date from UTC timestamp instead of ET, causing date mismatch in queries
+6. **Visualization timezone bug** - `gamma_viz.py` was displaying UTC timestamps directly instead of converting to ET, showing "8:00 PM" for 3:00 PM data
 
 **Implementation Details**:
 - Changed `gamma_scheduler.py` line 90: `datetime.now()` → `datetime.now(pytz.timezone('US/Eastern'))`
 - Changed `database.py` line 318: Added `trading_date = normalized_timestamp.astimezone(et_tz).date()` to extract date in ET timezone
+- Changed `gamma_viz.py` lines 38 & 153: Added `time_et = snap.interval_timestamp.astimezone(et_tz)` before display
 - SQL fix applied to correct existing records: `UPDATE gamma_pin_snapshots SET trading_date = DATE(interval_timestamp AT TIME ZONE 'America/New_York')`
 
 **Result**: All 4 indices (SPX, NDX, DJI, RUT) now successfully saving gamma snapshots every 15 minutes with **correct timestamps and UI display**:

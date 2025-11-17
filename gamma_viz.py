@@ -19,6 +19,8 @@ def create_gamma_evolution_chart(ticker, trading_date_obj):
     Returns:
         Plotly figure or None if no data
     """
+    import pytz
+    
     # Fetch gamma snapshots for the day
     snapshots = get_gamma_snapshots_for_day(ticker, trading_date_obj)
     
@@ -26,10 +28,13 @@ def create_gamma_evolution_chart(ticker, trading_date_obj):
         return None
     
     # Convert to DataFrame for easier plotting
+    et_tz = pytz.timezone('US/Eastern')
     data = []
     for snap in snapshots:
+        # Convert UTC timestamp to ET for display
+        time_et = snap.interval_timestamp.astimezone(et_tz)
         data.append({
-            'time': snap.interval_timestamp,
+            'time': time_et,
             'pin_strike': snap.pin_strike,
             'spot_price': snap.spot_price,
             'total_gex': snap.total_gex,
@@ -128,6 +133,8 @@ def display_gamma_history_table(ticker, trading_date_obj):
         ticker: Stock ticker (e.g., 'SPX')
         trading_date_obj: datetime.date or datetime object for the trading day
     """
+    import pytz
+    
     # Fetch gamma snapshots for the day
     snapshots = get_gamma_snapshots_for_day(ticker, trading_date_obj)
     
@@ -136,11 +143,14 @@ def display_gamma_history_table(ticker, trading_date_obj):
         return
     
     # Build table data
+    et_tz = pytz.timezone('US/Eastern')
     table_data = []
     for snap in snapshots:
+        # Convert UTC timestamp to ET for display
+        time_et = snap.interval_timestamp.astimezone(et_tz)
         # Calculate pin movement from previous snapshot
         row = {
-            'Time': snap.interval_timestamp.strftime('%I:%M %p ET'),
+            'Time': time_et.strftime('%I:%M %p ET'),
             'Pin Strike': f"${snap.pin_strike:.2f}",
             'Spot Price': f"${snap.spot_price:.2f}",
             'Distance': f"{((snap.pin_strike - snap.spot_price) / snap.spot_price * 100):+.2f}%",
