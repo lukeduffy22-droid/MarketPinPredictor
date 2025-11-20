@@ -8,7 +8,33 @@ This project is a dual-model stock market prediction system designed for major s
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (Nov 17, 2025)
+## Recent Changes (Nov 20, 2025)
+
+**ADVANCED GAMMA-BASED EOD PREDICTION SYSTEM INTEGRATED** (Latest):
+
+Successfully integrated advanced gamma-based end-of-day prediction features designed to reduce prediction error from 5-10 points to 1-3 points. The new system combines four sophisticated techniques:
+
+**New Components Added**:
+1. **Wall-Weighted Magnet (WWM)** - Primary anchor using gamma wall strikes weighted by absolute GEX, filters to 0-DTE contracts
+2. **Pin Stability Index (PSI)** - Measures gamma pin stability (0=chaotic, 1=stable), down-weights noisy intraday pin flips
+3. **Zero-Gamma Magnet** - Uses zero-gamma level as light anchor in final prediction
+4. **Volatility-Adjusted Close Predictor (VACP)** - Adjusts WWM by intraday trend and volatility scale (blends intraday range + HV10)
+
+**Implementation**:
+- `app/utils/gamma_eod_predictor.py` - Core prediction algorithm with weighted ensemble (50% WWM, 20% pin if stable, 10% zero-gamma, 40-20% VACP)
+- `app/utils/eod_data_integration.py` - Data integration layer fetching gamma walls from options chain, pin snapshots from database, spot prices, and HV10 calculation
+- FastAPI `/predict/eod` endpoint - Exposes EOD predictions with all component breakdowns
+- Streamlit UI panel - Displays EOD estimate with expandable component breakdown showing WWM, PSI, zero-gamma, VACP, and data sources
+
+**Data Requirements**:
+- Requires intraday gamma snapshots from `gamma_scheduler` (15-minute intervals, 9:30 AM - 4:00 PM ET)
+- Uses real-time gamma walls from Polygon options chain snapshot API
+- Calculates 10-day historical volatility (HV10) from gamma snapshot history
+- Integrates seamlessly with existing gamma sampling system
+
+**Architect Review**: ✅ Passed - Clean composition, correct integration, proper error handling, no security concerns
+
+## Earlier Changes (Nov 17, 2025)
 
 **CRITICAL BUG FIXES - Gamma Sampling System Fully Operational** (Latest):
 
