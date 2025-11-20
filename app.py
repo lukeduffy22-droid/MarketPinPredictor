@@ -350,6 +350,82 @@ def is_near_market_close():
     
     return critical_start <= current_time <= market_close
 
+def fetch_eod_prediction(symbol):
+    """
+    Fetch advanced gamma-based EOD prediction from FastAPI endpoint.
+    Returns dict with WWM, PSI, VACP, zero_gamma, and final estimate.
+    """
+    import requests
+    import os
+    
+    try:
+        # FastAPI endpoint (running on port 8000)
+        fastapi_url = os.getenv('FASTAPI_URL', 'http://localhost:8000')
+        response = requests.get(f"{fastapi_url}/predict/eod", params={"symbol": symbol}, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+    except Exception as e:
+        print(f"Error fetching EOD prediction for {symbol}: {str(e)}")
+        return None
+
+def show_eod_prediction_panel(selected_indexes):
+    """
+    Display advanced gamma-based EOD prediction panel with all components.
+    Shows WWM, PSI, VACP, and final estimate for selected indices.
+    """
+    st.markdown("### 🎯 Advanced Gamma-Based EOD Prediction")
+    st.caption("Wall-Weighted Magnet (WWM) + Pin Stability + Volatility-Adjusted Close Predictor")
+    
+    # Fetch EOD predictions for all selected indices
+    eod_predictions = {}
+    for index_name in selected_indexes:
+        symbol = INDEXES[index_name]
+        eod_data = fetch_eod_prediction(symbol)
+        if eod_data:
+            eod_predictions[index_name] = eod_data
+    
+    if not eod_predictions:
+        st.info("📊 EOD predictions will appear here when gamma data is available (requires intraday gamma snapshots)")
+        return
+    
+    # Display in columns
+    cols = st.columns(len(eod_predictions))
+    
+    for col, (index_name, eod) in zip(cols, eod_predictions.items()):
+        with col:
+            current_price = eod['current_price']
+            eod_estimate = eod['eod_estimate']
+            change = eod_estimate - current_price
+            change_pct = (change / current_price) * 100
+            change_color = "🟢" if change >= 0 else "🔴"
+            
+            # Main prediction card
+            st.metric(
+                label=f"{change_color} {index_name} EOD Estimate",
+                value=f"${eod_estimate:.2f}",
+                delta=f"{change:+.2f} ({change_pct:+.2f}%)"
+            )
+            st.caption(f"Current: ${current_price:.2f}")
+            
+            # Component breakdown in expander
+            with st.expander("📊 Component Breakdown", expanded=False):
+                st.markdown(f"**Wall-Weighted Magnet (WWM):** ${eod['wwm']:.2f}")
+                st.progress(min(1.0, eod['pin_stability_index']))
+                st.caption(f"Pin Stability: {eod['pin_stability_index']:.2%}")
+                
+                st.markdown(f"**Zero Gamma Level:** ${eod['zero_gamma']:.2f}")
+                st.markdown(f"**VACP (Trend-Adjusted):** ${eod['vacp']:.2f}")
+                
+                if eod.get('hv10_points'):
+                    st.caption(f"HV10: {eod['hv10_points']:.1f} pts")
+                
+                st.caption(f"Using {eod['num_walls']} gamma walls, {eod['num_pins']} pin snapshots")
+    
+    st.markdown("---")
+
 def export_to_csv(predictions_data, include_indicators=True):
     """Export predictions and indicators to CSV for Excel compatibility"""
     export_data = []
@@ -1308,6 +1384,9 @@ else:
             st.info(f"Current ET Time: {current_et.strftime('%I:%M %p')} | Critical window: 3:45-4:00 PM ET")
         
         st.header("📊 Prediction Results")
+        
+        # Show advanced gamma-based EOD prediction panel (NEW!)
+        show_eod_prediction_panel(selected_indexes)
         
         # Export options
         col_export1, col_export2, col_export3 = st.columns([2, 2, 6])

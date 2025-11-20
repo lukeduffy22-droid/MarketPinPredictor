@@ -61,6 +61,20 @@ class LevelsResponse(BaseModel):
     strongest_pin: Optional[float]
     timestamp: str
 
+class EODPredictionResponse(BaseModel):
+    """Advanced gamma-based EOD prediction response"""
+    symbol: str
+    current_price: float
+    eod_estimate: float
+    wwm: float
+    pin_stability_index: float
+    zero_gamma: float
+    vacp: float
+    hv10_points: Optional[float]
+    num_walls: int
+    num_pins: int
+    timestamp: str
+
 @app.on_event("startup")
 async def startup():
     """Initialize application - load coefficients from DB"""
@@ -313,6 +327,83 @@ async def predict_close(symbol: str) -> PredictionResponse:
         features=features,
         timestamp=now_et().isoformat()
     )
+
+@app.get("/predict/eod")
+async def predict_eod(symbol: str) -> EODPredictionResponse:
+    """
+    Advanced gamma-based EOD prediction using Wall-Weighted Magnet (WWM),
+    Pin Stability Index (PSI), Zero-Gamma, and Volatility-Adjusted Close Predictor (VACP).
+    
+    Designed to reduce prediction error from 5-10 points to 1-3 points.
+    """
+    # Validate symbol
+    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+    
+    # Convert symbol to ticker format for Polygon API
+    ticker_map = {
+        "SPX": "I:SPX",
+        "NDX": "I:NDX",
+        "DJI": "I:DJI",
+        "RUT": "I:RUT"
+    }
+    ticker = ticker_map[symbol]
+    
+    # Get current price
+    current_price = get_latest_price(symbol)
+    if not current_price:
+        raise HTTPException(503, f"No price data for {symbol}")
+    
+    try:
+        # Import EOD prediction modules
+        from app.utils.eod_data_integration import get_eod_prediction_inputs
+        from app.utils.gamma_eod_predictor import predict_eod_close
+        
+        # Get all required inputs
+        inputs = get_eod_prediction_inputs(
+            api_key=settings.POLYGON_API_KEY,
+            ticker=ticker,
+            spot_price=current_price,
+            trading_date=None  # Uses today
+        )
+        
+        # Validate we have minimum required data
+        if not inputs['walls']:
+            raise HTTPException(503, "No gamma walls data available")
+        
+        if not inputs['pin_history']:
+            raise HTTPException(503, "No gamma pin snapshots available for today")
+        
+        # Run EOD prediction
+        result = predict_eod_close(
+            walls=inputs['walls'],
+            pin_history=inputs['pin_history'],
+            zero_gamma=inputs['zero_gamma'],
+            spot_prices=inputs['spot_prices'],
+            intraday_high=inputs['intraday_high'],
+            intraday_low=inputs['intraday_low'],
+            hv10_points=inputs['hv10_points']
+        )
+        
+        return EODPredictionResponse(
+            symbol=symbol,
+            current_price=current_price,
+            eod_estimate=result.eod_estimate,
+            wwm=result.wwm,
+            pin_stability_index=result.pin_stability_index,
+            zero_gamma=result.zero_gamma,
+            vacp=result.vacp,
+            hv10_points=inputs['hv10_points'],
+            num_walls=len(inputs['walls']),
+            num_pins=len(inputs['pin_history']),
+            timestamp=now_et().isoformat()
+        )
+        
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.error(f"EOD prediction failed for {symbol}: {e}")
+        raise HTTPException(503, f"EOD prediction error: {str(e)}")
 
 @app.get("/metrics")
 async def get_metrics():
