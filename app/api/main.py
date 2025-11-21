@@ -122,8 +122,8 @@ async def startup():
     asyncio.create_task(start_websocket_stream())
     
     # Start REST fallback (in case WebSocket fails)
-    from app.ingest.rest_fallback import poll_rest_data
-    asyncio.create_task(poll_rest_data())
+    from app.ingest.rest_fallback import load_cached_snapshots
+    asyncio.create_task(load_cached_snapshots())
     
     log.info("API ready - WebSocket stream + REST fallback starting")
 
