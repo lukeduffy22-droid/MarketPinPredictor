@@ -360,19 +360,65 @@ def get_gamma_analysis(api_key, underlying, spot_price):
     """
     Main function to get complete gamma analysis for an index
     
-    Returns gamma analysis dict with is_mock_data flag
+    Returns gamma analysis dict with is_mock_data flag.
+    Falls back to latest stored snapshot if live API fails.
     """
     # Fetch options chain
     options_df, is_mock_data = fetch_options_chain(api_key, underlying, spot_price)
     
+    # If live API failed, try to use latest stored gamma snapshot
     if options_df.empty:
-        return None
+        print(f"Live options chain empty for {underlying}, attempting fallback to stored snapshot...")
+        try:
+            from database import get_latest_gamma_snapshot
+            snapshot = get_latest_gamma_snapshot(underlying)
+            
+            if snapshot:
+                print(f"✓ Using stored gamma snapshot from {snapshot.interval_timestamp}")
+                # Reconstruct gamma analysis from stored snapshot
+                gex_analysis = {
+                    'pin_strike': snapshot.pin_strike,
+                    'pin_expiry': snapshot.interval_timestamp,  # Use snapshot time as expiry
+                    'total_gex': snapshot.total_gex,
+                    'net_gex': snapshot.net_gex,
+                    'direction': 'above' if snapshot.pin_strike > snapshot.spot_price else 'below' if snapshot.pin_strike < snapshot.spot_price else 'at',
+                    'pull_strength': snapshot.pull_strength,
+                    'gex_by_strike': pd.DataFrame(),  # Empty - we don't store full strike data
+                    'gamma_walls': pd.DataFrame(),  # Empty - we don't store full wall data
+                    'zero_gamma': snapshot.spot_price,  # Fallback to spot if not available
+                    'spot_price': spot_price,  # Use current spot price
+                    'is_mock_data': snapshot.is_mock_data,
+                    'is_cached_data': True,  # Flag to indicate this is from cache
+                    'cache_timestamp': snapshot.interval_timestamp
+                }
+                
+                # Add summary message
+                pull_strength = gex_analysis['pull_strength']
+                if pull_strength < 1:
+                    strength_desc = "strong"
+                elif pull_strength < 2:
+                    strength_desc = "moderate"
+                else:
+                    strength_desc = "weak"
+                
+                direction = gex_analysis['direction']
+                pin_strike = gex_analysis['pin_strike']
+                gex_analysis['summary'] = f"Price is being {strength_desc}ly pulled {direction} to ${pin_strike:.0f} (Cached data)"
+                
+                return gex_analysis
+            else:
+                print(f"✗ No stored snapshot found for {underlying}")
+                return None
+        except Exception as e:
+            print(f"Error fetching fallback snapshot: {str(e)}")
+            return None
     
-    # Calculate gamma exposure
+    # Calculate gamma exposure from live data
     gex_analysis = calculate_gamma_exposure(options_df, spot_price)
     
     # Add is_mock_data flag to the analysis
     gex_analysis['is_mock_data'] = is_mock_data
+    gex_analysis['is_cached_data'] = False
     
     # Add summary message
     pin_strike = gex_analysis['pin_strike']
