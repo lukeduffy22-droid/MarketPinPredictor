@@ -38,26 +38,29 @@ async def poll_rest_data():
                 await asyncio.sleep(60)
                 continue
             
-            # Poll each index directly
+            # Poll each index directly using indices snapshot API
             for symbol, ticker in INDEX_TICKERS.items():
                 try:
-                    # Get latest quote for index
-                    quote = client.get_last_quote(ticker)
+                    # Get index snapshot using get_snapshot_indices method
+                    snapshot = client.get_snapshot_indices(ticker_any_of=ticker)
                     
-                    if quote and hasattr(quote, 'ask_price'):
-                        # Use mid price
-                        price = (quote.ask_price + quote.bid_price) / 2 if hasattr(quote, 'bid_price') else quote.ask_price
-                        
-                        ts = int(time.time())
-                        
-                        # Create tick
-                        tick = IndexTick(ts=ts, price=price, size=1.0)
-                        
-                        # Add to ring buffer
-                        INDEX_RINGS[symbol].add(ts, tick)
-                        update_session_vwap(symbol, price, 1.0)
-                        
-                        log.debug(f"{symbol}: ${price:.2f}")
+                    # Response is a list - get first result
+                    if snapshot and len(snapshot) > 0:
+                        result = snapshot[0]
+                        if hasattr(result, 'value'):
+                            # Use the index value
+                            price = result.value
+                            
+                            ts = int(time.time())
+                            
+                            # Create tick
+                            tick = IndexTick(ts=ts, price=price, size=1.0)
+                            
+                            # Add to ring buffer
+                            INDEX_RINGS[symbol].add(ts, tick)
+                            update_session_vwap(symbol, price, 1.0)
+                            
+                            log.info(f"{symbol}: ${price:.2f} (real-time index data)")
                         
                 except Exception as e:
                     log.error(f"Error polling {symbol} ({ticker}): {e}")

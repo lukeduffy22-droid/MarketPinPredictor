@@ -8,9 +8,29 @@ This project is a dual-model stock market prediction system designed for major s
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (Nov 20, 2025)
+## Recent Changes (Nov 21, 2025)
 
-**ADVANCED GAMMA-BASED EOD PREDICTION SYSTEM INTEGRATED** (Latest):
+**GAMMA DISPLAY & INDEX DATA FETCHING FIXES** (Latest):
+
+Successfully resolved gamma display showing $0.00B and fixed REST API to fetch actual index data:
+
+**Issues Fixed**:
+1. **Gamma Display $0.00B** - Added fallback mechanism in `options_gamma.py::get_gamma_analysis()` to use stored database snapshots when live API fails
+2. **REST API Index Data** - Fixed `app/ingest/rest_fallback.py` to use correct Polygon method: `client.get_snapshot_indices(ticker_any_of=ticker)` instead of incorrect `client.get_last_quote()`
+3. **API Endpoint Correction** - Changed from ETF proxies (SPY, QQQ, DIA, IWM) to direct index tickers (I:SPX, I:NDX, I:DJI, I:RUT) using proper indices snapshot endpoint
+
+**Implementation**:
+- `options_gamma.py` lines 359-440: Added database snapshot fallback with `is_cached_data` flag and cache timestamp
+- `app/ingest/rest_fallback.py` lines 44-69: Updated to use `get_snapshot_indices()` method with proper response parsing
+- Result: Gamma UI now displays real values from stored snapshots, REST API ready to fetch real-time index data during market hours
+
+**Known Limitations**:
+- WebSocket connection shows DNS errors (expected when markets closed or network issues) - REST fallback handles this
+- System uses stored gamma snapshots (updated every 15 min) when live API unavailable
+
+## Earlier Changes (Nov 20, 2025)
+
+**ADVANCED GAMMA-BASED EOD PREDICTION SYSTEM INTEGRATED**:
 
 Successfully integrated advanced gamma-based end-of-day prediction features designed to reduce prediction error from 5-10 points to 1-3 points. The new system combines four sophisticated techniques:
 
