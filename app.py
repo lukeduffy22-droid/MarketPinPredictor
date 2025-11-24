@@ -92,6 +92,10 @@ if 'indicator_params' not in st.session_state:
         'bb_std': 2,
         'momentum_period': 10
     }
+if 'backtest_mode' not in st.session_state:
+    st.session_state.backtest_mode = False
+if 'backtest_date' not in st.session_state:
+    st.session_state.backtest_date = None
 
 def calculate_kama(prices, n_period=10, fast_period=2, slow_period=30):
     """Calculate Kaufman's Adaptive Moving Average (KAMA)"""
@@ -216,6 +220,41 @@ def fetch_vix_data(api_key, days=60):
         return df
     except Exception as e:
         st.warning(f"Could not fetch VIX data: {str(e)}")
+        return None
+
+def get_historical_gamma_snapshot(ticker, trading_date):
+    """Fetch most recent gamma snapshot for a trading date and convert to display format"""
+    try:
+        from database import get_gamma_snapshots_for_day
+        import pytz
+        
+        snapshots = get_gamma_snapshots_for_day(ticker, trading_date)
+        if not snapshots:
+            return None
+        
+        # Get the latest snapshot for that trading date
+        latest = snapshots[-1]
+        
+        # Convert to display format
+        gex_levels = {
+            'total_gex': latest.total_gex,
+            'net_gex': latest.net_gex,
+            'pin_strike': latest.pin_strike,
+            'pin_expiry': latest.interval_timestamp + timedelta(days=1),
+            'zero_gamma': latest.spot_price,
+            'direction': 'stable',
+            'pull_strength': 0,
+            'summary': f'Historical snapshot from {latest.interval_timestamp.strftime("%I:%M %p ET")}',
+            'is_mock_data': latest.is_mock_data,
+            'gamma_walls': pd.DataFrame(),  # Empty for historical
+            'gex_by_strike': pd.DataFrame(),
+            'is_historical': True,
+            'timestamp': latest.interval_timestamp
+        }
+        
+        return gex_levels
+    except Exception as e:
+        st.error(f"Error fetching historical gamma: {str(e)}")
         return None
 
 def calculate_gex(api_key, ticker, spot_price):
@@ -1589,7 +1628,40 @@ else:
                 if 'gex_data' in pred and pred['gex_data']:
                     gex = pred['gex_data']
                     st.divider()
+                    
+                    # Backtesting controls
                     st.subheader("🎯 Gamma Exposure Analysis")
+                    backtest_col1, backtest_col2, backtest_col3 = st.columns([2, 2, 1])
+                    
+                    with backtest_col1:
+                        backtest_date = st.date_input(
+                            "📅 View Historical Gamma (or leave blank for live)",
+                            value=None,
+                            key=f"backtest_date_{pred['ticker']}"
+                        )
+                    
+                    with backtest_col2:
+                        if backtest_date and backtest_date < datetime.now().date():
+                            if st.button("🔄 Load Historical Data", key=f"load_backtest_{pred['ticker']}"):
+                                st.session_state.backtest_mode = True
+                                st.session_state.backtest_date = backtest_date
+                        elif backtest_date:
+                            st.info("📌 Select a past date")
+                    
+                    with backtest_col3:
+                        if st.session_state.backtest_mode and st.button("✕ Back to Live", key=f"back_to_live_{pred['ticker']}"):
+                            st.session_state.backtest_mode = False
+                            st.session_state.backtest_date = None
+                            st.rerun()
+                    
+                    # Load historical gamma if backtest mode is active
+                    if st.session_state.backtest_mode and st.session_state.backtest_date:
+                        historical_gex = get_historical_gamma_snapshot(pred['ticker'], st.session_state.backtest_date)
+                        if historical_gex:
+                            st.info(f"📊 **Viewing Historical Gamma from {st.session_state.backtest_date.strftime('%A, %B %d, %Y')}**")
+                            gex = historical_gex
+                        else:
+                            st.warning(f"⚠️ No gamma data found for {pred['ticker']} on {st.session_state.backtest_date}")
                     
                     # WARNING: Display prominent banner if using mock data
                     if gex.get('is_mock_data', True):
