@@ -963,6 +963,20 @@ with st.sidebar:
     elif st.session_state.streaming_active:
         # Show streaming status
         if st.session_state.ws_stream:
+            # Initialize stats with defaults
+            stats = {
+                'market_open': False,
+                'feed_type': 'unknown',
+                'current_time_et': None,
+                'data_delay': 'Unknown',
+                'index_count': 0,
+                'options_count': 0,
+                'trade_count': 0,
+                'quote_count': 0,
+                'indices_tracked': 0,
+                'options_tracked': 0
+            }
+            
             # Check for errors
             if st.session_state.ws_stream.error_message:
                 st.error(st.session_state.ws_stream.error_message)
@@ -971,7 +985,10 @@ with st.sidebar:
                 st.session_state.ws_stream = None
                 st.session_state.streaming_active = False
             else:
-                stats = st.session_state.ws_stream.get_stats()
+                # Get actual stats from stream
+                stream_stats = st.session_state.ws_stream.get_stats()
+                if stream_stats:
+                    stats.update(stream_stats)
                 
                 # Display market status and feed type prominently
                 market_status_color = "🟢" if stats.get('market_open', False) else "🔴"
@@ -1001,16 +1018,16 @@ with st.sidebar:
                 else:
                     st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
             
-            # Streaming stats
+            # Streaming stats (now stats is always defined)
             stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
             with stats_col1:
                 st.metric("Data Freshness", stats.get('data_delay', 'Unknown'))
             with stats_col2:
-                st.metric("Index Updates", stats['index_count'])
+                st.metric("Index Updates", stats.get('index_count', 0))
             with stats_col3:
-                st.metric("Options Updates", stats['options_count'])
+                st.metric("Options Updates", stats.get('options_count', 0))
             with stats_col4:
-                st.metric("Total Messages", stats['trade_count'] + stats['quote_count'])
+                st.metric("Total Messages", stats.get('trade_count', 0) + stats.get('quote_count', 0))
             
             # Stop streaming button
             if st.button("⏹ Stop Streaming", type="secondary"):
