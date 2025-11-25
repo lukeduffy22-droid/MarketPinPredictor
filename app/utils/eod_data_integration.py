@@ -2,11 +2,15 @@
 EOD Data Integration Layer
 
 Fetches and transforms data from various sources (database, ring buffers, options_gamma)
-into the format required by gamma_eod_predictor.py
+into the format required by gamma_eod_predictor.py.
+
+Also integrates AI enhancement for prediction critique and adjustment.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, date, timedelta
+from dataclasses import dataclass, asdict
+import asyncio
 import pytz
 import numpy as np
 
@@ -14,6 +18,23 @@ from app.utils.gamma_eod_predictor import GammaWall, PinSnapshot
 from database import get_gamma_snapshots_for_day, SessionLocal
 from database import GammaPinSnapshot as DBGammaPinSnapshot
 import options_gamma
+
+
+@dataclass
+class AIEnhancedPrediction:
+    """Result of AI-enhanced EOD prediction."""
+    original_prediction: float
+    ai_adjusted_prediction: float
+    ai_confidence: float
+    adjustment_reason: str
+    market_conditions: str
+    risk_factors: List[str]
+    recommendation: str
+    ai_provider: str
+    ai_available: bool
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 def fetch_gamma_walls_from_analysis(
@@ -235,3 +256,228 @@ def get_eod_prediction_inputs(
         'hv10_points': hv10_points,
         'multi_expiry_aggregate_pin': multi_expiry_aggregate_pin
     }
+
+
+async def get_ai_enhanced_prediction(
+    api_key: str,
+    ticker: str,
+    current_price: float,
+    eod_prediction: float,
+    gamma_data: Dict[str, Any],
+    vwap_deviation: float = 0.0,
+    microtrend: float = 0.0,
+    minutes_to_close: int = 0,
+    historical_accuracy: Optional[float] = None,
+    multi_expiry_data: Optional[Dict[str, Any]] = None
+) -> AIEnhancedPrediction:
+    """
+    Get AI-enhanced EOD prediction with critique and adjustment.
+    
+    Integrates the AI service to analyze the model's prediction and
+    provide adjusted predictions with confidence scores.
+    
+    Args:
+        api_key: Polygon API key
+        ticker: Stock symbol (e.g., 'SPX', 'NDX')
+        current_price: Current market price
+        eod_prediction: Base model's EOD prediction
+        gamma_data: Gamma exposure analysis data
+        vwap_deviation: Current VWAP deviation
+        microtrend: Recent price trend slope
+        minutes_to_close: Minutes until market close
+        historical_accuracy: Optional historical model accuracy
+        multi_expiry_data: Optional multi-expiration gamma data
+        
+    Returns:
+        AIEnhancedPrediction with original and AI-adjusted predictions
+    """
+    try:
+        # Import here to avoid circular imports
+        from app.services.ai_service import get_ai_service
+        
+        ai_service = get_ai_service()
+        
+        if not ai_service.is_available:
+            return AIEnhancedPrediction(
+                original_prediction=eod_prediction,
+                ai_adjusted_prediction=eod_prediction,
+                ai_confidence=0.0,
+                adjustment_reason="AI service not available",
+                market_conditions="Unable to analyze",
+                risk_factors=[],
+                recommendation="Use base model prediction",
+                ai_provider="none",
+                ai_available=False
+            )
+        
+        # Get AI critique of the prediction
+        critique = await ai_service.analyze_prediction(
+            symbol=ticker,
+            current_price=current_price,
+            predicted_eod=eod_prediction,
+            gamma_data=gamma_data,
+            vwap_deviation=vwap_deviation,
+            microtrend=microtrend,
+            minutes_to_close=minutes_to_close,
+            historical_accuracy=historical_accuracy
+        )
+        
+        if critique is None:
+            return AIEnhancedPrediction(
+                original_prediction=eod_prediction,
+                ai_adjusted_prediction=eod_prediction,
+                ai_confidence=0.0,
+                adjustment_reason="AI analysis failed",
+                market_conditions="Unable to analyze",
+                risk_factors=[],
+                recommendation="Use base model prediction",
+                ai_provider=ai_service.provider_name,
+                ai_available=True
+            )
+        
+        return AIEnhancedPrediction(
+            original_prediction=critique.original_prediction,
+            ai_adjusted_prediction=critique.adjusted_prediction,
+            ai_confidence=critique.confidence,
+            adjustment_reason=critique.adjustment_reason,
+            market_conditions=critique.market_conditions,
+            risk_factors=critique.risk_factors,
+            recommendation=critique.recommendation,
+            ai_provider=critique.provider,
+            ai_available=True
+        )
+        
+    except Exception as e:
+        print(f"AI enhancement error: {e}")
+        return AIEnhancedPrediction(
+            original_prediction=eod_prediction,
+            ai_adjusted_prediction=eod_prediction,
+            ai_confidence=0.0,
+            adjustment_reason=f"AI error: {str(e)}",
+            market_conditions="Unable to analyze",
+            risk_factors=["AI service error"],
+            recommendation="Use base model prediction",
+            ai_provider="error",
+            ai_available=False
+        )
+
+
+def get_ai_enhanced_prediction_sync(
+    api_key: str,
+    ticker: str,
+    current_price: float,
+    eod_prediction: float,
+    gamma_data: Dict[str, Any],
+    vwap_deviation: float = 0.0,
+    microtrend: float = 0.0,
+    minutes_to_close: int = 0,
+    historical_accuracy: Optional[float] = None,
+    multi_expiry_data: Optional[Dict[str, Any]] = None
+) -> AIEnhancedPrediction:
+    """
+    Synchronous wrapper for get_ai_enhanced_prediction.
+    Use this when calling from non-async code (like Streamlit).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(
+        get_ai_enhanced_prediction(
+            api_key=api_key,
+            ticker=ticker,
+            current_price=current_price,
+            eod_prediction=eod_prediction,
+            gamma_data=gamma_data,
+            vwap_deviation=vwap_deviation,
+            microtrend=microtrend,
+            minutes_to_close=minutes_to_close,
+            historical_accuracy=historical_accuracy,
+            multi_expiry_data=multi_expiry_data
+        )
+    )
+
+
+async def get_market_briefing(
+    api_key: str,
+    ticker: str,
+    current_price: float,
+    gamma_data: Dict[str, Any],
+    eod_prediction: float,
+    multi_expiry_data: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Get AI-generated market briefing for the given symbol.
+    
+    Returns a dictionary with market analysis including:
+    - summary: Executive summary of market conditions
+    - gamma_interpretation: What gamma positioning means
+    - trend_assessment: Bullish/bearish/neutral with reasoning
+    - key_levels: Support, resistance, and magnet levels
+    - sentiment: Overall market sentiment
+    - confidence: AI confidence in the analysis
+    """
+    try:
+        from app.services.ai_service import get_ai_service
+        
+        ai_service = get_ai_service()
+        
+        if not ai_service.is_available:
+            return None
+        
+        briefing = await ai_service.get_market_briefing(
+            symbol=ticker,
+            current_price=current_price,
+            gamma_data=gamma_data,
+            eod_prediction=eod_prediction,
+            multi_expiry_data=multi_expiry_data
+        )
+        
+        if briefing is None:
+            return None
+        
+        return {
+            'summary': briefing.summary,
+            'gamma_interpretation': briefing.gamma_interpretation,
+            'trend_assessment': briefing.trend_assessment,
+            'key_levels': briefing.key_levels,
+            'sentiment': briefing.sentiment,
+            'confidence': briefing.confidence,
+            'provider': briefing.provider
+        }
+        
+    except Exception as e:
+        print(f"Market briefing error: {e}")
+        return None
+
+
+def get_market_briefing_sync(
+    api_key: str,
+    ticker: str,
+    current_price: float,
+    gamma_data: Dict[str, Any],
+    eod_prediction: float,
+    multi_expiry_data: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Synchronous wrapper for get_market_briefing.
+    Use this when calling from non-async code (like Streamlit).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(
+        get_market_briefing(
+            api_key=api_key,
+            ticker=ticker,
+            current_price=current_price,
+            gamma_data=gamma_data,
+            eod_prediction=eod_prediction,
+            multi_expiry_data=multi_expiry_data
+        )
+    )

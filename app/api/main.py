@@ -454,6 +454,234 @@ async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
         raise HTTPException(503, f"Multi-expiry gamma error: {str(e)}")
 
 
+@app.get("/predict/ai-enhanced")
+async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
+    """
+    Get AI-enhanced EOD prediction with critique and adjustment.
+    
+    This endpoint:
+    1. Gets the base model's EOD prediction
+    2. Sends it to AI for analysis with all live market context
+    3. Returns both original and AI-adjusted predictions with reasoning
+    
+    The AI acts as a "second opinion" that can adjust predictions
+    based on market conditions the statistical model might miss.
+    """
+    # Normalize symbol
+    clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
+    
+    if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+    
+    current_price = get_latest_price(clean_symbol)
+    if not current_price:
+        raise HTTPException(503, f"No price data for {clean_symbol}")
+    
+    try:
+        from app.utils.eod_data_integration import (
+            get_eod_prediction_inputs,
+            get_ai_enhanced_prediction
+        )
+        from app.utils.gamma_eod_predictor import predict_eod_close
+        import options_gamma
+        
+        # Get base EOD prediction inputs
+        inputs = get_eod_prediction_inputs(
+            api_key=settings.polygon_api_key,
+            ticker=clean_symbol,
+            spot_price=current_price
+        )
+        
+        # Get base model's EOD prediction
+        base_result = predict_eod_close(
+            walls=inputs['walls'],
+            pin_history=inputs['pin_history'],
+            zero_gamma=inputs['zero_gamma'],
+            spot_prices=inputs['spot_prices'],
+            intraday_high=inputs['intraday_high'],
+            intraday_low=inputs['intraday_low'],
+            hv10_points=inputs['hv10_points'],
+            multi_expiry_aggregate_pin=inputs.get('multi_expiry_aggregate_pin')
+        )
+        
+        # Get gamma analysis for AI context
+        gamma_data = options_gamma.get_gamma_analysis(
+            settings.polygon_api_key,
+            clean_symbol,
+            current_price
+        )
+        
+        # Get multi-expiry data for additional context
+        multi_expiry_data = options_gamma.get_multi_expiry_analysis(
+            api_key=settings.polygon_api_key,
+            underlying=clean_symbol,
+            spot_price=current_price,
+            max_dte=7
+        )
+        
+        # Calculate minutes to close
+        from app.utils.time_et import now_et
+        now = now_et()
+        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        minutes_to_close = max(0, int((market_close - now).total_seconds() / 60))
+        
+        # Get AI-enhanced prediction
+        ai_result = await get_ai_enhanced_prediction(
+            api_key=settings.polygon_api_key,
+            ticker=clean_symbol,
+            current_price=current_price,
+            eod_prediction=base_result.eod_estimate,
+            gamma_data=gamma_data if gamma_data else {},
+            vwap_deviation=0.0,  # Could be fetched from ring buffers
+            microtrend=0.0,  # Could be fetched from ring buffers
+            minutes_to_close=minutes_to_close,
+            multi_expiry_data=multi_expiry_data
+        )
+        
+        return {
+            "symbol": clean_symbol,
+            "current_price": float(current_price),
+            "base_model": {
+                "eod_prediction": float(base_result.eod_estimate),
+                "wwm": float(base_result.wwm) if base_result.wwm else None,
+                "vacp": float(base_result.vacp) if base_result.vacp else None,
+                "pin_stability": float(base_result.pin_stability_index) if base_result.pin_stability_index else None
+            },
+            "ai_enhanced": {
+                "original_prediction": float(ai_result.original_prediction),
+                "ai_adjusted_prediction": float(ai_result.ai_adjusted_prediction),
+                "confidence": float(ai_result.ai_confidence),
+                "adjustment_reason": ai_result.adjustment_reason,
+                "market_conditions": ai_result.market_conditions,
+                "risk_factors": ai_result.risk_factors,
+                "recommendation": ai_result.recommendation,
+                "provider": ai_result.ai_provider,
+                "available": ai_result.ai_available
+            },
+            "minutes_to_close": minutes_to_close,
+            "timestamp": now_et().isoformat()
+        }
+        
+    except Exception as e:
+        log.error(f"AI-enhanced prediction failed for {symbol}: {e}")
+        raise HTTPException(503, f"AI-enhanced prediction error: {str(e)}")
+
+
+@app.get("/ai/market-briefing")
+async def get_market_briefing_endpoint(symbol: str = "SPX"):
+    """
+    Get AI-generated market briefing for the given symbol.
+    
+    Returns a comprehensive market analysis including:
+    - Executive summary of market conditions
+    - Gamma positioning interpretation
+    - Trend assessment with reasoning
+    - Key support/resistance/magnet levels
+    - Overall market sentiment
+    """
+    # Normalize symbol
+    clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
+    
+    if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+    
+    current_price = get_latest_price(clean_symbol)
+    if not current_price:
+        raise HTTPException(503, f"No price data for {clean_symbol}")
+    
+    try:
+        from app.utils.eod_data_integration import (
+            get_eod_prediction_inputs,
+            get_market_briefing
+        )
+        from app.utils.gamma_eod_predictor import predict_eod_close
+        import options_gamma
+        
+        # Get prediction inputs
+        inputs = get_eod_prediction_inputs(
+            api_key=settings.polygon_api_key,
+            ticker=clean_symbol,
+            spot_price=current_price
+        )
+        
+        # Get base EOD prediction for context
+        base_result = predict_eod_close(
+            walls=inputs['walls'],
+            pin_history=inputs['pin_history'],
+            zero_gamma=inputs['zero_gamma'],
+            spot_prices=inputs['spot_prices'],
+            intraday_high=inputs['intraday_high'],
+            intraday_low=inputs['intraday_low'],
+            hv10_points=inputs['hv10_points'],
+            multi_expiry_aggregate_pin=inputs.get('multi_expiry_aggregate_pin')
+        )
+        
+        # Get gamma analysis
+        gamma_data = options_gamma.get_gamma_analysis(
+            settings.polygon_api_key,
+            clean_symbol,
+            current_price
+        )
+        
+        # Get multi-expiry data
+        multi_expiry_data = options_gamma.get_multi_expiry_analysis(
+            api_key=settings.polygon_api_key,
+            underlying=clean_symbol,
+            spot_price=current_price,
+            max_dte=7
+        )
+        
+        # Get AI market briefing
+        briefing = await get_market_briefing(
+            api_key=settings.polygon_api_key,
+            ticker=clean_symbol,
+            current_price=current_price,
+            gamma_data=gamma_data if gamma_data else {},
+            eod_prediction=base_result.eod_estimate,
+            multi_expiry_data=multi_expiry_data
+        )
+        
+        if not briefing:
+            raise HTTPException(503, "AI briefing not available")
+        
+        return {
+            "symbol": clean_symbol,
+            "current_price": float(current_price),
+            "eod_prediction": float(base_result.eod_estimate),
+            "briefing": briefing,
+            "timestamp": now_et().isoformat()
+        }
+        
+    except Exception as e:
+        log.error(f"Market briefing failed for {symbol}: {e}")
+        raise HTTPException(503, f"Market briefing error: {str(e)}")
+
+
+@app.get("/ai/status")
+async def get_ai_status():
+    """
+    Check AI service availability and provider information.
+    """
+    try:
+        from app.services.ai_service import get_ai_service, AIService
+        
+        ai_service = get_ai_service()
+        
+        return {
+            "available": ai_service.is_available,
+            "provider": ai_service.provider_name,
+            "available_providers": AIService.get_available_providers(),
+            "timestamp": now_et().isoformat()
+        }
+    except Exception as e:
+        return {
+            "available": False,
+            "provider": "error",
+            "error": str(e),
+            "timestamp": now_et().isoformat()
+        }
+
+
 @app.get("/metrics")
 async def get_metrics():
     """Performance metrics endpoint"""
