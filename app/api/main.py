@@ -466,6 +466,9 @@ async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
     
     The AI acts as a "second opinion" that can adjust predictions
     based on market conditions the statistical model might miss.
+    
+    Always returns valid JSON - if AI is unavailable, returns base prediction
+    with ai_enhanced.available=False.
     """
     # Normalize symbol
     clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
@@ -477,22 +480,24 @@ async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
     if not current_price:
         raise HTTPException(503, f"No price data for {clean_symbol}")
     
+    from app.utils.time_et import now_et
+    now = now_et()
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    minutes_to_close = max(0, int((market_close - now).total_seconds() / 60))
+    
+    base_result = None
+    base_model_response = None
+    
     try:
-        from app.utils.eod_data_integration import (
-            get_eod_prediction_inputs,
-            get_ai_enhanced_prediction
-        )
+        from app.utils.eod_data_integration import get_eod_prediction_inputs
         from app.utils.gamma_eod_predictor import predict_eod_close
-        import options_gamma
         
-        # Get base EOD prediction inputs
         inputs = get_eod_prediction_inputs(
             api_key=settings.polygon_api_key,
             ticker=clean_symbol,
             spot_price=current_price
         )
         
-        # Get base model's EOD prediction
         base_result = predict_eod_close(
             walls=inputs['walls'],
             pin_history=inputs['pin_history'],
@@ -504,14 +509,29 @@ async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
             multi_expiry_aggregate_pin=inputs.get('multi_expiry_aggregate_pin')
         )
         
-        # Get gamma analysis for AI context
+        base_model_response = {
+            "eod_prediction": float(base_result.eod_estimate),
+            "wwm": float(base_result.wwm) if base_result.wwm else None,
+            "vacp": float(base_result.vacp) if base_result.vacp else None,
+            "pin_stability": float(base_result.pin_stability_index) if base_result.pin_stability_index else None
+        }
+        
+    except Exception as e:
+        log.error(f"Base prediction failed for {symbol}: {e}")
+        raise HTTPException(503, f"Base prediction error: {str(e)}")
+    
+    ai_enhanced_response = None
+    
+    try:
+        from app.utils.eod_data_integration import get_ai_enhanced_prediction
+        import options_gamma
+        
         gamma_data = options_gamma.get_gamma_analysis(
             settings.polygon_api_key,
             clean_symbol,
             current_price
         )
         
-        # Get multi-expiry data for additional context
         multi_expiry_data = options_gamma.get_multi_expiry_analysis(
             api_key=settings.polygon_api_key,
             underlying=clean_symbol,
@@ -519,52 +539,52 @@ async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
             max_dte=7
         )
         
-        # Calculate minutes to close
-        from app.utils.time_et import now_et
-        now = now_et()
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-        minutes_to_close = max(0, int((market_close - now).total_seconds() / 60))
-        
-        # Get AI-enhanced prediction
         ai_result = await get_ai_enhanced_prediction(
             api_key=settings.polygon_api_key,
             ticker=clean_symbol,
             current_price=current_price,
             eod_prediction=base_result.eod_estimate,
             gamma_data=gamma_data if gamma_data else {},
-            vwap_deviation=0.0,  # Could be fetched from ring buffers
-            microtrend=0.0,  # Could be fetched from ring buffers
+            vwap_deviation=0.0,
+            microtrend=0.0,
             minutes_to_close=minutes_to_close,
             multi_expiry_data=multi_expiry_data
         )
         
-        return {
-            "symbol": clean_symbol,
-            "current_price": float(current_price),
-            "base_model": {
-                "eod_prediction": float(base_result.eod_estimate),
-                "wwm": float(base_result.wwm) if base_result.wwm else None,
-                "vacp": float(base_result.vacp) if base_result.vacp else None,
-                "pin_stability": float(base_result.pin_stability_index) if base_result.pin_stability_index else None
-            },
-            "ai_enhanced": {
-                "original_prediction": float(ai_result.original_prediction),
-                "ai_adjusted_prediction": float(ai_result.ai_adjusted_prediction),
-                "confidence": float(ai_result.ai_confidence),
-                "adjustment_reason": ai_result.adjustment_reason,
-                "market_conditions": ai_result.market_conditions,
-                "risk_factors": ai_result.risk_factors,
-                "recommendation": ai_result.recommendation,
-                "provider": ai_result.ai_provider,
-                "available": ai_result.ai_available
-            },
-            "minutes_to_close": minutes_to_close,
-            "timestamp": now_et().isoformat()
+        ai_enhanced_response = {
+            "original_prediction": float(ai_result.original_prediction),
+            "adjusted_prediction": float(ai_result.ai_adjusted_prediction),
+            "confidence": float(ai_result.ai_confidence),
+            "adjustment_reason": ai_result.adjustment_reason,
+            "market_conditions": ai_result.market_conditions,
+            "risk_factors": ai_result.risk_factors,
+            "recommendation": ai_result.recommendation,
+            "provider": ai_result.ai_provider,
+            "available": ai_result.ai_available
         }
         
     except Exception as e:
-        log.error(f"AI-enhanced prediction failed for {symbol}: {e}")
-        raise HTTPException(503, f"AI-enhanced prediction error: {str(e)}")
+        log.warning(f"AI enhancement failed for {symbol}, returning base prediction: {e}")
+        ai_enhanced_response = {
+            "original_prediction": float(base_result.eod_estimate),
+            "adjusted_prediction": float(base_result.eod_estimate),
+            "confidence": 0.0,
+            "adjustment_reason": f"AI analysis unavailable: {str(e)}",
+            "market_conditions": "Unable to analyze",
+            "risk_factors": ["AI service error"],
+            "recommendation": "Use base model prediction",
+            "provider": "none",
+            "available": False
+        }
+    
+    return {
+        "symbol": clean_symbol,
+        "current_price": float(current_price),
+        "base_model": base_model_response,
+        "ai_enhanced": ai_enhanced_response,
+        "minutes_to_close": minutes_to_close,
+        "timestamp": now_et().isoformat()
+    }
 
 
 @app.get("/ai/market-briefing")

@@ -506,20 +506,11 @@ def show_ai_analysis_panel(selected_indexes):
     """
     Display AI-enhanced prediction analysis panel.
     Shows AI critique, adjusted predictions, and market insights.
+    Handles AI unavailable states gracefully.
     """
     st.markdown("### 🤖 AI Market Analyst")
     st.caption("AI-enhanced predictions with real-time critique and market insights")
     
-    # Check AI status
-    ai_status = fetch_ai_status()
-    
-    if not ai_status.get('available', False):
-        st.warning("⚠️ AI analysis is currently initializing. Please try again in a moment.")
-        return
-    
-    st.caption(f"Provider: {ai_status.get('provider', 'unknown').upper()}")
-    
-    # Fetch AI-enhanced predictions for selected indices
     ai_predictions = {}
     
     with st.spinner("Analyzing market conditions with AI..."):
@@ -533,19 +524,35 @@ def show_ai_analysis_panel(selected_indexes):
         st.info("📊 AI analysis will appear here when market data is available")
         return
     
-    # Display AI analysis for each index
     for index_name, ai_data in ai_predictions.items():
         with st.expander(f"🔍 {index_name} AI Analysis", expanded=True):
+            ai_enhanced = ai_data.get('ai_enhanced', {})
+            ai_available = ai_enhanced.get('available', False)
+            
+            base_pred = ai_data.get('base_model', {}).get('eod_prediction', 0)
+            current = ai_data.get('current_price', 0)
+            base_change = base_pred - current if base_pred and current else 0
+            
+            if not ai_available:
+                st.warning("⚠️ AI analysis unavailable - showing base model prediction only")
+                st.metric(
+                    "Base Model EOD Prediction",
+                    f"${base_pred:.2f}" if base_pred else "N/A",
+                    f"{base_change:+.2f} pts" if base_change else None
+                )
+                reason = ai_enhanced.get('adjustment_reason', 'AI service not configured')
+                st.caption(f"💡 {reason}")
+                st.caption(f"Timestamp: {ai_data.get('timestamp', 'N/A')}")
+                continue
+            
+            provider = ai_enhanced.get('provider', 'unknown')
+            st.caption(f"Provider: {provider.upper()}")
+            
             col1, col2 = st.columns(2)
             
             with col1:
-                # Base vs AI prediction comparison
-                base_pred = ai_data['base_model']['eod_prediction']
-                ai_pred = ai_data['ai_enhanced']['ai_adjusted_prediction']
-                current = ai_data['current_price']
-                
-                base_change = base_pred - current
-                ai_change = ai_pred - current
+                ai_pred = ai_enhanced.get('adjusted_prediction', base_pred)
+                ai_change = ai_pred - current if ai_pred and current else 0
                 
                 st.markdown("**Prediction Comparison**")
                 
@@ -553,50 +560,43 @@ def show_ai_analysis_panel(selected_indexes):
                 with pred_col1:
                     st.metric(
                         "Base Model EOD",
-                        f"${base_pred:.2f}",
-                        f"{base_change:+.2f} pts"
+                        f"${base_pred:.2f}" if base_pred else "N/A",
+                        f"{base_change:+.2f} pts" if base_change else None
                     )
                 with pred_col2:
                     delta_color = "normal" if ai_pred != base_pred else "off"
                     st.metric(
                         "AI-Adjusted EOD",
-                        f"${ai_pred:.2f}",
-                        f"{ai_change:+.2f} pts",
+                        f"${ai_pred:.2f}" if ai_pred else "N/A",
+                        f"{ai_change:+.2f} pts" if ai_change else None,
                         delta_color=delta_color
                     )
                 
-                # Confidence meter
-                confidence = ai_data['ai_enhanced']['confidence']
+                confidence = ai_enhanced.get('confidence', 0)
                 st.markdown(f"**AI Confidence:** {confidence:.0%}")
-                st.progress(min(1.0, confidence))
+                st.progress(min(1.0, max(0.0, confidence)))
             
             with col2:
-                # AI reasoning
                 st.markdown("**AI Assessment**")
                 
-                # Market conditions
-                market_conditions = ai_data['ai_enhanced'].get('market_conditions', '')
-                if market_conditions:
+                market_conditions = ai_enhanced.get('market_conditions', '')
+                if market_conditions and market_conditions != "Unable to analyze":
                     st.info(f"📈 {market_conditions}")
                 
-                # Adjustment reason
-                adj_reason = ai_data['ai_enhanced'].get('adjustment_reason', '')
+                adj_reason = ai_enhanced.get('adjustment_reason', '')
                 if adj_reason:
                     st.caption(f"💡 {adj_reason}")
                 
-                # Recommendation
-                recommendation = ai_data['ai_enhanced'].get('recommendation', '')
+                recommendation = ai_enhanced.get('recommendation', '')
                 if recommendation:
                     st.success(f"📌 **Recommendation:** {recommendation}")
             
-            # Risk factors
-            risk_factors = ai_data['ai_enhanced'].get('risk_factors', [])
-            if risk_factors:
+            risk_factors = ai_enhanced.get('risk_factors', [])
+            if risk_factors and risk_factors != ["AI service error"]:
                 st.markdown("**⚠️ Risk Factors:**")
-                for risk in risk_factors[:3]:  # Show top 3 risks
+                for risk in risk_factors[:3]:
                     st.caption(f"• {risk}")
             
-            # Timestamp
             st.caption(f"Analysis timestamp: {ai_data.get('timestamp', 'N/A')}")
     
     st.markdown("---")

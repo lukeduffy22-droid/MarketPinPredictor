@@ -15,9 +15,6 @@ from .base_provider import BaseAIProvider, PredictionCritique, MarketAnalysis
 
 log = logging.getLogger(__name__)
 
-AI_INTEGRATIONS_OPENAI_API_KEY = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY")
-AI_INTEGRATIONS_OPENAI_BASE_URL = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
-
 
 def is_rate_limit_error(exception: BaseException) -> bool:
     """Check if the exception is a rate limit error."""
@@ -39,23 +36,31 @@ class OpenAIProvider(BaseAIProvider):
     
     def __init__(self):
         self._client = None
-        if self.is_available():
-            # the newest OpenAI model is "gpt-5" which was released August 7, 2025.
-            # do not change this unless explicitly requested by the user
-            self._client = OpenAI(
-                api_key=AI_INTEGRATIONS_OPENAI_API_KEY,
-                base_url=AI_INTEGRATIONS_OPENAI_BASE_URL
-            )
-            self._model = "gpt-4.1-mini"  # Fast model for real-time use
-            self._reasoning_model = "gpt-4.1"  # Smarter model for complex analysis
+        self._model = "gpt-4.1-mini"
+        self._reasoning_model = "gpt-4.1"
+    
+    def _get_client(self) -> Optional[OpenAI]:
+        """Lazily initialize OpenAI client, checking env vars at call time."""
+        if self._client is not None:
+            return self._client
+        
+        api_key = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY")
+        base_url = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
+        
+        if api_key and base_url:
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
+            return self._client
+        return None
     
     @property
     def name(self) -> str:
         return "openai"
     
     def is_available(self) -> bool:
-        """Check if OpenAI integration is configured."""
-        return bool(AI_INTEGRATIONS_OPENAI_API_KEY and AI_INTEGRATIONS_OPENAI_BASE_URL)
+        """Check if OpenAI integration is configured (lazy check at call time)."""
+        api_key = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY")
+        base_url = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
+        return bool(api_key and base_url)
     
     @retry(
         stop=stop_after_attempt(3),
@@ -65,12 +70,13 @@ class OpenAIProvider(BaseAIProvider):
     )
     def _call_openai(self, messages: list, use_reasoning: bool = False) -> str:
         """Make an OpenAI API call with retries."""
-        if not self._client:
-            raise RuntimeError("OpenAI client not initialized")
+        client = self._get_client()
+        if not client:
+            raise RuntimeError("OpenAI client not initialized - env vars may not be set")
         
         model = self._reasoning_model if use_reasoning else self._model
         
-        response = self._client.chat.completions.create(
+        response = client.chat.completions.create(
             model=model,
             messages=messages,
             response_format={"type": "json_object"},

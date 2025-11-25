@@ -10,7 +10,33 @@ Preferred communication style: Simple, everyday language.
 
 ## Recent Changes (Nov 25, 2025)
 
-**MULTI-EXPIRATION GAMMA EXPOSURE FEATURE** (Latest):
+**AI ENHANCEMENT LAYER** (Latest):
+
+Integrated OpenAI-powered AI prediction enhancement layer that acts as a "critic and corrector" on top of base model predictions:
+
+**New Components**:
+1. **Swappable AI Provider Architecture** - Abstract `BaseAIProvider` interface enabling easy switching between OpenAI, Google Gemini, or Grok
+2. **AI Prediction Critic** - Analyzes live gamma, VWAP, microtrend, and options flow data to critique base model predictions
+3. **Confidence-Weighted Adjustment** - AI suggests prediction adjustments with confidence scores based on market conditions
+4. **Market Regime Detection** - Identifies trending, mean-reverting, or volatile market regimes
+5. **Natural Language Explanations** - Provides human-readable reasoning for prediction adjustments
+
+**Implementation**:
+- `app/services/ai_providers/base_provider.py`: Abstract interface for AI providers
+- `app/services/ai_providers/openai_provider.py`: OpenAI implementation using Replit AI Integrations
+- `app/services/ai_service.py`: Unified AI service with provider switching capability
+- `app/api/main.py`: Added `/predict/ai-enhanced` and `/ai/status` endpoints
+- `app.py`: Added "AI Market Analyst" panel showing analysis, adjusted predictions, and risk factors
+
+**Integration Details**:
+- Uses Replit AI Integrations (no API key required, billed to user's Replit credits)
+- Environment variables: AI_INTEGRATIONS_OPENAI_BASE_URL, AI_INTEGRATIONS_OPENAI_API_KEY (auto-set)
+- Realistic accuracy improvement target: 5-12% MAE reduction over base model
+- Graceful fallback to base model predictions if AI service unavailable
+
+---
+
+**MULTI-EXPIRATION GAMMA EXPOSURE FEATURE**:
 
 Added comprehensive multi-expiration gamma analysis (0-7 DTE) to improve EOD predictions by incorporating future gamma exposure:
 
