@@ -465,6 +465,143 @@ def show_eod_prediction_panel(selected_indexes):
     
     st.markdown("---")
 
+def fetch_ai_enhanced_prediction(symbol):
+    """
+    Fetch AI-enhanced EOD prediction from FastAPI endpoint.
+    Returns dict with base model prediction and AI analysis/adjustment.
+    """
+    import requests
+    import os
+    
+    try:
+        fastapi_url = os.getenv('FASTAPI_URL', 'http://localhost:8000')
+        response = requests.get(f"{fastapi_url}/predict/ai-enhanced", params={"symbol": symbol}, timeout=30)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+    except Exception as e:
+        print(f"Error fetching AI-enhanced prediction for {symbol}: {str(e)}")
+        return None
+
+
+def fetch_ai_status():
+    """Check if AI service is available."""
+    import requests
+    import os
+    
+    try:
+        fastapi_url = os.getenv('FASTAPI_URL', 'http://localhost:8000')
+        response = requests.get(f"{fastapi_url}/ai/status", timeout=5)
+        
+        if response.status_code == 200:
+            return response.json()
+        return {"available": False}
+    except:
+        return {"available": False}
+
+
+def show_ai_analysis_panel(selected_indexes):
+    """
+    Display AI-enhanced prediction analysis panel.
+    Shows AI critique, adjusted predictions, and market insights.
+    """
+    st.markdown("### 🤖 AI Market Analyst")
+    st.caption("AI-enhanced predictions with real-time critique and market insights")
+    
+    # Check AI status
+    ai_status = fetch_ai_status()
+    
+    if not ai_status.get('available', False):
+        st.warning("⚠️ AI analysis is currently initializing. Please try again in a moment.")
+        return
+    
+    st.caption(f"Provider: {ai_status.get('provider', 'unknown').upper()}")
+    
+    # Fetch AI-enhanced predictions for selected indices
+    ai_predictions = {}
+    
+    with st.spinner("Analyzing market conditions with AI..."):
+        for index_name in selected_indexes:
+            symbol = INDEXES[index_name]
+            ai_data = fetch_ai_enhanced_prediction(symbol)
+            if ai_data:
+                ai_predictions[index_name] = ai_data
+    
+    if not ai_predictions:
+        st.info("📊 AI analysis will appear here when market data is available")
+        return
+    
+    # Display AI analysis for each index
+    for index_name, ai_data in ai_predictions.items():
+        with st.expander(f"🔍 {index_name} AI Analysis", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Base vs AI prediction comparison
+                base_pred = ai_data['base_model']['eod_prediction']
+                ai_pred = ai_data['ai_enhanced']['ai_adjusted_prediction']
+                current = ai_data['current_price']
+                
+                base_change = base_pred - current
+                ai_change = ai_pred - current
+                
+                st.markdown("**Prediction Comparison**")
+                
+                pred_col1, pred_col2 = st.columns(2)
+                with pred_col1:
+                    st.metric(
+                        "Base Model EOD",
+                        f"${base_pred:.2f}",
+                        f"{base_change:+.2f} pts"
+                    )
+                with pred_col2:
+                    delta_color = "normal" if ai_pred != base_pred else "off"
+                    st.metric(
+                        "AI-Adjusted EOD",
+                        f"${ai_pred:.2f}",
+                        f"{ai_change:+.2f} pts",
+                        delta_color=delta_color
+                    )
+                
+                # Confidence meter
+                confidence = ai_data['ai_enhanced']['confidence']
+                st.markdown(f"**AI Confidence:** {confidence:.0%}")
+                st.progress(min(1.0, confidence))
+            
+            with col2:
+                # AI reasoning
+                st.markdown("**AI Assessment**")
+                
+                # Market conditions
+                market_conditions = ai_data['ai_enhanced'].get('market_conditions', '')
+                if market_conditions:
+                    st.info(f"📈 {market_conditions}")
+                
+                # Adjustment reason
+                adj_reason = ai_data['ai_enhanced'].get('adjustment_reason', '')
+                if adj_reason:
+                    st.caption(f"💡 {adj_reason}")
+                
+                # Recommendation
+                recommendation = ai_data['ai_enhanced'].get('recommendation', '')
+                if recommendation:
+                    st.success(f"📌 **Recommendation:** {recommendation}")
+            
+            # Risk factors
+            risk_factors = ai_data['ai_enhanced'].get('risk_factors', [])
+            if risk_factors:
+                st.markdown("**⚠️ Risk Factors:**")
+                for risk in risk_factors[:3]:  # Show top 3 risks
+                    st.caption(f"• {risk}")
+            
+            # Timestamp
+            st.caption(f"Analysis timestamp: {ai_data.get('timestamp', 'N/A')}")
+    
+    st.markdown("---")
+
+
 def export_to_csv(predictions_data, include_indicators=True):
     """Export predictions and indicators to CSV for Excel compatibility"""
     export_data = []
@@ -1441,8 +1578,11 @@ else:
         
         st.header("📊 Prediction Results")
         
-        # Show advanced gamma-based EOD prediction panel (NEW!)
+        # Show advanced gamma-based EOD prediction panel
         show_eod_prediction_panel(selected_indexes)
+        
+        # Show AI-enhanced analysis panel
+        show_ai_analysis_panel(selected_indexes)
         
         # Export options
         col_export1, col_export2, col_export3 = st.columns([2, 2, 6])

@@ -24,6 +24,7 @@ dependencies = [
     "scipy>=1.10.0",
     "sqlalchemy>=2.0.0",
     "streamlit>=1.28.0",
+    "tenacity>=9.1.2",
     "tensorflow>=2.13.0",
     "uvicorn>=0.38.0",
     "websocket-client>=1.6.0",
