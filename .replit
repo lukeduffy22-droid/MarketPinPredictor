@@ -90,6 +90,10 @@ localPort = 43749
 externalPort = 6800
 
 [[ports]]
+localPort = 44871
+externalPort = 8081
+
+[[ports]]
 localPort = 45363
 externalPort = 3001
 
@@ -104,3 +108,6 @@ externalPort = 8080
 [userenv]
 
 [userenv.shared]
+
+[agent]
+integrations = ["python_openai_ai_integrations:1.0.0"]
