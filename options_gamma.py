@@ -356,6 +356,201 @@ def calculate_gamma_exposure(options_df, spot_price):
         'spot_price': spot_price
     }
 
+def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
+    """
+    Calculate gamma exposure across multiple expirations (0-7 DTE).
+    
+    Returns dictionary with:
+    - gamma_by_expiry: Dict of {days_to_exp: gamma_data}
+    - unified_walls: Top gamma walls weighted across all expirations
+    - aggregate_pin: Weighted pin strike across all near-term expirations
+    - time_weights: Weights applied to each expiration
+    
+    Uses vectorized pandas operations for performance.
+    """
+    if options_df.empty:
+        return None
+    
+    CONTRACT_MULTIPLIER = 100
+    
+    # Filter to max DTE
+    near_term_df = options_df[options_df['days_to_expiry'] <= max_dte].copy()
+    
+    if near_term_df.empty:
+        return None
+    
+    # Vectorized GEX calculation (much faster than apply)
+    near_term_df['gex'] = (
+        near_term_df['gamma'] * 
+        near_term_df['open_interest'] * 
+        CONTRACT_MULTIPLIER * 
+        (spot_price ** 2) / 1e9
+    )
+    
+    # Vectorized sign convention: calls positive, puts negative
+    near_term_df['signed_gex'] = np.where(
+        near_term_df['type'] == 'call',
+        near_term_df['gex'],
+        -near_term_df['gex']
+    )
+    
+    # Time decay weights: 0-DTE has highest weight, declining as expiration increases
+    # Weights: 0DTE=1.0, 1DTE=0.5, 2DTE=0.3, 3DTE=0.2, 4DTE=0.15, 5DTE=0.12, 6DTE=0.10, 7DTE=0.08
+    time_weights = {
+        0: 1.0,
+        1: 0.5,
+        2: 0.3,
+        3: 0.2,
+        4: 0.15,
+        5: 0.12,
+        6: 0.10,
+        7: 0.08
+    }
+    
+    # Get unique expiration dates
+    expiry_days = sorted(near_term_df['days_to_expiry'].unique())
+    
+    gamma_by_expiry = {}
+    all_weighted_strikes = []
+    
+    for dte in expiry_days:
+        dte_df = near_term_df[near_term_df['days_to_expiry'] == dte]
+        
+        # Aggregate by strike for this expiry
+        gex_by_strike = dte_df.groupby('strike').agg({
+            'signed_gex': 'sum',
+            'gex': lambda x: abs(x).sum(),
+            'expiry': 'first',
+            'days_to_expiry': 'min'
+        }).reset_index()
+        
+        gex_by_strike.columns = ['strike', 'net_gex', 'total_gex', 'expiry', 'days_to_expiry']
+        
+        # Find pin for this expiry
+        if not gex_by_strike.empty:
+            # Filter to strikes within ±10% of spot
+            price_range = 0.10
+            lower_bound = spot_price * (1 - price_range)
+            upper_bound = spot_price * (1 + price_range)
+            
+            nearby_strikes = gex_by_strike[
+                (gex_by_strike['strike'] >= lower_bound) & 
+                (gex_by_strike['strike'] <= upper_bound)
+            ]
+            
+            if not nearby_strikes.empty:
+                pin_row = nearby_strikes.loc[nearby_strikes['total_gex'].idxmax()]
+            else:
+                pin_row = gex_by_strike.loc[gex_by_strike['total_gex'].idxmax()]
+            
+            weight = time_weights.get(int(dte), 0.05)
+            
+            gamma_by_expiry[int(dte)] = {
+                'pin_strike': float(pin_row['strike']),
+                'total_gex': float(pin_row['total_gex']),
+                'net_gex': float(pin_row['net_gex']),
+                'weight': weight,
+                'weighted_gex': float(pin_row['total_gex']) * weight,
+                'expiry_date': pin_row['expiry'].strftime('%Y-%m-%d') if hasattr(pin_row['expiry'], 'strftime') else str(pin_row['expiry']),
+                'top_walls': gex_by_strike.nlargest(3, 'total_gex')[['strike', 'net_gex', 'total_gex']].to_dict('records')
+            }
+            
+            # Add weighted strikes for unified wall calculation
+            for _, row in gex_by_strike.iterrows():
+                all_weighted_strikes.append({
+                    'strike': row['strike'],
+                    'net_gex': row['net_gex'] * weight,
+                    'total_gex': row['total_gex'] * weight,
+                    'days_to_expiry': int(dte),
+                    'weight': weight
+                })
+    
+    # Calculate unified gamma walls (weighted across all expirations)
+    if all_weighted_strikes:
+        unified_df = pd.DataFrame(all_weighted_strikes)
+        
+        # Aggregate weighted GEX by strike across all expirations
+        unified_walls = unified_df.groupby('strike').agg({
+            'net_gex': 'sum',
+            'total_gex': 'sum',
+            'days_to_expiry': lambda x: list(set(x))  # List of expirations with this strike
+        }).reset_index()
+        
+        unified_walls.columns = ['strike', 'weighted_net_gex', 'weighted_total_gex', 'expirations']
+        unified_walls = unified_walls.nlargest(10, 'weighted_total_gex')
+        
+        # Calculate aggregate pin (weighted average of pins)
+        total_weight = sum(data['weight'] for data in gamma_by_expiry.values())
+        if total_weight > 0:
+            aggregate_pin = sum(
+                data['pin_strike'] * data['weight'] 
+                for data in gamma_by_expiry.values()
+            ) / total_weight
+        else:
+            aggregate_pin = spot_price
+    else:
+        unified_walls = pd.DataFrame()
+        aggregate_pin = spot_price
+    
+    return {
+        'gamma_by_expiry': gamma_by_expiry,
+        'unified_walls': unified_walls,
+        'aggregate_pin': aggregate_pin,
+        'time_weights': time_weights,
+        'spot_price': spot_price,
+        'max_dte': max_dte
+    }
+
+
+def get_multi_expiry_analysis(api_key, underlying, spot_price, max_dte=7):
+    """
+    Get multi-expiration gamma analysis for enhanced EOD predictions.
+    
+    Returns analysis across 0-DTE through 7-DTE expirations with:
+    - Time-weighted gamma exposure by expiration
+    - Unified gamma walls across all near-term expirations
+    - Aggregate pin strike (weighted average)
+    
+    All return values are JSON-safe Python native types.
+    """
+    # Fetch options chain (already gets all expirations up to 90 days)
+    options_df, is_mock_data = fetch_options_chain(api_key, underlying, spot_price)
+    
+    if options_df.empty:
+        return None
+    
+    # Calculate multi-expiry gamma
+    analysis = calculate_multi_expiry_gamma(options_df, spot_price, max_dte)
+    
+    if not analysis:
+        return None
+    
+    # Convert unified_walls DataFrame to JSON-safe list
+    unified_walls_list = []
+    if not analysis['unified_walls'].empty:
+        for _, row in analysis['unified_walls'].iterrows():
+            unified_walls_list.append({
+                'strike': float(row['strike']),
+                'weighted_net_gex': float(row['weighted_net_gex']),
+                'weighted_total_gex': float(row['weighted_total_gex']),
+                'expirations': [int(e) for e in row['expirations']]
+            })
+    
+    # Build fully JSON-safe result
+    result = {
+        'gamma_by_expiry': analysis['gamma_by_expiry'],  # Already dict with native types
+        'unified_walls': unified_walls_list,
+        'aggregate_pin': float(analysis['aggregate_pin']),
+        'time_weights': {int(k): float(v) for k, v in analysis['time_weights'].items()},
+        'spot_price': float(analysis['spot_price']),
+        'max_dte': int(analysis['max_dte']),
+        'is_mock_data': bool(is_mock_data),
+        'underlying': str(underlying)
+    }
+    
+    return result
+
+
 def get_gamma_analysis(api_key, underlying, spot_price):
     """
     Main function to get complete gamma analysis for an index

@@ -202,11 +202,28 @@ def get_eod_prediction_inputs(
         et_tz = pytz.timezone('US/Eastern')
         trading_date = datetime.now(et_tz).date()
     
+    # Convert Polygon ticker format (I:SPX) to database format (SPX)
+    db_ticker = ticker.replace('I:', '') if ticker.startswith('I:') else ticker
+    
     # Fetch all components
     walls, zero_gamma = fetch_gamma_walls_from_analysis(api_key, ticker, spot_price)
-    pin_history = fetch_pin_snapshots_from_db(ticker, trading_date)
-    spot_prices, intraday_high, intraday_low = fetch_spot_prices_from_db(ticker, trading_date)
-    hv10_points = calculate_hv10_points(ticker, spot_price)
+    pin_history = fetch_pin_snapshots_from_db(db_ticker, trading_date)
+    spot_prices, intraday_high, intraday_low = fetch_spot_prices_from_db(db_ticker, trading_date)
+    hv10_points = calculate_hv10_points(db_ticker, spot_price)
+    
+    # Fetch multi-expiry aggregate pin for enhanced predictions
+    multi_expiry_aggregate_pin = None
+    try:
+        multi_expiry_analysis = options_gamma.get_multi_expiry_analysis(
+            api_key=api_key,
+            underlying=db_ticker,
+            spot_price=spot_price,
+            max_dte=7
+        )
+        if multi_expiry_analysis:
+            multi_expiry_aggregate_pin = multi_expiry_analysis.get('aggregate_pin')
+    except Exception as e:
+        print(f"Warning: Could not fetch multi-expiry data: {e}")
     
     return {
         'walls': walls,
@@ -215,5 +232,6 @@ def get_eod_prediction_inputs(
         'spot_prices': spot_prices if spot_prices else [spot_price],  # Fallback to current spot
         'intraday_high': intraday_high if intraday_high > 0 else spot_price,
         'intraday_low': intraday_low if intraday_low > 0 else spot_price,
-        'hv10_points': hv10_points
+        'hv10_points': hv10_points,
+        'multi_expiry_aggregate_pin': multi_expiry_aggregate_pin
     }

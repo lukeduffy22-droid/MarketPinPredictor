@@ -183,6 +183,7 @@ def predict_eod_close(
     intraday_high: float,
     intraday_low: float,
     hv10_points: Optional[float] = None,
+    multi_expiry_aggregate_pin: Optional[float] = None,
 ) -> EODPredictionResult:
     """
     Main entry point.
@@ -193,6 +194,10 @@ def predict_eod_close(
     - zero gamma
     - vacp
     - final EOD estimate
+    
+    Optional multi_expiry_aggregate_pin adds future gamma influence:
+    - When provided, it acts as additional anchor weighted at 10%
+    - This accounts for gamma from 1-7 DTE options that influence price action
     """
     if not walls:
         raise ValueError("No gamma walls provided")
@@ -226,22 +231,44 @@ def predict_eod_close(
     #   - Pin only matters if stable (psi)
     #   - Zero gamma is a light anchor
     #   - VACP adds trend/vol adjustment
+    #   - Multi-expiry aggregate pin adds future gamma influence (when available)
     last_pin = pin_history[-1].pin_strike if pin_history else wwm
 
     pin_weight = 0.2 * psi      # pin more important only when stable
-    weights = {
-        "wwm": 0.5,
-        "pin": pin_weight,
-        "zero": 0.1,
-        "vacp": 0.4 - pin_weight,   # keep total weight = 1.0
-    }
-
-    eod_estimate = (
-        wwm * weights["wwm"]
-        + last_pin * weights["pin"]
-        + zero_gamma * weights["zero"]
-        + vacp * weights["vacp"]
-    )
+    
+    # Include multi-expiry aggregate pin if available
+    if multi_expiry_aggregate_pin is not None:
+        # Redistribute weights to include future gamma influence
+        weights = {
+            "wwm": 0.45,                     # Slightly reduced from 0.5
+            "pin": pin_weight,               # Same as before (up to 0.2)
+            "zero": 0.08,                    # Slightly reduced from 0.1
+            "vacp": 0.37 - pin_weight,       # Adjusted to keep total = 1.0
+            "multi_expiry": 0.10,            # Future gamma influence
+        }
+        
+        eod_estimate = (
+            wwm * weights["wwm"]
+            + last_pin * weights["pin"]
+            + zero_gamma * weights["zero"]
+            + vacp * weights["vacp"]
+            + multi_expiry_aggregate_pin * weights["multi_expiry"]
+        )
+    else:
+        # Original weights without multi-expiry
+        weights = {
+            "wwm": 0.5,
+            "pin": pin_weight,
+            "zero": 0.1,
+            "vacp": 0.4 - pin_weight,
+        }
+        
+        eod_estimate = (
+            wwm * weights["wwm"]
+            + last_pin * weights["pin"]
+            + zero_gamma * weights["zero"]
+            + vacp * weights["vacp"]
+        )
 
     return EODPredictionResult(
         wwm=wwm,

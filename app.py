@@ -1731,6 +1731,76 @@ else:
                         
                         st.dataframe(gamma_walls_display, width='stretch')
                     
+                    # Multi-Expiration Gamma Analysis Section
+                    with st.expander("📅 Future Gamma Exposure (0-7 DTE)", expanded=False):
+                        try:
+                            multi_expiry_response = requests.get(
+                                f"http://localhost:8000/gamma/multi-expiry?symbol={pred['ticker']}&max_dte=7",
+                                timeout=15
+                            )
+                            
+                            if multi_expiry_response.status_code == 200:
+                                multi_data = multi_expiry_response.json()
+                                
+                                # Display aggregate pin
+                                st.metric(
+                                    "🎯 Aggregate Pin (Weighted)",
+                                    f"${multi_data['aggregate_pin']:.0f}",
+                                    help="Pin strike weighted across all near-term expirations"
+                                )
+                                
+                                # Display gamma by expiration
+                                st.write("**Gamma Exposure by Expiration:**")
+                                
+                                gamma_by_exp = multi_data.get('gamma_by_expiry', {})
+                                if gamma_by_exp:
+                                    exp_data = []
+                                    for dte, data in sorted(gamma_by_exp.items(), key=lambda x: int(x[0])):
+                                        dte_label = "0-DTE (Today)" if int(dte) == 0 else f"{dte}-DTE"
+                                        exp_data.append({
+                                            'Expiration': dte_label,
+                                            'Pin Strike': f"${data['pin_strike']:.0f}",
+                                            'GEX': f"${data['total_gex']:.2f}B",
+                                            'Weight': f"{data['weight']*100:.0f}%",
+                                            'Weighted GEX': f"${data['weighted_gex']:.2f}B"
+                                        })
+                                    
+                                    st.dataframe(
+                                        pd.DataFrame(exp_data),
+                                        width='stretch',
+                                        hide_index=True
+                                    )
+                                
+                                # Display unified walls
+                                unified_walls = multi_data.get('unified_walls', [])
+                                if unified_walls:
+                                    st.write("**Unified Gamma Walls (All Expirations):**")
+                                    
+                                    walls_data = []
+                                    for wall in unified_walls[:5]:
+                                        exp_list = wall.get('expirations', [])
+                                        exp_str = ', '.join([f"{e}d" for e in sorted(exp_list)])
+                                        walls_data.append({
+                                            'Strike': f"${wall['strike']:.0f}",
+                                            'Weighted GEX': f"${wall['weighted_total_gex']:.2f}B",
+                                            'Net GEX': f"${wall['weighted_net_gex']:.2f}B",
+                                            'Expirations': exp_str
+                                        })
+                                    
+                                    st.dataframe(
+                                        pd.DataFrame(walls_data),
+                                        width='stretch',
+                                        hide_index=True
+                                    )
+                                
+                                if multi_data.get('is_mock_data'):
+                                    st.caption("⚠️ Using simulated options data")
+                            else:
+                                st.warning("Multi-expiry gamma data not available")
+                        
+                        except Exception as e:
+                            st.info(f"Multi-expiry analysis unavailable: {str(e)[:50]}")
+                    
                     # Create gamma exposure bar chart if we have strike-level data
                     if 'gex_by_strike' in gex and not gex['gex_by_strike'].empty:
                         import plotly.graph_objects as go

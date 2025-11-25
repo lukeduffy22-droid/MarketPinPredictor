@@ -374,7 +374,7 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
         if not inputs['pin_history']:
             raise HTTPException(503, "No gamma pin snapshots available for today")
         
-        # Run EOD prediction
+        # Run EOD prediction with multi-expiry data if available
         result = predict_eod_close(
             walls=inputs['walls'],
             pin_history=inputs['pin_history'],
@@ -382,7 +382,8 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
             spot_prices=inputs['spot_prices'],
             intraday_high=inputs['intraday_high'],
             intraday_low=inputs['intraday_low'],
-            hv10_points=inputs['hv10_points']
+            hv10_points=inputs['hv10_points'],
+            multi_expiry_aggregate_pin=inputs.get('multi_expiry_aggregate_pin')
         )
         
         return EODPredictionResponse(
@@ -404,6 +405,54 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     except Exception as e:
         log.error(f"EOD prediction failed for {symbol}: {e}")
         raise HTTPException(503, f"EOD prediction error: {str(e)}")
+
+@app.get("/gamma/multi-expiry")
+async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
+    """
+    Get multi-expiration gamma exposure analysis (0-DTE through 7-DTE).
+    
+    Returns time-weighted gamma exposure by expiration date, unified gamma walls,
+    and an aggregate pin strike based on all near-term expirations.
+    """
+    # Normalize symbol - strip I: prefix if present
+    clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
+    
+    if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+    
+    current_price = get_latest_price(clean_symbol)
+    if not current_price:
+        raise HTTPException(503, f"No price data for {clean_symbol}")
+    
+    try:
+        import options_gamma
+        
+        analysis = options_gamma.get_multi_expiry_analysis(
+            api_key=settings.polygon_api_key,
+            underlying=clean_symbol,
+            spot_price=current_price,
+            max_dte=max_dte
+        )
+        
+        if not analysis:
+            raise HTTPException(503, "Unable to fetch multi-expiry gamma data")
+        
+        # Analysis is already JSON-safe from get_multi_expiry_analysis
+        return {
+            "symbol": clean_symbol,
+            "current_price": float(current_price),
+            "aggregate_pin": analysis['aggregate_pin'],
+            "gamma_by_expiry": analysis['gamma_by_expiry'],
+            "unified_walls": analysis['unified_walls'],
+            "time_weights": {str(k): float(v) for k, v in analysis['time_weights'].items()},
+            "is_mock_data": analysis.get('is_mock_data', False),
+            "timestamp": now_et().isoformat()
+        }
+        
+    except Exception as e:
+        log.error(f"Multi-expiry gamma failed for {symbol}: {e}")
+        raise HTTPException(503, f"Multi-expiry gamma error: {str(e)}")
+
 
 @app.get("/metrics")
 async def get_metrics():

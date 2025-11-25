@@ -8,9 +8,34 @@ This project is a dual-model stock market prediction system designed for major s
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (Nov 21, 2025)
+## Recent Changes (Nov 25, 2025)
 
-**GAMMA DISPLAY & INDEX DATA FETCHING FIXES** (Latest):
+**MULTI-EXPIRATION GAMMA EXPOSURE FEATURE** (Latest):
+
+Added comprehensive multi-expiration gamma analysis (0-7 DTE) to improve EOD predictions by incorporating future gamma exposure:
+
+**New Components**:
+1. **Multi-Expiry Gamma Analysis** - Analyzes gamma across 0-DTE through 7-DTE expirations
+2. **Time-Weighted Aggregation** - Weights gamma by proximity to expiration (0DTE=100%, 1DTE=50%, 2DTE=30%, etc.)
+3. **Unified Gamma Walls** - Identifies strike levels where gamma concentrates across multiple expirations
+4. **Aggregate Pin Strike** - Weighted average of pins from all near-term expirations
+5. **Enhanced EOD Prediction** - Incorporates multi-expiry aggregate pin as 10% weight in final estimate
+
+**Implementation**:
+- `options_gamma.py`: Added `calculate_multi_expiry_gamma()` and `get_multi_expiry_analysis()` functions with vectorized pandas operations
+- `app/api/main.py`: Added `/gamma/multi-expiry` API endpoint with full JSON serialization safety
+- `app.py`: Added expandable UI section "Future Gamma Exposure (0-7 DTE)" showing gamma by expiration and unified walls
+- `app/utils/gamma_eod_predictor.py`: Enhanced `predict_eod_close()` to accept optional `multi_expiry_aggregate_pin` parameter
+- `app/utils/eod_data_integration.py`: Fetches multi-expiry aggregate pin for enhanced predictions
+
+**Bug Fixes Applied**:
+- Fixed ticker format mismatch (I:SPX vs SPX) in database queries
+- Added JSON-safe type conversions to prevent API serialization errors
+- Used vectorized numpy operations instead of slow apply() loops
+
+## Earlier Changes (Nov 21, 2025)
+
+**GAMMA DISPLAY & INDEX DATA FETCHING FIXES**:
 
 Successfully resolved gamma display showing $0.00B and fixed REST API to fetch actual index data:
 
