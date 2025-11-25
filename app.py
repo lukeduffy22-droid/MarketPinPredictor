@@ -1654,16 +1654,16 @@ else:
                         backtest_date = st.date_input(
                             "📅 View Historical Gamma (or leave blank for live)",
                             value=None,
+                            max_value=datetime.now().date(),
                             key=f"backtest_date_{pred['ticker']}"
                         )
                     
                     with backtest_col2:
-                        if backtest_date and backtest_date < datetime.now().date():
+                        if backtest_date:
                             if st.button("🔄 Load Historical Data", key=f"load_backtest_{pred['ticker']}"):
                                 st.session_state.backtest_mode = True
                                 st.session_state.backtest_date = backtest_date
-                        elif backtest_date:
-                            st.info("📌 Select a past date")
+                                st.rerun()
                     
                     with backtest_col3:
                         if st.session_state.backtest_mode and st.button("✕ Back to Live", key=f"back_to_live_{pred['ticker']}"):

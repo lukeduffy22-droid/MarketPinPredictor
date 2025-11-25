@@ -361,7 +361,7 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
         
         # Get all required inputs
         inputs = get_eod_prediction_inputs(
-            api_key=settings.POLYGON_API_KEY,
+            api_key=settings.polygon_api_key,
             ticker=ticker,
             spot_price=current_price,
             trading_date=None  # Uses today
