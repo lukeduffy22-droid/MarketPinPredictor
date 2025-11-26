@@ -8,6 +8,29 @@ This project is a dual-model stock market prediction system for major stock indi
 
 Preferred communication style: Simple, everyday language.
 
+## Recent Changes (November 2025)
+
+### Prediction Accuracy Improvements
+- **Timeframe-Adaptive Bounds**: Predictions now use adaptive limits based on timeframe:
+  - 1-day: ±3% maximum move
+  - 5-day: ±5% maximum move  
+  - 1-week: ±8% maximum move
+- **VIX Volatility Override**: When VIX > 35 (crash/panic), allows 2x normal range; VIX > 25 allows 1.5x
+- **Gamma Pin Validation**: Rejects gamma pins more than 15% from current spot price (prevents showing unrealistic values like $2800 for SPX at $6800)
+
+### AI Enhancement Layer Improvements
+- **Historical Accuracy Feedback**: AI now receives historical model accuracy data including:
+  - Average accuracy percentage from past predictions
+  - Prediction bias (bullish/bearish/neutral)
+  - Consistency rating (highly_consistent/moderately_consistent/variable)
+  - Last 3 predictions with predicted/actual/accuracy details
+- This allows AI to calibrate adjustments based on past model performance
+
+### Database Functions Added
+- `get_historical_accuracy_for_ai()` - Fetches rich historical accuracy data for AI context
+- `get_predictions_needing_actuals()` - Find predictions missing actual EOD prices
+- `batch_update_prediction_actuals()` - Batch update predictions with actuals
+
 ## System Architecture
 
 ### Frontend Architecture
@@ -22,11 +45,11 @@ The backend is built with FastAPI (port 8000) using an async/await pattern.
 -   **Per-Symbol Ring Buffers**: Stores 90 minutes of 1-second index bars and options flow data for rapid access.
 -   **WebSocket Ingestion**: Normalizes incoming messages, aggregates sub-second data into 1-second bars, and intelligently switches between real-time and delayed feeds.
 -   **Feature Calculators**: Computes critical features such as VWAP Deviation, Microtrend, Gamma Pinning (Black-Scholes), and Flow Urgency. Includes a 150ms circuit breaker.
--   **AI Enhancement Layer**: Integrates a swappable AI provider architecture (e.g., OpenAI) to act as a "critic and corrector" on base model predictions. It analyzes live gamma, VWAP, microtrend, and options flow data to suggest confidence-weighted adjustments and provides natural language explanations.
+-   **AI Enhancement Layer**: Integrates a swappable AI provider architecture (e.g., OpenAI) to act as a "critic and corrector" on base model predictions. It analyzes live gamma, VWAP, microtrend, options flow data, AND historical accuracy feedback to suggest confidence-weighted adjustments and provides natural language explanations.
 -   **Multi-Expiry Gamma Analysis**: Analyzes gamma across 0-7 DTE expirations with time-weighted aggregation to identify unified gamma walls and an aggregate pin strike for enhanced EOD predictions.
 -   **Advanced Gamma-Based EOD Prediction**: Incorporates Wall-Weighted Magnet (WWM), Pin Stability Index (PSI), Zero-Gamma Magnet, and Volatility-Adjusted Close Predictor (VACP) for highly accurate end-of-day predictions.
 -   **OI Cache Service**: Refreshes Open Interest (OI) data in the background.
--   **Database Models**: SQLAlchemy models for `CalibrationCoeff`, `RMSEBucket`, and `PredictionLog`.
+-   **Database Models**: SQLAlchemy models for `CalibrationCoeff`, `RMSEBucket`, `PredictionLog`, and `Prediction` with accuracy tracking.
 -   **FastAPI Endpoints**: Provides health checks, gamma exposure levels, and prediction endpoints.
 
 ### Prediction Model
@@ -35,7 +58,7 @@ The primary prediction model is Ridge Regression with time-adaptive weights, inc
 
 ### Guards and Validation
 
-The system enforces prediction cadence, performs freshness checks on market data, requires minimum data availability, and includes a circuit breaker for feature computation.
+The system enforces prediction cadence, performs freshness checks on market data, requires minimum data availability, includes a circuit breaker for feature computation, validates gamma pins within ±15% of spot price, and applies timeframe-adaptive prediction bounds with VIX volatility overrides.
 
 ### Time Utilities
 
