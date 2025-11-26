@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 from polygon import RESTClient
 from datetime import datetime, timedelta
 import time
+import requests
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
