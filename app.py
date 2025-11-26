@@ -264,10 +264,22 @@ def calculate_gex(api_key, ticker, spot_price):
         gex_analysis = get_gamma_analysis(api_key, ticker, spot_price)
         
         if gex_analysis and not gex_analysis.get('data_unavailable', False):
+            # Validate gamma pin is within realistic range (±15% of spot)
+            raw_pin = gex_analysis['pin_strike']
+            if spot_price > 0:
+                pin_distance_pct = abs(raw_pin - spot_price) / spot_price
+                if pin_distance_pct > 0.15:
+                    print(f"WARNING: Gamma pin ${raw_pin:.0f} is {pin_distance_pct*100:.1f}% from spot ${spot_price:.0f}, using spot as pin")
+                    validated_pin = spot_price
+                else:
+                    validated_pin = raw_pin
+            else:
+                validated_pin = raw_pin
+            
             gex_levels = {
                 'total_gex': gex_analysis['total_gex'],
                 'net_gex': gex_analysis['net_gex'],
-                'pin_strike': gex_analysis['pin_strike'],
+                'pin_strike': validated_pin,  # Use validated pin
                 'pin_expiry': gex_analysis['pin_expiry'],
                 'zero_gamma': gex_analysis['zero_gamma'],
                 'direction': gex_analysis['direction'],
@@ -1381,8 +1393,31 @@ else:
                     adaptive_original_conf = adaptive_pred.confidence
                     current_price = adaptive_pred.current_price
                     
-                    # Apply conservative bounds (±2.5%) to Time-Adaptive prediction
-                    max_change_ta = current_price * 0.025
+                    # Apply timeframe-adaptive bounds
+                    # 1-day: ±3% base (can go higher in volatile markets)
+                    # 5-day: ±5%
+                    # 1-week: ±8%
+                    timeframe = st.session_state.timeframe
+                    if timeframe == '1-day':
+                        base_max_pct = 0.03
+                    elif timeframe == '5-day':
+                        base_max_pct = 0.05
+                    else:  # 1-week
+                        base_max_pct = 0.08
+                    
+                    # VIX-based volatility override: if VIX > 25, allow larger moves
+                    vix_override = 1.0
+                    if vix_df is not None and len(vix_df) > 0:
+                        try:
+                            current_vix = vix_df['close'].iloc[-1]
+                            if current_vix > 35:
+                                vix_override = 2.0  # High fear - allow 2x normal range
+                            elif current_vix > 25:
+                                vix_override = 1.5  # Elevated vol - allow 1.5x
+                        except:
+                            pass
+                    
+                    max_change_ta = current_price * base_max_pct * vix_override
                     adaptive_constrained = min(max(adaptive_original_price, current_price - max_change_ta), current_price + max_change_ta)
                     
                     adaptive_success = True
@@ -1404,8 +1439,28 @@ else:
                         timeframe=st.session_state.timeframe
                     )
                     
-                    # Apply conservative bounds (±2.5%) to Traditional prediction
-                    max_change_trad = trad_current * 0.025
+                    # Apply timeframe-adaptive bounds to Traditional prediction
+                    timeframe = st.session_state.timeframe
+                    if timeframe == '1-day':
+                        base_max_pct = 0.03
+                    elif timeframe == '5-day':
+                        base_max_pct = 0.05
+                    else:  # 1-week
+                        base_max_pct = 0.08
+                    
+                    # VIX-based volatility override
+                    vix_override = 1.0
+                    if vix_df is not None and len(vix_df) > 0:
+                        try:
+                            current_vix = vix_df['close'].iloc[-1]
+                            if current_vix > 35:
+                                vix_override = 2.0
+                            elif current_vix > 25:
+                                vix_override = 1.5
+                        except:
+                            pass
+                    
+                    max_change_trad = trad_current * base_max_pct * vix_override
                     traditional_constrained = min(max(traditional_original_price, trad_current - max_change_trad), trad_current + max_change_trad)
                     
                     traditional_success = True
@@ -1517,16 +1572,18 @@ else:
                         'gex_data': gex_data,  # Add GEX data
                         'has_vix': vix_df is not None,  # Track VIX availability
                         'price_source': price_source,  # Show which data source is being used
-                        # Store ORIGINAL individual model predictions for comparison (before constraints)
+                        # Store CONSTRAINED individual model predictions for display (more realistic)
                         'adaptive_pred': {
-                            'predicted_price': adaptive_original_price,  # Use ORIGINAL value
-                            'confidence': adaptive_original_conf,  # Use ORIGINAL confidence
-                            'features': adaptive_pred.features if adaptive_pred else {}
+                            'predicted_price': adaptive_constrained,  # Use CONSTRAINED value
+                            'confidence': adaptive_original_conf,
+                            'features': adaptive_pred.features if adaptive_pred else {},
+                            'original_price': adaptive_original_price  # Keep original for debugging
                         } if adaptive_success else None,
                         'traditional_pred': {
-                            'predicted_price': traditional_original_price,  # Use ORIGINAL value
-                            'confidence': traditional_original_conf,  # Use ORIGINAL confidence  
-                            'current_price': trad_current if traditional_success else None
+                            'predicted_price': traditional_constrained,  # Use CONSTRAINED value
+                            'confidence': traditional_original_conf,
+                            'current_price': trad_current if traditional_success else None,
+                            'original_price': traditional_original_price  # Keep original for debugging
                         } if traditional_success else None,
                         'time_to_close_min': minutes_to_close,
                         'show_both_models': st.session_state.show_traditional_model
