@@ -29,126 +29,143 @@ def black_scholes_gamma(S, K, T, r, sigma):
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
 
-def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90):
+def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90, max_retries=3):
     """
     Fetch REAL options chain data from Polygon Snapshot API with actual OI and IV
     
     Returns tuple: (DataFrame with strike/expiry/type/OI/IV/gamma, is_mock_data: bool)
     
     Uses Options Chain Snapshot API for real-time open interest and implied volatility.
+    The Polygon Options Chain Snapshot API works AFTER HOURS and returns real EOD data.
+    
+    IMPORTANT: This function NEVER returns mock data. If the API fails after retries,
+    it returns an empty DataFrame with is_mock_data=False to let the UI handle it gracefully.
     """
     import time
     
-    try:
-        client = RESTClient(api_key)
-        
-        # Use Options Chain Snapshot API to get REAL OI and IV
-        # This endpoint returns actual market data for all contracts on the underlying
-        # Add timeout protection by limiting iteration
-        print(f"Fetching options chain snapshot for {underlying}...")
-        start_time = time.time()
-        timeout_seconds = 10  # Maximum 10 seconds to fetch options data
-        
-        snapshot = client.list_snapshot_options_chain(underlying)
-        
-        options_data = []
-        contract_count = 0
-        max_contracts = 200  # Reduced limit for faster processing
-        skipped_no_details = 0
-        skipped_invalid = 0
-        skipped_expiry = 0
-        errors = 0
-        
-        # Process each contract in the snapshot
-        for contract in snapshot:
-            # Check timeout
-            if time.time() - start_time > timeout_seconds:
-                print(f"Warning: Timeout after {timeout_seconds}s, processed {contract_count} contracts. Using what we have.")
-                break
+    last_error = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = RESTClient(api_key)
             
-            contract_count += 1
-            if contract_count > max_contracts:
-                print(f"Warning: Processed {max_contracts} contracts, stopping to prevent timeout")
-                break
-            try:
-                # Extract contract details
-                if not hasattr(contract, 'details'):
-                    skipped_no_details += 1
-                    continue
+            print(f"[Attempt {attempt}/{max_retries}] Fetching options chain snapshot for {underlying}...")
+            start_time = time.time()
+            timeout_seconds = 15  # Increased timeout for premium API
+            
+            snapshot = client.list_snapshot_options_chain(underlying)
+            
+            options_data = []
+            contract_count = 0
+            max_contracts = 500  # Increased for premium subscription
+            skipped_no_details = 0
+            skipped_invalid = 0
+            skipped_expiry = 0
+            errors = 0
+            
+            for contract in snapshot:
+                if time.time() - start_time > timeout_seconds:
+                    print(f"Warning: Timeout after {timeout_seconds}s, processed {contract_count} contracts. Using what we have.")
+                    break
+                
+                contract_count += 1
+                if contract_count > max_contracts:
+                    print(f"Warning: Processed {max_contracts} contracts, stopping to prevent timeout")
+                    break
                     
-                details = contract.details
-                strike = float(details.strike_price) if hasattr(details, 'strike_price') else 0
-                expiry_str = details.expiration_date if hasattr(details, 'expiration_date') else ''
-                option_type = details.contract_type.lower() if hasattr(details, 'contract_type') else ''
-                
-                if strike <= 0 or not expiry_str:
-                    skipped_invalid += 1
+                try:
+                    if not hasattr(contract, 'details'):
+                        skipped_no_details += 1
+                        continue
+                        
+                    details = contract.details
+                    strike = float(details.strike_price) if hasattr(details, 'strike_price') else 0
+                    expiry_str = details.expiration_date if hasattr(details, 'expiration_date') else ''
+                    option_type = details.contract_type.lower() if hasattr(details, 'contract_type') else ''
+                    
+                    if strike <= 0 or not expiry_str:
+                        skipped_invalid += 1
+                        continue
+                    
+                    expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
+                    
+                    if expiry.date() == datetime.now().date():
+                        days_to_expiry = 0
+                    else:
+                        days_to_expiry = (expiry.date() - datetime.now().date()).days
+                    
+                    if expiry.date() < datetime.now().date() or days_to_expiry > days_ahead:
+                        skipped_expiry += 1
+                        continue
+                    
+                    oi = int(contract.open_interest) if hasattr(contract, 'open_interest') and contract.open_interest else 0
+                    iv = float(contract.implied_volatility) if hasattr(contract, 'implied_volatility') and contract.implied_volatility else 0.25
+                    
+                    T = max(days_to_expiry, 0.001) / 365.0
+                    gamma = black_scholes_gamma(spot_price, strike, T, 0.05, iv)
+                    
+                    options_data.append({
+                        'strike': strike,
+                        'expiry': expiry,
+                        'days_to_expiry': days_to_expiry,
+                        'type': option_type,
+                        'open_interest': oi,
+                        'implied_volatility': iv,
+                        'gamma': gamma,
+                        'ticker': details.ticker if hasattr(details, 'ticker') else ''
+                    })
+                except Exception as contract_error:
+                    errors += 1
+                    if errors <= 3:
+                        print(f"Contract processing error: {str(contract_error)[:100]}")
                     continue
-                
-                # Parse expiry
-                expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
-                
-                # IMPORTANT: Include 0DTE (same-day) options
-                # Calculate days properly - 0DTE should show as 0, not -1
-                if expiry.date() == datetime.now().date():
-                    days_to_expiry = 0  # Same day = 0 days
-                else:
-                    days_to_expiry = (expiry.date() - datetime.now().date()).days
-                
-                # Only exclude if expiry date is before today's date
-                if expiry.date() < datetime.now().date() or days_to_expiry > days_ahead:
-                    skipped_expiry += 1
+            
+            print(f"✓ Processed {contract_count} contracts: {len(options_data)} valid, {skipped_no_details} no details, {skipped_invalid} invalid, {skipped_expiry} expired/far, {errors} errors")
+            
+            if options_data:
+                return pd.DataFrame(options_data), False  # REAL DATA from Polygon API
+            else:
+                print(f"Warning: API returned data but no valid contracts for {underlying}. This may indicate the underlying symbol is incorrect.")
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
                     continue
-                
-                # Get REAL market data from snapshot
-                # These are actual values from the market, not estimates!
-                oi = int(contract.open_interest) if hasattr(contract, 'open_interest') and contract.open_interest else 0
-                iv = float(contract.implied_volatility) if hasattr(contract, 'implied_volatility') and contract.implied_volatility else 0.25
-                
-                # Calculate gamma using real IV
-                T = max(days_to_expiry, 0.001) / 365.0  # Avoid division by zero
-                gamma = black_scholes_gamma(spot_price, strike, T, 0.05, iv)
-                
-                options_data.append({
-                    'strike': strike,
-                    'expiry': expiry,
-                    'days_to_expiry': days_to_expiry,
-                    'type': option_type,
-                    'open_interest': oi,
-                    'implied_volatility': iv,
-                    'gamma': gamma,
-                    'ticker': details.ticker if hasattr(details, 'ticker') else ''
-                })
-            except Exception as contract_error:
-                # Skip malformed contracts
-                errors += 1
-                if errors <= 3:  # Only print first few errors
-                    print(f"Contract processing error: {str(contract_error)[:100]}")
-                continue
-        
-        print(f"Processed {contract_count} contracts: {len(options_data)} valid, {skipped_no_details} no details, {skipped_invalid} invalid, {skipped_expiry} expired/far, {errors} errors")
-        
-        # If we got real data, return it
-        if options_data:
-            return pd.DataFrame(options_data), False  # is_mock_data = False - REAL DATA!
-        else:
-            # No data found, fall back to mock
-            print(f"Warning: No options snapshot data returned for {underlying}. Using simulated data.")
-            return create_mock_options_chain(underlying, spot_price), True
-        
-    except Exception as e:
-        # API error - fall back to mock data
-        error_msg = str(e)
-        if "not found" in error_msg.lower() or "404" in error_msg:
-            print(f"Warning: Options snapshot not available for {underlying}. Using simulated data. Error: {error_msg[:100]}")
-        else:
-            print(f"Warning: Options snapshot API error for {underlying}. Using simulated data. Error: {error_msg[:100]}")
-        
-        return create_mock_options_chain(underlying, spot_price), True
+                return pd.DataFrame(), False  # Empty DataFrame, NOT mock data
+            
+        except Exception as e:
+            last_error = str(e)
+            error_msg = str(e)
+            
+            if "429" in error_msg or "rate limit" in error_msg.lower():
+                print(f"✗ Rate limit hit on attempt {attempt}. Waiting before retry...")
+                time.sleep(5)
+            elif "401" in error_msg or "unauthorized" in error_msg.lower():
+                print(f"✗ Authentication error: API key may be invalid. Error: {error_msg[:100]}")
+                break  # Don't retry auth errors
+            elif "not found" in error_msg.lower() or "404" in error_msg:
+                print(f"✗ Symbol not found: {underlying}. Error: {error_msg[:100]}")
+                break  # Don't retry 404 errors
+            else:
+                print(f"✗ API error on attempt {attempt}/{max_retries}: {error_msg[:150]}")
+            
+            if attempt < max_retries:
+                wait_time = 2 ** attempt
+                print(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+    
+    print(f"✗ FAILED: Could not fetch options data for {underlying} after {max_retries} attempts. Last error: {last_error[:150] if last_error else 'Unknown'}")
+    print(f"NOTE: Returning empty data instead of fake mock data. The UI should show 'data unavailable'.")
+    return pd.DataFrame(), False  # Empty DataFrame, NOT mock data
 
-def create_mock_options_chain(underlying, spot_price):
+def _create_mock_options_chain_for_testing(underlying, spot_price):
     """
-    Create realistic mock options chain for demonstration
+    TESTING/DEVELOPMENT ONLY: Create mock options chain for unit tests.
+    
+    WARNING: This function should NEVER be called in production code.
+    It generates fake random data that will show incorrect gamma pin levels.
+    
+    For production, use fetch_options_chain() which returns real Polygon API data.
     """
     strikes = []
     data = []
@@ -515,20 +532,44 @@ def get_multi_expiry_analysis(api_key, underlying, spot_price, max_dte=7):
     - Aggregate pin strike (weighted average)
     
     All return values are JSON-safe Python native types.
+    
+    IMPORTANT: This function NEVER returns mock data. If no real data is available,
+    it returns a special 'data_unavailable' response for the UI to handle gracefully.
     """
-    # Fetch options chain (already gets all expirations up to 90 days)
     options_df, is_mock_data = fetch_options_chain(api_key, underlying, spot_price)
     
     if options_df.empty:
-        return None
+        print(f"✗ No real options data available for {underlying} multi-expiry analysis")
+        return {
+            'data_unavailable': True,
+            'underlying': str(underlying),
+            'spot_price': float(spot_price),
+            'max_dte': int(max_dte),
+            'is_mock_data': False,
+            'gamma_by_expiry': {},
+            'unified_walls': [],
+            'aggregate_pin': float(spot_price),
+            'time_weights': {0: 1.0, 1: 0.5, 2: 0.3, 3: 0.2, 4: 0.15, 5: 0.12, 6: 0.10, 7: 0.08},
+            'error_message': f"No real options data available for {underlying}. The Polygon API may be experiencing issues."
+        }
     
-    # Calculate multi-expiry gamma
     analysis = calculate_multi_expiry_gamma(options_df, spot_price, max_dte)
     
     if not analysis:
-        return None
+        print(f"✗ Failed to calculate multi-expiry gamma for {underlying}")
+        return {
+            'data_unavailable': True,
+            'underlying': str(underlying),
+            'spot_price': float(spot_price),
+            'max_dte': int(max_dte),
+            'is_mock_data': False,
+            'gamma_by_expiry': {},
+            'unified_walls': [],
+            'aggregate_pin': float(spot_price),
+            'time_weights': {0: 1.0, 1: 0.5, 2: 0.3, 3: 0.2, 4: 0.15, 5: 0.12, 6: 0.10, 7: 0.08},
+            'error_message': f"Failed to calculate gamma exposure for {underlying}."
+        }
     
-    # Convert unified_walls DataFrame to JSON-safe list
     unified_walls_list = []
     if not analysis['unified_walls'].empty:
         for _, row in analysis['unified_walls'].iterrows():
@@ -539,16 +580,16 @@ def get_multi_expiry_analysis(api_key, underlying, spot_price, max_dte=7):
                 'expirations': [int(e) for e in row['expirations']]
             })
     
-    # Build fully JSON-safe result
     result = {
-        'gamma_by_expiry': analysis['gamma_by_expiry'],  # Already dict with native types
+        'gamma_by_expiry': analysis['gamma_by_expiry'],
         'unified_walls': unified_walls_list,
         'aggregate_pin': float(analysis['aggregate_pin']),
         'time_weights': {int(k): float(v) for k, v in analysis['time_weights'].items()},
         'spot_price': float(analysis['spot_price']),
         'max_dte': int(analysis['max_dte']),
-        'is_mock_data': bool(is_mock_data),
-        'underlying': str(underlying)
+        'is_mock_data': False,  # Always False - we never return mock data
+        'underlying': str(underlying),
+        'data_unavailable': False
     }
     
     return result
@@ -559,38 +600,37 @@ def get_gamma_analysis(api_key, underlying, spot_price):
     Main function to get complete gamma analysis for an index
     
     Returns gamma analysis dict with is_mock_data flag.
-    Falls back to latest stored snapshot if live API fails.
+    Falls back to latest stored REAL (non-mock) snapshot if live API fails.
+    
+    IMPORTANT: This function NEVER returns mock data. If no real data is available,
+    it returns a special 'data_unavailable' response for the UI to handle gracefully.
     """
-    # Fetch options chain
     options_df, is_mock_data = fetch_options_chain(api_key, underlying, spot_price)
     
-    # If live API failed, try to use latest stored gamma snapshot
     if options_df.empty:
-        print(f"Live options chain empty for {underlying}, attempting fallback to stored snapshot...")
+        print(f"Live options chain empty for {underlying}, attempting fallback to stored REAL snapshot...")
         try:
             from database import get_latest_gamma_snapshot
             snapshot = get_latest_gamma_snapshot(underlying)
             
-            if snapshot:
-                print(f"✓ Using stored gamma snapshot from {snapshot.interval_timestamp}")
-                # Reconstruct gamma analysis from stored snapshot
+            if snapshot and not snapshot.is_mock_data:
+                print(f"✓ Using stored REAL gamma snapshot from {snapshot.interval_timestamp}")
                 gex_analysis = {
                     'pin_strike': snapshot.pin_strike,
-                    'pin_expiry': snapshot.interval_timestamp,  # Use snapshot time as expiry
+                    'pin_expiry': snapshot.interval_timestamp,
                     'total_gex': snapshot.total_gex,
                     'net_gex': snapshot.net_gex,
                     'direction': 'above' if snapshot.pin_strike > snapshot.spot_price else 'below' if snapshot.pin_strike < snapshot.spot_price else 'at',
                     'pull_strength': snapshot.pull_strength,
-                    'gex_by_strike': pd.DataFrame(),  # Empty - we don't store full strike data
-                    'gamma_walls': pd.DataFrame(),  # Empty - we don't store full wall data
-                    'zero_gamma': snapshot.spot_price,  # Fallback to spot if not available
-                    'spot_price': spot_price,  # Use current spot price
-                    'is_mock_data': snapshot.is_mock_data,
-                    'is_cached_data': True,  # Flag to indicate this is from cache
+                    'gex_by_strike': pd.DataFrame(),
+                    'gamma_walls': pd.DataFrame(),
+                    'zero_gamma': snapshot.spot_price,
+                    'spot_price': spot_price,
+                    'is_mock_data': False,  # Always False - we only use real snapshots
+                    'is_cached_data': True,
                     'cache_timestamp': snapshot.interval_timestamp
                 }
                 
-                # Add summary message
                 pull_strength = gex_analysis['pull_strength']
                 if pull_strength < 1:
                     strength_desc = "strong"
@@ -601,15 +641,35 @@ def get_gamma_analysis(api_key, underlying, spot_price):
                 
                 direction = gex_analysis['direction']
                 pin_strike = gex_analysis['pin_strike']
-                gex_analysis['summary'] = f"Price is being {strength_desc}ly pulled {direction} to ${pin_strike:.0f} (Cached data)"
+                gex_analysis['summary'] = f"Price is being {strength_desc}ly pulled {direction} to ${pin_strike:.0f} (Cached EOD data)"
                 
                 return gex_analysis
+            elif snapshot and snapshot.is_mock_data:
+                print(f"✗ Found stored snapshot for {underlying} but it contains MOCK data - ignoring")
             else:
                 print(f"✗ No stored snapshot found for {underlying}")
-                return None
+            
+            print(f"✗ DATA UNAVAILABLE: No real gamma data available for {underlying}")
+            return {
+                'data_unavailable': True,
+                'underlying': underlying,
+                'spot_price': spot_price,
+                'is_mock_data': False,
+                'is_cached_data': False,
+                'summary': f"Gamma data temporarily unavailable for {underlying}. Real-time data will be available during next market session.",
+                'error_message': f"No real options data available for {underlying}. The Polygon API may be experiencing issues or the symbol may not have options data."
+            }
         except Exception as e:
             print(f"Error fetching fallback snapshot: {str(e)}")
-            return None
+            return {
+                'data_unavailable': True,
+                'underlying': underlying,
+                'spot_price': spot_price,
+                'is_mock_data': False,
+                'is_cached_data': False,
+                'summary': f"Gamma data temporarily unavailable for {underlying}.",
+                'error_message': f"Error retrieving gamma data: {str(e)[:100]}"
+            }
     
     # Calculate gamma exposure from live data
     gex_analysis = calculate_gamma_exposure(options_df, spot_price)

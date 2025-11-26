@@ -16,7 +16,7 @@ from app.utils.time_et import (
     now_et, minutes_to_close_et, is_regular_hours,
     is_power_hour, get_cadence_ms
 )
-from app.state.ring_buffers import INDEX_RINGS, get_latest_price
+from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
 from app.features.calculators import compute_all_features
 from app.models.db_models import load_coefficients, get_rmse_for_tau
 
@@ -121,11 +121,15 @@ async def startup():
     from app.ingest.websocket_stream import start_websocket_stream
     asyncio.create_task(start_websocket_stream())
     
+    # Start dedicated Options WebSocket stream for real-time gamma updates
+    from app.ingest.options_websocket_stream import start_options_websocket_stream
+    asyncio.create_task(start_options_websocket_stream())
+    
     # Start REST fallback (in case WebSocket fails)
     from app.ingest.rest_fallback import load_cached_snapshots
     asyncio.create_task(load_cached_snapshots())
     
-    log.info("API ready - WebSocket stream + REST fallback starting")
+    log.info("API ready - WebSocket streams (stocks + options) + REST fallback starting")
 
 @app.get("/healthz")
 async def health_check():
@@ -160,13 +164,14 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
     """
     Get gamma exposure levels for symbol.
     Uses OI cache (no REST calls).
+    Works after hours using fallback pricing.
     """
     if symbol not in ("SPX", "NDX", "DJI", "RUT"):
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     from app.state.oi_cache import oi_cache
     
-    current_price = get_latest_price(symbol)
+    current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
     if not current_price:
         raise HTTPException(503, f"No price data for {symbol}")
     
@@ -335,6 +340,7 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     Pin Stability Index (PSI), Zero-Gamma, and Volatility-Adjusted Close Predictor (VACP).
     
     Designed to reduce prediction error from 5-10 points to 1-3 points.
+    Works after hours using fallback pricing from database or Polygon REST API.
     """
     # Validate symbol
     if symbol not in ("SPX", "NDX", "DJI", "RUT"):
@@ -349,8 +355,8 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     }
     ticker = ticker_map[symbol]
     
-    # Get current price
-    current_price = get_latest_price(symbol)
+    # Get current price with fallback for after-hours access
+    current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
     if not current_price:
         raise HTTPException(503, f"No price data for {symbol}")
     
@@ -413,6 +419,7 @@ async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
     
     Returns time-weighted gamma exposure by expiration date, unified gamma walls,
     and an aggregate pin strike based on all near-term expirations.
+    Works after hours using fallback pricing from database or Polygon REST API.
     """
     # Normalize symbol - strip I: prefix if present
     clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
@@ -420,7 +427,7 @@ async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
     if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
-    current_price = get_latest_price(clean_symbol)
+    current_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
     if not current_price:
         raise HTTPException(503, f"No price data for {clean_symbol}")
     
@@ -476,7 +483,7 @@ async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
     if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
-    current_price = get_latest_price(clean_symbol)
+    current_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
     if not current_price:
         raise HTTPException(503, f"No price data for {clean_symbol}")
     
@@ -598,6 +605,7 @@ async def get_market_briefing_endpoint(symbol: str = "SPX"):
     - Trend assessment with reasoning
     - Key support/resistance/magnet levels
     - Overall market sentiment
+    Works after hours using fallback pricing.
     """
     # Normalize symbol
     clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
@@ -605,7 +613,7 @@ async def get_market_briefing_endpoint(symbol: str = "SPX"):
     if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
-    current_price = get_latest_price(clean_symbol)
+    current_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
     if not current_price:
         raise HTTPException(503, f"No price data for {clean_symbol}")
     

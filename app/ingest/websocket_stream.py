@@ -41,12 +41,12 @@ class PolygonWebSocketStream:
         
         while self.running and self.reconnect_count < self.max_reconnects:
             try:
-                # Determine which feed to use (per Massive.com WebSocket quickstart guide)
+                # Determine which feed to use (per Polygon WebSocket documentation)
                 dt_utc = datetime.utcnow()
                 use_realtime = is_regular_hours(dt_utc)
                 
-                feed_type = "real-time (wss://socket.massive.com/stocks)" if use_realtime else "delayed (wss://delayed.massive.com/stocks)"
-                endpoint_url = "wss://socket.massive.com/stocks" if use_realtime else "wss://delayed.massive.com/stocks"
+                feed_type = "real-time (wss://socket.polygon.io/stocks)" if use_realtime else "delayed (wss://delayed.polygon.io/stocks)"
+                endpoint_url = "wss://socket.polygon.io/stocks" if use_realtime else "wss://delayed.polygon.io/stocks"
                 log.info(f"Starting {feed_type} WebSocket feed - {endpoint_url}")
                 
                 # Create client with appropriate feed
@@ -56,7 +56,7 @@ class PolygonWebSocketStream:
                     feed="RealTime" if use_realtime else "Delayed"
                 )
                 
-                # Subscribe to index aggregates and options trades per Massive documentation
+                # Subscribe to index aggregates and options trades per Polygon documentation
                 self.client.subscribe(
                     "A.I:SPX",    # S&P 500 minute aggregates (AM event)
                     "A.I:NDX",    # NASDAQ 100 minute aggregates (AM event)
@@ -69,9 +69,9 @@ class PolygonWebSocketStream:
                 )
                 
                 # Run client with message handler
-                log.info(f"Connecting to Massive WebSocket with {len(self.client._subscriptions) if hasattr(self.client, '_subscriptions') else '8'} subscriptions")
+                log.info(f"Connecting to Polygon WebSocket with {len(self.client._subscriptions) if hasattr(self.client, '_subscriptions') else '8'} subscriptions")
                 await self.client.connect(self.message_handler)
-                log.info("Massive WebSocket connected successfully")
+                log.info("Polygon WebSocket connected successfully")
                 
             except Exception as e:
                 log.error(f"WebSocket error: {e}")

@@ -98,7 +98,7 @@ def reset_session_vwap():
         _vwap_state[symbol] = {"sum_pv": 0.0, "sum_v": 0.0}
 
 def get_latest_price(symbol: str) -> Optional[float]:
-    """Get latest price for symbol"""
+    """Get latest price for symbol from ring buffer only"""
     ring = INDEX_RINGS.get(symbol)
     if ring:
         latest = ring.latest()
@@ -107,4 +107,51 @@ def get_latest_price(symbol: str) -> Optional[float]:
             if isinstance(tick, IndexTick):
                 return tick.price
             return tick  # Fallback for raw float
+    return None
+
+def get_latest_price_with_fallback(symbol: str, api_key: str = None) -> Optional[float]:
+    """
+    Get latest price for symbol with fallback sources for after-hours access.
+    
+    Priority:
+    1. Ring buffer (real-time WebSocket data)
+    2. Database (last gamma snapshot spot price)
+    3. Polygon REST API (previous close)
+    
+    This ensures EOD data is available after hours for premium subscribers.
+    """
+    # Try ring buffer first (fastest, real-time)
+    price = get_latest_price(symbol)
+    if price is not None:
+        return price
+    
+    # Fallback 1: Database - get last known spot price from gamma snapshot
+    try:
+        from database import get_latest_gamma_snapshot
+        snapshot = get_latest_gamma_snapshot(symbol)
+        if snapshot and snapshot.spot_price:
+            return float(snapshot.spot_price)
+    except Exception as e:
+        import logging
+        logging.getLogger("ring_buffers").warning(f"Database fallback failed for {symbol}: {e}")
+    
+    # Fallback 2: Polygon REST API - get previous close
+    if api_key:
+        try:
+            from polygon import RESTClient
+            client = RESTClient(api_key)
+            
+            # Try to get the previous day's close for indices
+            ticker = f"I:{symbol}"
+            
+            # Use previous close from snapshot endpoint
+            response = client.get_previous_close(ticker)
+            if response and hasattr(response, 'results') and response.results:
+                result = response.results[0]
+                if hasattr(result, 'close') and result.close:
+                    return float(result.close)
+        except Exception as e:
+            import logging
+            logging.getLogger("ring_buffers").warning(f"Polygon REST fallback failed for {symbol}: {e}")
+    
     return None

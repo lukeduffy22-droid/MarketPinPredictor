@@ -261,11 +261,9 @@ def get_historical_gamma_snapshot(ticker, trading_date):
 def calculate_gex(api_key, ticker, spot_price):
     """Calculate real Gamma Exposure (GEX) for options using gamma analysis"""
     try:
-        # Use the real gamma analysis from options_gamma module
         gex_analysis = get_gamma_analysis(api_key, ticker, spot_price)
         
-        if gex_analysis:
-            # Convert to the expected format for the app
+        if gex_analysis and not gex_analysis.get('data_unavailable', False):
             gex_levels = {
                 'total_gex': gex_analysis['total_gex'],
                 'net_gex': gex_analysis['net_gex'],
@@ -277,10 +275,10 @@ def calculate_gex(api_key, ticker, spot_price):
                 'summary': gex_analysis['summary'],
                 'gamma_walls': gex_analysis['gamma_walls'],
                 'gex_by_strike': gex_analysis['gex_by_strike'],
-                'is_mock_data': gex_analysis.get('is_mock_data', True)  # Flag for mock data
+                'is_mock_data': gex_analysis.get('is_mock_data', False),
+                'is_cached_data': gex_analysis.get('is_cached_data', False)
             }
             
-            # Add key support/resistance levels from gamma walls
             if not gex_analysis['gamma_walls'].empty:
                 key_levels = gex_analysis['gamma_walls']['strike'].tolist()[:3]
             else:
@@ -289,8 +287,22 @@ def calculate_gex(api_key, ticker, spot_price):
             gex_levels['key_levels'] = key_levels
             
             return gex_levels
+        elif gex_analysis and gex_analysis.get('data_unavailable', False):
+            return {
+                'total_gex': 0,
+                'net_gex': 0,
+                'pin_strike': spot_price,
+                'pin_expiry': datetime.now(),
+                'zero_gamma': spot_price,
+                'direction': 'at',
+                'pull_strength': 0,
+                'summary': gex_analysis.get('summary', 'Gamma data temporarily unavailable'),
+                'key_levels': [spot_price * 0.98, spot_price * 1.02],
+                'is_mock_data': False,
+                'data_unavailable': True,
+                'error_message': gex_analysis.get('error_message', 'Real gamma data not available')
+            }
         else:
-            # Fallback to simple calculation if real data not available
             return {
                 'total_gex': 0,
                 'net_gex': 0,
@@ -300,7 +312,9 @@ def calculate_gex(api_key, ticker, spot_price):
                 'direction': 'at',
                 'pull_strength': 0,
                 'summary': 'Gamma data unavailable',
-                'key_levels': [spot_price * 0.98, spot_price * 1.02]
+                'key_levels': [spot_price * 0.98, spot_price * 1.02],
+                'is_mock_data': False,
+                'data_unavailable': True
             }
     except Exception as e:
         st.warning(f"Could not calculate GEX: {str(e)}")
@@ -1821,12 +1835,17 @@ else:
                         else:
                             st.warning(f"⚠️ No gamma data found for {pred['ticker']} on {st.session_state.backtest_date}")
                     
-                    # WARNING: Display prominent banner if using mock data
-                    if gex.get('is_mock_data', True):
+                    if gex.get('data_unavailable', False):
+                        st.info(
+                            "ℹ️ **Gamma Data Temporarily Unavailable** - "
+                            + gex.get('error_message', 'Real-time data will be available during next market session.')
+                        )
+                    elif gex.get('is_cached_data', False):
+                        st.info("📊 **Using Cached EOD Data** - Showing last available real market data.")
+                    elif gex.get('is_mock_data', False):
                         st.warning(
                             "⚠️ **SIMULATED GAMMA DATA** - Using estimated options data. "
-                            "Real open interest and implied volatility require a higher Polygon API tier. "
-                            "Gamma pins and exposure levels shown are for demonstration only and may not reflect actual market dynamics."
+                            "This should not appear with a premium Polygon subscription. Please check your API key."
                         )
                     
                     # Main gamma pin information
@@ -1934,10 +1953,12 @@ else:
                                         hide_index=True
                                     )
                                 
-                                if multi_data.get('is_mock_data'):
-                                    st.caption("⚠️ Using simulated options data")
+                                if multi_data.get('data_unavailable'):
+                                    st.caption("ℹ️ " + multi_data.get('error_message', 'Data temporarily unavailable'))
+                                elif multi_data.get('is_mock_data'):
+                                    st.caption("⚠️ Using simulated options data (should not appear with premium API)")
                             else:
-                                st.warning("Multi-expiry gamma data not available")
+                                st.info("Multi-expiry gamma data not available")
                         
                         except Exception as e:
                             st.info(f"Multi-expiry analysis unavailable: {str(e)[:50]}")
