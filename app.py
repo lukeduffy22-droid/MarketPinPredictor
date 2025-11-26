@@ -1945,49 +1945,82 @@ else:
                     if 'gex_by_strike' in gex and not gex['gex_by_strike'].empty:
                         import plotly.graph_objects as go
                         
-                        gex_df = gex['gex_by_strike']
+                        gex_df = gex['gex_by_strike'].copy()
+                        current_price = pred.get('current_price', 0)
+                        pin_strike = gex.get('pin_strike', current_price)
                         
-                        # Create bar chart showing gamma exposure by strike
+                        # Focus on strikes within ±10% of current price for clarity
+                        price_range = max(current_price * 0.1, 50)  # At least $50 range
+                        filtered_df = gex_df[
+                            (gex_df['strike'] >= current_price - price_range) &
+                            (gex_df['strike'] <= current_price + price_range)
+                        ].copy()
+                        
+                        # If filtered data is empty, use closest 15 strikes to current price
+                        if filtered_df.empty:
+                            filtered_df = gex_df.iloc[(gex_df['strike'] - current_price).abs().argsort()[:15]].copy()
+                        
+                        # Create bar chart with optimized spacing
                         fig_gex = go.Figure()
                         
-                        # Add net GEX bars
+                        # Add net GEX bars with better labels
                         fig_gex.add_trace(go.Bar(
-                            x=gex_df['strike'],
-                            y=gex_df['net_gex'],
+                            x=filtered_df['strike'],
+                            y=filtered_df['net_gex'],
                             name='Net GEX',
-                            marker_color=['green' if x > 0 else 'red' for x in gex_df['net_gex']],
-                            text=[f"${abs(x):.1f}B" for x in gex_df['net_gex']],
-                            textposition='outside'
+                            marker_color=['green' if x > 0 else 'red' for x in filtered_df['net_gex']],
+                            text=[f"${s:.0f}\n${abs(g):.2f}B" for s, g in zip(filtered_df['strike'], filtered_df['net_gex'])],
+                            textposition='outside',
+                            hovertemplate='<b>Strike: $%{x:.0f}</b><br>Net GEX: %{y:.3f}B<extra></extra>'
                         ))
                         
-                        # Add current price line
-                        if 'current_price' in pred:
-                            fig_gex.add_vline(
-                                x=pred['current_price'],
-                                line_dash="dash",
-                                line_color="blue",
-                                annotation_text=f"Current: ${pred['current_price']:.0f}"
-                            )
-                        
-                        # Add pin strike line
-                        if 'pin_strike' in gex:
-                            fig_gex.add_vline(
-                                x=gex['pin_strike'],
-                                line_dash="solid",
-                                line_color="orange",
-                                line_width=2,
-                                annotation_text=f"Pin: ${gex['pin_strike']:.0f}"
-                            )
-                        
-                        fig_gex.update_layout(
-                            title="Gamma Exposure by Strike Price",
-                            xaxis_title="Strike Price",
-                            yaxis_title="Net Gamma Exposure (Billions)",
-                            showlegend=False,
-                            height=300
+                        # Add current price line with annotation box
+                        fig_gex.add_vline(
+                            x=current_price,
+                            line_dash="dash",
+                            line_color="blue",
+                            line_width=2,
+                            annotation_text="CURRENT",
+                            annotation_position="top left",
+                            annotation_font=dict(color="blue", size=11),
+                            name="Current Price"
                         )
                         
-                        st.plotly_chart(fig_gex, width='stretch')
+                        # Add pin strike line with annotation box
+                        fig_gex.add_vline(
+                            x=pin_strike,
+                            line_dash="solid",
+                            line_color="orange",
+                            line_width=2,
+                            annotation_text="PIN",
+                            annotation_position="top right",
+                            annotation_font=dict(color="orange", size=11),
+                            name="Pin Strike"
+                        )
+                        
+                        fig_gex.update_layout(
+                            title=f"Gamma Exposure (±${price_range:.0f} around ${current_price:.0f})",
+                            xaxis_title="Strike Price ($)",
+                            yaxis_title="Net Gamma Exposure (Billions $)",
+                            showlegend=False,
+                            height=450,
+                            margin=dict(b=100, t=80, l=80, r=80),
+                            xaxis=dict(
+                                showgrid=True,
+                                gridwidth=1,
+                                gridcolor='lightgray',
+                                tickformat='$,.0f'
+                            ),
+                            yaxis=dict(
+                                showgrid=True,
+                                gridwidth=1,
+                                gridcolor='lightgray'
+                            ),
+                            hovermode='x unified',
+                            font=dict(size=11)
+                        )
+                        
+                        st.plotly_chart(fig_gex, use_container_width=True)
                     
                     if 'summary' in gex:
                         st.info(f"💡 {gex['summary']}")

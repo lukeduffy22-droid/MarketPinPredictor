@@ -8,6 +8,10 @@ import numpy as np
 from datetime import datetime, timedelta
 from scipy.stats import norm
 from polygon import RESTClient
+import requests
+import time
+import pytz
+from database import get_latest_gamma_snapshot
 
 def black_scholes_gamma(S, K, T, r, sigma):
     """
