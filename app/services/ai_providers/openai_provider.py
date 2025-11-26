@@ -94,7 +94,8 @@ class OpenAIProvider(BaseAIProvider):
         vwap_deviation: float,
         microtrend: float,
         minutes_to_close: int,
-        historical_accuracy: Optional[float] = None
+        historical_accuracy: Optional[float] = None,
+        historical_accuracy_data: Optional[Dict[str, Any]] = None
     ) -> PredictionCritique:
         """Analyze and critique an EOD prediction using OpenAI."""
         
@@ -102,6 +103,36 @@ class OpenAIProvider(BaseAIProvider):
         gamma_summary = self._format_gamma_for_prompt(gamma_data)
         predicted_move = predicted_eod - current_price
         predicted_pct = (predicted_move / current_price) * 100
+        
+        # Build historical accuracy context
+        accuracy_context = ""
+        if historical_accuracy_data and historical_accuracy_data.get('sample_size', 0) > 0:
+            avg_acc = historical_accuracy_data.get('avg_accuracy')
+            avg_err = historical_accuracy_data.get('avg_error_pct', 0)
+            bias = historical_accuracy_data.get('bias', 'unknown')
+            consistency = historical_accuracy_data.get('consistency', 'unknown')
+            
+            accuracy_context = f"""
+HISTORICAL MODEL PERFORMANCE ({historical_accuracy_data['sample_size']} past predictions):
+- Average Accuracy: {avg_acc:.1f}% (if available)
+- Prediction Bias: {bias.replace('_', ' ').title()}
+- Consistency: {consistency.replace('_', ' ').title()}
+- Average Error: {avg_err:+.2f}%
+""" if avg_acc else f"""
+HISTORICAL MODEL PERFORMANCE ({historical_accuracy_data['sample_size']} past predictions):
+- Prediction Bias: {bias.replace('_', ' ').title()}
+- Consistency: {consistency.replace('_', ' ').title()}
+- Average Error: {avg_err:+.2f}%
+"""
+            recent_preds = historical_accuracy_data.get('recent_predictions', [])
+            if recent_preds:
+                valid_recent = [p for p in recent_preds if p.get('accuracy') is not None]
+                if valid_recent:
+                    accuracy_context += f"\nLast {len(valid_recent)} Prediction{'s' if len(valid_recent) > 1 else ''}:\n"
+                    for p in valid_recent[:3]:
+                        accuracy_context += f"  - Predicted: {p['predicted']:.2f}, Actual: {p['actual']:.2f}, Accuracy: {p['accuracy']:.1f}%\n"
+        elif historical_accuracy is not None:
+            accuracy_context = f"\n- Historical Model Accuracy: {historical_accuracy:.1f}%\n"
         
         prompt = f"""You are an expert quantitative analyst reviewing an end-of-day stock index prediction.
 
@@ -111,16 +142,15 @@ CURRENT MARKET DATA for {symbol}:
 - Minutes to Close: {minutes_to_close}
 - VWAP Deviation: {vwap_deviation:+.2f} pts
 - Microtrend (5-min slope): {microtrend:+.4f}
-{f'- Historical Model Accuracy: {historical_accuracy:.1f}%' if historical_accuracy else ''}
-
+{accuracy_context}
 GAMMA EXPOSURE ANALYSIS:
 {gamma_summary}
 
 TASK: Analyze this prediction and provide:
 1. Whether the prediction seems reasonable given the gamma positioning
-2. Any adjustments you would make (if any)
+2. Any adjustments you would make (if any) - consider historical bias when adjusting
 3. Key risk factors
-4. A confidence score (0.0 to 1.0)
+4. A confidence score (0.0 to 1.0) - adjust based on historical accuracy
 
 Respond in JSON format:
 {{

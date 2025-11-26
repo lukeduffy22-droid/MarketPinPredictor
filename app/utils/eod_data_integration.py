@@ -294,6 +294,7 @@ async def get_ai_enhanced_prediction(
     try:
         # Import here to avoid circular imports
         from app.services.ai_service import get_ai_service
+        from database import get_historical_accuracy_for_ai
         
         ai_service = get_ai_service()
         
@@ -310,6 +311,18 @@ async def get_ai_enhanced_prediction(
                 ai_available=False
             )
         
+        # Fetch rich historical accuracy data for AI context
+        historical_accuracy_data = None
+        try:
+            historical_accuracy_data = get_historical_accuracy_for_ai(ticker)
+            # Only update historical_accuracy if we got a valid average
+            if historical_accuracy_data:
+                avg_acc = historical_accuracy_data.get('avg_accuracy')
+                if avg_acc is not None and avg_acc > 0:
+                    historical_accuracy = avg_acc
+        except Exception as e:
+            print(f"Warning: Could not fetch historical accuracy data: {e}")
+        
         # Get AI critique of the prediction
         critique = await ai_service.analyze_prediction(
             symbol=ticker,
@@ -319,7 +332,8 @@ async def get_ai_enhanced_prediction(
             vwap_deviation=vwap_deviation,
             microtrend=microtrend,
             minutes_to_close=minutes_to_close,
-            historical_accuracy=historical_accuracy
+            historical_accuracy=historical_accuracy,
+            historical_accuracy_data=historical_accuracy_data
         )
         
         if critique is None:

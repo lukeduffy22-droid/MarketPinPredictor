@@ -250,6 +250,167 @@ def get_prediction_accuracy_stats(ticker=None):
     finally:
         db.close()
 
+def get_historical_accuracy_for_ai(ticker, model_type=None, limit=20):
+    """
+    Get historical prediction accuracy data to feed to AI for better predictions.
+    
+    This provides the AI with insight into how accurate past predictions were,
+    helping it calibrate its adjustments more effectively.
+    
+    Args:
+        ticker: Stock ticker (e.g., 'SPX')
+        model_type: Optional filter by model type (e.g., 'time_adaptive', 'random_forest')
+        limit: Maximum number of recent predictions to analyze
+        
+    Returns:
+        dict with:
+            - avg_accuracy: Average accuracy percentage (0-100)
+            - recent_predictions: List of recent prediction details
+            - bias: Whether predictions tend to be high or low
+            - consistency: How consistent the accuracy is
+    """
+    db = SessionLocal()
+    try:
+        query = db.query(Prediction).filter(
+            Prediction.ticker == ticker,
+            Prediction.actual_price.isnot(None),
+            Prediction.accuracy.isnot(None)
+        )
+        
+        if model_type:
+            query = query.filter(Prediction.model_type == model_type)
+        
+        predictions = query.order_by(Prediction.prediction_date.desc()).limit(limit).all()
+        
+        if not predictions:
+            return {
+                'avg_accuracy': None,
+                'recent_predictions': [],
+                'bias': 'unknown',
+                'consistency': 'unknown',
+                'sample_size': 0
+            }
+        
+        accuracies = [p.accuracy for p in predictions if p.accuracy is not None]
+        
+        errors = []
+        for p in predictions:
+            if p.predicted_price and p.actual_price:
+                error_pct = ((p.predicted_price - p.actual_price) / p.actual_price) * 100
+                errors.append(error_pct)
+        
+        avg_error = sum(errors) / len(errors) if errors else 0
+        if avg_error > 0.1:
+            bias = 'bullish_bias'
+        elif avg_error < -0.1:
+            bias = 'bearish_bias'
+        else:
+            bias = 'neutral'
+        
+        if accuracies:
+            accuracy_std = (sum((a - (sum(accuracies)/len(accuracies)))**2 for a in accuracies) / len(accuracies)) ** 0.5
+            if accuracy_std < 5:
+                consistency = 'highly_consistent'
+            elif accuracy_std < 15:
+                consistency = 'moderately_consistent'
+            else:
+                consistency = 'variable'
+        else:
+            consistency = 'unknown'
+        
+        recent_predictions = []
+        for p in predictions[:10]:
+            recent_predictions.append({
+                'date': p.prediction_date.isoformat() if p.prediction_date else None,
+                'predicted': p.predicted_price,
+                'actual': p.actual_price,
+                'accuracy': p.accuracy,
+                'error_pct': ((p.predicted_price - p.actual_price) / p.actual_price * 100) if p.actual_price else None
+            })
+        
+        return {
+            'avg_accuracy': sum(accuracies) / len(accuracies) if accuracies else None,
+            'recent_predictions': recent_predictions,
+            'bias': bias,
+            'consistency': consistency,
+            'sample_size': len(predictions),
+            'avg_error_pct': avg_error
+        }
+    finally:
+        db.close()
+
+def get_predictions_needing_actuals(limit=100):
+    """
+    Find predictions that need actual EOD prices populated.
+    
+    Returns predictions where:
+    - target_date has passed
+    - actual_price is still NULL
+    
+    Args:
+        limit: Maximum number of predictions to return
+        
+    Returns:
+        List of Prediction objects needing actuals
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        predictions = db.query(Prediction).filter(
+            Prediction.actual_price.is_(None),
+            Prediction.target_date <= now
+        ).order_by(Prediction.target_date.desc()).limit(limit).all()
+        return predictions
+    finally:
+        db.close()
+
+def batch_update_prediction_actuals(updates):
+    """
+    Batch update multiple predictions with their actual prices.
+    
+    Args:
+        updates: List of dicts with {'prediction_id': int, 'actual_price': float}
+        
+    Returns:
+        dict with 'updated' count and 'errors' list
+    """
+    db = SessionLocal()
+    results = {'updated': 0, 'errors': []}
+    
+    try:
+        for update in updates:
+            try:
+                prediction = db.query(Prediction).filter(
+                    Prediction.id == update['prediction_id']
+                ).first()
+                
+                if prediction and update.get('actual_price'):
+                    prediction.actual_price = update['actual_price']
+                    prediction.actual_change_pct = (
+                        (update['actual_price'] - prediction.current_price) / 
+                        prediction.current_price * 100
+                    )
+                    mape = abs(
+                        (update['actual_price'] - prediction.predicted_price) / 
+                        update['actual_price']
+                    ) * 100
+                    prediction.accuracy = max(0, 100 - mape)
+                    results['updated'] += 1
+            except Exception as e:
+                results['errors'].append({
+                    'prediction_id': update.get('prediction_id'),
+                    'error': str(e)
+                })
+        
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        results['errors'].append({'batch_error': str(e)})
+    finally:
+        db.close()
+    
+    return results
+
 def round_to_15min(dt):
     """
     Round datetime to nearest 15-minute boundary in US/Eastern timezone.

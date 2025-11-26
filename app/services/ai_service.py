@@ -107,7 +107,8 @@ class AIService:
         vwap_deviation: float = 0.0,
         microtrend: float = 0.0,
         minutes_to_close: int = 0,
-        historical_accuracy: Optional[float] = None
+        historical_accuracy: Optional[float] = None,
+        historical_accuracy_data: Optional[Dict[str, Any]] = None
     ) -> Optional[PredictionCritique]:
         """
         Analyze and critique an EOD prediction using AI.
@@ -120,7 +121,8 @@ class AIService:
             vwap_deviation: Current VWAP deviation
             microtrend: Recent price trend slope
             minutes_to_close: Minutes until market close
-            historical_accuracy: Optional historical model accuracy
+            historical_accuracy: Optional historical model accuracy (legacy)
+            historical_accuracy_data: Rich historical accuracy data from database
             
         Returns:
             PredictionCritique with analysis and adjusted prediction,
@@ -139,7 +141,8 @@ class AIService:
                 vwap_deviation=vwap_deviation,
                 microtrend=microtrend,
                 minutes_to_close=minutes_to_close,
-                historical_accuracy=historical_accuracy
+                historical_accuracy=historical_accuracy,
+                historical_accuracy_data=historical_accuracy_data
             )
         except Exception as e:
             log.error(f"AI prediction analysis error: {e}")

@@ -55,7 +55,8 @@ class BaseAIProvider(ABC):
         vwap_deviation: float,
         microtrend: float,
         minutes_to_close: int,
-        historical_accuracy: Optional[float] = None
+        historical_accuracy: Optional[float] = None,
+        historical_accuracy_data: Optional[Dict[str, Any]] = None
     ) -> PredictionCritique:
         """
         Analyze and critique an EOD prediction.
@@ -68,7 +69,9 @@ class BaseAIProvider(ABC):
             vwap_deviation: Current VWAP deviation
             microtrend: Recent price trend slope
             minutes_to_close: Minutes until market close
-            historical_accuracy: Optional historical model accuracy
+            historical_accuracy: Optional historical model accuracy (legacy)
+            historical_accuracy_data: Rich historical accuracy data from database
+                including bias, consistency, and recent prediction details
             
         Returns:
             PredictionCritique with analysis and adjusted prediction
