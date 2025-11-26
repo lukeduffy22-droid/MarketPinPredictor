@@ -356,12 +356,54 @@ def calculate_gamma_exposure(options_df, spot_price):
     gex_by_strike_sorted['cumulative_gex'] = gex_by_strike_sorted['net_gex'].cumsum()
     
     # Find zero gamma level (where cumulative GEX crosses zero)
+    # Look for sign changes in cumulative GEX
     positive_to_negative = gex_by_strike_sorted[
         (gex_by_strike_sorted['cumulative_gex'].shift(1) > 0) & 
         (gex_by_strike_sorted['cumulative_gex'] <= 0)
     ]
     
-    zero_gamma_level = positive_to_negative['strike'].iloc[0] if not positive_to_negative.empty else spot_price
+    negative_to_positive = gex_by_strike_sorted[
+        (gex_by_strike_sorted['cumulative_gex'].shift(1) < 0) & 
+        (gex_by_strike_sorted['cumulative_gex'] >= 0)
+    ]
+    
+    # Get all available strikes from the options chain
+    available_strikes = sorted(gex_by_strike['strike'].unique())
+    
+    # Find zero gamma crossing point
+    zero_gamma_raw = None
+    if not positive_to_negative.empty:
+        zero_gamma_raw = positive_to_negative['strike'].iloc[0]
+    elif not negative_to_positive.empty:
+        zero_gamma_raw = negative_to_positive['strike'].iloc[0]
+    
+    # Snap to nearest VALID strike price
+    if zero_gamma_raw is not None and available_strikes:
+        # Find the nearest actual strike
+        zero_gamma_level = min(available_strikes, key=lambda x: abs(x - zero_gamma_raw))
+        
+        # Validate: zero gamma should be within ±15% of spot price to be meaningful
+        if abs(zero_gamma_level - spot_price) / spot_price > 0.15:
+            # If too far from spot, find the nearest strike to spot that has meaningful GEX
+            nearby_strikes = [s for s in available_strikes 
+                            if abs(s - spot_price) / spot_price <= 0.15]
+            if nearby_strikes:
+                # Pick the strike closest to where cumulative GEX is smallest (near zero)
+                strike_gex = gex_by_strike_sorted.set_index('strike')['cumulative_gex']
+                valid_nearby = [s for s in nearby_strikes if s in strike_gex.index]
+                if valid_nearby:
+                    zero_gamma_level = min(valid_nearby, key=lambda s: abs(strike_gex[s]))
+                else:
+                    zero_gamma_level = min(nearby_strikes, key=lambda x: abs(x - spot_price))
+            else:
+                # No nearby strikes, use the one closest to spot
+                zero_gamma_level = min(available_strikes, key=lambda x: abs(x - spot_price))
+    else:
+        # Fallback: use nearest strike to spot price
+        if available_strikes:
+            zero_gamma_level = min(available_strikes, key=lambda x: abs(x - spot_price))
+        else:
+            zero_gamma_level = spot_price
     
     return {
         'pin_strike': pin_strike,
@@ -387,6 +429,9 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
     - time_weights: Weights applied to each expiration
     
     Uses vectorized pandas operations for performance.
+    
+    IMPORTANT: Filters strikes to reasonable moneyness range (±20% for 0-DTE, 
+    ±25% for longer DTE) to avoid far OTM strikes with near-zero gamma dominating.
     """
     if options_df.empty:
         return None
@@ -395,6 +440,19 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
     
     # Filter to max DTE
     near_term_df = options_df[options_df['days_to_expiry'] <= max_dte].copy()
+    
+    if near_term_df.empty:
+        return None
+    
+    # Filter to strikes within reasonable moneyness range
+    # Tighter range for 0-DTE (±15%), wider for longer DTE (±25%)
+    min_strike = spot_price * 0.75  # 25% below spot
+    max_strike = spot_price * 1.25  # 25% above spot
+    
+    near_term_df = near_term_df[
+        (near_term_df['strike'] >= min_strike) & 
+        (near_term_df['strike'] <= max_strike)
+    ].copy()
     
     if near_term_df.empty:
         return None
@@ -433,6 +491,8 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
     gamma_by_expiry = {}
     all_weighted_strikes = []
     
+    MIN_GEX_THRESHOLD = 0.001  # Minimum GEX in billions to be considered meaningful
+    
     for dte in expiry_days:
         dte_df = near_term_df[near_term_df['days_to_expiry'] == dte]
         
@@ -445,6 +505,9 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
         }).reset_index()
         
         gex_by_strike.columns = ['strike', 'net_gex', 'total_gex', 'expiry', 'days_to_expiry']
+        
+        # Filter out strikes with near-zero GEX BEFORE any further processing
+        gex_by_strike = gex_by_strike[gex_by_strike['total_gex'].abs() > MIN_GEX_THRESHOLD]
         
         # Find pin for this expiry
         if not gex_by_strike.empty:
@@ -461,29 +524,49 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
             if not nearby_strikes.empty:
                 pin_row = nearby_strikes.loc[nearby_strikes['total_gex'].idxmax()]
             else:
-                pin_row = gex_by_strike.loc[gex_by_strike['total_gex'].idxmax()]
+                # No nearby strikes - skip this expiry as it has no meaningful gamma
+                continue
+            
+            # Skip expirations with essentially zero GEX (< 0.001B threshold)
+            # This filters out far OTM options with near-zero gamma
+            MIN_GEX_THRESHOLD = 0.001  # Minimum GEX in billions to be considered valid
+            if float(pin_row['total_gex']) < MIN_GEX_THRESHOLD:
+                print(f"Skipping DTE {dte}: GEX {pin_row['total_gex']:.2e}B is below threshold")
+                continue
+            
+            # Validate pin strike is within reasonable range of spot
+            pin_strike_value = float(pin_row['strike'])
+            if abs(pin_strike_value - spot_price) / spot_price > 0.15:
+                print(f"Skipping DTE {dte}: pin strike ${pin_strike_value:.0f} is >15% from spot ${spot_price:.0f}")
+                continue
             
             weight = time_weights.get(int(dte), 0.05)
             
+            # Get top walls (already filtered to meaningful GEX)
+            top_walls = gex_by_strike.nlargest(3, 'total_gex')[['strike', 'net_gex', 'total_gex']].to_dict('records')
+            
             gamma_by_expiry[int(dte)] = {
-                'pin_strike': float(pin_row['strike']),
+                'pin_strike': pin_strike_value,
                 'total_gex': float(pin_row['total_gex']),
                 'net_gex': float(pin_row['net_gex']),
                 'weight': weight,
                 'weighted_gex': float(pin_row['total_gex']) * weight,
                 'expiry_date': pin_row['expiry'].strftime('%Y-%m-%d') if hasattr(pin_row['expiry'], 'strftime') else str(pin_row['expiry']),
-                'top_walls': gex_by_strike.nlargest(3, 'total_gex')[['strike', 'net_gex', 'total_gex']].to_dict('records')
+                'top_walls': top_walls
             }
             
-            # Add weighted strikes for unified wall calculation
+            # Add weighted strikes for unified wall calculation (only meaningful GEX)
             for _, row in gex_by_strike.iterrows():
-                all_weighted_strikes.append({
-                    'strike': row['strike'],
-                    'net_gex': row['net_gex'] * weight,
-                    'total_gex': row['total_gex'] * weight,
-                    'days_to_expiry': int(dte),
-                    'weight': weight
-                })
+                # Only add strikes with meaningful weighted GEX
+                weighted_gex = row['total_gex'] * weight
+                if weighted_gex > MIN_GEX_THRESHOLD:
+                    all_weighted_strikes.append({
+                        'strike': row['strike'],
+                        'net_gex': row['net_gex'] * weight,
+                        'total_gex': weighted_gex,
+                        'days_to_expiry': int(dte),
+                        'weight': weight
+                    })
     
     # Calculate unified gamma walls (weighted across all expirations)
     if all_weighted_strikes:

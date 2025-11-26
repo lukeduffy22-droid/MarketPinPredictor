@@ -1966,13 +1966,16 @@ else:
                                     help="Pin strike weighted across all near-term expirations"
                                 )
                                 
-                                # Display gamma by expiration
-                                st.write("**Gamma Exposure by Expiration:**")
-                                
+                                # Display gamma by expiration (only DTEs with meaningful GEX)
                                 gamma_by_exp = multi_data.get('gamma_by_expiry', {})
-                                if gamma_by_exp:
+                                # Filter to only show DTEs with meaningful GEX (> 0.001B)
+                                meaningful_exp = {k: v for k, v in gamma_by_exp.items() 
+                                                 if v.get('total_gex', 0) > 0.001}
+                                
+                                if meaningful_exp:
+                                    st.write("**Gamma Exposure by Expiration:**")
                                     exp_data = []
-                                    for dte, data in sorted(gamma_by_exp.items(), key=lambda x: int(x[0])):
+                                    for dte, data in sorted(meaningful_exp.items(), key=lambda x: int(x[0])):
                                         dte_label = "0-DTE (Today)" if int(dte) == 0 else f"{dte}-DTE"
                                         exp_data.append({
                                             'Expiration': dte_label,
@@ -1987,14 +1990,18 @@ else:
                                         width='stretch',
                                         hide_index=True
                                     )
+                                else:
+                                    st.caption("ℹ️ No significant gamma exposure for future expirations")
                                 
-                                # Display unified walls
+                                # Display unified walls (filter out near-zero GEX)
                                 unified_walls = multi_data.get('unified_walls', [])
-                                if unified_walls:
+                                # Only show walls with meaningful GEX (> 0.001B)
+                                meaningful_walls = [w for w in unified_walls if w.get('weighted_total_gex', 0) > 0.001]
+                                if meaningful_walls:
                                     st.write("**Unified Gamma Walls (All Expirations):**")
                                     
                                     walls_data = []
-                                    for wall in unified_walls[:5]:
+                                    for wall in meaningful_walls[:5]:
                                         exp_list = wall.get('expirations', [])
                                         exp_str = ', '.join([f"{e}d" for e in sorted(exp_list)])
                                         walls_data.append({
@@ -2009,6 +2016,8 @@ else:
                                         width='stretch',
                                         hide_index=True
                                     )
+                                elif unified_walls:
+                                    st.caption("ℹ️ No significant gamma walls detected for this period")
                                 
                                 if multi_data.get('data_unavailable'):
                                     st.caption("ℹ️ " + multi_data.get('error_message', 'Data temporarily unavailable'))
@@ -2028,78 +2037,84 @@ else:
                         current_price = pred.get('current_price', 0)
                         pin_strike = gex.get('pin_strike', current_price)
                         
-                        # Focus on strikes within ±10% of current price for clarity
-                        price_range = max(current_price * 0.1, 50)  # At least $50 range
-                        filtered_df = gex_df[
-                            (gex_df['strike'] >= current_price - price_range) &
-                            (gex_df['strike'] <= current_price + price_range)
-                        ].copy()
+                        # Filter out near-zero GEX values (< 0.001B threshold)
+                        gex_df = gex_df[gex_df['total_gex'].abs() > 0.001].copy()
                         
-                        # If filtered data is empty, use closest 15 strikes to current price
-                        if filtered_df.empty:
-                            filtered_df = gex_df.iloc[(gex_df['strike'] - current_price).abs().argsort()[:15]].copy()
-                        
-                        # Create bar chart with optimized spacing
-                        fig_gex = go.Figure()
-                        
-                        # Add net GEX bars with better labels
-                        fig_gex.add_trace(go.Bar(
-                            x=filtered_df['strike'],
-                            y=filtered_df['net_gex'],
-                            name='Net GEX',
-                            marker_color=['green' if x > 0 else 'red' for x in filtered_df['net_gex']],
-                            text=[f"${s:.0f}\n${abs(g):.2f}B" for s, g in zip(filtered_df['strike'], filtered_df['net_gex'])],
-                            textposition='outside',
-                            hovertemplate='<b>Strike: $%{x:.0f}</b><br>Net GEX: %{y:.3f}B<extra></extra>'
-                        ))
-                        
-                        # Add current price line with annotation box
-                        fig_gex.add_vline(
-                            x=current_price,
-                            line_dash="dash",
-                            line_color="blue",
-                            line_width=2,
-                            annotation_text="CURRENT",
-                            annotation_position="top left",
-                            annotation_font=dict(color="blue", size=11),
-                            name="Current Price"
-                        )
-                        
-                        # Add pin strike line with annotation box
-                        fig_gex.add_vline(
-                            x=pin_strike,
-                            line_dash="solid",
-                            line_color="orange",
-                            line_width=2,
-                            annotation_text="PIN",
-                            annotation_position="top right",
-                            annotation_font=dict(color="orange", size=11),
-                            name="Pin Strike"
-                        )
-                        
-                        fig_gex.update_layout(
-                            title=f"Gamma Exposure (±${price_range:.0f} around ${current_price:.0f})",
-                            xaxis_title="Strike Price ($)",
-                            yaxis_title="Net Gamma Exposure (Billions $)",
-                            showlegend=False,
-                            height=450,
-                            margin=dict(b=100, t=80, l=80, r=80),
-                            xaxis=dict(
-                                showgrid=True,
-                                gridwidth=1,
-                                gridcolor='lightgray',
-                                tickformat='$,.0f'
-                            ),
-                            yaxis=dict(
-                                showgrid=True,
-                                gridwidth=1,
-                                gridcolor='lightgray'
-                            ),
-                            hovermode='x unified',
-                            font=dict(size=11)
-                        )
-                        
-                        st.plotly_chart(fig_gex, use_container_width=True)
+                        if gex_df.empty:
+                            st.caption("ℹ️ No significant gamma exposure at nearby strikes")
+                        else:
+                            # Focus on strikes within ±10% of current price for clarity
+                            price_range = max(current_price * 0.1, 50)  # At least $50 range
+                            filtered_df = gex_df[
+                                (gex_df['strike'] >= current_price - price_range) &
+                                (gex_df['strike'] <= current_price + price_range)
+                            ].copy()
+                            
+                            # If filtered data is empty, use closest 15 strikes to current price
+                            if filtered_df.empty:
+                                filtered_df = gex_df.iloc[(gex_df['strike'] - current_price).abs().argsort()[:15]].copy()
+                            
+                            # Create bar chart with optimized spacing
+                            fig_gex = go.Figure()
+                            
+                            # Add net GEX bars with better labels
+                            fig_gex.add_trace(go.Bar(
+                                x=filtered_df['strike'],
+                                y=filtered_df['net_gex'],
+                                name='Net GEX',
+                                marker_color=['green' if x > 0 else 'red' for x in filtered_df['net_gex']],
+                                text=[f"${s:.0f}\n${abs(g):.2f}B" for s, g in zip(filtered_df['strike'], filtered_df['net_gex'])],
+                                textposition='outside',
+                                hovertemplate='<b>Strike: $%{x:.0f}</b><br>Net GEX: %{y:.3f}B<extra></extra>'
+                            ))
+                            
+                            # Add current price line with annotation box
+                            fig_gex.add_vline(
+                                x=current_price,
+                                line_dash="dash",
+                                line_color="blue",
+                                line_width=2,
+                                annotation_text="CURRENT",
+                                annotation_position="top left",
+                                annotation_font=dict(color="blue", size=11),
+                                name="Current Price"
+                            )
+                            
+                            # Add pin strike line with annotation box
+                            fig_gex.add_vline(
+                                x=pin_strike,
+                                line_dash="solid",
+                                line_color="orange",
+                                line_width=2,
+                                annotation_text="PIN",
+                                annotation_position="top right",
+                                annotation_font=dict(color="orange", size=11),
+                                name="Pin Strike"
+                            )
+                            
+                            fig_gex.update_layout(
+                                title=f"Gamma Exposure (±${price_range:.0f} around ${current_price:.0f})",
+                                xaxis_title="Strike Price ($)",
+                                yaxis_title="Net Gamma Exposure (Billions $)",
+                                showlegend=False,
+                                height=450,
+                                margin=dict(b=100, t=80, l=80, r=80),
+                                xaxis=dict(
+                                    showgrid=True,
+                                    gridwidth=1,
+                                    gridcolor='lightgray',
+                                    tickformat='$,.0f'
+                                ),
+                                yaxis=dict(
+                                    showgrid=True,
+                                    gridwidth=1,
+                                    gridcolor='lightgray'
+                                ),
+                                hovermode='x unified',
+                                font=dict(size=11)
+                            )
+                            
+                            st.plotly_chart(fig_gex, use_container_width=True)
                     
                     if 'summary' in gex:
                         st.info(f"💡 {gex['summary']}")
