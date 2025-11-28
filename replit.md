@@ -2,13 +2,35 @@
 
 ## Overview
 
-This project is a dual-model stock market prediction system for major stock indices (SPX, NDX, DJI, RUT). It combines a Time-Adaptive Ridge Regression model, optimized for the final trading hour, with traditional machine learning models for earlier predictions. Key features include adaptive model selection, gamma exposure analytics, real-time WebSocket streaming, comprehensive technical analysis, and an AI-powered prediction enhancement layer. The system aims to provide accurate price predictions, with a focus on improving accuracy in the last 30 minutes of trading.
+This project is a dual-model stock market prediction system for major stock indices (SPX, NDX, DJI, RUT). It combines a Time-Adaptive Ridge Regression model, optimized for the final trading hour, with traditional machine learning models for earlier predictions. Key features include adaptive model selection, gamma exposure analytics, real-time WebSocket streaming, comprehensive technical analysis, 1-hour Opening Range Breakout (ORB) tracking, AI market event scanning, and an AI-powered prediction enhancement layer. The system aims to provide accurate price predictions, with a focus on improving accuracy in the last 30 minutes of trading.
 
 ## User Preferences
 
 Preferred communication style: Simple, everyday language.
 
 ## Recent Changes (November 2025)
+
+### 1-Hour Opening Range Breakout (ORB) Tracking
+- **ORB Tracker Module** (`app/state/orb_tracker.py`): Captures high/low during 9:30-10:30 AM ET for each trading day
+- **ORB Features in ML Model**: Position in range, breakout direction (bullish/bearish/inside), range width percentage
+- **ML Integration**: ORB breakout signals now influence Time-Adaptive Ridge predictions
+- **Confidence Boost**: When ORB direction aligns with other signals (VWAP, microtrend), confidence increases
+- **API Endpoints**: `/orb/{symbol}` and `/orb` for accessing ORB data
+
+### AI Market Event Scanner
+- **Event Scanner Module** (`app/services/market_event_scanner.py`): Scans for macro/micro events affecting indices
+- **Event Categories**: Fed announcements (FOMC, rate decisions), economic data (CPI, jobs, GDP), earnings, geopolitical, market structure (options expiration)
+- **Calendar Integration**: Automatically detects monthly OPEX, weekly options expiration, NFP report days
+- **AI Analysis**: Uses OpenAI to analyze news context and identify market-moving events
+- **Risk Level Assessment**: Low/Normal/Elevated/High based on event count and impact
+- **Sidebar Display**: Shows top 3 events with impact level and expected direction
+- **AI Prompt Integration**: Events are passed to AI prediction enhancement for context-aware adjustments
+- **API Endpoints**: `/market-events` and `/market-events/summary`
+
+### Enhanced AI Prediction Analysis
+- AI now receives ORB data (high/low, position in range, breakout status)
+- AI now receives market events context for event-aware prediction adjustments
+- Combined with historical accuracy data for comprehensive prediction critique
 
 ### Prediction Accuracy Improvements
 - **Timeframe-Adaptive Bounds**: Predictions now use adaptive limits based on timeframe:

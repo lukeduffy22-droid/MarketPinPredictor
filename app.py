@@ -1003,6 +1003,42 @@ with st.sidebar:
     
     st.divider()
     
+    # Market Events Scanner (new)
+    st.header("📰 Market Events")
+    try:
+        from app.services.market_event_scanner import get_events_for_ai_prompt, scan_market_events
+        
+        # Get market events scan
+        events_scan = scan_market_events()
+        
+        if events_scan and events_scan.events:
+            # Show risk level indicator
+            risk_colors = {
+                "low": "🟢",
+                "normal": "🟡", 
+                "elevated": "🟠",
+                "high": "🔴"
+            }
+            risk_icon = risk_colors.get(events_scan.risk_level, "🟡")
+            st.caption(f"{risk_icon} Risk Level: {events_scan.risk_level.upper()}")
+            st.caption(f"Sentiment: {events_scan.overall_sentiment.capitalize()}")
+            
+            # Show top events
+            for event in events_scan.events[:3]:
+                impact_icons = {"high": "🔴", "medium": "🟠", "low": "🟢"}
+                direction_icons = {"bullish": "↑", "bearish": "↓", "neutral": "↔"}
+                
+                impact_icon = impact_icons.get(event.impact_level, "🟡")
+                direction = direction_icons.get(event.expected_direction or "neutral", "↔")
+                
+                st.caption(f"{impact_icon} {direction} **{event.title}**")
+        else:
+            st.caption("No significant events detected")
+    except Exception as e:
+        st.caption("Market events unavailable")
+    
+    st.divider()
+    
     # Advanced indicator settings
     with st.expander("⚙️ Advanced: Technical Indicator Parameters"):
         st.caption("Customize technical indicator calculation parameters")
@@ -1778,6 +1814,34 @@ else:
                             st.caption(f"Gamma Pin: {features.get('gamma_pin', 0):.2f}")
                         with feat_cols[3]:
                             st.caption(f"Flow: {features.get('flow_urgency', 0):.2f}")
+                        
+                        # ORB Features (new)
+                        orb_signal = features.get('orb_breakout_signal', 0)
+                        orb_complete = features.get('orb_complete', 0)
+                        orb_position = features.get('orb_position', 0.5)
+                        orb_range_pct = features.get('orb_range_width_pct', 0)
+                        
+                        if orb_complete > 0.5 or orb_range_pct > 0:
+                            st.markdown("**📊 1-Hour ORB Analysis:**")
+                            orb_cols = st.columns(4)
+                            with orb_cols[0]:
+                                if orb_signal > 0:
+                                    st.caption(f"🟢 Bullish Breakout")
+                                elif orb_signal < 0:
+                                    st.caption(f"🔴 Bearish Breakout")
+                                elif orb_complete > 0.5:
+                                    st.caption(f"📦 Inside Range")
+                                else:
+                                    st.caption(f"⏳ ORB Forming")
+                            with orb_cols[1]:
+                                st.caption(f"Position: {orb_position:.2f}")
+                            with orb_cols[2]:
+                                st.caption(f"Range: {orb_range_pct:.2f}%")
+                            with orb_cols[3]:
+                                if orb_complete > 0.5:
+                                    st.caption("✓ Complete")
+                                else:
+                                    st.caption("⏳ Forming")
                     
                     # Show gamma pin influence if available
                     if 'gex_data' in pred and pred['gex_data'] and 'pin_strike' in pred['gex_data']:

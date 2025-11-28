@@ -1,7 +1,7 @@
 """
 Time-Adaptive Ridge Regression Predictor
 Optimized for final trading hour (3:00 PM - 4:00 PM ET) predictions.
-Uses VWAP deviation, microtrend, gamma pinning, and flow urgency.
+Uses VWAP deviation, microtrend, gamma pinning, flow urgency, and ORB features.
 """
 import numpy as np
 import pandas as pd
@@ -9,6 +9,9 @@ from datetime import datetime, time
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import pytz
+import logging
+
+log = logging.getLogger("ridge_predictor")
 
 # Calibrated coefficients from backtesting (fallback defaults)
 DEFAULT_COEFFICIENTS = {
@@ -183,9 +186,48 @@ def compute_flow_urgency(df: pd.DataFrame) -> float:
     
     return urgency
 
-def compute_features(df: pd.DataFrame, gex_data: Optional[Dict] = None) -> Dict[str, float]:
+def compute_orb_features(symbol: str, current_price: float) -> Dict[str, float]:
+    """
+    Get ORB (Opening Range Breakout) features for the symbol.
+    Returns features for ML model integration.
+    """
+    try:
+        from app.state.orb_tracker import get_orb_features, get_orb_tracker
+        
+        orb_features = get_orb_features(symbol, current_price)
+        
+        # Convert breakout direction to numeric signal
+        # -1 = bearish breakout, 0 = inside range, +1 = bullish breakout
+        breakout_signal = 0.0
+        if orb_features.breakout_direction == 'bullish':
+            breakout_signal = 1.0
+        elif orb_features.breakout_direction == 'bearish':
+            breakout_signal = -1.0
+        
+        return {
+            "orb_position": orb_features.position_in_range,  # 0-1 (can exceed for breakouts)
+            "orb_breakout_signal": breakout_signal,  # -1, 0, +1
+            "orb_range_width_pct": orb_features.range_width_pct,  # Range as % of opening
+            "orb_distance_to_high_pct": orb_features.distance_to_high_pct,
+            "orb_distance_to_low_pct": orb_features.distance_to_low_pct,
+            "orb_complete": 1.0 if orb_features.orb_complete else 0.0
+        }
+    except Exception as e:
+        log.warning(f"Error computing ORB features for {symbol}: {e}")
+        return {
+            "orb_position": 0.5,
+            "orb_breakout_signal": 0.0,
+            "orb_range_width_pct": 0.0,
+            "orb_distance_to_high_pct": 0.0,
+            "orb_distance_to_low_pct": 0.0,
+            "orb_complete": 0.0
+        }
+
+
+def compute_features(df: pd.DataFrame, gex_data: Optional[Dict] = None, symbol: str = "SPX") -> Dict[str, float]:
     """
     Compute all features required for Ridge regression prediction.
+    Now includes ORB (Opening Range Breakout) features.
     """
     current_price = df['close'].iloc[-1]
     
@@ -195,14 +237,22 @@ def compute_features(df: pd.DataFrame, gex_data: Optional[Dict] = None) -> Dict[
     gamma_pin = compute_gamma_pinning(current_price, gex_data)
     flow_urgency = compute_flow_urgency(df)
     
-    return {
+    # ORB features (new)
+    orb_features = compute_orb_features(symbol, current_price)
+    
+    features = {
         "vwap": vwap,
         "vwap_deviation": vwap_dev,
         "microtrend": microtrend,
         "gamma_pin": gamma_pin,
         "flow_urgency": flow_urgency,
-        "current_price": current_price
+        "current_price": current_price,
     }
+    
+    # Merge ORB features
+    features.update(orb_features)
+    
+    return features
 
 def get_time_adaptive_weights(minutes_to_close: int) -> Tuple[float, float]:
     """
@@ -223,7 +273,7 @@ def get_time_adaptive_weights(minutes_to_close: int) -> Tuple[float, float]:
         return 1.0, 1.0
 
 def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, last_price: float) -> float:
-    """Conservative Time-Adaptive formula with tight bounds"""
+    """Conservative Time-Adaptive formula with tight bounds, now including ORB features"""
     minutes_to_close = max(int((close_et - now_et).total_seconds() // 60), 0)
     
     # Normalized feature taps
@@ -232,30 +282,57 @@ def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, 
     gamma_pull = float(features.get("gamma_pull", 0.0))          # $ target toward pin
     flow_urg = float(features.get("flow_urgency", 0.0))          # 0..1
     
+    # ORB features (new)
+    orb_breakout_signal = float(features.get("orb_breakout_signal", 0.0))  # -1, 0, +1
+    orb_position = float(features.get("orb_position", 0.5))  # 0-1 (can exceed for breakouts)
+    orb_range_width_pct = float(features.get("orb_range_width_pct", 0.0))  # Range as % of opening
+    orb_complete = float(features.get("orb_complete", 0.0))  # 1.0 if ORB period complete
+    
     # Horizon scalers
     t = min(minutes_to_close, 60) / 60.0                         # 0..1, last hour emphasized
     t_gamma = 1.0 - t  # INVERTED for gamma - strongest at close (0 min = 1.0, 60 min = 0.0)
     
     # Coefficients with stronger gamma influence
-    k_vwap = 0.30  # Slightly reduced to make room for gamma
-    k_micro = 0.20
-    k_gamma = 0.70  # DOUBLED from 0.35 to increase gamma influence
+    k_vwap = 0.25  # Slightly reduced to make room for ORB
+    k_micro = 0.15
+    k_gamma = 0.65  # Strong gamma influence
     k_flow = 0.10
+    k_orb = 0.20  # ORB breakout coefficient (new)
     
     delta_from_vwap = k_vwap * (vwap_dev * last_price) * t
     delta_from_micro = k_micro * micro * min(minutes_to_close, 20)  # assume micro in $/5min or $/bar; no seconds
     delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.30 + 0.70 * t_gamma))  # 30–100% of gap, STRONGEST at close
     delta_from_flow = k_flow * (flow_urg - 0.5) * 0.006 * last_price  # ~±0.6% max
     
-    pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow
+    # ORB contribution - if breakout confirmed, trend continuation is likely
+    # Scale by range width (wider range = more significant breakout)
+    # Only apply if ORB is complete
+    delta_from_orb = 0.0
+    if orb_complete > 0.5 and orb_range_width_pct > 0.1:  # ORB complete and meaningful range
+        # orb_breakout_signal: +1 = bullish breakout, -1 = bearish breakout, 0 = inside
+        # Scale effect by range width (larger ranges = more conviction)
+        range_multiplier = min(orb_range_width_pct / 0.5, 1.5)  # Cap at 1.5x for wide ranges
+        
+        # Breakouts tend to continue toward EOD (ORB theory)
+        # Use the breakout direction to bias the prediction
+        delta_from_orb = k_orb * orb_breakout_signal * range_multiplier * last_price * 0.003  # ~±0.3-0.45% contribution
     
-    # Conditional bounds: widen when strong gamma pinning is detected
-    # Strong pinning = gamma_pull is >2.5% away AND we're within final hour
+    pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow + delta_from_orb
+    
+    # Conditional bounds: widen when strong gamma pinning is detected OR clear breakout
     distance_to_pin_pct = abs(gamma_pull - last_price) / last_price
+    
+    # Check for strong ORB breakout (widen bounds for trend continuation)
+    strong_orb_breakout = orb_complete > 0.5 and abs(orb_breakout_signal) > 0.5 and orb_range_width_pct > 0.2
     
     if distance_to_pin_pct > 0.025 and minutes_to_close <= 60:
         # Widen bounds to allow reaching the gamma pin (up to ±5%)
         max_move = min(distance_to_pin_pct * 1.2, 0.05)  # Cap at 5%
+        lo = last_price * (1 - max_move)
+        hi = last_price * (1 + max_move)
+    elif strong_orb_breakout:
+        # Widen bounds for confirmed ORB breakout (trend continuation)
+        max_move = 0.03  # Allow up to ±3% for strong breakouts
         lo = last_price * (1 - max_move)
         hi = last_price * (1 + max_move)
     else:
@@ -268,6 +345,7 @@ def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, 
 def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> PredictionResult:
     """
     Generate time-adaptive Ridge regression prediction using conservative formula.
+    Now incorporates ORB (Opening Range Breakout) features.
     
     Args:
         symbol: Index symbol (SPX, NDX, DJI, RUT)
@@ -277,8 +355,8 @@ def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> P
     Returns:
         PredictionResult with prediction and metadata
     """
-    # Compute features
-    features = compute_features(df, gex_data)
+    # Compute features (now includes ORB features)
+    features = compute_features(df, gex_data, symbol=symbol)
     current_price = features["current_price"]
     
     # Get time context
@@ -312,19 +390,41 @@ def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> P
     # Adjust confidence based on feature agreement
     vwap_direction = 1 if features["vwap_deviation"] > 0 else -1
     micro_direction = 1 if features["microtrend"] > 0 else -1
+    orb_direction = features.get("orb_breakout_signal", 0)
+    orb_complete = features.get("orb_complete", 0)
     
+    # Base confidence boost from VWAP/microtrend agreement
+    confidence_boost = 0
     if vwap_direction == micro_direction:
-        confidence_boost = 5
+        confidence_boost += 5
     else:
-        confidence_boost = -5
+        confidence_boost -= 5
+    
+    # Additional boost if ORB breakout confirms other signals
+    if orb_complete > 0.5:
+        if (orb_direction > 0 and vwap_direction > 0 and micro_direction > 0):
+            confidence_boost += 5  # All bullish signals align
+        elif (orb_direction < 0 and vwap_direction < 0 and micro_direction < 0):
+            confidence_boost += 5  # All bearish signals align
+        elif orb_direction != 0 and (orb_direction != vwap_direction or orb_direction != micro_direction):
+            confidence_boost -= 2  # Conflicting signals
     
     confidence = max(45, min(95, base_confidence + confidence_boost))
     
-    # Generate recommendation
+    # Generate recommendation - include ORB status
+    orb_status = ""
+    if orb_complete > 0.5:
+        if orb_direction > 0:
+            orb_status = " + Bullish ORB Breakout"
+        elif orb_direction < 0:
+            orb_status = " + Bearish ORB Breakout"
+        else:
+            orb_status = " + Inside ORB Range"
+    
     if minutes_to_close <= 30:
-        recommendation = "Time-Adaptive (Recommended)"
+        recommendation = f"Time-Adaptive (Recommended){orb_status}"
     else:
-        recommendation = "Traditional ML (Recommended)"
+        recommendation = f"Traditional ML (Recommended){orb_status}"
     
     return PredictionResult(
         predicted_price=predicted_close,

@@ -95,9 +95,14 @@ class OpenAIProvider(BaseAIProvider):
         microtrend: float,
         minutes_to_close: int,
         historical_accuracy: Optional[float] = None,
-        historical_accuracy_data: Optional[Dict[str, Any]] = None
+        historical_accuracy_data: Optional[Dict[str, Any]] = None,
+        orb_data: Optional[Dict[str, Any]] = None,
+        market_events: Optional[str] = None
     ) -> PredictionCritique:
-        """Analyze and critique an EOD prediction using OpenAI."""
+        """Analyze and critique an EOD prediction using OpenAI.
+        
+        Now includes ORB (Opening Range Breakout) data and market events context.
+        """
         
         # Build context for the AI
         gamma_summary = self._format_gamma_for_prompt(gamma_data)
@@ -134,6 +139,34 @@ HISTORICAL MODEL PERFORMANCE ({historical_accuracy_data['sample_size']} past pre
         elif historical_accuracy is not None:
             accuracy_context = f"\n- Historical Model Accuracy: {historical_accuracy:.1f}%\n"
         
+        # Build ORB context (new)
+        orb_context = ""
+        if orb_data:
+            orb_complete = orb_data.get('orb_complete', False)
+            if orb_complete:
+                orb_high = orb_data.get('orb_high', 0)
+                orb_low = orb_data.get('orb_low', 0)
+                range_width_pct = orb_data.get('range_width_pct', 0)
+                breakout = orb_data.get('breakout_direction', 'unknown')
+                position = orb_data.get('position_in_range', 0.5)
+                
+                orb_context = f"""
+1-HOUR OPENING RANGE BREAKOUT (ORB) ANALYSIS:
+- ORB High: {orb_high:.2f}
+- ORB Low: {orb_low:.2f}
+- Range Width: {range_width_pct:.2f}% of opening price
+- Current Breakout Status: {breakout.upper()}
+- Position in Range: {position:.2f} (0=at low, 0.5=midpoint, 1=at high, >1=above high, <0=below low)
+Note: ORB theory suggests breakouts tend to continue toward EOD. A bullish breakout favors higher closes, bearish breakout favors lower closes.
+"""
+            else:
+                orb_context = "\n1-HOUR ORB: Still forming (before 10:30 AM ET)\n"
+        
+        # Build market events context (new)
+        events_context = ""
+        if market_events:
+            events_context = f"\n{market_events}\n"
+        
         prompt = f"""You are an expert quantitative analyst reviewing an end-of-day stock index prediction.
 
 CURRENT MARKET DATA for {symbol}:
@@ -145,21 +178,21 @@ CURRENT MARKET DATA for {symbol}:
 {accuracy_context}
 GAMMA EXPOSURE ANALYSIS:
 {gamma_summary}
-
+{orb_context}{events_context}
 TASK: Analyze this prediction and provide:
-1. Whether the prediction seems reasonable given the gamma positioning
-2. Any adjustments you would make (if any) - consider historical bias when adjusting
-3. Key risk factors
-4. A confidence score (0.0 to 1.0) - adjust based on historical accuracy
+1. Whether the prediction seems reasonable given gamma positioning AND ORB breakout status
+2. Any adjustments you would make - consider historical bias, ORB breakout direction, and market events
+3. Key risk factors including any significant macro events
+4. A confidence score (0.0 to 1.0) - adjust based on historical accuracy and event risk
 
 Respond in JSON format:
 {{
     "adjusted_prediction": <float - your adjusted EOD prediction, or same as original if no change>,
     "confidence": <float 0.0-1.0>,
     "adjustment_reason": "<brief explanation of any adjustment or 'No adjustment needed'>",
-    "market_conditions": "<1-2 sentence market condition summary>",
+    "market_conditions": "<1-2 sentence market condition summary including ORB status and key events>",
     "risk_factors": ["<risk 1>", "<risk 2>", ...],
-    "recommendation": "<actionable insight for traders>"
+    "recommendation": "<actionable insight for traders considering ORB and events>"
 }}"""
 
         messages = [
