@@ -38,10 +38,29 @@ Preferred communication style: Simple, everyday language.
   - `aggregate_total_gex` / `aggregate_net_gex`: NEW fields with sum across all strikes (gross and net)
   - Multi-expiry gamma also updated with `expiry_total_gex` / `expiry_net_gex` fields
 
-### Early Close Day Support
+### Half-Day Session Fix (Nov 28, 2025)
+- **Fixed Time Countdown Bug**: Previously showed wrong minutes remaining on early close days
+- **Root Cause**: `ridge_predictor.get_minutes_to_close()` was hardcoded to 4 PM, now delegates to `time_et.minutes_to_close_et()`
+- **Prediction Formula Fix**: `predict()` function now uses `close_time_et()` for correct close time
 - **Half-Day Detection**: UI now prominently displays when market closes early (1 PM ET)
 - **Close Time Display**: Shows actual close time in countdown (e.g., "Market closes in 2h 15m (01:00 PM ET)")
 - **Holiday-Aware**: Uses `app/utils/time_et.py` for accurate holiday/early close detection
+
+### Regime-Aware Predictions (Nov 28, 2025)
+- **Regime Flags**: Model now detects and adjusts for special session types:
+  - `regime_half_day`: Early close sessions (1 PM ET) - reduces VWAP influence, increases gamma weight
+  - `regime_holiday_adjacent`: Day before/after holidays - reduces microtrend weight, increases flow weight
+  - `regime_eom`: End of month (last 3 days) - allows more drift, reduces mean-reversion
+  - `regime_eow`: End of week (Thu/Fri) - tracked for pattern analysis
+  - `regime_vix`: VIX level placeholder for volatility regime
+- **Gamma Snapshot Features**: Added distance_to_pin, net_gamma_level, aggregate GEX for better short-horizon predictions
+- **Coefficient Adjustments**: Model coefficients now adapt based on regime flags
+
+### MAE-by-Regime Error Tracking (Nov 28, 2025)
+- **PredictionLog Schema**: Added regime flag columns for historical analysis
+- **get_mae_by_regime()**: New function to compute MAE/bias by session type
+- **API Endpoint**: `/prediction-accuracy/by-regime` returns MAE statistics by regime type
+- **Bias Detection**: Helps identify systematic under/over-prediction in specific session types
 
 ### Enhanced CSV Export
 - **New Columns**: IndexSymbol, SessionDate, Distance_Points, Distance_Pct, Pin_Drift_Per_Hour

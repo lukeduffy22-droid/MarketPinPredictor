@@ -835,3 +835,44 @@ async def get_market_events_summary():
     except Exception as e:
         log.error(f"Market events summary error: {e}")
         raise HTTPException(503, f"Market events error: {str(e)}")
+
+
+@app.get("/prediction-accuracy/by-regime")
+async def get_prediction_accuracy_by_regime(symbol: Optional[str] = None, days: int = 30):
+    """
+    Get MAE (Mean Absolute Error) statistics by regime type.
+    Helps identify systematic bias in specific session types:
+    - half_day: Early close sessions (1 PM ET)
+    - regular_day: Normal 4 PM close sessions
+    - eom: End of month (last 3 trading days)
+    - eow: End of week (Thursday/Friday)
+    - holiday_adjacent: Day before/after market holidays
+    
+    Args:
+        symbol: Optional symbol filter (None = all symbols)
+        days: Number of days to look back (default 30)
+    
+    Returns:
+        MAE and bias statistics by regime type
+    """
+    try:
+        from app.models.db_models import get_mae_by_regime
+        
+        stats = get_mae_by_regime(symbol=symbol, days=days)
+        
+        return {
+            "symbol": symbol or "all",
+            "days_lookback": days,
+            "stats_by_regime": stats,
+            "interpretation": {
+                "mae": "Mean Absolute Error in price points",
+                "mae_pct": "Mean Absolute Error as percentage of price",
+                "bias": "Average (predicted - actual), positive = over-prediction",
+                "n_samples": "Number of predictions in this category"
+            },
+            "timestamp": now_et().isoformat()
+        }
+        
+    except Exception as e:
+        log.error(f"Prediction accuracy by regime error: {e}")
+        raise HTTPException(503, f"Prediction accuracy error: {str(e)}")

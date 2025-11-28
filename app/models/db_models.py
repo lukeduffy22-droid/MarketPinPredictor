@@ -63,6 +63,7 @@ class PredictionLog(Base):
     """
     Historical predictions for backtesting and accuracy tracking.
     Stores prediction → actual outcome for continuous calibration.
+    Now includes regime flags for regime-aware error analysis.
     """
     __tablename__ = "prediction_logs"
     
@@ -92,6 +93,12 @@ class PredictionLog(Base):
     
     # Model version tracking
     model_version = Column(String(50), default="v1")
+    
+    # Regime flags (new) - for regime-aware error analysis
+    regime_half_day = Column(Boolean, default=False)
+    regime_holiday_adjacent = Column(Boolean, default=False)
+    regime_eom = Column(Boolean, default=False)  # End of month
+    regime_eow = Column(Boolean, default=False)  # End of week
 
 # Database connection
 def get_engine():
@@ -167,5 +174,81 @@ def get_rmse_for_tau(symbol: str, tau: int) -> Optional[RMSEBucket]:
             RMSEBucket.tau_max > tau
         ).first()
         return bucket
+    finally:
+        session.close()
+
+
+def get_mae_by_regime(symbol: str = None, days: int = 30) -> dict:
+    """
+    Compute MAE (Mean Absolute Error) by regime type.
+    Helps identify if model has systematic bias in specific session types.
+    
+    Args:
+        symbol: Optional symbol filter (None = all symbols)
+        days: Number of days to look back (default 30)
+    
+    Returns:
+        Dict with MAE statistics by regime:
+        {
+            'overall': {'mae': float, 'mae_pct': float, 'n_samples': int, 'bias': float},
+            'half_day': {'mae': float, 'mae_pct': float, 'n_samples': int, 'bias': float},
+            'regular_day': {'mae': float, 'mae_pct': float, 'n_samples': int, 'bias': float},
+            'eom': {'mae': float, 'mae_pct': float, 'n_samples': int, 'bias': float},
+            'eow': {'mae': float, 'mae_pct': float, 'n_samples': int, 'bias': float},
+            'holiday_adjacent': {'mae': float, 'mae_pct': float, 'n_samples': int, 'bias': float},
+        }
+    """
+    from datetime import timedelta
+    from sqlalchemy import and_, func
+    
+    session = get_session()
+    try:
+        cutoff_date = datetime.utcnow().date() - timedelta(days=days)
+        
+        # Base query filter
+        base_filter = [
+            PredictionLog.prediction_date >= cutoff_date,
+            PredictionLog.actual_close.isnot(None),
+            PredictionLog.error_abs.isnot(None)
+        ]
+        if symbol:
+            base_filter.append(PredictionLog.symbol == symbol)
+        
+        def compute_stats(filter_conditions) -> dict:
+            """Compute MAE stats for given filter conditions"""
+            query = session.query(
+                func.avg(PredictionLog.error_abs).label('mae'),
+                func.avg(PredictionLog.error_pct).label('mae_pct'),
+                func.count(PredictionLog.id).label('n_samples'),
+                func.avg(PredictionLog.predicted_close - PredictionLog.actual_close).label('bias')
+            ).filter(and_(*filter_conditions))
+            
+            result = query.first()
+            if result and result.n_samples > 0:
+                return {
+                    'mae': round(float(result.mae or 0), 2),
+                    'mae_pct': round(float(result.mae_pct or 0), 4),
+                    'n_samples': result.n_samples,
+                    'bias': round(float(result.bias or 0), 2)
+                }
+            return {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0}
+        
+        return {
+            'overall': compute_stats(base_filter),
+            'half_day': compute_stats(base_filter + [PredictionLog.regime_half_day == True]),
+            'regular_day': compute_stats(base_filter + [PredictionLog.regime_half_day != True]),
+            'eom': compute_stats(base_filter + [PredictionLog.regime_eom == True]),
+            'eow': compute_stats(base_filter + [PredictionLog.regime_eow == True]),
+            'holiday_adjacent': compute_stats(base_filter + [PredictionLog.regime_holiday_adjacent == True]),
+        }
+    except Exception as e:
+        return {
+            'overall': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0, 'error': str(e)},
+            'half_day': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
+            'regular_day': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
+            'eom': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
+            'eow': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
+            'holiday_adjacent': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
+        }
     finally:
         session.close()

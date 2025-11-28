@@ -57,25 +57,23 @@ class PredictionResult:
     recommendation: Optional[str] = None
 
 def get_minutes_to_close() -> int:
-    """Calculate minutes until market close (4:00 PM ET) with proper bounds"""
+    """
+    Calculate minutes until market close with proper bounds.
+    Delegates to time_et utilities to respect early close days (1 PM ET).
+    """
+    import datetime as dt_module
+    from app.utils.time_et import minutes_to_close_et
+    
     et_tz = pytz.timezone('US/Eastern')
     now_et = datetime.now(et_tz)
     
-    # Market close time
-    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    
-    # Floor at 0 for after hours, weekends, holidays
-    if now_et >= market_close:
-        return 0
+    # Check for weekend
     if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
         return 0
     
-    # Calculate difference
-    diff = market_close - now_et
-    minutes = int(diff.total_seconds() / 60)
-    
-    # Cap at 0 minimum
-    return max(0, minutes)
+    # Use time_et utility which respects early close days
+    now_utc = dt_module.datetime.now(dt_module.timezone.utc)
+    return minutes_to_close_et(now_utc)
 
 def load_coefficients(symbol: str) -> Dict[str, float]:
     """
@@ -224,10 +222,116 @@ def compute_orb_features(symbol: str, current_price: float) -> Dict[str, float]:
         }
 
 
+def compute_regime_flags() -> Dict[str, float]:
+    """
+    Compute regime flags for session-aware predictions.
+    These flags help the model adapt to special market conditions.
+    
+    Returns:
+        Dict with regime flags as binary (0.0 or 1.0) or continuous values
+    """
+    from datetime import timedelta
+    from calendar import monthrange
+    from app.utils.time_et import is_early_close, now_et as get_now_et, EARLY_CLOSE_ET_DATES, US_MARKET_HOLIDAYS
+    
+    current_et = get_now_et()
+    today = current_et.date()
+    
+    # is_half_day: Early close day (1 PM ET) - different intraday dynamics
+    is_half_day = 1.0 if is_early_close(current_et) else 0.0
+    
+    # is_holiday_adjacent: Day before or after a holiday
+    # Use date strings directly to check against holiday set
+    is_holiday_adj = 0.0
+    try:
+        yesterday = today - timedelta(days=1)
+        tomorrow = today + timedelta(days=1)
+        yesterday_str = yesterday.isoformat()
+        tomorrow_str = tomorrow.isoformat()
+        if yesterday_str in US_MARKET_HOLIDAYS or tomorrow_str in US_MARKET_HOLIDAYS:
+            is_holiday_adj = 1.0
+    except Exception:
+        pass
+    
+    # is_EOM: End of month (last 3 calendar days)
+    is_eom = 0.0
+    try:
+        _, last_day = monthrange(today.year, today.month)
+        days_to_eom = last_day - today.day
+        if days_to_eom <= 3:
+            is_eom = 1.0
+    except Exception:
+        pass
+    
+    # is_EOW: End of week (Thursday, Friday)
+    is_eow = 1.0 if current_et.weekday() >= 3 else 0.0  # Thu=3, Fri=4
+    
+    # VIX regime: Placeholder - will be populated with actual VIX if available
+    vix_regime = 0.5  # Default to normal
+    
+    return {
+        "regime_half_day": is_half_day,
+        "regime_holiday_adjacent": is_holiday_adj,
+        "regime_eom": is_eom,
+        "regime_eow": is_eow,
+        "regime_vix": vix_regime,
+    }
+
+
+def compute_gamma_snapshot_features(current_price: float, gex_data: Optional[Dict]) -> Dict[str, float]:
+    """
+    Extract gamma snapshot features for short-horizon predictions.
+    These features are critical for the final 30-60 minutes before close.
+    
+    Args:
+        current_price: Current spot price
+        gex_data: Gamma exposure data from calculate_gamma_exposure()
+    
+    Returns:
+        Dict with gamma-derived features
+    """
+    if not gex_data or 'pin_strike' not in gex_data:
+        return {
+            "gamma_distance_to_pin": 0.0,
+            "gamma_distance_to_pin_pct": 0.0,
+            "gamma_net_level": 0.0,
+            "gamma_aggregate_total": 0.0,
+            "gamma_aggregate_net": 0.0,
+        }
+    
+    pin_strike = gex_data.get('pin_strike', current_price)
+    
+    # Distance from spot to pin (in points and percentage)
+    distance_pts = pin_strike - current_price
+    distance_pct = (distance_pts / current_price) * 100 if current_price > 0 else 0.0
+    
+    # Net GEX at pin strike (normalized by dividing by typical levels)
+    net_gex = gex_data.get('net_gex', 0.0)
+    net_gex_normalized = net_gex / 1e9 if abs(net_gex) > 0 else 0.0  # Normalize to billions
+    
+    # Aggregate GEX across all strikes (if available)
+    aggregate_total = gex_data.get('aggregate_total_gex', gex_data.get('total_gex', 0.0))
+    aggregate_net = gex_data.get('aggregate_net_gex', gex_data.get('net_gex', 0.0))
+    
+    # Normalize to log scale for model input (prevents extreme values)
+    import math
+    agg_total_log = math.log1p(abs(aggregate_total / 1e9)) if aggregate_total else 0.0
+    agg_net_sign = 1 if aggregate_net >= 0 else -1
+    agg_net_log = agg_net_sign * math.log1p(abs(aggregate_net / 1e9)) if aggregate_net else 0.0
+    
+    return {
+        "gamma_distance_to_pin": distance_pts,
+        "gamma_distance_to_pin_pct": distance_pct,
+        "gamma_net_level": net_gex_normalized,
+        "gamma_aggregate_total": agg_total_log,
+        "gamma_aggregate_net": agg_net_log,
+    }
+
+
 def compute_features(df: pd.DataFrame, gex_data: Optional[Dict] = None, symbol: str = "SPX") -> Dict[str, float]:
     """
     Compute all features required for Ridge regression prediction.
-    Now includes ORB (Opening Range Breakout) features.
+    Now includes ORB, regime flags, and gamma snapshot features.
     """
     current_price = df['close'].iloc[-1]
     
@@ -237,8 +341,14 @@ def compute_features(df: pd.DataFrame, gex_data: Optional[Dict] = None, symbol: 
     gamma_pin = compute_gamma_pinning(current_price, gex_data)
     flow_urgency = compute_flow_urgency(df)
     
-    # ORB features (new)
+    # ORB features
     orb_features = compute_orb_features(symbol, current_price)
+    
+    # Regime flags - session-aware features
+    regime_features = compute_regime_flags()
+    
+    # Gamma snapshot features - critical for final hour predictions
+    gamma_features = compute_gamma_snapshot_features(current_price, gex_data)
     
     features = {
         "vwap": vwap,
@@ -249,8 +359,10 @@ def compute_features(df: pd.DataFrame, gex_data: Optional[Dict] = None, symbol: 
         "current_price": current_price,
     }
     
-    # Merge ORB features
+    # Merge all feature sets
     features.update(orb_features)
+    features.update(regime_features)
+    features.update(gamma_features)
     
     return features
 
@@ -273,49 +385,81 @@ def get_time_adaptive_weights(minutes_to_close: int) -> Tuple[float, float]:
         return 1.0, 1.0
 
 def predict_time_adaptive(features: dict, now_et: datetime, close_et: datetime, last_price: float) -> float:
-    """Conservative Time-Adaptive formula with tight bounds, now including ORB features"""
+    """
+    Conservative Time-Adaptive formula with regime awareness.
+    Includes ORB features, gamma snapshot features, and regime flags.
+    """
     minutes_to_close = max(int((close_et - now_et).total_seconds() // 60), 0)
     
-    # Normalized feature taps
+    # Core features
     vwap_dev = float(features.get("vwap_deviation", 0.0))        # fraction, e.g., +0.003 = +0.3%
     micro = float(features.get("microtrend", 0.0))               # $/bar on shortest window
     gamma_pull = float(features.get("gamma_pull", 0.0))          # $ target toward pin
     flow_urg = float(features.get("flow_urgency", 0.0))          # 0..1
     
-    # ORB features (new)
+    # ORB features
     orb_breakout_signal = float(features.get("orb_breakout_signal", 0.0))  # -1, 0, +1
     orb_position = float(features.get("orb_position", 0.5))  # 0-1 (can exceed for breakouts)
     orb_range_width_pct = float(features.get("orb_range_width_pct", 0.0))  # Range as % of opening
     orb_complete = float(features.get("orb_complete", 0.0))  # 1.0 if ORB period complete
     
-    # Horizon scalers
-    t = min(minutes_to_close, 60) / 60.0                         # 0..1, last hour emphasized
-    t_gamma = 1.0 - t  # INVERTED for gamma - strongest at close (0 min = 1.0, 60 min = 0.0)
+    # Regime flags (new) - adjust model behavior based on session type
+    regime_half_day = float(features.get("regime_half_day", 0.0))
+    regime_holiday_adj = float(features.get("regime_holiday_adjacent", 0.0))
+    regime_eom = float(features.get("regime_eom", 0.0))
+    regime_eow = float(features.get("regime_eow", 0.0))
     
-    # Coefficients with stronger gamma influence
-    k_vwap = 0.25  # Slightly reduced to make room for ORB
+    # Gamma snapshot features (new)
+    gamma_distance_pct = float(features.get("gamma_distance_to_pin_pct", 0.0))  # Signed % distance to pin
+    gamma_net_level = float(features.get("gamma_net_level", 0.0))  # Normalized net GEX
+    
+    # Horizon scalers - adjust for half-day sessions
+    effective_session_length = 210 if regime_half_day > 0.5 else 390  # 3.5h vs 6.5h in minutes
+    t = min(minutes_to_close, 60) / 60.0  # 0..1, last hour emphasized
+    t_gamma = 1.0 - t  # INVERTED for gamma - strongest at close
+    
+    # Coefficients with regime adjustments
+    k_vwap = 0.25
     k_micro = 0.15
-    k_gamma = 0.65  # Strong gamma influence
+    k_gamma = 0.65
     k_flow = 0.10
-    k_orb = 0.20  # ORB breakout coefficient (new)
+    k_orb = 0.20
+    
+    # Regime-based coefficient adjustments
+    # Half-day sessions: Reduce VWAP influence (less mean-reversion time), increase gamma
+    if regime_half_day > 0.5:
+        k_vwap *= 0.7
+        k_gamma *= 1.2
+        k_micro *= 1.1  # Microtrend matters more in compressed sessions
+    
+    # EOM: Allow more drift toward the close (month-end rebalancing)
+    if regime_eom > 0.5:
+        k_micro *= 1.15
+        k_vwap *= 0.85  # Less mean-reversion pressure
+    
+    # Holiday-adjacent: Lower liquidity, more volatile microtrend
+    if regime_holiday_adj > 0.5:
+        k_micro *= 0.8  # Less reliable microtrend signal
+        k_flow *= 1.2   # Flow becomes more important
     
     delta_from_vwap = k_vwap * (vwap_dev * last_price) * t
-    delta_from_micro = k_micro * micro * min(minutes_to_close, 20)  # assume micro in $/5min or $/bar; no seconds
-    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.30 + 0.70 * t_gamma))  # 30–100% of gap, STRONGEST at close
-    delta_from_flow = k_flow * (flow_urg - 0.5) * 0.006 * last_price  # ~±0.6% max
+    delta_from_micro = k_micro * micro * min(minutes_to_close, 20)
+    delta_from_gamma = k_gamma * ((gamma_pull - last_price) * (0.30 + 0.70 * t_gamma))
+    delta_from_flow = k_flow * (flow_urg - 0.5) * 0.006 * last_price
+    
+    # Enhanced gamma adjustment based on net gamma level
+    # High positive gamma = strong pinning, reduce delta from gamma
+    # High negative gamma = more volatility expected
+    if gamma_net_level > 0.1:  # Strong positive gamma - strong pinning
+        delta_from_gamma *= 1.2  # Increase pull toward pin
+    elif gamma_net_level < -0.1:  # Negative gamma - breakaway possible
+        delta_from_gamma *= 0.8  # Reduce pin pull, price may break away
     
     # ORB contribution - if breakout confirmed, trend continuation is likely
-    # Scale by range width (wider range = more significant breakout)
-    # Only apply if ORB is complete
     delta_from_orb = 0.0
-    if orb_complete > 0.5 and orb_range_width_pct > 0.1:  # ORB complete and meaningful range
-        # orb_breakout_signal: +1 = bullish breakout, -1 = bearish breakout, 0 = inside
-        # Scale effect by range width (larger ranges = more conviction)
-        range_multiplier = min(orb_range_width_pct / 0.5, 1.5)  # Cap at 1.5x for wide ranges
-        
-        # Breakouts tend to continue toward EOD (ORB theory)
-        # Use the breakout direction to bias the prediction
-        delta_from_orb = k_orb * orb_breakout_signal * range_multiplier * last_price * 0.003  # ~±0.3-0.45% contribution
+    if orb_complete > 0.5 and orb_range_width_pct > 0.1:
+        range_multiplier = min(orb_range_width_pct / 0.5, 1.5)
+        delta_from_orb = k_orb * orb_breakout_signal * range_multiplier * last_price * 0.003
     
     pred = last_price + delta_from_vwap + delta_from_micro + delta_from_gamma + delta_from_flow + delta_from_orb
     
@@ -359,10 +503,10 @@ def predict(symbol: str, df: pd.DataFrame, gex_data: Optional[Dict] = None) -> P
     features = compute_features(df, gex_data, symbol=symbol)
     current_price = features["current_price"]
     
-    # Get time context
-    et_tz = pytz.timezone('US/Eastern')
-    now_et = datetime.now(et_tz)
-    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    # Get time context - respects early close days
+    from app.utils.time_et import close_time_et, now_et as get_now_et
+    now_et = get_now_et()
+    close_et = close_time_et(now_et)
     
     # Get gamma pull price if available
     if gex_data and 'pin_strike' in gex_data:
