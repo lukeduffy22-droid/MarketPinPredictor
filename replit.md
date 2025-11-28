@@ -32,6 +32,30 @@ Preferred communication style: Simple, everyday language.
 - AI now receives market events context for event-aware prediction adjustments
 - Combined with historical accuracy data for comprehensive prediction critique
 
+### GEX Calculation Fix (Based on External Feedback)
+- **Fixed Total GEX vs Net GEX**: Now correctly calculates aggregate sums across ALL strikes
+  - `total_gex` / `net_gex`: Pin-level values (backward compatible)
+  - `aggregate_total_gex` / `aggregate_net_gex`: NEW fields with sum across all strikes (gross and net)
+  - Multi-expiry gamma also updated with `expiry_total_gex` / `expiry_net_gex` fields
+
+### Early Close Day Support
+- **Half-Day Detection**: UI now prominently displays when market closes early (1 PM ET)
+- **Close Time Display**: Shows actual close time in countdown (e.g., "Market closes in 2h 15m (01:00 PM ET)")
+- **Holiday-Aware**: Uses `app/utils/time_et.py` for accurate holiday/early close detection
+
+### Enhanced CSV Export
+- **New Columns**: IndexSymbol, SessionDate, Distance_Points, Distance_Pct, Pin_Drift_Per_Hour
+- **Raw Values**: Export includes raw numeric values for analysis (not formatted strings)
+- **Download Button**: Added CSV download button in gamma history table
+
+### Adaptive Gamma Sampling
+- **Intelligent Intervals**: Sampling frequency increases as market close approaches
+  - Regular: 15-minute intervals
+  - Last hour: 5-minute intervals
+  - Last 30 minutes: 3-minute intervals
+  - Last 15 minutes: 2-minute intervals
+- **Early Close Aware**: Uses proper close time for half-day sessions
+
 ### Prediction Accuracy Improvements
 - **Timeframe-Adaptive Bounds**: Predictions now use adaptive limits based on timeframe:
   - 1-day: ±3% maximum move

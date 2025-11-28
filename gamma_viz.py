@@ -142,7 +142,7 @@ def display_gamma_history_table(ticker, trading_date_obj):
         st.info("No gamma pin history available for today yet. The system samples every 15 minutes during market hours (9:30 AM - 4:00 PM ET).")
         return
     
-    # Build table data
+    # Build table data for DISPLAY (formatted)
     et_tz = pytz.timezone('US/Eastern')
     table_data = []
     for snap in snapshots:
@@ -170,6 +170,63 @@ def display_gamma_history_table(ticker, trading_date_obj):
         use_container_width=True,
         hide_index=True,
         height=min(400, len(df) * 35 + 38)  # Auto-height based on rows
+    )
+    
+    # Build EXPORT data with raw values and additional columns
+    export_data = []
+    prev_pin = None
+    prev_time = None
+    
+    for snap in snapshots:
+        time_et = snap.interval_timestamp.astimezone(et_tz)
+        
+        # Calculate distance in points and percentage
+        distance_points = snap.pin_strike - snap.spot_price
+        distance_pct = (distance_points / snap.spot_price) * 100
+        
+        # Calculate pin drift rate (change in pin per hour)
+        pin_drift_per_hour = 0.0
+        if prev_pin is not None and prev_time is not None:
+            time_diff_hours = (time_et - prev_time).total_seconds() / 3600
+            if time_diff_hours > 0:
+                pin_drift_per_hour = (snap.pin_strike - prev_pin) / time_diff_hours
+        
+        # Intraday range (high-low estimate based on distance from pin)
+        # This is an approximation - actual high/low would need additional data
+        spot_range_pct = abs(distance_pct) * 2  # Rough estimate
+        
+        export_row = {
+            'IndexSymbol': ticker,
+            'SessionDate': trading_date_obj.isoformat() if hasattr(trading_date_obj, 'isoformat') else str(trading_date_obj),
+            'Time_ET': time_et.strftime('%Y-%m-%d %H:%M:%S'),
+            'Time_Display': time_et.strftime('%I:%M %p ET'),
+            'Pin_Strike': snap.pin_strike,
+            'Spot_Price': snap.spot_price,
+            'Distance_Points': distance_points,
+            'Distance_Pct': distance_pct,
+            'Pull_Strength': snap.pull_strength,
+            'Total_GEX_Billions': snap.total_gex,
+            'Net_GEX_Billions': snap.net_gex,
+            'Pin_Drift_Per_Hour': pin_drift_per_hour,
+            'Spot_Range_Pct_Est': spot_range_pct,
+            'Data_Source': 'Simulated' if snap.is_mock_data else 'Real'
+        }
+        export_data.append(export_row)
+        
+        prev_pin = snap.pin_strike
+        prev_time = time_et
+    
+    # Create export DataFrame
+    export_df = pd.DataFrame(export_data)
+    
+    # Add CSV download button
+    csv_data = export_df.to_csv(index=False)
+    st.download_button(
+        label=f"📥 Export {ticker} Gamma Data (CSV)",
+        data=csv_data,
+        file_name=f"gamma_data_{ticker}_{trading_date_obj.isoformat() if hasattr(trading_date_obj, 'isoformat') else str(trading_date_obj)}.csv",
+        mime="text/csv",
+        help="Download gamma pin data with raw values for analysis"
     )
     
     # Show summary stats

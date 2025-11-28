@@ -342,8 +342,15 @@ def calculate_gamma_exposure(options_df, spot_price):
     
     pin_strike = pin_row['strike']
     pin_expiry = pin_row['expiry']
-    total_gex = pin_row['total_gex']
-    net_gex = pin_row['net_gex']
+    
+    # Pin-level GEX values (original semantics for existing consumers)
+    total_gex = pin_row['total_gex']  # GEX at pin strike
+    net_gex = pin_row['net_gex']      # Net GEX at pin strike
+    
+    # Calculate AGGREGATE GEX across ALL strikes (for exports/display)
+    # These are NEW fields - won't break existing consumers
+    aggregate_total_gex = gex_by_strike['total_gex'].sum()  # Sum of absolute GEX (gross market gamma)
+    aggregate_net_gex = gex_by_strike['net_gex'].sum()      # Sum of signed GEX (net dealer position)
     
     # Direction of pull
     direction = 'above' if pin_strike > spot_price else 'below' if pin_strike < spot_price else 'at'
@@ -408,8 +415,10 @@ def calculate_gamma_exposure(options_df, spot_price):
     return {
         'pin_strike': pin_strike,
         'pin_expiry': pin_expiry,
-        'total_gex': total_gex,
-        'net_gex': net_gex,
+        'total_gex': total_gex,  # GEX at pin strike (original semantics)
+        'net_gex': net_gex,      # Net GEX at pin strike (original semantics)
+        'aggregate_total_gex': aggregate_total_gex,  # NEW: Sum of absolute GEX across ALL strikes
+        'aggregate_net_gex': aggregate_net_gex,      # NEW: Sum of signed GEX across ALL strikes
         'direction': direction,
         'pull_strength': abs(pin_strike - spot_price) / spot_price * 100,  # % distance
         'gex_by_strike': gex_by_strike,
@@ -545,12 +554,23 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
             # Get top walls (already filtered to meaningful GEX)
             top_walls = gex_by_strike.nlargest(3, 'total_gex')[['strike', 'net_gex', 'total_gex']].to_dict('records')
             
+            # Calculate TOTAL GEX across ALL strikes for this expiry (gross market gamma)
+            total_gex_sum = float(gex_by_strike['total_gex'].sum())
+            
+            # Calculate NET GEX across ALL strikes for this expiry (net directional gamma)
+            net_gex_sum = float(gex_by_strike['net_gex'].sum())
+            
+            # Pin strike's GEX for reference
+            pin_gex = float(pin_row['total_gex'])
+            
             gamma_by_expiry[int(dte)] = {
                 'pin_strike': pin_strike_value,
-                'total_gex': float(pin_row['total_gex']),
-                'net_gex': float(pin_row['net_gex']),
+                'total_gex': pin_gex,        # GEX at pin strike (original behavior for consumers)
+                'net_gex': float(pin_row['net_gex']),  # Net GEX at pin strike (original behavior)
+                'expiry_total_gex': total_gex_sum,  # NEW: Sum of absolute GEX across ALL strikes (for export)
+                'expiry_net_gex': net_gex_sum,      # NEW: Sum of signed GEX across ALL strikes (for export)
                 'weight': weight,
-                'weighted_gex': float(pin_row['total_gex']) * weight,
+                'weighted_gex': pin_gex * weight,   # Use PIN's GEX for aggregate pin calculation
                 'expiry_date': pin_row['expiry'].strftime('%Y-%m-%d') if hasattr(pin_row['expiry'], 'strftime') else str(pin_row['expiry']),
                 'top_walls': top_walls
             }

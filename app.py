@@ -955,14 +955,34 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚡ Dual-Model System")
     
-    # Calculate minutes to close
+    # Calculate minutes to close and check for early close
     try:
+        from app.utils.time_et import is_early_close, close_time_et, is_market_holiday, now_et
+        
+        current_et = now_et()
+        is_half_day = is_early_close()
+        is_holiday = is_market_holiday()
+        close_time = close_time_et()
+        close_time_str = close_time.strftime("%I:%M %p ET")
+        
         minutes_left = get_minutes_to_close()
+        
+        # Show prominent early close warning
+        if is_half_day and minutes_left > 0:
+            st.warning(f"⚠️ **HALF-DAY SESSION** - Market closes at **{close_time_str}**")
+        elif is_holiday:
+            st.error("🔴 **MARKET CLOSED** - Holiday")
+        
         if minutes_left > 0:
-            st.caption(f"⏰ Market closes in {minutes_left} minutes")
-        else:
+            hours_left = minutes_left // 60
+            mins_remaining = minutes_left % 60
+            if hours_left > 0:
+                st.caption(f"⏰ Market closes in {hours_left}h {mins_remaining}m ({close_time_str})")
+            else:
+                st.caption(f"⏰ Market closes in {minutes_left} minutes ({close_time_str})")
+        elif not is_holiday:
             st.caption("🔴 Market is closed")
-    except:
+    except Exception as e:
         minutes_left = 999
     
     # Show recommendation

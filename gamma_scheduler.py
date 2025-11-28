@@ -1,11 +1,16 @@
 """
 Background Scheduler for Automatic Gamma Pin Sampling
-Runs every 15 minutes during market hours to track gamma evolution
+Runs with adaptive intervals during market hours to track gamma evolution:
+- Default: 15 minutes
+- Last hour before close: 5 minutes  
+- Last 15 minutes before close: 2 minutes (highest precision when it matters most)
+
+Respects early close days (1 PM ET) like Black Friday and Christmas Eve.
 """
 import threading
 import time
 import os
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 import pytz
 from database import save_gamma_snapshot
 from websocket_streaming import get_snapshot_data
@@ -13,32 +18,84 @@ from options_gamma import fetch_options_chain, calculate_gamma_exposure
 
 # Market hours in Eastern Time
 MARKET_OPEN_TIME = dt_time(9, 30)  # 9:30 AM ET
-MARKET_CLOSE_TIME = dt_time(16, 0)  # 4:00 PM ET
-SAMPLE_INTERVAL_MINUTES = 15
+MARKET_CLOSE_REGULAR = dt_time(16, 0)  # 4:00 PM ET (regular close)
+MARKET_CLOSE_EARLY = dt_time(13, 0)   # 1:00 PM ET (early close)
+
 TRACKED_SYMBOLS = ['SPX', 'NDX', 'DJI', 'RUT']
 
 # Global flag to control scheduler
 _scheduler_running = False
 _scheduler_thread = None
 
-def is_market_hours():
-    """Check if current time is during regular trading hours (9:30 AM - 4:00 PM ET)"""
+def get_market_close_time():
+    """Get today's market close time, accounting for early close days"""
     try:
+        from app.utils.time_et import is_early_close, close_time_et
+        if is_early_close():
+            return MARKET_CLOSE_EARLY
+        return MARKET_CLOSE_REGULAR
+    except:
+        return MARKET_CLOSE_REGULAR
+
+def get_minutes_until_close():
+    """Get minutes until today's market close"""
+    try:
+        from app.utils.time_et import minutes_to_close_et
+        from datetime import datetime, timezone
+        return minutes_to_close_et(datetime.now(timezone.utc))
+    except:
+        # Fallback calculation
+        et_tz = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et_tz)
+        close_time = get_market_close_time()
+        close_dt = now_et.replace(hour=close_time.hour, minute=close_time.minute, second=0)
+        if now_et >= close_dt:
+            return 0
+        return int((close_dt - now_et).total_seconds() // 60)
+
+def get_adaptive_sample_interval():
+    """
+    Get the sampling interval in minutes based on time until close.
+    More frequent sampling as market close approaches.
+    
+    Returns: (interval_minutes, interval_name)
+    """
+    minutes_left = get_minutes_until_close()
+    
+    if minutes_left <= 0:
+        return (15, "market_closed")
+    elif minutes_left <= 15:
+        return (2, "final_15min")  # Highest precision in last 15 minutes
+    elif minutes_left <= 30:
+        return (3, "final_30min")  # High precision in last 30 minutes
+    elif minutes_left <= 60:
+        return (5, "final_hour")   # Increased precision in last hour
+    else:
+        return (15, "regular")     # Standard interval
+
+def is_market_hours():
+    """Check if current time is during regular trading hours, respecting early close days"""
+    try:
+        from app.utils.time_et import is_regular_hours, is_market_holiday
+        from datetime import datetime, timezone
+        
+        if is_market_holiday():
+            return False
+        
+        return is_regular_hours(datetime.now(timezone.utc))
+    except:
+        # Fallback to simple check
         et_tz = pytz.timezone('US/Eastern')
         now_et = datetime.now(et_tz)
         current_time = now_et.time()
         
-        # Check if weekday (Monday = 0, Sunday = 6)
-        if now_et.weekday() >= 5:  # Saturday or Sunday
+        if now_et.weekday() >= 5:
             return False
         
-        # Check if within market hours
-        if MARKET_OPEN_TIME <= current_time < MARKET_CLOSE_TIME:
+        close_time = get_market_close_time()
+        if MARKET_OPEN_TIME <= current_time < close_time:
             return True
         
-        return False
-    except Exception as e:
-        print(f"Error checking market hours: {str(e)}")
         return False
 
 def fetch_and_save_gamma_snapshot(api_key, symbol):
@@ -105,7 +162,13 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         return False
 
 def gamma_sampling_loop():
-    """Main loop that runs every 15 minutes during market hours"""
+    """
+    Main loop with adaptive sampling intervals based on time to close.
+    - Regular session: 15-minute intervals
+    - Last hour: 5-minute intervals
+    - Last 30 minutes: 3-minute intervals
+    - Last 15 minutes: 2-minute intervals (highest precision when it matters most)
+    """
     global _scheduler_running
     
     api_key = os.getenv('POLYGON_API_KEY')
@@ -113,7 +176,7 @@ def gamma_sampling_loop():
         print("ERROR: POLYGON_API_KEY not found in environment, gamma sampling disabled")
         return
     
-    print("🚀 Gamma sampling scheduler started")
+    print("🚀 Gamma sampling scheduler started (adaptive intervals)")
     
     # Track consecutive failures for backoff
     consecutive_failures = 0
@@ -121,6 +184,7 @@ def gamma_sampling_loop():
     
     # Track last sample time to avoid duplicates
     last_sample_time = None
+    last_interval = None
     
     while _scheduler_running:
         try:
@@ -129,16 +193,28 @@ def gamma_sampling_loop():
                 et_tz = pytz.timezone('US/Eastern')
                 current_time_et = datetime.now(et_tz)
                 
-                # Calculate which 15-minute boundary we're in
+                # Get adaptive interval based on time to close
+                interval_minutes, interval_mode = get_adaptive_sample_interval()
+                
+                # Log interval change
+                if last_interval != interval_mode:
+                    minutes_left = get_minutes_until_close()
+                    close_time = get_market_close_time()
+                    print(f"\n🔄 Sampling interval adjusted: {interval_minutes} min ({interval_mode})")
+                    print(f"   Market closes at {close_time.hour}:{close_time.minute:02d} PM ET, {minutes_left} minutes left")
+                    last_interval = interval_mode
+                
+                # Calculate which interval boundary we're in
                 current_minute = current_time_et.minute
-                current_boundary = (current_minute // 15) * 15  # 0, 15, 30, 45
+                current_boundary = (current_minute // interval_minutes) * interval_minutes
                 
                 # Create a timestamp for this boundary
                 boundary_time = current_time_et.replace(minute=current_boundary, second=0, microsecond=0)
                 
                 # Sample if we haven't sampled this boundary yet
                 if last_sample_time is None or boundary_time > last_sample_time:
-                    print(f"\n📊 Running gamma sampling at {current_time_et.strftime('%I:%M %p ET')} (boundary: {boundary_time.strftime('%I:%M %p')})")
+                    minutes_left = get_minutes_until_close()
+                    print(f"\n📊 Gamma sampling at {current_time_et.strftime('%I:%M %p ET')} [{interval_mode}] ({minutes_left} min to close)")
                     
                     # Sample all tracked symbols
                     success_count = 0
@@ -150,7 +226,7 @@ def gamma_sampling_loop():
                         else:
                             failed_count += 1
                     
-                    print(f"✓ Gamma sampling cycle complete ({success_count}/{len(TRACKED_SYMBOLS)} successful)\n")
+                    print(f"✓ Gamma sampling complete ({success_count}/{len(TRACKED_SYMBOLS)} successful)\n")
                     
                     # Update last sample time
                     last_sample_time = boundary_time
@@ -167,17 +243,18 @@ def gamma_sampling_loop():
                 # Market closed, don't sample
                 consecutive_failures = 0  # Reset failures when market closed
                 last_sample_time = None  # Reset for next day
+                last_interval = None  # Reset interval mode
             
-            # Sleep 1 minute between checks (more reasonable than 15 minutes)
-            # Check every 10 seconds if scheduler should stop (for graceful shutdown)
-            for _ in range(6):  # 6 * 10 seconds = 1 minute
+            # Check every 30 seconds for faster response to interval changes
+            # This allows quick adaptation when transitioning to higher frequency modes
+            for _ in range(3):  # 3 * 10 seconds = 30 seconds
                 if not _scheduler_running:
                     break
                 time.sleep(10)
                 
         except Exception as e:
             print(f"Error in gamma sampling loop: {str(e)}")
-            time.sleep(60)  # Wait 1 minute before retry on error
+            time.sleep(30)  # Wait 30 seconds before retry on error
     
     print("🛑 Gamma sampling scheduler stopped")
 
