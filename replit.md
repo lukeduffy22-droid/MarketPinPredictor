@@ -10,20 +10,20 @@ Preferred communication style: Simple, everyday language.
 
 ## Recent Changes (December 2025)
 
-### Replit WebSocket Limitation & 1-Second REST Polling Fix (Dec 3, 2025)
-- **Issue**: Replit environment blocks WebSocket connections to `socket.polygon.io` (DNS resolution fails with `gaierror: [Errno -2]`)
-- **Root Cause**: Replit's network infrastructure doesn't allow long-lived WebSocket connections to certain external hosts
-- **Solution**: Implemented aggressive 1-second REST API polling using premium Polygon subscription (unlimited API calls)
-- **Implementation** (`app/ingest/rest_fallback.py`):
-  - `poll_polygon_rest()` polls every 1 second for near-real-time data
-  - Uses `client.get_snapshot_indices()` for batch fetching all 4 indices
-  - Logs every 10 polls to reduce noise
-- **Health Endpoint Updates**:
-  - `data_age_seconds`: Shows how old the latest tick is (should be 0-1 seconds)
+### Real-Time WebSocket Fix (Dec 3, 2025)
+- **Issue**: Polygon SDK's `WebSocketClient` class was failing with DNS resolution errors in Replit
+- **Root Cause**: The Polygon SDK's WebSocket implementation had compatibility issues, but raw `websockets` library works perfectly
+- **Solution**: Replaced Polygon SDK's `WebSocketClient` with raw `websockets` library for direct WebSocket connections
+- **Implementation**:
+  - `app/ingest/websocket_stream.py`: Uses raw `websockets` library to connect to `wss://socket.polygon.io/indices`
+  - `app/ingest/options_websocket_stream.py`: Uses raw `websockets` for `wss://socket.polygon.io/options`
+  - Both streams now connect successfully and receive real-time data
+  - REST polling (`app/ingest/rest_fallback.py`) remains as backup fallback
+- **Health Endpoint**:
+  - `data_age_seconds`: Shows how old the latest tick is (0-2 seconds with WebSocket)
   - `buffer_length`: Number of seconds of data in ring buffer
-  - `mode`: Shows "REST" or "WebSocket"
-- **Freshness Threshold**: 5 seconds (compatible with 1-second polling)
-- **Note**: This is a Replit-specific workaround. If deploying elsewhere with WebSocket support, the system will use real WebSocket streaming.
+  - `mode`: Shows "WebSocket" when connected, "REST" as fallback
+- **Result**: TRUE real-time streaming is now active, maximizing the $350/month premium Polygon subscription value
 
 ## Recent Changes (November 2025)
 

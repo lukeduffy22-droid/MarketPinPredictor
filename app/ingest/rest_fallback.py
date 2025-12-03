@@ -19,8 +19,8 @@ from app.utils.time_et import is_regular_hours
 
 log = logging.getLogger("rest_fallback")
 
-# Global flag to indicate REST-only mode is active
-REST_ONLY_MODE = False
+# Global flag to indicate WebSocket is connected
+WEBSOCKET_CONNECTED = False
 
 # Polling interval - 1 second for near-real-time with premium subscription (unlimited API calls)
 REST_POLL_INTERVAL = 1.0
@@ -29,18 +29,21 @@ REST_POLL_INTERVAL = 1.0
 LOG_EVERY_N_POLLS = 10
 _poll_count = 0
 
+def set_websocket_connected(connected: bool):
+    """Set WebSocket connection status"""
+    global WEBSOCKET_CONNECTED
+    WEBSOCKET_CONNECTED = connected
+
 def is_rest_only_mode() -> bool:
     """Check if we're running in REST-only mode (WebSocket unavailable)"""
-    return REST_ONLY_MODE
+    return not WEBSOCKET_CONNECTED
 
 async def poll_polygon_rest():
     """
-    Poll Polygon REST API for live index prices when WebSocket fails.
-    With premium Polygon subscription (unlimited API calls), polls every 1 second
-    for near-real-time data during market hours.
+    Poll Polygon REST API as backup when WebSocket is primary.
+    With premium Polygon subscription (unlimited API calls), polls every 1 second.
     """
-    global REST_ONLY_MODE, _poll_count
-    REST_ONLY_MODE = True
+    global _poll_count
     
     from polygon import RESTClient
     
@@ -140,9 +143,6 @@ async def load_cached_snapshots():
     Secondary fallback: Load cached index snapshots from database.
     Used when both WebSocket AND REST API fail.
     """
-    global REST_ONLY_MODE
-    REST_ONLY_MODE = True
-    
     from database import get_latest_gamma_snapshot
     
     INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]

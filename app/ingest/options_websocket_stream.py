@@ -1,15 +1,16 @@
 """
 Options WebSocket streaming for real-time gamma exposure updates.
-Connects to Polygon options WebSocket during market hours and falls back to REST EOD snapshots.
+Uses raw websockets library for Replit compatibility.
 """
 import asyncio
+import json
 import logging
 import random
 from datetime import datetime
 from typing import Dict, Optional, Callable
 
-from polygon import WebSocketClient, RESTClient
-from polygon.websocket.models import WebSocketMessage, Market
+import websockets
+from polygon import RESTClient
 
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
@@ -71,29 +72,71 @@ def get_gamma_tracker() -> OptionsGammaTracker:
 class OptionsWebSocketStream:
     """
     Manages dedicated options WebSocket connection for real-time gamma tracking.
+    Uses raw websockets library for Replit compatibility.
     """
     
     def __init__(self):
-        self.client = None
+        self.ws = None
         self.reconnect_count = 0
         self.max_reconnects = settings.ws_max_reconnects
         self.running = False
         self.is_market_hours = False
         self._last_trade_time = 0
+        self.subscriptions = [
+            "T.O:SPX*",   # SPX options trades
+            "T.O:NDX*",   # NDX options trades
+            "T.O:SPXW*",  # SPX weekly options
+        ]
     
-    async def message_handler(self, msg: WebSocketMessage):
-        """Handle incoming options WebSocket messages"""
-        try:
-            msg_dict = msg.to_dict() if hasattr(msg, "to_dict") else msg
-            ev = msg_dict.get("ev", "")
-            
-            if ev == "T":  # Options trade
-                await self._process_options_trade(msg_dict)
-            elif ev == "AM":  # Options minute aggregate
-                await self._process_options_aggregate(msg_dict)
+    async def _send(self, action: str, params: str = None):
+        """Send a message to WebSocket"""
+        msg = {"action": action}
+        if params:
+            msg["params"] = params
+        await self.ws.send(json.dumps(msg))
+    
+    async def _handle_messages(self):
+        """Handle incoming WebSocket messages"""
+        async for message in self.ws:
+            try:
+                data = json.loads(message)
                 
-        except Exception as e:
-            log.error(f"Error handling options message: {e}")
+                if isinstance(data, list):
+                    for msg in data:
+                        await self._process_message(msg)
+                else:
+                    await self._process_message(data)
+                    
+            except json.JSONDecodeError as e:
+                log.warning(f"Invalid JSON message: {e}")
+            except Exception as e:
+                log.error(f"Error processing options message: {e}")
+    
+    async def _process_message(self, msg: dict):
+        """Process a single message"""
+        ev = msg.get("ev")
+        
+        if ev == "status":
+            status = msg.get("status")
+            message = msg.get("message", "")
+            
+            if status == "connected":
+                log.info(f"Options WebSocket connected: {message}")
+            elif status == "auth_success":
+                log.info("Options WebSocket authentication successful - subscribing to channels")
+                await self._send("subscribe", ",".join(self.subscriptions))
+            elif status == "auth_failed":
+                log.error(f"Options WebSocket authentication failed: {message}")
+            elif status == "success":
+                log.info(f"Options subscription confirmed: {message}")
+            else:
+                log.debug(f"Options status: {status} - {message}")
+        
+        elif ev == "T":
+            await self._process_options_trade(msg)
+        
+        elif ev == "AM":
+            await self._process_options_aggregate(msg)
     
     async def _process_options_trade(self, msg: dict):
         """
@@ -106,24 +149,29 @@ class OptionsWebSocketStream:
             if not sym.startswith("O:"):
                 return
             
-            parts = sym[2:]  # Remove O:
+            parts = sym[2:]
             
             root = None
-            for r in ("SPX", "NDX", "DJI", "RUT"):
+            for r in ("SPXW", "SPX", "NDX", "DJI", "RUT"):
                 if parts.startswith(r):
-                    root = r
+                    root = "SPX" if r == "SPXW" else r
                     break
             
             if not root:
                 return
             
-            cp_flag = parts[len(root)+6] if len(parts) > len(root)+6 else None
+            parts_after_root = parts[len(root if root != "SPX" else ("SPXW" if parts.startswith("SPXW") else "SPX")):]
+            
+            if len(parts_after_root) < 8:
+                return
+            
+            cp_flag = parts_after_root[6] if len(parts_after_root) > 6 else None
             if cp_flag not in ("C", "P"):
                 return
             
             is_call = (cp_flag == "C")
             
-            strike_str = parts[len(root)+7:]
+            strike_str = parts_after_root[7:]
             if not strike_str.isdigit():
                 return
             strike = int(strike_str) // 1000
@@ -150,6 +198,11 @@ class OptionsWebSocketStream:
     async def start(self):
         """Start options WebSocket stream"""
         self.running = True
+        api_key = settings.polygon_api_key
+        
+        if not api_key:
+            log.error("POLYGON_API_KEY not set, cannot start Options WebSocket")
+            return
         
         while self.running and self.reconnect_count < self.max_reconnects:
             try:
@@ -157,33 +210,33 @@ class OptionsWebSocketStream:
                 self.is_market_hours = is_regular_hours(dt_utc)
                 
                 if not self.is_market_hours:
-                    log.info("Market closed - options WebSocket waiting for market hours")
+                    log.info("Market closed - Options WebSocket waiting for market hours")
                     await asyncio.sleep(60)
                     continue
                 
-                feed_type = "real-time" if self.is_market_hours else "delayed"
-                log.info(f"Starting {feed_type} Options WebSocket feed (wss://socket.polygon.io/options)")
+                endpoint = "wss://socket.polygon.io/options"
+                log.info(f"Connecting to Options WebSocket: {endpoint}")
                 
-                self.client = WebSocketClient(
-                    api_key=settings.polygon_api_key,
-                    market=Market.Options,
-                    feed="RealTime" if self.is_market_hours else "Delayed"
-                )
-                
-                self.client.subscribe(
-                    "T.O:SPX*",
-                    "T.O:NDX*",
-                    "T.O:DJI*",
-                    "T.O:RUT*"
-                )
-                
-                log.info("Connecting to Polygon Options WebSocket...")
-                await self.client.connect(self.message_handler)
-                log.info("Options WebSocket connected successfully")
-                
+                async with websockets.connect(
+                    endpoint,
+                    ping_interval=30,
+                    ping_timeout=30,
+                    close_timeout=10
+                ) as ws:
+                    self.ws = ws
+                    self.reconnect_count = 0
+                    
+                    log.info("Authenticating with Polygon Options...")
+                    await self._send("auth", api_key)
+                    
+                    await self._handle_messages()
+                    
+            except websockets.exceptions.ConnectionClosed as e:
+                log.warning(f"Options WebSocket connection closed: {e}")
             except Exception as e:
-                log.error(f"Options WebSocket error: {e}")
-                
+                log.error(f"Options WebSocket error: {type(e).__name__}: {e}")
+            
+            if self.running:
                 self.reconnect_count += 1
                 backoff = min(60, settings.ws_backoff_base ** self.reconnect_count)
                 jitter = backoff * settings.ws_backoff_jitter * random.random()
@@ -198,8 +251,8 @@ class OptionsWebSocketStream:
     async def stop(self):
         """Stop options WebSocket stream"""
         self.running = False
-        if self.client:
-            await self.client.close()
+        if self.ws:
+            await self.ws.close()
             log.info("Options WebSocket stream stopped")
 
 
