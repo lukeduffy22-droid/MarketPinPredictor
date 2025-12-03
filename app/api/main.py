@@ -139,20 +139,29 @@ async def health_check():
     Health check endpoint.
     Returns per-symbol freshness and ring buffer status.
     """
+    import time
     from app.ingest.rest_fallback import is_rest_only_mode
-    max_age = 15 if is_rest_only_mode() else 5  # Lenient for REST-only mode
+    max_age = 5  # 5 second freshness threshold (1s REST polling)
     
     status = {}
+    current_time = int(time.time())
     
     for symbol in ("SPX", "NDX", "DJI", "RUT"):
         ring = INDEX_RINGS.get(symbol)
         
         is_fresh = ring.is_fresh(max_age_seconds=max_age) if ring else False
-        length = ring.length_seconds if ring else 0
+        buffer_length = ring.length_seconds if ring else 0
+        
+        # Calculate data age (how old the latest tick is)
+        data_age = 0
+        if ring and ring.q:
+            latest_ts = ring.q[-1][0]
+            data_age = current_time - latest_ts
         
         status[symbol] = {
             "fresh": is_fresh,
-            "index_seconds": length,
+            "data_age_seconds": data_age,
+            "buffer_length": buffer_length,
             "latest_price": get_latest_price(symbol),
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
@@ -242,9 +251,9 @@ async def predict_close(symbol: str) -> PredictionResponse:
     if elapsed_ms < required_cadence_ms:
         raise HTTPException(429, f"Too many requests. Wait {int(required_cadence_ms - elapsed_ms)}ms")
     
-    # Check freshness - use longer threshold if in REST-only mode
+    # Check freshness - with 1-second REST polling, use 5s threshold for both modes
     from app.ingest.rest_fallback import is_rest_only_mode
-    max_age = 15 if is_rest_only_mode() else 5  # 15s for REST, 5s for WebSocket
+    max_age = 5  # 5 seconds freshness threshold (1s REST polling, real-time WebSocket)
     min_data_seconds = 10 if is_rest_only_mode() else 300  # Lower threshold for REST
     
     ring = INDEX_RINGS.get(symbol)

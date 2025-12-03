@@ -2,6 +2,11 @@
 REST fallback for when WebSocket connection fails.
 Polls Polygon REST API for live prices when WebSocket is unavailable.
 Also loads cached snapshots as a secondary fallback.
+
+NOTE: Replit blocks WebSocket connections to socket.polygon.io (DNS resolution fails).
+This REST polling is the primary data source in the Replit environment.
+With premium Polygon subscription (unlimited API calls), we poll every 1 second
+for near-real-time data.
 """
 import asyncio
 import logging
@@ -17,6 +22,13 @@ log = logging.getLogger("rest_fallback")
 # Global flag to indicate REST-only mode is active
 REST_ONLY_MODE = False
 
+# Polling interval - 1 second for near-real-time with premium subscription (unlimited API calls)
+REST_POLL_INTERVAL = 1.0
+
+# Logging interval - log every N polls to reduce noise
+LOG_EVERY_N_POLLS = 10
+_poll_count = 0
+
 def is_rest_only_mode() -> bool:
     """Check if we're running in REST-only mode (WebSocket unavailable)"""
     return REST_ONLY_MODE
@@ -24,9 +36,10 @@ def is_rest_only_mode() -> bool:
 async def poll_polygon_rest():
     """
     Poll Polygon REST API for live index prices when WebSocket fails.
-    This is the primary REST fallback - polls every 5 seconds for near-real-time data.
+    With premium Polygon subscription (unlimited API calls), polls every 1 second
+    for near-real-time data during market hours.
     """
-    global REST_ONLY_MODE
+    global REST_ONLY_MODE, _poll_count
     REST_ONLY_MODE = True
     
     from polygon import RESTClient
@@ -39,7 +52,7 @@ async def poll_polygon_rest():
     client = RESTClient(api_key)
     INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
     
-    log.info("Starting REST API polling fallback (5-second intervals)")
+    log.info(f"Starting REST API polling (every {REST_POLL_INTERVAL}s - premium subscription, unlimited API calls)")
     
     # Track consecutive failures per symbol
     failure_counts = {s: 0 for s in INDEX_SYMBOLS}
@@ -70,7 +83,12 @@ async def poll_polygon_rest():
                 results_list = list(results) if results else []
                 
                 if results_list:
-                    log.info(f"REST API returned {len(results_list)} results")
+                    _poll_count += 1
+                    should_log = (_poll_count % LOG_EVERY_N_POLLS == 0)
+                    
+                    if should_log:
+                        log.info(f"REST API poll #{_poll_count} - {len(results_list)} indices")
+                    
                     for snapshot in results_list:
                         if hasattr(snapshot, 'ticker') and hasattr(snapshot, 'value') and snapshot.value:
                             # Extract symbol from ticker (e.g., "I:SPX" -> "SPX")
@@ -91,7 +109,8 @@ async def poll_polygon_rest():
                                 failure_counts[symbol] = 0
                                 fetched_symbols.add(symbol)
                                 
-                                log.info(f"{symbol}: ${price:.2f} (REST API)")
+                                if should_log:
+                                    log.info(f"{symbol}: ${price:.2f}")
                 else:
                     log.warning("REST API returned no results")
                 
@@ -109,12 +128,12 @@ async def poll_polygon_rest():
                     if failure_counts[symbol] < MAX_FAILURES:
                         failure_counts[symbol] += 1
             
-            # Poll every 5 seconds for near-real-time data
-            await asyncio.sleep(5.0)
+            # Poll at configured interval (1s with premium subscription)
+            await asyncio.sleep(REST_POLL_INTERVAL)
             
         except Exception as e:
             log.error(f"REST polling error: {e}")
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(REST_POLL_INTERVAL)
 
 async def load_cached_snapshots():
     """
