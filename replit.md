@@ -8,6 +8,23 @@ This project is a dual-model stock market prediction system for major stock indi
 
 Preferred communication style: Simple, everyday language.
 
+## Recent Changes (December 2025)
+
+### Replit WebSocket Limitation & 1-Second REST Polling Fix (Dec 3, 2025)
+- **Issue**: Replit environment blocks WebSocket connections to `socket.polygon.io` (DNS resolution fails with `gaierror: [Errno -2]`)
+- **Root Cause**: Replit's network infrastructure doesn't allow long-lived WebSocket connections to certain external hosts
+- **Solution**: Implemented aggressive 1-second REST API polling using premium Polygon subscription (unlimited API calls)
+- **Implementation** (`app/ingest/rest_fallback.py`):
+  - `poll_polygon_rest()` polls every 1 second for near-real-time data
+  - Uses `client.get_snapshot_indices()` for batch fetching all 4 indices
+  - Logs every 10 polls to reduce noise
+- **Health Endpoint Updates**:
+  - `data_age_seconds`: Shows how old the latest tick is (should be 0-1 seconds)
+  - `buffer_length`: Number of seconds of data in ring buffer
+  - `mode`: Shows "REST" or "WebSocket"
+- **Freshness Threshold**: 5 seconds (compatible with 1-second polling)
+- **Note**: This is a Replit-specific workaround. If deploying elsewhere with WebSocket support, the system will use real WebSocket streaming.
+
 ## Recent Changes (November 2025)
 
 ### 1-Hour Opening Range Breakout (ORB) Tracking
