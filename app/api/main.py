@@ -126,8 +126,10 @@ async def startup():
     asyncio.create_task(start_options_websocket_stream())
     
     # Start REST fallback (in case WebSocket fails)
-    from app.ingest.rest_fallback import load_cached_snapshots
-    asyncio.create_task(load_cached_snapshots())
+    # Use REST API polling as primary fallback (5-second intervals)
+    from app.ingest.rest_fallback import poll_polygon_rest, load_cached_snapshots
+    asyncio.create_task(poll_polygon_rest())
+    asyncio.create_task(load_cached_snapshots())  # Secondary fallback from DB
     
     log.info("API ready - WebSocket streams (stocks + options) + REST fallback starting")
 
@@ -137,18 +139,22 @@ async def health_check():
     Health check endpoint.
     Returns per-symbol freshness and ring buffer status.
     """
+    from app.ingest.rest_fallback import is_rest_only_mode
+    max_age = 15 if is_rest_only_mode() else 5  # Lenient for REST-only mode
+    
     status = {}
     
     for symbol in ("SPX", "NDX", "DJI", "RUT"):
         ring = INDEX_RINGS.get(symbol)
         
-        is_fresh = ring.is_fresh(max_age_seconds=5) if ring else False
+        is_fresh = ring.is_fresh(max_age_seconds=max_age) if ring else False
         length = ring.length_seconds if ring else 0
         
         status[symbol] = {
             "fresh": is_fresh,
             "index_seconds": length,
-            "latest_price": get_latest_price(symbol)
+            "latest_price": get_latest_price(symbol),
+            "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
     
     overall_ok = all(s["fresh"] or not is_regular_hours(datetime.utcnow()) for s in status.values())
@@ -236,12 +242,16 @@ async def predict_close(symbol: str) -> PredictionResponse:
     if elapsed_ms < required_cadence_ms:
         raise HTTPException(429, f"Too many requests. Wait {int(required_cadence_ms - elapsed_ms)}ms")
     
-    # Check freshness
+    # Check freshness - use longer threshold if in REST-only mode
+    from app.ingest.rest_fallback import is_rest_only_mode
+    max_age = 15 if is_rest_only_mode() else 5  # 15s for REST, 5s for WebSocket
+    min_data_seconds = 10 if is_rest_only_mode() else 300  # Lower threshold for REST
+    
     ring = INDEX_RINGS.get(symbol)
-    if not ring or not ring.is_fresh(max_age_seconds=5):
+    if not ring or not ring.is_fresh(max_age_seconds=max_age):
         raise HTTPException(503, f"Stale data for {symbol}")
     
-    if ring.length_seconds < 300:
+    if ring.length_seconds < min_data_seconds:
         raise HTTPException(503, f"Insufficient data for {symbol}")
     
     # Get current price

@@ -1,23 +1,129 @@
 """
-Database fallback for when WebSocket connection fails.
-Loads cached snapshots instead of polling REST API.
-Primary live data comes from Polygon WebSocket streaming.
+REST fallback for when WebSocket connection fails.
+Polls Polygon REST API for live prices when WebSocket is unavailable.
+Also loads cached snapshots as a secondary fallback.
 """
 import asyncio
 import logging
 from datetime import datetime
 import time
+import os
 
 from app.state.ring_buffers import INDEX_RINGS, update_session_vwap, IndexTick
 from app.utils.time_et import is_regular_hours
 
 log = logging.getLogger("rest_fallback")
 
+# Global flag to indicate REST-only mode is active
+REST_ONLY_MODE = False
+
+def is_rest_only_mode() -> bool:
+    """Check if we're running in REST-only mode (WebSocket unavailable)"""
+    return REST_ONLY_MODE
+
+async def poll_polygon_rest():
+    """
+    Poll Polygon REST API for live index prices when WebSocket fails.
+    This is the primary REST fallback - polls every 5 seconds for near-real-time data.
+    """
+    global REST_ONLY_MODE
+    REST_ONLY_MODE = True
+    
+    from polygon import RESTClient
+    
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        log.error("POLYGON_API_KEY not set, cannot poll REST API")
+        return
+    
+    client = RESTClient(api_key)
+    INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
+    
+    log.info("Starting REST API polling fallback (5-second intervals)")
+    
+    # Track consecutive failures per symbol
+    failure_counts = {s: 0 for s in INDEX_SYMBOLS}
+    MAX_FAILURES = 10  # Stop retrying after 10 consecutive failures
+    
+    while True:
+        try:
+            if not is_regular_hours(datetime.utcnow()):
+                await asyncio.sleep(60)
+                continue
+            
+            # Build list of tickers to fetch (excluding failed ones)
+            tickers_to_fetch = [f"I:{s}" for s in INDEX_SYMBOLS if failure_counts[s] < MAX_FAILURES]
+            
+            if not tickers_to_fetch:
+                log.warning("All index REST fetches have failed, waiting...")
+                await asyncio.sleep(30)
+                continue
+            
+            try:
+                # Use get_snapshot_indices for batch fetching
+                results = client.get_snapshot_indices(ticker_any_of=tickers_to_fetch)
+                
+                ts = int(time.time())
+                fetched_symbols = set()
+                
+                # Convert iterator to list to avoid exhaustion issues
+                results_list = list(results) if results else []
+                
+                if results_list:
+                    log.info(f"REST API returned {len(results_list)} results")
+                    for snapshot in results_list:
+                        if hasattr(snapshot, 'ticker') and hasattr(snapshot, 'value') and snapshot.value:
+                            # Extract symbol from ticker (e.g., "I:SPX" -> "SPX")
+                            ticker = snapshot.ticker
+                            symbol = ticker.replace("I:", "") if ticker.startswith("I:") else ticker
+                            
+                            if symbol in INDEX_SYMBOLS:
+                                price = float(snapshot.value)
+                                
+                                # Create tick from REST data
+                                tick = IndexTick(ts=ts, price=price, size=1.0)
+                                
+                                # Add to ring buffer
+                                INDEX_RINGS[symbol].add(ts, tick)
+                                update_session_vwap(symbol, price, 1.0)
+                                
+                                # Reset failure count on success
+                                failure_counts[symbol] = 0
+                                fetched_symbols.add(symbol)
+                                
+                                log.info(f"{symbol}: ${price:.2f} (REST API)")
+                else:
+                    log.warning("REST API returned no results")
+                
+                # Mark failures for symbols not in results
+                for symbol in INDEX_SYMBOLS:
+                    if symbol not in fetched_symbols and failure_counts[symbol] < MAX_FAILURES:
+                        failure_counts[symbol] += 1
+                        if failure_counts[symbol] <= 3:
+                            log.warning(f"No REST data for {symbol} (failures: {failure_counts[symbol]})")
+                            
+            except Exception as e:
+                log.warning(f"REST API batch error: {e}")
+                # Increment all failure counts
+                for symbol in INDEX_SYMBOLS:
+                    if failure_counts[symbol] < MAX_FAILURES:
+                        failure_counts[symbol] += 1
+            
+            # Poll every 5 seconds for near-real-time data
+            await asyncio.sleep(5.0)
+            
+        except Exception as e:
+            log.error(f"REST polling error: {e}")
+            await asyncio.sleep(5.0)
+
 async def load_cached_snapshots():
     """
-    Fallback: Load cached index snapshots from database when WebSocket fails.
-    This is a graceful degradation - not real-time but prevents complete data loss.
+    Secondary fallback: Load cached index snapshots from database.
+    Used when both WebSocket AND REST API fail.
     """
+    global REST_ONLY_MODE
+    REST_ONLY_MODE = True
+    
     from database import get_latest_gamma_snapshot
     
     INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
@@ -53,7 +159,7 @@ async def load_cached_snapshots():
                 except Exception as e:
                     log.error(f"Error loading cached snapshot for {symbol}: {e}")
             
-            # Refresh every 30 seconds (cached data, no need to hammer)
+            # Refresh every 30 seconds (cached data, secondary fallback)
             await asyncio.sleep(30.0)
             
         except Exception as e:
