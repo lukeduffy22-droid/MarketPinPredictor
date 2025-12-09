@@ -1204,39 +1204,41 @@ with st.sidebar:
                 st.session_state.ws_stream.disconnect()
                 st.session_state.ws_stream = None
                 st.session_state.streaming_active = False
-            else:
-                # Get actual stats from stream
+                st.rerun()
+            
+            # Get actual stats from stream (with null check)
+            if st.session_state.ws_stream:
                 stream_stats = st.session_state.ws_stream.get_stats()
                 if stream_stats:
                     stats.update(stream_stats)
-                
-                # Display market status and feed type prominently
-                market_status_color = "🟢" if stats.get('market_open', False) else "🔴"
-                market_status_text = "OPEN" if stats.get('market_open', False) else "CLOSED"
-                
-                feed_type = stats.get('feed_type', 'unknown')
-                if feed_type == 'real-time':
-                    feed_indicator = "⚡ REAL-TIME DATA"
-                    feed_color = "green"
-                else:
-                    feed_indicator = "🕐 DELAYED DATA (~15 min)"
-                    feed_color = "orange"
-                
-                # Show current ET time
-                current_time = stats.get('current_time_et')
-                if current_time:
-                    time_str = current_time.strftime('%I:%M:%S %p ET')
-                else:
-                    import pytz
-                    et_tz = pytz.timezone('US/Eastern')
-                    time_str = datetime.now(et_tz).strftime('%I:%M:%S %p ET')
-                
-                # Show connection status with clear indicators
-                if st.session_state.ws_stream.connection_status == "connected":
-                    st.success(f"{market_status_color} Market {market_status_text} | :{feed_color}[{feed_indicator}] | 🕐 {time_str}")
-                    st.caption(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options tracked")
-                else:
-                    st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
+            
+            # Display market status and feed type prominently
+            market_status_color = "🟢" if stats.get('market_open', False) else "🔴"
+            market_status_text = "OPEN" if stats.get('market_open', False) else "CLOSED"
+            
+            feed_type = stats.get('feed_type', 'unknown')
+            if feed_type == 'real-time':
+                feed_indicator = "⚡ REAL-TIME DATA"
+                feed_color = "green"
+            else:
+                feed_indicator = "🕐 DELAYED DATA (~15 min)"
+                feed_color = "orange"
+            
+            # Show current ET time
+            current_time = stats.get('current_time_et')
+            if current_time:
+                time_str = current_time.strftime('%I:%M:%S %p ET')
+            else:
+                import pytz
+                et_tz = pytz.timezone('US/Eastern')
+                time_str = datetime.now(et_tz).strftime('%I:%M:%S %p ET')
+            
+            # Show connection status with clear indicators
+            if st.session_state.ws_stream and st.session_state.ws_stream.connection_status == "connected":
+                st.success(f"{market_status_color} Market {market_status_text} | :{feed_color}[{feed_indicator}] | 🕐 {time_str}")
+                st.caption(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options tracked")
+            elif st.session_state.ws_stream:
+                st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
             
             # Streaming stats (now stats is always defined)
             stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
@@ -1251,19 +1253,33 @@ with st.sidebar:
             
             # Stop streaming button
             if st.button("⏹ Stop Streaming", type="secondary"):
-                st.session_state.ws_stream.disconnect()
+                if st.session_state.ws_stream:
+                    st.session_state.ws_stream.disconnect()
                 st.session_state.ws_stream = None
                 st.session_state.streaming_active = False
                 st.rerun()
             
             # Show recent messages
             with st.expander("📡 Recent Messages", expanded=False):
-                recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
-                if recent_msgs:
-                    for msg in recent_msgs:
-                        st.caption(format_websocket_message(msg))
+                if st.session_state.ws_stream:
+                    recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
+                    if recent_msgs:
+                        for msg in recent_msgs:
+                            st.caption(format_websocket_message(msg))
+                    else:
+                        st.caption("No messages yet...")
                 else:
-                    st.caption("No messages yet...")
+                    st.caption("WebSocket disconnected - using REST API fallback")
+        else:
+            # ws_stream is None but streaming_active is True - show fallback UI
+            st.warning("⚠️ WebSocket connection lost - Data is being fetched via REST API (backup mode)")
+            st.caption("The WebSocket connection was interrupted. Your data is still being updated via REST API polling.")
+            
+            # Show button to reset streaming state
+            if st.button("🔄 Reset Connection", type="secondary"):
+                st.session_state.streaming_active = False
+                st.session_state.ws_stream = None
+                st.rerun()
     
     # Show recommendations
     with st.expander("💡 Streaming Tips", expanded=False):
