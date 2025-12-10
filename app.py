@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from polygon import StocksClient
+from polygon import RESTClient
 from datetime import datetime, timedelta
 import time
 from sklearn.linear_model import LinearRegression
@@ -167,17 +167,17 @@ def calculate_technical_indicators(df, params=None):
 def fetch_vix_data(api_key, days=60):
     """Fetch VIX (Volatility Index) data from Polygon"""
     try:
-        client = StocksClient(api_key)
+        client = RESTClient(api_key)
         
         # Get date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
         # Fetch VIX data (using VXX ETF as proxy)
-        aggs = client.get_aggregate_bars(
-            symbol='VIX:INDEXCBOE',  # Try direct VIX index
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d"),
+        aggs = client.get_aggs(
+            ticker='VIX:INDEXCBOE',  # Try direct VIX index
+            from_=start_date.strftime("%Y-%m-%d"),
+            to=end_date.strftime("%Y-%m-%d"),
             timespan='day',
             multiplier=1,
             adjusted=True,
@@ -187,10 +187,10 @@ def fetch_vix_data(api_key, days=60):
         
         if not aggs:
             # Fallback to VXX ETF if VIX index not available
-            aggs = client.get_aggregate_bars(
-                symbol='VXX',
-                from_date=start_date.strftime("%Y-%m-%d"),
-                to_date=end_date.strftime("%Y-%m-%d"),
+            aggs = client.get_aggs(
+                ticker='VXX',
+                from_=start_date.strftime("%Y-%m-%d"),
+                to=end_date.strftime("%Y-%m-%d"),
                 timespan='day',
                 multiplier=1,
                 adjusted=True,
@@ -277,17 +277,17 @@ def calculate_gex(api_key, ticker, spot_price):
 def fetch_market_data(api_key, ticker, days=60):
     """Fetch historical market data from Polygon"""
     try:
-        client = StocksClient(api_key)
+        client = RESTClient(api_key)
         
         # Get date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
         # Fetch aggregates (daily bars)
-        aggs = client.get_aggregate_bars(
-            symbol=ticker,
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d"),
+        aggs = client.get_aggs(
+            ticker=ticker,
+            from_=start_date.strftime("%Y-%m-%d"),
+            to=end_date.strftime("%Y-%m-%d"),
             timespan='day',
             multiplier=1,
             adjusted=True,
@@ -332,16 +332,16 @@ def fetch_market_data(api_key, ticker, days=60):
 def get_current_price(api_key, ticker):
     """Get current/latest price"""
     try:
-        client = StocksClient(api_key)
+        client = RESTClient(api_key)
         
         # Get previous day's close
         end_date = datetime.now()
         start_date = end_date - timedelta(days=5)
         
-        aggs = client.get_aggregate_bars(
-            symbol=ticker,
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d"),
+        aggs = client.get_aggs(
+            ticker=ticker,
+            from_=start_date.strftime("%Y-%m-%d"),
+            to=end_date.strftime("%Y-%m-%d"),
             timespan='day',
             multiplier=1,
             adjusted=True,
@@ -655,7 +655,7 @@ with st.sidebar:
     selected_indexes = st.multiselect(
         "Choose indexes to analyze",
         options=list(INDEXES.keys()),
-        default=["S&P 500", "NASDAQ 100"]
+        default=["S&P 500 (SPX)", "NASDAQ 100 (NDX)"]
     )
     
     days_history = st.slider(
