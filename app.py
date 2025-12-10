@@ -437,7 +437,7 @@ async def setup_websocket_streaming(api_key, tickers, on_data_callback):
 
 def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     """Predict end-of-day price using technical indicators and ML"""
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 25:
         return None, None, None, None
     
     # Calculate technical indicators
@@ -446,7 +446,7 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     # Drop rows with NaN values
     df_clean = df.dropna().copy()
     
-    if len(df_clean) < 20:
+    if len(df_clean) < 10:
         return None, None, None, None
     
     # Prepare features for prediction - including new indicators
@@ -471,7 +471,7 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     # Remove rows with NaN for next_close
     df_model = df_clean[:-shift_days].dropna().copy()
     
-    if len(df_model) < 20:
+    if len(df_model) < 10:
         return None, None, None, None
     
     X = df_model[feature_columns].values
@@ -961,6 +961,14 @@ else:
             # Fetch price data using ETF proxy
             df = fetch_market_data(st.session_state.api_key, etf_ticker, days_history)
             
+            # Debug: Show data fetch result
+            if df is None:
+                st.warning(f"⚠️ {index_name}: No data returned from fetch")
+            elif len(df) == 0:
+                st.warning(f"⚠️ {index_name}: Empty dataframe returned")
+            else:
+                st.caption(f"✓ {index_name}: Fetched {len(df)} rows")
+            
             if df is not None and len(df) > 0:
                 # Merge VIX data if available
                 if vix_df is not None and len(vix_df) > 0:
@@ -980,11 +988,17 @@ else:
                     timeframe=st.session_state.timeframe
                 )
                 
+                # Debug: Show prediction result
+                if predicted_price is None:
+                    st.warning(f"⚠️ {index_name}: Prediction failed (not enough data)")
+                else:
+                    st.caption(f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}%")
+                
                 if predicted_price and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
                     st.session_state.predictions[index_name] = {
-                        'ticker': ticker,
+                        'ticker': index_ticker,
                         'current_price': current_price,
                         'predicted_price': predicted_price,
                         'confidence': confidence,
@@ -1006,7 +1020,7 @@ else:
                             target_date = datetime.now() + timedelta(days=7)
                         
                         save_prediction(
-                            ticker=ticker,
+                            ticker=index_ticker,
                             index_name=index_name,
                             current_price=current_price,
                             predicted_price=predicted_price,
@@ -1021,7 +1035,7 @@ else:
                             direction = "increase" if change_pct > 0 else "decrease"
                             message = f"{index_name} predicted to {direction} by {abs(change_pct):.2f}% (Confidence: {confidence:.1f}%)"
                             save_alert(
-                                ticker=ticker,
+                                ticker=index_ticker,
                                 index_name=index_name,
                                 alert_type="price_movement",
                                 threshold=alert_threshold,
@@ -1038,6 +1052,12 @@ else:
         time.sleep(0.5)
         status_text.empty()
         progress_bar.empty()
+        
+        # Debug: Show prediction count
+        if st.session_state.predictions:
+            st.success(f"✅ Generated {len(st.session_state.predictions)} predictions")
+        else:
+            st.error("⚠️ No predictions were generated - check data availability")
     
     # Display predictions
     if st.session_state.predictions:
