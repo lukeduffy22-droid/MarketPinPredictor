@@ -175,9 +175,9 @@ def fetch_vix_data(api_key, days=60):
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
-        # Fetch VIX data (using VXX ETF as proxy)
+        # Fetch VIX data - try direct VIX index first, fallback to VXX ETF
         aggs = client.get_aggs(
-            ticker='VIX:INDEXCBOE',  # Try direct VIX index
+            ticker='I:VIX',  # Polygon format for CBOE VIX index
             from_=start_date.strftime("%Y-%m-%d"),
             to=end_date.strftime("%Y-%m-%d"),
             timespan='day',
@@ -200,30 +200,18 @@ def fetch_vix_data(api_key, days=60):
                 limit=50000
             )
         
-        # Convert to DataFrame
+        # Convert to DataFrame - new polygon API returns Agg objects
         data = []
-        # Handle the response format from polygon library
-        if isinstance(aggs, dict):
-            # If it's a dict, the data is likely in a 'results' key or similar
-            if 'results' in aggs:
-                aggs_list = aggs['results']
-            elif len(aggs) > 0:
-                # Try to get the first value if it's a list
-                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
-            else:
-                aggs_list = []
-        else:
-            aggs_list = aggs
-        
-        for agg in aggs_list:
-            if isinstance(agg, dict):
+        if aggs:
+            for agg in aggs:
                 data.append({
-                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
-                    'vix_close': agg['c']
+                    'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
+                    'vix_close': agg.close
                 })
         
         df = pd.DataFrame(data)
-        df = df.sort_values('timestamp').reset_index(drop=True)
+        if not df.empty:
+            df = df.sort_values('timestamp').reset_index(drop=True)
         return df
     except Exception as e:
         st.warning(f"Could not fetch VIX data: {str(e)}")
@@ -297,34 +285,22 @@ def fetch_market_data(api_key, ticker, days=60):
             limit=50000
         )
         
-        # Convert to DataFrame
+        # Convert to DataFrame - new polygon API returns Agg objects
         data = []
-        # Handle the response format from polygon library
-        if isinstance(aggs, dict):
-            # If it's a dict, the data is likely in a 'results' key or similar
-            if 'results' in aggs:
-                aggs_list = aggs['results']
-            elif len(aggs) > 0:
-                # Try to get the first value if it's a list
-                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
-            else:
-                aggs_list = []
-        else:
-            aggs_list = aggs
-        
-        for agg in aggs_list:
-            if isinstance(agg, dict):
+        if aggs:
+            for agg in aggs:
                 data.append({
-                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
-                    'open': agg['o'],
-                    'high': agg['h'],
-                    'low': agg['l'],
-                    'close': agg['c'],
-                    'volume': agg['v']
+                    'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
+                    'open': agg.open,
+                    'high': agg.high,
+                    'low': agg.low,
+                    'close': agg.close,
+                    'volume': agg.volume
                 })
         
         df = pd.DataFrame(data)
-        df = df.sort_values('timestamp').reset_index(drop=True)
+        if not df.empty:
+            df = df.sort_values('timestamp').reset_index(drop=True)
         
         return df
     except Exception as e:
@@ -351,17 +327,9 @@ def get_current_price(api_key, ticker):
             limit=1
         )
         
-        if aggs:
-            # Handle the response format
-            if isinstance(aggs, dict):
-                if 'results' in aggs and len(aggs['results']) > 0:
-                    return aggs['results'][0]['c']
-                elif len(aggs) > 0:
-                    aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
-                    if aggs_list and len(aggs_list) > 0:
-                        return aggs_list[0]['c']
-            elif isinstance(aggs, list) and len(aggs) > 0:
-                return aggs[0]['c']
+        # New polygon API returns list of Agg objects
+        if aggs and len(aggs) > 0:
+            return aggs[0].close
         return None
     except Exception as e:
         st.error(f"Error fetching current price: {str(e)}")
