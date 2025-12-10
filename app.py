@@ -48,9 +48,11 @@ INDEX_ETFS = {
     "RUT": "IWM"
 }
 
-# Initialize session state
+import os
+
+# Initialize session state - load API key from environment if available
 if 'api_key' not in st.session_state:
-    st.session_state.api_key = ''
+    st.session_state.api_key = os.environ.get('Massive_API', '') or os.environ.get('POLYGON_API_KEY', '')
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
