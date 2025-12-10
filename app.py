@@ -812,33 +812,33 @@ with st.sidebar:
                     st.success(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options")
                 else:
                     st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
-            
-            # Streaming stats
-            stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
-            with stats_col1:
-                st.metric("Index Updates", stats['index_count'])
-            with stats_col2:
-                st.metric("Options Updates", stats['options_count'])
-            with stats_col3:
-                st.metric("Trades", stats['trade_count'])
-            with stats_col4:
-                st.metric("Quotes", stats['quote_count'])
-            
-            # Stop streaming button
-            if st.button("⏹ Stop Streaming", type="secondary"):
-                st.session_state.ws_stream.disconnect()
-                st.session_state.ws_stream = None
-                st.session_state.streaming_active = False
-                st.rerun()
-            
-            # Show recent messages
-            with st.expander("📡 Recent Messages", expanded=False):
-                recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
-                if recent_msgs:
-                    for msg in recent_msgs:
-                        st.caption(format_websocket_message(msg))
-                else:
-                    st.caption("No messages yet...")
+                
+                # Streaming stats
+                stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
+                with stats_col1:
+                    st.metric("Index Updates", stats.get('index_count', 0))
+                with stats_col2:
+                    st.metric("Options Updates", stats.get('options_count', 0))
+                with stats_col3:
+                    st.metric("Trades", stats.get('trade_count', 0))
+                with stats_col4:
+                    st.metric("Quotes", stats.get('quote_count', 0))
+                
+                # Stop streaming button
+                if st.button("⏹ Stop Streaming", type="secondary"):
+                    st.session_state.ws_stream.disconnect()
+                    st.session_state.ws_stream = None
+                    st.session_state.streaming_active = False
+                    st.rerun()
+                
+                # Show recent messages
+                with st.expander("📡 Recent Messages", expanded=False):
+                    recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
+                    if recent_msgs:
+                        for msg in recent_msgs:
+                            st.caption(format_websocket_message(msg))
+                    else:
+                        st.caption("No messages yet...")
     
     # Show recommendations
     with st.expander("💡 Streaming Tips", expanded=False):
