@@ -3,10 +3,9 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from polygon import RESTClient
+from polygon import StocksClient
 from datetime import datetime, timedelta
 import time
-import requests
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
@@ -18,17 +17,13 @@ from websocket_streaming import (
     RealTimeDataStream, is_market_open, format_websocket_message, 
     start_streaming_session, get_streaming_recommendations, get_snapshot_data
 )
-from app.models.ridge_predictor import predict as predict_adaptive, get_minutes_to_close
-from gamma_scheduler import start_gamma_scheduler, is_scheduler_running
-from gamma_viz import show_gamma_evolution_section
+from ai_analysis import (
+    analyze_prediction, analyze_streaming_data, 
+    get_risk_assessment, explain_gamma_exposure
+)
 
 # Initialize database
 init_db()
-
-# Start background gamma sampling scheduler (runs every 15 minutes during market hours)
-if not is_scheduler_running():
-    start_gamma_scheduler()
-    print("✓ Background gamma sampling scheduler started")
 
 # Page configuration
 st.set_page_config(
@@ -45,8 +40,7 @@ INDEXES = {
     "Russell 2000 (RUT)": "RUT"
 }
 
-# ETF proxies for data fetching (kept for reference, but we now use actual index data)
-# NOTE: We now fetch actual index data using I:SPX, I:NDX, etc. format
+# ETF proxies for data fetching (indexes don't have direct price data)
 INDEX_ETFS = {
     "SPX": "SPY",
     "NDX": "QQQ",
@@ -54,16 +48,9 @@ INDEX_ETFS = {
     "RUT": "IWM"
 }
 
-# Polygon API ticker format for actual indices
-def get_index_ticker(index_symbol):
-    """Convert index symbol to Polygon API format (e.g., SPX -> I:SPX)"""
-    return f"I:{index_symbol}"
-
 # Initialize session state
 if 'api_key' not in st.session_state:
-    # Load API key from environment variable (Replit Secrets)
-    import os
-    st.session_state.api_key = os.getenv('POLYGON_API_KEY', '')
+    st.session_state.api_key = ''
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
@@ -76,8 +63,6 @@ if 'timeframe' not in st.session_state:
     st.session_state.timeframe = '1-day'
 if 'alerts' not in st.session_state:
     st.session_state.alerts = []
-if 'show_traditional_model' not in st.session_state:
-    st.session_state.show_traditional_model = True
 if 'indicator_params' not in st.session_state:
     st.session_state.indicator_params = {
         'sma_short': 5,
@@ -93,10 +78,6 @@ if 'indicator_params' not in st.session_state:
         'bb_std': 2,
         'momentum_period': 10
     }
-if 'backtest_mode' not in st.session_state:
-    st.session_state.backtest_mode = False
-if 'backtest_date' not in st.session_state:
-    st.session_state.backtest_date = None
 
 def calculate_kama(prices, n_period=10, fast_period=2, slow_period=30):
     """Calculate Kaufman's Adaptive Moving Average (KAMA)"""
@@ -144,6 +125,11 @@ def calculate_technical_indicators(df, params=None):
     df['EMA_5'] = df['close'].ewm(span=params['ema_short'], adjust=False).mean()
     df['EMA_10'] = df['close'].ewm(span=params['ema_long'], adjust=False).mean()
     
+    # VWAP (Volume Weighted Average Price)
+    df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
+    df['PV'] = df['Typical_Price'] * df['volume']
+    df['VWAP'] = df['PV'].cumsum() / df['volume'].cumsum()
+    
     # Kaufman's Adaptive Moving Average (AMA/KAMA)
     df['AMA'] = calculate_kama(df['close'], n_period=10, fast_period=2, slow_period=30)
     
@@ -172,49 +158,67 @@ def calculate_technical_indicators(df, params=None):
     # Rate of Change
     df['ROC'] = ((df['close'] - df['close'].shift(params['momentum_period'])) / df['close'].shift(params['momentum_period'])) * 100
     
+    # Volume indicators
+    df['Volume_SMA'] = df['volume'].rolling(window=20).mean()
+    df['Volume_Ratio'] = df['volume'] / df['Volume_SMA']
+    
     return df
 
 def fetch_vix_data(api_key, days=60):
     """Fetch VIX (Volatility Index) data from Polygon"""
     try:
-        client = RESTClient(api_key)
+        client = StocksClient(api_key)
         
         # Get date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
         # Fetch VIX data (using VXX ETF as proxy)
-        try:
-            aggs = list(client.list_aggs(
-                ticker='I:VIX',  # Polygon index ticker format
-                multiplier=1,
-                timespan='day',
-                from_=start_date.strftime("%Y-%m-%d"),
-                to=end_date.strftime("%Y-%m-%d"),
-                adjusted=True,
-                sort='asc',
-                limit=50000
-            ))
-        except:
+        aggs = client.get_aggregate_bars(
+            symbol='VIX:INDEXCBOE',  # Try direct VIX index
+            from_date=start_date.strftime("%Y-%m-%d"),
+            to_date=end_date.strftime("%Y-%m-%d"),
+            timespan='day',
+            multiplier=1,
+            adjusted=True,
+            sort='asc',
+            limit=50000
+        )
+        
+        if not aggs:
             # Fallback to VXX ETF if VIX index not available
-            aggs = list(client.list_aggs(
-                ticker='VXX',
-                multiplier=1,
+            aggs = client.get_aggregate_bars(
+                symbol='VXX',
+                from_date=start_date.strftime("%Y-%m-%d"),
+                to_date=end_date.strftime("%Y-%m-%d"),
                 timespan='day',
-                from_=start_date.strftime("%Y-%m-%d"),
-                to=end_date.strftime("%Y-%m-%d"),
+                multiplier=1,
                 adjusted=True,
                 sort='asc',
                 limit=50000
-            ))
+            )
         
         # Convert to DataFrame
         data = []
-        for agg in aggs:
-            data.append({
-                'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
-                'vix_close': agg.close
-            })
+        # Handle the response format from polygon library
+        if isinstance(aggs, dict):
+            # If it's a dict, the data is likely in a 'results' key or similar
+            if 'results' in aggs:
+                aggs_list = aggs['results']
+            elif len(aggs) > 0:
+                # Try to get the first value if it's a list
+                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
+            else:
+                aggs_list = []
+        else:
+            aggs_list = aggs
+        
+        for agg in aggs_list:
+            if isinstance(agg, dict):
+                data.append({
+                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
+                    'vix_close': agg['c']
+                })
         
         df = pd.DataFrame(data)
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -223,74 +227,28 @@ def fetch_vix_data(api_key, days=60):
         st.warning(f"Could not fetch VIX data: {str(e)}")
         return None
 
-def get_historical_gamma_snapshot(ticker, trading_date):
-    """Fetch most recent gamma snapshot for a trading date and convert to display format"""
-    try:
-        from database import get_gamma_snapshots_for_day
-        import pytz
-        
-        snapshots = get_gamma_snapshots_for_day(ticker, trading_date)
-        if not snapshots:
-            return None
-        
-        # Get the latest snapshot for that trading date
-        latest = snapshots[-1]
-        
-        # Convert to display format
-        gex_levels = {
-            'total_gex': latest.total_gex,
-            'net_gex': latest.net_gex,
-            'pin_strike': latest.pin_strike,
-            'pin_expiry': latest.interval_timestamp + timedelta(days=1),
-            'zero_gamma': latest.spot_price,
-            'direction': 'stable',
-            'pull_strength': 0,
-            'summary': f'Historical snapshot from {latest.interval_timestamp.strftime("%I:%M %p ET")}',
-            'is_mock_data': latest.is_mock_data,
-            'gamma_walls': pd.DataFrame(),  # Empty for historical
-            'gex_by_strike': pd.DataFrame(),
-            'is_historical': True,
-            'timestamp': latest.interval_timestamp
-        }
-        
-        return gex_levels
-    except Exception as e:
-        st.error(f"Error fetching historical gamma: {str(e)}")
-        return None
-
 def calculate_gex(api_key, ticker, spot_price):
     """Calculate real Gamma Exposure (GEX) for options using gamma analysis"""
     try:
+        # Use the real gamma analysis from options_gamma module
         gex_analysis = get_gamma_analysis(api_key, ticker, spot_price)
         
-        if gex_analysis and not gex_analysis.get('data_unavailable', False):
-            # Validate gamma pin is within realistic range (±15% of spot)
-            raw_pin = gex_analysis['pin_strike']
-            if spot_price > 0:
-                pin_distance_pct = abs(raw_pin - spot_price) / spot_price
-                if pin_distance_pct > 0.15:
-                    print(f"WARNING: Gamma pin ${raw_pin:.0f} is {pin_distance_pct*100:.1f}% from spot ${spot_price:.0f}, using spot as pin")
-                    validated_pin = spot_price
-                else:
-                    validated_pin = raw_pin
-            else:
-                validated_pin = raw_pin
-            
+        if gex_analysis:
+            # Convert to the expected format for the app
             gex_levels = {
                 'total_gex': gex_analysis['total_gex'],
                 'net_gex': gex_analysis['net_gex'],
-                'pin_strike': validated_pin,  # Use validated pin
+                'pin_strike': gex_analysis['pin_strike'],
                 'pin_expiry': gex_analysis['pin_expiry'],
                 'zero_gamma': gex_analysis['zero_gamma'],
                 'direction': gex_analysis['direction'],
                 'pull_strength': gex_analysis['pull_strength'],
                 'summary': gex_analysis['summary'],
                 'gamma_walls': gex_analysis['gamma_walls'],
-                'gex_by_strike': gex_analysis['gex_by_strike'],
-                'is_mock_data': gex_analysis.get('is_mock_data', False),
-                'is_cached_data': gex_analysis.get('is_cached_data', False)
+                'gex_by_strike': gex_analysis['gex_by_strike']
             }
             
+            # Add key support/resistance levels from gamma walls
             if not gex_analysis['gamma_walls'].empty:
                 key_levels = gex_analysis['gamma_walls']['strike'].tolist()[:3]
             else:
@@ -299,22 +257,8 @@ def calculate_gex(api_key, ticker, spot_price):
             gex_levels['key_levels'] = key_levels
             
             return gex_levels
-        elif gex_analysis and gex_analysis.get('data_unavailable', False):
-            return {
-                'total_gex': 0,
-                'net_gex': 0,
-                'pin_strike': spot_price,
-                'pin_expiry': datetime.now(),
-                'zero_gamma': spot_price,
-                'direction': 'at',
-                'pull_strength': 0,
-                'summary': gex_analysis.get('summary', 'Gamma data temporarily unavailable'),
-                'key_levels': [spot_price * 0.98, spot_price * 1.02],
-                'is_mock_data': False,
-                'data_unavailable': True,
-                'error_message': gex_analysis.get('error_message', 'Real gamma data not available')
-            }
         else:
+            # Fallback to simple calculation if real data not available
             return {
                 'total_gex': 0,
                 'net_gex': 0,
@@ -324,9 +268,7 @@ def calculate_gex(api_key, ticker, spot_price):
                 'direction': 'at',
                 'pull_strength': 0,
                 'summary': 'Gamma data unavailable',
-                'key_levels': [spot_price * 0.98, spot_price * 1.02],
-                'is_mock_data': False,
-                'data_unavailable': True
+                'key_levels': [spot_price * 0.98, spot_price * 1.02]
             }
     except Exception as e:
         st.warning(f"Could not calculate GEX: {str(e)}")
@@ -335,35 +277,49 @@ def calculate_gex(api_key, ticker, spot_price):
 def fetch_market_data(api_key, ticker, days=60):
     """Fetch historical market data from Polygon"""
     try:
-        client = RESTClient(api_key)
+        client = StocksClient(api_key)
         
         # Get date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
         # Fetch aggregates (daily bars)
-        aggs = list(client.list_aggs(
-            ticker=ticker,
-            multiplier=1,
+        aggs = client.get_aggregate_bars(
+            symbol=ticker,
+            from_date=start_date.strftime("%Y-%m-%d"),
+            to_date=end_date.strftime("%Y-%m-%d"),
             timespan='day',
-            from_=start_date.strftime("%Y-%m-%d"),
-            to=end_date.strftime("%Y-%m-%d"),
+            multiplier=1,
             adjusted=True,
             sort='asc',
             limit=50000
-        ))
+        )
         
         # Convert to DataFrame
         data = []
-        for agg in aggs:
-            data.append({
-                'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
-                'open': agg.open,
-                'high': agg.high,
-                'low': agg.low,
-                'close': agg.close,
-                'volume': agg.volume
-            })
+        # Handle the response format from polygon library
+        if isinstance(aggs, dict):
+            # If it's a dict, the data is likely in a 'results' key or similar
+            if 'results' in aggs:
+                aggs_list = aggs['results']
+            elif len(aggs) > 0:
+                # Try to get the first value if it's a list
+                aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
+            else:
+                aggs_list = []
+        else:
+            aggs_list = aggs
+        
+        for agg in aggs_list:
+            if isinstance(agg, dict):
+                data.append({
+                    'timestamp': datetime.fromtimestamp(agg['t'] / 1000),
+                    'open': agg['o'],
+                    'high': agg['h'],
+                    'low': agg['l'],
+                    'close': agg['c'],
+                    'volume': agg['v']
+                })
         
         df = pd.DataFrame(data)
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -376,25 +332,34 @@ def fetch_market_data(api_key, ticker, days=60):
 def get_current_price(api_key, ticker):
     """Get current/latest price"""
     try:
-        client = RESTClient(api_key)
+        client = StocksClient(api_key)
         
         # Get previous day's close
         end_date = datetime.now()
         start_date = end_date - timedelta(days=5)
         
-        aggs = list(client.list_aggs(
-            ticker=ticker,
-            multiplier=1,
+        aggs = client.get_aggregate_bars(
+            symbol=ticker,
+            from_date=start_date.strftime("%Y-%m-%d"),
+            to_date=end_date.strftime("%Y-%m-%d"),
             timespan='day',
-            from_=start_date.strftime("%Y-%m-%d"),
-            to=end_date.strftime("%Y-%m-%d"),
+            multiplier=1,
             adjusted=True,
             sort='desc',
             limit=1
-        ))
+        )
         
-        if aggs and len(aggs) > 0:
-            return aggs[0].close
+        if aggs:
+            # Handle the response format
+            if isinstance(aggs, dict):
+                if 'results' in aggs and len(aggs['results']) > 0:
+                    return aggs['results'][0]['c']
+                elif len(aggs) > 0:
+                    aggs_list = list(aggs.values())[0] if isinstance(list(aggs.values())[0], list) else aggs
+                    if aggs_list and len(aggs_list) > 0:
+                        return aggs_list[0]['c']
+            elif isinstance(aggs, list) and len(aggs) > 0:
+                return aggs[0]['c']
         return None
     except Exception as e:
         st.error(f"Error fetching current price: {str(e)}")
@@ -415,219 +380,6 @@ def is_near_market_close():
     market_close = time(16, 0)     # 4:00 PM
     
     return critical_start <= current_time <= market_close
-
-def fetch_eod_prediction(symbol):
-    """
-    Fetch advanced gamma-based EOD prediction from FastAPI endpoint.
-    Returns dict with WWM, PSI, VACP, zero_gamma, and final estimate.
-    """
-    import requests
-    import os
-    
-    try:
-        # FastAPI endpoint (running on port 8000)
-        fastapi_url = os.getenv('FASTAPI_URL', 'http://localhost:8000')
-        response = requests.get(f"{fastapi_url}/predict/eod", params={"symbol": symbol}, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return None
-    except Exception as e:
-        print(f"Error fetching EOD prediction for {symbol}: {str(e)}")
-        return None
-
-def show_eod_prediction_panel(selected_indexes):
-    """
-    Display advanced gamma-based EOD prediction panel with all components.
-    Shows WWM, PSI, VACP, and final estimate for selected indices.
-    """
-    st.markdown("### 🎯 Advanced Gamma-Based EOD Prediction")
-    st.caption("Wall-Weighted Magnet (WWM) + Pin Stability + Volatility-Adjusted Close Predictor")
-    
-    # Fetch EOD predictions for all selected indices
-    eod_predictions = {}
-    for index_name in selected_indexes:
-        symbol = INDEXES[index_name]
-        eod_data = fetch_eod_prediction(symbol)
-        if eod_data:
-            eod_predictions[index_name] = eod_data
-    
-    if not eod_predictions:
-        st.info("📊 EOD predictions will appear here when gamma data is available (requires intraday gamma snapshots)")
-        return
-    
-    # Display in columns
-    cols = st.columns(len(eod_predictions))
-    
-    for col, (index_name, eod) in zip(cols, eod_predictions.items()):
-        with col:
-            current_price = eod['current_price']
-            eod_estimate = eod['eod_estimate']
-            change = eod_estimate - current_price
-            change_pct = (change / current_price) * 100
-            change_color = "🟢" if change >= 0 else "🔴"
-            
-            # Main prediction card
-            st.metric(
-                label=f"{change_color} {index_name} EOD Estimate",
-                value=f"${eod_estimate:.2f}",
-                delta=f"{change:+.2f} ({change_pct:+.2f}%)"
-            )
-            st.caption(f"Current: ${current_price:.2f}")
-            
-            # Component breakdown in expander
-            with st.expander("📊 Component Breakdown", expanded=False):
-                st.markdown(f"**Wall-Weighted Magnet (WWM):** ${eod['wwm']:.2f}")
-                st.progress(min(1.0, eod['pin_stability_index']))
-                st.caption(f"Pin Stability: {eod['pin_stability_index']:.2%}")
-                
-                st.markdown(f"**Zero Gamma Level:** ${eod['zero_gamma']:.2f}")
-                st.markdown(f"**VACP (Trend-Adjusted):** ${eod['vacp']:.2f}")
-                
-                if eod.get('hv10_points'):
-                    st.caption(f"HV10: {eod['hv10_points']:.1f} pts")
-                
-                st.caption(f"Using {eod['num_walls']} gamma walls, {eod['num_pins']} pin snapshots")
-    
-    st.markdown("---")
-
-def fetch_ai_enhanced_prediction(symbol):
-    """
-    Fetch AI-enhanced EOD prediction from FastAPI endpoint.
-    Returns dict with base model prediction and AI analysis/adjustment.
-    """
-    import requests
-    import os
-    
-    try:
-        fastapi_url = os.getenv('FASTAPI_URL', 'http://localhost:8000')
-        response = requests.get(f"{fastapi_url}/predict/ai-enhanced", params={"symbol": symbol}, timeout=30)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return None
-    except Exception as e:
-        print(f"Error fetching AI-enhanced prediction for {symbol}: {str(e)}")
-        return None
-
-
-def fetch_ai_status():
-    """Check if AI service is available."""
-    import requests
-    import os
-    
-    try:
-        fastapi_url = os.getenv('FASTAPI_URL', 'http://localhost:8000')
-        response = requests.get(f"{fastapi_url}/ai/status", timeout=5)
-        
-        if response.status_code == 200:
-            return response.json()
-        return {"available": False}
-    except:
-        return {"available": False}
-
-
-def show_ai_analysis_panel(selected_indexes):
-    """
-    Display AI-enhanced prediction analysis panel.
-    Shows AI critique, adjusted predictions, and market insights.
-    Handles AI unavailable states gracefully.
-    """
-    st.markdown("### 🤖 AI Market Analyst")
-    st.caption("AI-enhanced predictions with real-time critique and market insights")
-    
-    ai_predictions = {}
-    
-    with st.spinner("Analyzing market conditions with AI..."):
-        for index_name in selected_indexes:
-            symbol = INDEXES[index_name]
-            ai_data = fetch_ai_enhanced_prediction(symbol)
-            if ai_data:
-                ai_predictions[index_name] = ai_data
-    
-    if not ai_predictions:
-        st.info("📊 AI analysis will appear here when market data is available")
-        return
-    
-    for index_name, ai_data in ai_predictions.items():
-        with st.expander(f"🔍 {index_name} AI Analysis", expanded=True):
-            ai_enhanced = ai_data.get('ai_enhanced', {})
-            ai_available = ai_enhanced.get('available', False)
-            
-            base_pred = ai_data.get('base_model', {}).get('eod_prediction', 0)
-            current = ai_data.get('current_price', 0)
-            base_change = base_pred - current if base_pred and current else 0
-            
-            if not ai_available:
-                st.warning("⚠️ AI analysis unavailable - showing base model prediction only")
-                st.metric(
-                    "Base Model EOD Prediction",
-                    f"${base_pred:.2f}" if base_pred else "N/A",
-                    f"{base_change:+.2f} pts" if base_change else None
-                )
-                reason = ai_enhanced.get('adjustment_reason', 'AI service not configured')
-                st.caption(f"💡 {reason}")
-                st.caption(f"Timestamp: {ai_data.get('timestamp', 'N/A')}")
-                continue
-            
-            provider = ai_enhanced.get('provider', 'unknown')
-            st.caption(f"Provider: {provider.upper()}")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                ai_pred = ai_enhanced.get('adjusted_prediction', base_pred)
-                ai_change = ai_pred - current if ai_pred and current else 0
-                
-                st.markdown("**Prediction Comparison**")
-                
-                pred_col1, pred_col2 = st.columns(2)
-                with pred_col1:
-                    st.metric(
-                        "Base Model EOD",
-                        f"${base_pred:.2f}" if base_pred else "N/A",
-                        f"{base_change:+.2f} pts" if base_change else None
-                    )
-                with pred_col2:
-                    delta_color = "normal" if ai_pred != base_pred else "off"
-                    st.metric(
-                        "AI-Adjusted EOD",
-                        f"${ai_pred:.2f}" if ai_pred else "N/A",
-                        f"{ai_change:+.2f} pts" if ai_change else None,
-                        delta_color=delta_color
-                    )
-                
-                confidence = ai_enhanced.get('confidence', 0)
-                st.markdown(f"**AI Confidence:** {confidence:.0%}")
-                st.progress(min(1.0, max(0.0, confidence)))
-            
-            with col2:
-                st.markdown("**AI Assessment**")
-                
-                market_conditions = ai_enhanced.get('market_conditions', '')
-                if market_conditions and market_conditions != "Unable to analyze":
-                    st.info(f"📈 {market_conditions}")
-                
-                adj_reason = ai_enhanced.get('adjustment_reason', '')
-                if adj_reason:
-                    st.caption(f"💡 {adj_reason}")
-                
-                recommendation = ai_enhanced.get('recommendation', '')
-                if recommendation:
-                    st.success(f"📌 **Recommendation:** {recommendation}")
-            
-            risk_factors = ai_enhanced.get('risk_factors', [])
-            if risk_factors and risk_factors != ["AI service error"]:
-                st.markdown("**⚠️ Risk Factors:**")
-                for risk in risk_factors[:3]:
-                    st.caption(f"• {risk}")
-            
-            st.caption(f"Analysis timestamp: {ai_data.get('timestamp', 'N/A')}")
-    
-    st.markdown("---")
-
 
 def export_to_csv(predictions_data, include_indicators=True):
     """Export predictions and indicators to CSV for Excel compatibility"""
@@ -718,10 +470,6 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     if df is None or len(df) < 30:
         return None, None, None, None
     
-    # Drop volume column (indices have no volume data - all None)
-    if 'volume' in df.columns:
-        df = df.drop(columns=['volume'])
-    
     # Calculate technical indicators
     df = calculate_technical_indicators(df)
     
@@ -731,10 +479,10 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     if len(df_clean) < 20:
         return None, None, None, None
     
-    # Prepare features for prediction - excluding volume-based indicators (indices have no volume)
+    # Prepare features for prediction - including new indicators
     feature_columns = ['SMA_5', 'SMA_10', 'SMA_20', 'EMA_5', 'EMA_10', 
                        'RSI', 'MACD', 'Signal_Line', 'Momentum', 'ROC', 
-                       'BB_Upper', 'BB_Lower', 'AMA']
+                       'Volume_Ratio', 'BB_Upper', 'BB_Lower', 'VWAP', 'AMA']
     
     # Determine shift based on timeframe
     if timeframe == '1-day':
@@ -794,26 +542,13 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
 
 def create_price_chart(df, predicted_price, ticker_name):
     """Create interactive price chart with prediction"""
-    # Check if volume data exists (indices don't have volume)
-    has_volume = 'volume' in df.columns and df['volume'].notna().any()
-    
-    if has_volume:
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI', 'Volume'),
-            row_heights=[0.6, 0.2, 0.2]
-        )
-    else:
-        # No volume data for indices - only 2 rows
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI'),
-            row_heights=[0.7, 0.3]
-        )
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI', 'Volume'),
+        row_heights=[0.6, 0.2, 0.2]
+    )
     
     # Candlestick chart
     fig.add_trace(
@@ -874,15 +609,14 @@ def create_price_chart(df, predicted_price, ticker_name):
     fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
     
-    # Volume (only if data exists)
-    if has_volume:
-        colors = ['red' if close < open else 'green' 
-                  for close, open in zip(df['close'], df['open'])]
-        fig.add_trace(
-            go.Bar(x=df['timestamp'], y=df['volume'], 
-                   name='Volume', marker_color=colors),
-            row=3, col=1
-        )
+    # Volume
+    colors = ['red' if close < open else 'green' 
+              for close, open in zip(df['close'], df['open'])]
+    fig.add_trace(
+        go.Bar(x=df['timestamp'], y=df['volume'], 
+               name='Volume', marker_color=colors),
+        row=3, col=1
+    )
     
     fig.update_layout(
         height=800,
@@ -893,8 +627,7 @@ def create_price_chart(df, predicted_price, ticker_name):
     
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1)
-    if has_volume:
-        fig.update_yaxes(title_text="Volume", row=3, col=1)
+    fig.update_yaxes(title_text="Volume", row=3, col=1)
     
     return fig
 
@@ -922,15 +655,15 @@ with st.sidebar:
     selected_indexes = st.multiselect(
         "Choose indexes to analyze",
         options=list(INDEXES.keys()),
-        default=["S&P 500 (SPX)", "NASDAQ 100 (NDX)"]
+        default=["S&P 500", "NASDAQ 100"]
     )
     
     days_history = st.slider(
         "Historical Data (days)",
-        min_value=90,
-        max_value=365,
-        value=120,
-        help="More data improves prediction accuracy. Minimum 90 days required for technical indicators."
+        min_value=30,
+        max_value=90,
+        value=60,
+        help="More data can improve prediction accuracy"
     )
     
     st.divider()
@@ -952,51 +685,11 @@ with st.sidebar:
     )
     st.session_state.timeframe = selected_timeframe
     
-    st.markdown("---")
-    st.subheader("⚡ Dual-Model System")
+    st.divider()
     
-    # Calculate minutes to close and check for early close
-    try:
-        from app.utils.time_et import is_early_close, close_time_et, is_market_holiday, now_et
-        
-        current_et = now_et()
-        is_half_day = is_early_close()
-        is_holiday = is_market_holiday()
-        close_time = close_time_et()
-        close_time_str = close_time.strftime("%I:%M %p ET")
-        
-        minutes_left = get_minutes_to_close()
-        
-        # Show prominent early close warning
-        if is_half_day and minutes_left > 0:
-            st.warning(f"⚠️ **HALF-DAY SESSION** - Market closes at **{close_time_str}**")
-        elif is_holiday:
-            st.error("🔴 **MARKET CLOSED** - Holiday")
-        
-        if minutes_left > 0:
-            hours_left = minutes_left // 60
-            mins_remaining = minutes_left % 60
-            if hours_left > 0:
-                st.caption(f"⏰ Market closes in {hours_left}h {mins_remaining}m ({close_time_str})")
-            else:
-                st.caption(f"⏰ Market closes in {minutes_left} minutes ({close_time_str})")
-        elif not is_holiday:
-            st.caption("🔴 Market is closed")
-    except Exception as e:
-        minutes_left = 999
-    
-    # Show recommendation
-    if minutes_left <= 30:
-        st.info("💡 **Recommended**: Time-Adaptive model (optimal for final 30 min)")
-    else:
-        st.info("💡 **Recommended**: Traditional ML model (better for early trading)")
-    
-    # Toggle for showing both models
-    st.session_state.show_traditional_model = st.checkbox(
-        "Show Traditional ML alongside Time-Adaptive",
-        value=st.session_state.show_traditional_model,
-        help="Display both prediction models side-by-side for comparison"
-    )
+    st.header("🤖 AI Analysis")
+    enable_ai = st.checkbox("Enable OpenAI Analysis", value=True, 
+                           help="Get AI-powered insights on predictions and market data")
     
     st.divider()
     
@@ -1020,42 +713,6 @@ with st.sidebar:
             step=5,
             help="Alert only when confidence is above this level"
         )
-    
-    st.divider()
-    
-    # Market Events Scanner (new)
-    st.header("📰 Market Events")
-    try:
-        from app.services.market_event_scanner import get_events_for_ai_prompt, scan_market_events
-        
-        # Get market events scan
-        events_scan = scan_market_events()
-        
-        if events_scan and events_scan.events:
-            # Show risk level indicator
-            risk_colors = {
-                "low": "🟢",
-                "normal": "🟡", 
-                "elevated": "🟠",
-                "high": "🔴"
-            }
-            risk_icon = risk_colors.get(events_scan.risk_level, "🟡")
-            st.caption(f"{risk_icon} Risk Level: {events_scan.risk_level.upper()}")
-            st.caption(f"Sentiment: {events_scan.overall_sentiment.capitalize()}")
-            
-            # Show top events
-            for event in events_scan.events[:3]:
-                impact_icons = {"high": "🔴", "medium": "🟠", "low": "🟢"}
-                direction_icons = {"bullish": "↑", "bearish": "↓", "neutral": "↔"}
-                
-                impact_icon = impact_icons.get(event.impact_level, "🟡")
-                direction = direction_icons.get(event.expected_direction or "neutral", "↔")
-                
-                st.caption(f"{impact_icon} {direction} **{event.title}**")
-        else:
-            st.caption("No significant events detected")
-    except Exception as e:
-        st.caption("Market events unavailable")
     
     st.divider()
     
@@ -1103,17 +760,8 @@ with st.sidebar:
         }
         
         if st.button("Reset to Defaults"):
-            # Delete widget keys from session state - Streamlit will recreate them with default values on rerun
-            widget_keys = ['sma_short', 'sma_medium', 'sma_long', 'ema_short', 'ema_long', 
-                          'rsi_period', 'macd_fast', 'macd_slow', 'macd_signal',  
-                          'bb_period', 'bb_std', 'momentum_period']
-            
-            for key in widget_keys:
-                if key in st.session_state:
-                    del st.session_state[key]
-            
-            # Reset indicator_params to defaults
-            st.session_state.indicator_params = {
+            # Reset both indicator_params and widget keys
+            defaults = {
                 'sma_short': 5,
                 'sma_medium': 10,
                 'sma_long': 20,
@@ -1127,6 +775,10 @@ with st.sidebar:
                 'bb_std': 2.0,
                 'momentum_period': 10
             }
+            st.session_state.indicator_params = defaults
+            # Also reset widget state
+            for key, value in defaults.items():
+                st.session_state[key] = value
             st.rerun()
     
     st.divider()
@@ -1146,7 +798,7 @@ with st.sidebar:
     enable_streaming = st.checkbox(
         "Enable WebSocket Streaming", 
         value=st.session_state.streaming_active,
-        help="Smart feed switching: Real-time during market hours, delayed (~15 min) when market is closed - works 24/7",
+        help="Connect to real-time data feed from Massive.com - works 24/7, including after hours",
         key="streaming_checkbox"
     )
     
@@ -1154,9 +806,6 @@ with st.sidebar:
         # Start streaming
         if st.button("🚀 Start Streaming", type="secondary"):
             if selected_indexes and st.session_state.api_key:
-                # Clean up any stale connections first
-                RealTimeDataStream.cleanup_stale_connections()
-                
                 # Get actual index tickers (not ETF proxies) for streaming
                 tickers_to_stream = [INDEXES[idx] for idx in selected_indexes]
                 
@@ -1167,12 +816,7 @@ with st.sidebar:
                     if stream:
                         st.session_state.ws_stream = stream
                         st.session_state.streaming_active = True
-                        
-                        # Show which feed type was connected
-                        if is_market_open():
-                            st.success(f"✅ Connected to REAL-TIME feed for: {', '.join(tickers_to_stream)}")
-                        else:
-                            st.info(f"✅ Connected to DELAYED feed (~15 min) for: {', '.join(tickers_to_stream)}\n\nMarket is currently closed. Real-time feed will activate during market hours (9:30 AM - 4:00 PM ET, Mon-Fri).")
+                        st.success(f"✅ Streaming started for indices: {', '.join(tickers_to_stream)} (with options)")
                         time.sleep(2)
                         st.rerun()
                     else:
@@ -1183,20 +827,6 @@ with st.sidebar:
     elif st.session_state.streaming_active:
         # Show streaming status
         if st.session_state.ws_stream:
-            # Initialize stats with defaults
-            stats = {
-                'market_open': False,
-                'feed_type': 'unknown',
-                'current_time_et': None,
-                'data_delay': 'Unknown',
-                'index_count': 0,
-                'options_count': 0,
-                'trade_count': 0,
-                'quote_count': 0,
-                'indices_tracked': 0,
-                'options_tracked': 0
-            }
-            
             # Check for errors
             if st.session_state.ws_stream.error_message:
                 st.error(st.session_state.ws_stream.error_message)
@@ -1204,82 +834,41 @@ with st.sidebar:
                 st.session_state.ws_stream.disconnect()
                 st.session_state.ws_stream = None
                 st.session_state.streaming_active = False
-                st.rerun()
-            
-            # Get actual stats from stream (with null check)
-            if st.session_state.ws_stream:
-                stream_stats = st.session_state.ws_stream.get_stats()
-                if stream_stats:
-                    stats.update(stream_stats)
-            
-            # Display market status and feed type prominently
-            market_status_color = "🟢" if stats.get('market_open', False) else "🔴"
-            market_status_text = "OPEN" if stats.get('market_open', False) else "CLOSED"
-            
-            feed_type = stats.get('feed_type', 'unknown')
-            if feed_type == 'real-time':
-                feed_indicator = "⚡ REAL-TIME DATA"
-                feed_color = "green"
             else:
-                feed_indicator = "🕐 DELAYED DATA (~15 min)"
-                feed_color = "orange"
+                stats = st.session_state.ws_stream.get_stats()
+                
+                # Show connection status
+                if st.session_state.ws_stream.connection_status == "connected":
+                    st.success(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options")
+                else:
+                    st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
             
-            # Show current ET time
-            current_time = stats.get('current_time_et')
-            if current_time:
-                time_str = current_time.strftime('%I:%M:%S %p ET')
-            else:
-                import pytz
-                et_tz = pytz.timezone('US/Eastern')
-                time_str = datetime.now(et_tz).strftime('%I:%M:%S %p ET')
-            
-            # Show connection status with clear indicators
-            if st.session_state.ws_stream and st.session_state.ws_stream.connection_status == "connected":
-                st.success(f"{market_status_color} Market {market_status_text} | :{feed_color}[{feed_indicator}] | 🕐 {time_str}")
-                st.caption(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options tracked")
-            elif st.session_state.ws_stream:
-                st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
-            
-            # Streaming stats (now stats is always defined)
+            # Streaming stats
             stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
             with stats_col1:
-                st.metric("Data Freshness", stats.get('data_delay', 'Unknown'))
+                st.metric("Index Updates", stats['index_count'])
             with stats_col2:
-                st.metric("Index Updates", stats.get('index_count', 0))
+                st.metric("Options Updates", stats['options_count'])
             with stats_col3:
-                st.metric("Options Updates", stats.get('options_count', 0))
+                st.metric("Trades", stats['trade_count'])
             with stats_col4:
-                st.metric("Total Messages", stats.get('trade_count', 0) + stats.get('quote_count', 0))
+                st.metric("Quotes", stats['quote_count'])
             
             # Stop streaming button
             if st.button("⏹ Stop Streaming", type="secondary"):
-                if st.session_state.ws_stream:
-                    st.session_state.ws_stream.disconnect()
+                st.session_state.ws_stream.disconnect()
                 st.session_state.ws_stream = None
                 st.session_state.streaming_active = False
                 st.rerun()
             
             # Show recent messages
             with st.expander("📡 Recent Messages", expanded=False):
-                if st.session_state.ws_stream:
-                    recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
-                    if recent_msgs:
-                        for msg in recent_msgs:
-                            st.caption(format_websocket_message(msg))
-                    else:
-                        st.caption("No messages yet...")
+                recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
+                if recent_msgs:
+                    for msg in recent_msgs:
+                        st.caption(format_websocket_message(msg))
                 else:
-                    st.caption("WebSocket disconnected - using REST API fallback")
-        else:
-            # ws_stream is None but streaming_active is True - show fallback UI
-            st.warning("⚠️ WebSocket connection lost - Data is being fetched via REST API (backup mode)")
-            st.caption("The WebSocket connection was interrupted. Your data is still being updated via REST API polling.")
-            
-            # Show button to reset streaming state
-            if st.button("🔄 Reset Connection", type="secondary"):
-                st.session_state.streaming_active = False
-                st.session_state.ws_stream = None
-                st.rerun()
+                    st.caption("No messages yet...")
     
     # Show recommendations
     with st.expander("💡 Streaming Tips", expanded=False):
@@ -1290,8 +879,7 @@ with st.sidebar:
         st.caption("**Snapshot Data (Backup Method)**")
         if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via REST API"):
             if selected_indexes and st.session_state.api_key:
-                # Use actual index tickers (I:SPX format) instead of ETFs
-                tickers_to_fetch = [get_index_ticker(INDEXES[idx]) for idx in selected_indexes]
+                tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
                 with st.spinner("Fetching snapshot data..."):
                     snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
                     if snapshot_data:
@@ -1316,7 +904,7 @@ with st.sidebar:
     
     st.divider()
     
-    analyze_button = st.button("🔄 Analyze & Predict", type="primary", width='stretch')
+    analyze_button = st.button("🔄 Analyze & Predict", type="primary", use_container_width=True)
     
     st.divider()
     
@@ -1324,12 +912,6 @@ with st.sidebar:
     st.header("📊 Backtesting")
     run_backtest_btn = st.checkbox("Enable Backtesting Mode", value=False,
                                    help="Test prediction accuracy using historical data")
-    
-    # Initialize backtest variables
-    run_backtest_analysis = False
-    backtest_start = None
-    backtest_end = None
-    backtest_model = "linear_regression"
     
     if run_backtest_btn:
         st.subheader("Backtest Configuration")
@@ -1356,7 +938,7 @@ with st.sidebar:
             help="Model to use for backtesting"
         )
         
-        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", width='stretch')
+        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", use_container_width=True)
     
     st.divider()
     st.caption("💡 This tool uses technical indicators and machine learning to predict closing prices. Predictions are estimates and should not be used as financial advice.")
@@ -1403,262 +985,45 @@ else:
         
         for idx, index_name in enumerate(selected_indexes):
             index_ticker = INDEXES[index_name]  # Actual index ticker (SPX, NDX, etc.)
-            polygon_ticker = get_index_ticker(index_ticker)  # Format for Polygon API (I:SPX)
+            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)  # ETF for price data
             status_text.text(f"Analyzing {index_name}...")
             
-            # Fetch price data using actual index ticker (I:SPX format)
-            df = fetch_market_data(st.session_state.api_key, polygon_ticker, days_history)
+            # Fetch price data using ETF proxy
+            df = fetch_market_data(st.session_state.api_key, etf_ticker, days_history)
             
             if df is not None and len(df) > 0:
                 # Merge VIX data if available
                 if vix_df is not None and len(vix_df) > 0:
                     df = pd.merge(df, vix_df, on='timestamp', how='left')
-                    df['vix_close'] = df['vix_close'].ffill()
+                    df['vix_close'] = df['vix_close'].fillna(method='ffill')
                 
-                # Get current price - prioritize real-time sources over historical close
-                # Priority: 1) WebSocket streaming, 2) Snapshot API (real-time on $300+ plan), 3) Historical close
-                current_price = df['close'].iloc[-1]  # Fallback to historical
-                price_source = "Historical Close"  # Track data source for display
-                
-                # Try WebSocket streaming first (true real-time if active)
-                if st.session_state.streaming_active and st.session_state.ws_stream:
-                    try:
-                        stream_price = st.session_state.ws_stream.get_latest_price(polygon_ticker)
-                        if stream_price and 'price' in stream_price:
-                            current_price = stream_price['price']
-                            # Update df with streaming price for accurate calculations
-                            df.loc[df.index[-1], 'close'] = current_price
-                            price_source = "🟢 WebSocket Streaming (Real-Time)"
-                    except Exception as stream_err:
-                        pass  # Fall through to snapshot
-                
-                # If streaming not available, try snapshot API (real-time on highest-tier plans)
-                if current_price == df['close'].iloc[-1]:  # Still using historical fallback
-                    try:
-                        snapshot = get_snapshot_data(st.session_state.api_key, [polygon_ticker])
-                        if snapshot and polygon_ticker in snapshot and snapshot[polygon_ticker]['price']:
-                            current_price = snapshot[polygon_ticker]['price']
-                            # Update df with snapshot price for accurate calculations
-                            df.loc[df.index[-1], 'close'] = current_price
-                            price_source = "🟢 Premium Snapshot API (Real-Time)"
-                    except Exception as snap_err:
-                        pass  # Use historical close (already set above)
+                # Get current price for GEX calculation
+                current_price = df['close'].iloc[-1]
                 
                 # Calculate GEX levels using actual index ticker for options
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
-                # Always calculate technical indicators for chart rendering
-                # (regardless of which model is used)
-                df_with_indicators = calculate_technical_indicators(df)
+                # Predict EOD price using selected model and timeframe
+                predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
+                    df, 
+                    model_type=st.session_state.selected_model,
+                    timeframe=st.session_state.timeframe
+                )
                 
-                # Predict EOD price using TIME-ADAPTIVE RIDGE model (primary)
-                adaptive_pred = None
-                adaptive_success = False
-                adaptive_original_price = None
-                adaptive_original_conf = None
-                adaptive_constrained = None
-                
-                try:
-                    adaptive_pred = predict_adaptive(index_ticker, df_with_indicators, gex_data)
-                    # Store ORIGINAL Time-Adaptive prediction before any modifications
-                    adaptive_original_price = adaptive_pred.predicted_price
-                    adaptive_original_conf = adaptive_pred.confidence
-                    current_price = adaptive_pred.current_price
-                    
-                    # Apply timeframe-adaptive bounds
-                    # 1-day: ±3% base (can go higher in volatile markets)
-                    # 5-day: ±5%
-                    # 1-week: ±8%
-                    timeframe = st.session_state.timeframe
-                    if timeframe == '1-day':
-                        base_max_pct = 0.03
-                    elif timeframe == '5-day':
-                        base_max_pct = 0.05
-                    else:  # 1-week
-                        base_max_pct = 0.08
-                    
-                    # VIX-based volatility override: if VIX > 25, allow larger moves
-                    vix_override = 1.0
-                    if vix_df is not None and len(vix_df) > 0:
-                        try:
-                            current_vix = vix_df['close'].iloc[-1]
-                            if current_vix > 35:
-                                vix_override = 2.0  # High fear - allow 2x normal range
-                            elif current_vix > 25:
-                                vix_override = 1.5  # Elevated vol - allow 1.5x
-                        except:
-                            pass
-                    
-                    max_change_ta = current_price * base_max_pct * vix_override
-                    adaptive_constrained = min(max(adaptive_original_price, current_price - max_change_ta), current_price + max_change_ta)
-                    
-                    adaptive_success = True
-                except Exception as e:
-                    st.warning(f"Time-Adaptive model error for {index_name}: {str(e)}")
-                    adaptive_success = False
-                
-                # Run TRADITIONAL ML model (always as backup, and for comparison if toggle enabled)
-                traditional_pred = None
-                traditional_original_price = None
-                traditional_original_conf = None
-                traditional_constrained = None
-                traditional_success = False
-                
-                try:
-                    traditional_original_price, traditional_original_conf, df_with_indicators, trad_current = predict_eod_price(
-                        df_with_indicators, 
-                        model_type=st.session_state.selected_model,
-                        timeframe=st.session_state.timeframe
-                    )
-                    
-                    # Apply timeframe-adaptive bounds to Traditional prediction
-                    timeframe = st.session_state.timeframe
-                    if timeframe == '1-day':
-                        base_max_pct = 0.03
-                    elif timeframe == '5-day':
-                        base_max_pct = 0.05
-                    else:  # 1-week
-                        base_max_pct = 0.08
-                    
-                    # VIX-based volatility override
-                    vix_override = 1.0
-                    if vix_df is not None and len(vix_df) > 0:
-                        try:
-                            current_vix = vix_df['close'].iloc[-1]
-                            if current_vix > 35:
-                                vix_override = 2.0
-                            elif current_vix > 25:
-                                vix_override = 1.5
-                        except:
-                            pass
-                    
-                    max_change_trad = trad_current * base_max_pct * vix_override
-                    traditional_constrained = min(max(traditional_original_price, trad_current - max_change_trad), trad_current + max_change_trad)
-                    
-                    traditional_success = True
-                except Exception as e:
-                    if not adaptive_success:
-                        st.error(f"Both models failed for {index_name}: {str(e)}")
-                    traditional_success = False
-                
-                # Import ensemble functions
-                from models import blended_eod, pin_nudge, calculate_realized_volatility
-                from app.models.ridge_predictor import get_minutes_to_close
-                
-                # Get minutes to close for blending
-                minutes_to_close = get_minutes_to_close()
-                
-                # Apply ensemble blending if both models succeeded
-                if adaptive_success and traditional_success:
-                    # Apply pin nudging to INDIVIDUAL constrained predictions first
-                    adaptive_final = adaptive_constrained
-                    traditional_final = traditional_constrained
-                    
-                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
-                        # Pin nudge each model individually
-                        adaptive_pin_adjust = pin_nudge(
-                            last_price=adaptive_constrained,
-                            pin=gex_data['pin_strike'],
-                            minutes_to_close=minutes_to_close
-                        )
-                        adaptive_final = adaptive_constrained + adaptive_pin_adjust
-                        
-                        traditional_pin_adjust = pin_nudge(
-                            last_price=traditional_constrained,
-                            pin=gex_data['pin_strike'],
-                            minutes_to_close=minutes_to_close
-                        )
-                        traditional_final = traditional_constrained + traditional_pin_adjust
-                    
-                    # Calculate realized volatility for guardrail
-                    price_series = df_with_indicators['close'].values
-                    realized_vol = calculate_realized_volatility(price_series, window=5)
-                    
-                    # Blend the pin-nudged, constrained predictions
-                    blended_price = blended_eod(
-                        last_price=current_price,
-                        pred_trad=traditional_final,
-                        pred_ta=adaptive_final,
-                        minutes_to_close=minutes_to_close,
-                        realized_vol_5d=realized_vol
-                    )
-                    
-                    # Final conservative clamp at ±3% for the blend
-                    max_change = current_price * 0.03
-                    blended_price = min(max(blended_price, current_price - max_change), current_price + max_change)
-                    
-                    # Use blended prediction as the final prediction
-                    predicted_price = blended_price
-                    # Confidence is weighted average based on time
-                    w = min(max((60 - minutes_to_close) / 60.0, 0.0), 1.0)
-                    confidence = (1 - w) * traditional_original_conf + w * adaptive_original_conf
-                    
-                # Fallback logic: Use adaptive if available, otherwise fall back to traditional
-                elif not adaptive_success and traditional_success:
-                    st.info(f"ℹ️ {index_name}: Using Traditional ML (Time-Adaptive unavailable)")
-                    # Apply pin nudging to traditional if in final 15 minutes
-                    traditional_final = traditional_constrained
-                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
-                        traditional_pin_adjust = pin_nudge(
-                            last_price=traditional_constrained,
-                            pin=gex_data['pin_strike'],
-                            minutes_to_close=minutes_to_close
-                        )
-                        traditional_final = traditional_constrained + traditional_pin_adjust
-                    
-                    predicted_price = traditional_final
-                    confidence = traditional_original_conf
-                    current_price = trad_current
-                elif adaptive_success and not traditional_success:
-                    st.info(f"ℹ️ {index_name}: Using Time-Adaptive Ridge (Traditional ML unavailable)")
-                    # Apply pin nudging to adaptive if in final 15 minutes
-                    adaptive_final = adaptive_constrained
-                    if gex_data and 'pin_strike' in gex_data and minutes_to_close <= 15:
-                        adaptive_pin_adjust = pin_nudge(
-                            last_price=adaptive_constrained,
-                            pin=gex_data['pin_strike'],
-                            minutes_to_close=minutes_to_close
-                        )
-                        adaptive_final = adaptive_constrained + adaptive_pin_adjust
-                    
-                    predicted_price = adaptive_final
-                    confidence = adaptive_original_conf
-                elif not adaptive_success and not traditional_success:
-                    predicted_price = None
-                    confidence = None
-                    current_price = None
-                
-                if predicted_price is not None and current_price:
+                if predicted_price and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
-                    # Store all model results
                     st.session_state.predictions[index_name] = {
-                        'ticker': index_ticker,  # Actual index ticker (SPX, NDX, etc.)
+                        'ticker': ticker,
                         'current_price': current_price,
-                        'predicted_price': predicted_price,  # Final blended prediction
+                        'predicted_price': predicted_price,
                         'confidence': confidence,
                         'df': df_with_indicators,
                         'change_pct': change_pct,
-                        'model_type': 'Blended',  # Now using blended model
+                        'model_type': st.session_state.selected_model,
                         'timeframe': st.session_state.timeframe,
                         'gex_data': gex_data,  # Add GEX data
-                        'has_vix': vix_df is not None,  # Track VIX availability
-                        'price_source': price_source,  # Show which data source is being used
-                        # Store CONSTRAINED individual model predictions for display (more realistic)
-                        'adaptive_pred': {
-                            'predicted_price': adaptive_constrained,  # Use CONSTRAINED value
-                            'confidence': adaptive_original_conf,
-                            'features': adaptive_pred.features if adaptive_pred else {},
-                            'original_price': adaptive_original_price  # Keep original for debugging
-                        } if adaptive_success else None,
-                        'traditional_pred': {
-                            'predicted_price': traditional_constrained,  # Use CONSTRAINED value
-                            'confidence': traditional_original_conf,
-                            'current_price': trad_current if traditional_success else None,
-                            'original_price': traditional_original_price  # Keep original for debugging
-                        } if traditional_success else None,
-                        'time_to_close_min': minutes_to_close,
-                        'show_both_models': st.session_state.show_traditional_model
+                        'has_vix': vix_df is not None  # Track VIX availability
                     }
                     
                     # Save prediction to database
@@ -1671,7 +1036,7 @@ else:
                             target_date = datetime.now() + timedelta(days=7)
                         
                         save_prediction(
-                            ticker=index_ticker,
+                            ticker=ticker,
                             index_name=index_name,
                             current_price=current_price,
                             predicted_price=predicted_price,
@@ -1686,7 +1051,7 @@ else:
                             direction = "increase" if change_pct > 0 else "decrease"
                             message = f"{index_name} predicted to {direction} by {abs(change_pct):.2f}% (Confidence: {confidence:.1f}%)"
                             save_alert(
-                                ticker=index_ticker,
+                                ticker=ticker,
                                 index_name=index_name,
                                 alert_type="price_movement",
                                 threshold=alert_threshold,
@@ -1695,11 +1060,7 @@ else:
                             )
                             st.session_state.alerts.append(message)
                     except Exception as e:
-                        st.warning(f"Could not save prediction to database: {str(e)}")
-                else:
-                    st.warning(f"⚠️ Unable to generate prediction for {index_name}. Insufficient data or model error.")
-            else:
-                st.error(f"❌ Failed to fetch market data for {index_name} ({polygon_ticker})")
+                        st.warning(f"Could not save prediction: {str(e)}")
             
             progress_bar.progress((idx + 1) / len(selected_indexes))
         
@@ -1721,12 +1082,6 @@ else:
             st.info(f"Current ET Time: {current_et.strftime('%I:%M %p')} | Critical window: 3:45-4:00 PM ET")
         
         st.header("📊 Prediction Results")
-        
-        # Show advanced gamma-based EOD prediction panel
-        show_eod_prediction_panel(selected_indexes)
-        
-        # Show AI-enhanced analysis panel
-        show_ai_analysis_panel(selected_indexes)
         
         # Export options
         col_export1, col_export2, col_export3 = st.columns([2, 2, 6])
@@ -1758,36 +1113,14 @@ else:
         
         for col, (index_name, pred) in zip(cols, st.session_state.predictions.items()):
             with col:
-                # Time-Adaptive prediction (primary)
                 change_color = "🟢" if pred['change_pct'] >= 0 else "🔴"
                 st.metric(
                     label=f"{change_color} {index_name}",
                     value=f"${pred['predicted_price']:.2f}",
                     delta=f"{pred['change_pct']:.2f}%"
                 )
-                st.caption(f"🔮 Blended Prediction")
                 st.caption(f"Current: ${pred['current_price']:.2f}")
-                # Show premium data source indicator
-                if pred.get('price_source'):
-                    st.caption(f"📡 {pred['price_source']}")
                 st.caption(f"Confidence: {pred['confidence']:.1f}%")
-                
-                # Show individual models if toggle enabled and available
-                if pred.get('show_both_models'):
-                    st.markdown("---")
-                    st.caption("**Individual Models:**")
-                    
-                    # Show Time-Adaptive if available
-                    if pred.get('adaptive_pred') and pred['adaptive_pred']['predicted_price']:
-                        adaptive = pred['adaptive_pred']
-                        adaptive_change = ((adaptive['predicted_price'] - pred['current_price']) / pred['current_price']) * 100
-                        st.caption(f"⚡ Time-Adaptive: ${adaptive['predicted_price']:.2f} ({adaptive_change:+.2f}%)")
-                    
-                    # Show Traditional if available
-                    if pred.get('traditional_pred'):
-                        trad = pred['traditional_pred']
-                        trad_change = ((trad['predicted_price'] - trad['current_price']) / trad['current_price']) * 100
-                        st.caption(f"📊 Traditional ML: ${trad['predicted_price']:.2f} ({trad_change:+.2f}%)")
                 
                 # Confidence bar
                 conf_color = "green" if pred['confidence'] > 70 else "orange" if pred['confidence'] > 50 else "red"
@@ -1808,124 +1141,62 @@ else:
         
         st.divider()
         
+        # AI Portfolio Risk Assessment
+        if enable_ai and st.session_state.predictions:
+            st.header("🎯 AI Portfolio Risk Assessment")
+            with st.spinner("Analyzing overall market risk..."):
+                risk_assessment = get_risk_assessment(st.session_state.predictions)
+                if risk_assessment:
+                    st.warning(f"**Risk Analysis:** {risk_assessment}")
+        
+        st.divider()
+        
         # Detailed charts
         st.header("📈 Detailed Analysis")
         
         for index_name, pred in st.session_state.predictions.items():
             with st.expander(f"📊 {index_name} ({pred['ticker']}) - Detailed Chart", expanded=True):
-                # Display model comparison if both models are shown
-                if pred.get('show_both_models') and pred.get('traditional_pred'):
-                    st.subheader("🔀 Model Comparison")
-                    comp_col1, comp_col2, comp_col3, comp_col4 = st.columns(4)
-                    
-                    with comp_col1:
-                        st.metric("Current Price", f"${pred['current_price']:.2f}")
-                    
-                    with comp_col2:
-                        st.metric("⚡ Time-Adaptive", f"${pred['predicted_price']:.2f}")
-                        st.caption(f"{pred['change_pct']:+.2f}% | {pred['confidence']:.0f}% conf")
-                    
-                    with comp_col3:
-                        trad = pred['traditional_pred']
-                        trad_change = ((trad['predicted_price'] - trad['current_price']) / trad['current_price']) * 100
-                        st.metric("📊 Traditional ML", f"${trad['predicted_price']:.2f}")
-                        st.caption(f"{trad_change:+.2f}% | {trad['confidence']:.0f}% conf")
-                    
-                    with comp_col4:
-                        diff = pred['predicted_price'] - trad['predicted_price']
-                        diff_pct = (diff / trad['predicted_price']) * 100
-                        st.metric("Δ Difference", f"${abs(diff):.2f}")
-                        st.caption(f"{diff_pct:+.2f}% spread")
-                    
-                    # Show adaptive model features
-                    if pred.get('adaptive_features'):
-                        st.markdown("**⚡ Time-Adaptive Features:**")
-                        feat_cols = st.columns(4)
-                        features = pred['adaptive_features']
-                        with feat_cols[0]:
-                            st.caption(f"VWAP Dev: {features.get('vwap_deviation', 0)*100:.2f}%")
-                        with feat_cols[1]:
-                            st.caption(f"Microtrend: {features.get('microtrend', 0):.3f}")
-                        with feat_cols[2]:
-                            st.caption(f"Gamma Pin: {features.get('gamma_pin', 0):.2f}")
-                        with feat_cols[3]:
-                            st.caption(f"Flow: {features.get('flow_urgency', 0):.2f}")
-                        
-                        # ORB Features (new)
-                        orb_signal = features.get('orb_breakout_signal', 0)
-                        orb_complete = features.get('orb_complete', 0)
-                        orb_position = features.get('orb_position', 0.5)
-                        orb_range_pct = features.get('orb_range_width_pct', 0)
-                        
-                        if orb_complete > 0.5 or orb_range_pct > 0:
-                            st.markdown("**📊 1-Hour ORB Analysis:**")
-                            orb_cols = st.columns(4)
-                            with orb_cols[0]:
-                                if orb_signal > 0:
-                                    st.caption(f"🟢 Bullish Breakout")
-                                elif orb_signal < 0:
-                                    st.caption(f"🔴 Bearish Breakout")
-                                elif orb_complete > 0.5:
-                                    st.caption(f"📦 Inside Range")
-                                else:
-                                    st.caption(f"⏳ ORB Forming")
-                            with orb_cols[1]:
-                                st.caption(f"Position: {orb_position:.2f}")
-                            with orb_cols[2]:
-                                st.caption(f"Range: {orb_range_pct:.2f}%")
-                            with orb_cols[3]:
-                                if orb_complete > 0.5:
-                                    st.caption("✓ Complete")
-                                else:
-                                    st.caption("⏳ Forming")
-                    
-                    # Show gamma pin influence if available
-                    if 'gex_data' in pred and pred['gex_data'] and 'pin_strike' in pred['gex_data']:
-                        gex = pred['gex_data']
-                        pin_strike = gex['pin_strike']
-                        current = pred['current_price']
-                        prediction = pred['predicted_price']
-                        
-                        # Calculate how much the pin is pulling the prediction
-                        distance_to_pin = pin_strike - current
-                        distance_to_pin_pct = (distance_to_pin / current) * 100
-                        prediction_movement = prediction - current
-                        prediction_movement_pct = (prediction_movement / current) * 100
-                        
-                        # Calculate influence percentage (how much of the gap to pin did we move)
-                        if abs(distance_to_pin) > 0.01:  # Avoid division by zero
-                            influence_pct = (prediction_movement / distance_to_pin) * 100
-                        else:
-                            influence_pct = 0
-                        
-                        st.markdown("**🧲 Gamma Pin Influence:**")
-                        inf_cols = st.columns(4)
-                        with inf_cols[0]:
-                            st.caption(f"Pin @ ${pin_strike:.2f}")
-                        with inf_cols[1]:
-                            st.caption(f"Distance: {distance_to_pin_pct:+.2f}%")
-                        with inf_cols[2]:
-                            st.caption(f"Prediction Pull: {prediction_movement_pct:+.2f}%")
-                        with inf_cols[3]:
-                            influence_color = "🟢" if abs(influence_pct) > 50 else "🟡" if abs(influence_pct) > 25 else "🔴"
-                            st.caption(f"{influence_color} Influence: {influence_pct:.0f}%")
-                    
-                    st.divider()
-                
-                # Standard metrics display
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
                     st.metric("Last Close", f"${pred['current_price']:.2f}")
                 with col2:
                     st.metric("Predicted EOD", f"${pred['predicted_price']:.2f}")
-                    st.caption(f"⚡ {pred.get('model_type', 'Time-Adaptive Ridge')}")
                 with col3:
                     st.metric("Expected Change", f"{pred['change_pct']:.2f}%")
                 
+                # AI Analysis
+                if enable_ai:
+                    with st.spinner("Getting AI analysis..."):
+                        latest_data = pred['df'].iloc[-1]
+                        tech_indicators = {
+                            'RSI': latest_data['RSI'],
+                            'MACD': latest_data['MACD'],
+                            'Signal_Line': latest_data['Signal_Line'],
+                            'SMA_20': latest_data['SMA_20'],
+                            'Momentum': latest_data['Momentum'],
+                            'VWAP': latest_data['VWAP'],
+                            'AMA': latest_data['AMA']
+                        }
+                        
+                        vix_val = latest_data.get('vix_close') if 'vix_close' in latest_data else None
+                        
+                        ai_analysis = analyze_prediction(
+                            index_name,
+                            pred['current_price'],
+                            pred['predicted_price'],
+                            pred['confidence'],
+                            tech_indicators,
+                            pred.get('gex_data'),
+                            vix_val
+                        )
+                        
+                        if ai_analysis:
+                            st.info(f"🤖 **AI Analysis:** {ai_analysis}")
+                
                 # Create and display chart
                 fig = create_price_chart(pred['df'], pred['predicted_price'], index_name)
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
                 
                 # Technical indicators summary
                 st.subheader("Technical Indicators Summary")
@@ -1957,53 +1228,7 @@ else:
                 if 'gex_data' in pred and pred['gex_data']:
                     gex = pred['gex_data']
                     st.divider()
-                    
-                    # Backtesting controls
                     st.subheader("🎯 Gamma Exposure Analysis")
-                    backtest_col1, backtest_col2, backtest_col3 = st.columns([2, 2, 1])
-                    
-                    with backtest_col1:
-                        backtest_date = st.date_input(
-                            "📅 View Historical Gamma (or leave blank for live)",
-                            value=None,
-                            max_value=datetime.now().date(),
-                            key=f"backtest_date_{pred['ticker']}"
-                        )
-                    
-                    with backtest_col2:
-                        if backtest_date:
-                            if st.button("🔄 Load Historical Data", key=f"load_backtest_{pred['ticker']}"):
-                                st.session_state.backtest_mode = True
-                                st.session_state.backtest_date = backtest_date
-                                st.rerun()
-                    
-                    with backtest_col3:
-                        if st.session_state.backtest_mode and st.button("✕ Back to Live", key=f"back_to_live_{pred['ticker']}"):
-                            st.session_state.backtest_mode = False
-                            st.session_state.backtest_date = None
-                            st.rerun()
-                    
-                    # Load historical gamma if backtest mode is active
-                    if st.session_state.backtest_mode and st.session_state.backtest_date:
-                        historical_gex = get_historical_gamma_snapshot(pred['ticker'], st.session_state.backtest_date)
-                        if historical_gex:
-                            st.info(f"📊 **Viewing Historical Gamma from {st.session_state.backtest_date.strftime('%A, %B %d, %Y')}**")
-                            gex = historical_gex
-                        else:
-                            st.warning(f"⚠️ No gamma data found for {pred['ticker']} on {st.session_state.backtest_date}")
-                    
-                    if gex.get('data_unavailable', False):
-                        st.info(
-                            "ℹ️ **Gamma Data Temporarily Unavailable** - "
-                            + gex.get('error_message', 'Real-time data will be available during next market session.')
-                        )
-                    elif gex.get('is_cached_data', False):
-                        st.info("📊 **Using Cached EOD Data** - Showing last available real market data.")
-                    elif gex.get('is_mock_data', False):
-                        st.warning(
-                            "⚠️ **SIMULATED GAMMA DATA** - Using estimated options data. "
-                            "This should not appear with a premium Polygon subscription. Please check your API key."
-                        )
                     
                     # Main gamma pin information
                     gamma_col1, gamma_col2, gamma_col3 = st.columns(3)
@@ -2046,223 +1271,94 @@ else:
                             'days_to_expiry': 'Days to Expiry'
                         })
                         
-                        st.dataframe(gamma_walls_display, width='stretch')
-                    
-                    # Multi-Expiration Gamma Analysis Section
-                    with st.expander("📅 Future Gamma Exposure (0-7 DTE)", expanded=False):
-                        try:
-                            multi_expiry_response = requests.get(
-                                f"http://localhost:8000/gamma/multi-expiry?symbol={pred['ticker']}&max_dte=7",
-                                timeout=15
-                            )
-                            
-                            if multi_expiry_response.status_code == 200:
-                                multi_data = multi_expiry_response.json()
-                                
-                                # Display aggregate pin
-                                st.metric(
-                                    "🎯 Aggregate Pin (Weighted)",
-                                    f"${multi_data['aggregate_pin']:.0f}",
-                                    help="Pin strike weighted across all near-term expirations"
-                                )
-                                
-                                # Display gamma by expiration (only DTEs with meaningful GEX)
-                                gamma_by_exp = multi_data.get('gamma_by_expiry', {})
-                                # Filter to only show DTEs with meaningful GEX (> 0.001B)
-                                meaningful_exp = {k: v for k, v in gamma_by_exp.items() 
-                                                 if v.get('total_gex', 0) > 0.001}
-                                
-                                if meaningful_exp:
-                                    st.write("**Gamma Exposure by Expiration:**")
-                                    exp_data = []
-                                    for dte, data in sorted(meaningful_exp.items(), key=lambda x: int(x[0])):
-                                        dte_label = "0-DTE (Today)" if int(dte) == 0 else f"{dte}-DTE"
-                                        exp_data.append({
-                                            'Expiration': dte_label,
-                                            'Pin Strike': f"${data['pin_strike']:.0f}",
-                                            'GEX': f"${data['total_gex']:.2f}B",
-                                            'Weight': f"{data['weight']*100:.0f}%",
-                                            'Weighted GEX': f"${data['weighted_gex']:.2f}B"
-                                        })
-                                    
-                                    st.dataframe(
-                                        pd.DataFrame(exp_data),
-                                        width='stretch',
-                                        hide_index=True
-                                    )
-                                else:
-                                    st.caption("ℹ️ No significant gamma exposure for future expirations")
-                                
-                                # Display unified walls (filter out near-zero GEX)
-                                unified_walls = multi_data.get('unified_walls', [])
-                                # Only show walls with meaningful GEX (> 0.001B)
-                                meaningful_walls = [w for w in unified_walls if w.get('weighted_total_gex', 0) > 0.001]
-                                if meaningful_walls:
-                                    st.write("**Unified Gamma Walls (All Expirations):**")
-                                    
-                                    walls_data = []
-                                    for wall in meaningful_walls[:5]:
-                                        exp_list = wall.get('expirations', [])
-                                        exp_str = ', '.join([f"{e}d" for e in sorted(exp_list)])
-                                        walls_data.append({
-                                            'Strike': f"${wall['strike']:.0f}",
-                                            'Weighted GEX': f"${wall['weighted_total_gex']:.2f}B",
-                                            'Net GEX': f"${wall['weighted_net_gex']:.2f}B",
-                                            'Expirations': exp_str
-                                        })
-                                    
-                                    st.dataframe(
-                                        pd.DataFrame(walls_data),
-                                        width='stretch',
-                                        hide_index=True
-                                    )
-                                elif unified_walls:
-                                    st.caption("ℹ️ No significant gamma walls detected for this period")
-                                
-                                if multi_data.get('data_unavailable'):
-                                    st.caption("ℹ️ " + multi_data.get('error_message', 'Data temporarily unavailable'))
-                                elif multi_data.get('is_mock_data'):
-                                    st.caption("⚠️ Using simulated options data (should not appear with premium API)")
-                            else:
-                                st.info("Multi-expiry gamma data not available")
-                        
-                        except Exception as e:
-                            st.info(f"Multi-expiry analysis unavailable: {str(e)[:50]}")
+                        st.dataframe(gamma_walls_display, use_container_width=True)
                     
                     # Create gamma exposure bar chart if we have strike-level data
                     if 'gex_by_strike' in gex and not gex['gex_by_strike'].empty:
                         import plotly.graph_objects as go
                         
-                        gex_df = gex['gex_by_strike'].copy()
-                        current_price = pred.get('current_price', 0)
-                        pin_strike = gex.get('pin_strike', current_price)
+                        gex_df = gex['gex_by_strike']
                         
-                        # Filter out near-zero GEX values (< 0.001B threshold)
-                        gex_df = gex_df[gex_df['total_gex'].abs() > 0.001].copy()
+                        # Create bar chart showing gamma exposure by strike
+                        fig_gex = go.Figure()
                         
-                        if gex_df.empty:
-                            st.caption("ℹ️ No significant gamma exposure at nearby strikes")
-                        else:
-                            # Focus on strikes within ±10% of current price for clarity
-                            price_range = max(current_price * 0.1, 50)  # At least $50 range
-                            filtered_df = gex_df[
-                                (gex_df['strike'] >= current_price - price_range) &
-                                (gex_df['strike'] <= current_price + price_range)
-                            ].copy()
-                            
-                            # If filtered data is empty, use closest 15 strikes to current price
-                            if filtered_df.empty:
-                                filtered_df = gex_df.iloc[(gex_df['strike'] - current_price).abs().argsort()[:15]].copy()
-                            
-                            # Create bar chart with optimized spacing
-                            fig_gex = go.Figure()
-                            
-                            # Add net GEX bars with better labels
-                            fig_gex.add_trace(go.Bar(
-                                x=filtered_df['strike'],
-                                y=filtered_df['net_gex'],
-                                name='Net GEX',
-                                marker_color=['green' if x > 0 else 'red' for x in filtered_df['net_gex']],
-                                text=[f"${s:.0f}\n${abs(g):.2f}B" for s, g in zip(filtered_df['strike'], filtered_df['net_gex'])],
-                                textposition='outside',
-                                hovertemplate='<b>Strike: $%{x:.0f}</b><br>Net GEX: %{y:.3f}B<extra></extra>'
-                            ))
-                            
-                            # Add current price line with annotation box
+                        # Add net GEX bars
+                        fig_gex.add_trace(go.Bar(
+                            x=gex_df['strike'],
+                            y=gex_df['net_gex'],
+                            name='Net GEX',
+                            marker_color=['green' if x > 0 else 'red' for x in gex_df['net_gex']],
+                            text=[f"${abs(x):.1f}B" for x in gex_df['net_gex']],
+                            textposition='outside'
+                        ))
+                        
+                        # Add current price line
+                        if 'current_price' in pred:
                             fig_gex.add_vline(
-                                x=current_price,
+                                x=pred['current_price'],
                                 line_dash="dash",
                                 line_color="blue",
-                                line_width=2,
-                                annotation_text="CURRENT",
-                                annotation_position="top left",
-                                annotation_font=dict(color="blue", size=11),
-                                name="Current Price"
+                                annotation_text=f"Current: ${pred['current_price']:.0f}"
                             )
-                            
-                            # Add pin strike line with annotation box
+                        
+                        # Add pin strike line
+                        if 'pin_strike' in gex:
                             fig_gex.add_vline(
-                                x=pin_strike,
+                                x=gex['pin_strike'],
                                 line_dash="solid",
                                 line_color="orange",
                                 line_width=2,
-                                annotation_text="PIN",
-                                annotation_position="top right",
-                                annotation_font=dict(color="orange", size=11),
-                                name="Pin Strike"
+                                annotation_text=f"Pin: ${gex['pin_strike']:.0f}"
                             )
-                            
-                            fig_gex.update_layout(
-                                title=f"Gamma Exposure (±${price_range:.0f} around ${current_price:.0f})",
-                                xaxis_title="Strike Price ($)",
-                                yaxis_title="Net Gamma Exposure (Billions $)",
-                                showlegend=False,
-                                height=450,
-                                margin=dict(b=100, t=80, l=80, r=80),
-                                xaxis=dict(
-                                    showgrid=True,
-                                    gridwidth=1,
-                                    gridcolor='lightgray',
-                                    tickformat='$,.0f'
-                                ),
-                                yaxis=dict(
-                                    showgrid=True,
-                                    gridwidth=1,
-                                    gridcolor='lightgray'
-                                ),
-                                hovermode='x unified',
-                                font=dict(size=11)
-                            )
-                            
-                            st.plotly_chart(fig_gex, use_container_width=True)
+                        
+                        fig_gex.update_layout(
+                            title="Gamma Exposure by Strike Price",
+                            xaxis_title="Strike Price",
+                            yaxis_title="Net Gamma Exposure (Billions)",
+                            showlegend=False,
+                            height=300
+                        )
+                        
+                        st.plotly_chart(fig_gex, use_container_width=True)
                     
                     if 'summary' in gex:
                         st.info(f"💡 {gex['summary']}")
                     
+                    # AI Explanation of Gamma
+                    if enable_ai:
+                        gamma_explanation = explain_gamma_exposure(gex)
+                        if gamma_explanation:
+                            st.success(f"🤖 **What This Means:** {gamma_explanation}")
+                    
                     # Key levels
                     if gex.get('key_levels'):
                         st.info(f"Key Support/Resistance: ${gex['key_levels'][0]:.2f} / ${gex['key_levels'][1]:.2f}")
-                    
-                    # Add Gamma Pin Evolution Chart (intraday history)
-                    st.divider()
-                    show_gamma_evolution_section(pred['ticker'], index_name)
                 
-                # Display VWAP and AMA (only if available)
+                # Display VWAP and AMA
                 st.subheader("📊 Advanced Indicators")
                 adv_col1, adv_col2, adv_col3 = st.columns(3)
                 
                 with adv_col1:
-                    if 'VWAP' in latest_data:
-                        st.metric("VWAP", f"${latest_data['VWAP']:.2f}")
-                        vwap_signal = "Above" if pred['current_price'] > latest_data['VWAP'] else "Below"
-                        st.caption(f"Price {vwap_signal}")
-                    else:
-                        st.metric("VWAP", "N/A")
-                        st.caption("Not available")
+                    st.metric("VWAP", f"${latest_data['VWAP']:.2f}")
+                    vwap_signal = "Above" if pred['current_price'] > latest_data['VWAP'] else "Below"
+                    st.caption(f"Price {vwap_signal}")
                 
                 with adv_col2:
-                    if 'AMA' in latest_data and pd.notna(latest_data['AMA']):
-                        st.metric("AMA (Adaptive)", f"${latest_data['AMA']:.2f}")
-                        ama_signal = "Above" if pred['current_price'] > latest_data['AMA'] else "Below"
-                        st.caption(f"Price {ama_signal}")
-                    else:
-                        st.metric("AMA (Adaptive)", "N/A")
-                        st.caption("Not available")
+                    st.metric("AMA (Adaptive)", f"${latest_data['AMA']:.2f}")
+                    ama_signal = "Above" if pred['current_price'] > latest_data['AMA'] else "Below"
+                    st.caption(f"Price {ama_signal}")
                 
                 with adv_col3:
-                    if 'vix_close' in latest_data and pd.notna(latest_data['vix_close']):
+                    if 'vix_close' in latest_data:
                         st.metric("VIX", f"{latest_data['vix_close']:.2f}")
                         vix_level = "High Vol" if latest_data['vix_close'] > 20 else "Low Vol"
                         st.caption(vix_level)
-                    else:
-                        st.metric("VIX", "N/A")
-                        st.caption("Not available")
     
     elif selected_indexes and not st.session_state.predictions:
         st.info("👆 Click 'Analyze & Predict' to generate predictions for selected indexes")
     
     # Backtesting execution
-    if run_backtest_analysis and selected_indexes and backtest_start and backtest_end:
+    if run_backtest_btn and 'run_backtest_analysis' in locals() and run_backtest_analysis and selected_indexes:
         st.header("📊 Backtest Results")
         
         # Initialize session state for backtest results
@@ -2276,16 +1372,16 @@ else:
         
         for idx, index_name in enumerate(selected_indexes):
             index_ticker = INDEXES[index_name]
-            polygon_ticker = get_index_ticker(index_ticker)  # Use actual index (I:SPX format)
+            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)
             
             backtest_status.text(f"Running backtest for {index_name}...")
             
-            # Run backtest with actual index ticker (I:SPX format)
+            # Run backtest
             backtest_df = run_backtest(
                 st.session_state.api_key,
                 index_name,
                 index_ticker,
-                polygon_ticker,  # Use actual index ticker instead of ETF
+                etf_ticker,
                 datetime.combine(backtest_start, datetime.min.time()),
                 datetime.combine(backtest_end, datetime.min.time()),
                 backtest_model
@@ -2328,7 +1424,7 @@ else:
                         display_df['error_pct'] = display_df['error_pct'].apply(lambda x: f"{x:.2f}%")
                         display_df['direction_correct'] = display_df['direction_correct'].apply(lambda x: "✓" if x else "✗")
                         
-                        st.dataframe(display_df, width='stretch', hide_index=True)
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
                     
                     # Create accuracy chart
                     import plotly.graph_objects as go
@@ -2360,7 +1456,7 @@ else:
                         height=400
                     )
                     
-                    st.plotly_chart(fig_acc, width='stretch')
+                    st.plotly_chart(fig_acc, use_container_width=True)
                     
                     # Show best and worst predictions
                     st.write("**Best & Worst Predictions:**")
@@ -2434,7 +1530,7 @@ else:
                         })
                     
                     df_history = pd.DataFrame(history_data)
-                    st.dataframe(df_history, width='stretch', hide_index=True)
+                    st.dataframe(df_history, use_container_width=True, hide_index=True)
                     
                     st.caption(f"Showing {len(all_predictions)} most recent predictions")
                 else:
@@ -2472,7 +1568,7 @@ else:
                         })
                     
                     df_alerts = pd.DataFrame(alert_data)
-                    st.dataframe(df_alerts, width='stretch', hide_index=True)
+                    st.dataframe(df_alerts, use_container_width=True, hide_index=True)
             except Exception as e:
                 st.error(f"Error loading alerts: {str(e)}")
         
@@ -2513,7 +1609,7 @@ else:
                     
                     if ticker_stats:
                         df_stats = pd.DataFrame(ticker_stats)
-                        st.dataframe(df_stats, width='stretch', hide_index=True)
+                        st.dataframe(df_stats, use_container_width=True, hide_index=True)
                 else:
                     st.info("No completed predictions yet. Accuracy statistics will appear once predictions are verified with actual prices.")
             except Exception as e:
