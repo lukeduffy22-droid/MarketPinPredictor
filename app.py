@@ -118,10 +118,17 @@ def calculate_technical_indicators(df, params=None):
     if params is None:
         params = st.session_state.indicator_params
     
+    # Use smaller windows to work with limited data
+    sma_short = min(params['sma_short'], 5)
+    sma_medium = min(params['sma_medium'], 10)
+    sma_long = min(params['sma_long'], 15)  # Reduced from 20
+    bb_period = min(params['bb_period'], 15)  # Reduced from 20
+    vol_window = min(15, len(df) // 4)  # Adaptive window for volume
+    
     # Simple Moving Averages
-    df['SMA_5'] = df['close'].rolling(window=params['sma_short']).mean()
-    df['SMA_10'] = df['close'].rolling(window=params['sma_medium']).mean()
-    df['SMA_20'] = df['close'].rolling(window=params['sma_long']).mean()
+    df['SMA_5'] = df['close'].rolling(window=sma_short, min_periods=1).mean()
+    df['SMA_10'] = df['close'].rolling(window=sma_medium, min_periods=1).mean()
+    df['SMA_20'] = df['close'].rolling(window=sma_long, min_periods=1).mean()
     
     # Exponential Moving Averages
     df['EMA_5'] = df['close'].ewm(span=params['ema_short'], adjust=False).mean()
@@ -130,17 +137,26 @@ def calculate_technical_indicators(df, params=None):
     # VWAP (Volume Weighted Average Price)
     df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
     df['PV'] = df['Typical_Price'] * df['volume']
-    df['VWAP'] = df['PV'].cumsum() / df['volume'].cumsum()
+    cumvol = df['volume'].cumsum()
+    cumvol = cumvol.replace(0, np.nan)  # Avoid division by zero
+    df['VWAP'] = df['PV'].cumsum() / cumvol
+    df['VWAP'] = df['VWAP'].ffill().bfill()  # Fill any NaN
     
-    # Kaufman's Adaptive Moving Average (AMA/KAMA)
-    df['AMA'] = calculate_kama(df['close'], n_period=10, fast_period=2, slow_period=30)
+    # Kaufman's Adaptive Moving Average (AMA/KAMA) - with fallback
+    try:
+        df['AMA'] = calculate_kama(df['close'], n_period=min(10, len(df)//5), fast_period=2, slow_period=min(20, len(df)//3))
+        df['AMA'] = df['AMA'].ffill().bfill()  # Fill NaN
+    except Exception:
+        df['AMA'] = df['close'].ewm(span=10, adjust=False).mean()  # Fallback to EMA
     
     # Relative Strength Index (RSI)
     delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=params['rsi_period']).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=params['rsi_period']).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(window=params['rsi_period'], min_periods=1).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=params['rsi_period'], min_periods=1).mean()
+    loss = loss.replace(0, 0.0001)  # Avoid division by zero
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
+    df['RSI'] = df['RSI'].fillna(50)  # Default to neutral RSI
     
     # MACD
     exp1 = df['close'].ewm(span=params['macd_fast'], adjust=False).mean()
@@ -149,20 +165,29 @@ def calculate_technical_indicators(df, params=None):
     df['Signal_Line'] = df['MACD'].ewm(span=params['macd_signal'], adjust=False).mean()
     
     # Bollinger Bands
-    df['BB_Middle'] = df['close'].rolling(window=params['bb_period']).mean()
-    bb_std = df['close'].rolling(window=params['bb_period']).std()
+    df['BB_Middle'] = df['close'].rolling(window=bb_period, min_periods=1).mean()
+    bb_std = df['close'].rolling(window=bb_period, min_periods=1).std()
+    bb_std = bb_std.fillna(df['close'].std())  # Fallback to overall std
     df['BB_Upper'] = df['BB_Middle'] + (bb_std * params['bb_std'])
     df['BB_Lower'] = df['BB_Middle'] - (bb_std * params['bb_std'])
     
     # Momentum
-    df['Momentum'] = df['close'] - df['close'].shift(params['momentum_period'])
+    mom_period = min(params['momentum_period'], len(df) // 5)
+    df['Momentum'] = df['close'] - df['close'].shift(max(1, mom_period))
+    df['Momentum'] = df['Momentum'].fillna(0)
     
     # Rate of Change
-    df['ROC'] = ((df['close'] - df['close'].shift(params['momentum_period'])) / df['close'].shift(params['momentum_period'])) * 100
+    shifted = df['close'].shift(max(1, mom_period))
+    shifted = shifted.replace(0, np.nan)
+    df['ROC'] = ((df['close'] - shifted) / shifted) * 100
+    df['ROC'] = df['ROC'].fillna(0)
     
     # Volume indicators
-    df['Volume_SMA'] = df['volume'].rolling(window=20).mean()
+    vol_window = max(5, vol_window)
+    df['Volume_SMA'] = df['volume'].rolling(window=vol_window, min_periods=1).mean()
+    df['Volume_SMA'] = df['Volume_SMA'].replace(0, 1)  # Avoid division by zero
     df['Volume_Ratio'] = df['volume'] / df['Volume_SMA']
+    df['Volume_Ratio'] = df['Volume_Ratio'].fillna(1)
     
     return df
 
@@ -438,21 +463,34 @@ async def setup_websocket_streaming(api_key, tickers, on_data_callback):
 def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     """Predict end-of-day price using technical indicators and ML"""
     if df is None or len(df) < 25:
-        return None, None, None, None
+        print(f"DEBUG: Initial check failed - df is None: {df is None}, len: {len(df) if df is not None else 0}")
+        return None, None, None, None, "Initial data check failed (need 25+ rows)"
     
     # Calculate technical indicators
     df = calculate_technical_indicators(df)
     
-    # Drop rows with NaN values
-    df_clean = df.dropna().copy()
+    # Check which columns have NaN values
+    nan_cols = df.columns[df.isna().any()].tolist()
+    print(f"DEBUG: After indicators - {len(df)} rows, NaN columns: {nan_cols}")
     
-    if len(df_clean) < 10:
-        return None, None, None, None
-    
-    # Prepare features for prediction - including new indicators
+    # Only drop rows with NaN in the feature columns we actually use
     feature_columns = ['SMA_5', 'SMA_10', 'SMA_20', 'EMA_5', 'EMA_10', 
                        'RSI', 'MACD', 'Signal_Line', 'Momentum', 'ROC', 
                        'Volume_Ratio', 'BB_Upper', 'BB_Lower', 'VWAP', 'AMA']
+    
+    # Check if all feature columns exist
+    missing_cols = [c for c in feature_columns if c not in df.columns]
+    if missing_cols:
+        print(f"DEBUG: Missing columns: {missing_cols}")
+        return None, None, None, None, f"Missing columns: {missing_cols}"
+    
+    # Drop rows only where feature columns have NaN
+    df_clean = df.dropna(subset=feature_columns + ['close']).copy()
+    print(f"DEBUG: After dropna on features - {len(df_clean)} rows")
+    
+    if len(df_clean) < 10:
+        print(f"DEBUG: Not enough clean rows: {len(df_clean)}")
+        return None, None, None, None, f"Only {len(df_clean)} clean rows (need 10+)"
     
     # Determine shift based on timeframe
     if timeframe == '1-day':
@@ -469,10 +507,12 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     df_clean['next_close'] = df_clean['close'].shift(-shift_days)
     
     # Remove rows with NaN for next_close
-    df_model = df_clean[:-shift_days].dropna().copy()
+    df_model = df_clean[:-shift_days].dropna(subset=feature_columns + ['next_close']).copy()
+    print(f"DEBUG: After shift removal - {len(df_model)} rows for model")
     
     if len(df_model) < 10:
-        return None, None, None, None
+        print(f"DEBUG: Not enough model rows: {len(df_model)}")
+        return None, None, None, None, f"Only {len(df_model)} rows after shift (need 10+)"
     
     X = df_model[feature_columns].values
     y = df_model['next_close'].values
@@ -508,7 +548,8 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     base_confidence = min(accuracy, 85)
     confidence = max(40, base_confidence - (volatility * 2))
     
-    return predicted_price, confidence, df_clean, current_price
+    print(f"DEBUG: Prediction successful! Price: {predicted_price:.2f}, Confidence: {confidence:.1f}%")
+    return predicted_price, confidence, df_clean, current_price, None
 
 def create_price_chart(df, predicted_price, ticker_name):
     """Create interactive price chart with prediction"""
@@ -982,7 +1023,7 @@ else:
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
                 # Predict EOD price using selected model and timeframe
-                predicted_price, confidence, df_with_indicators, current_price = predict_eod_price(
+                predicted_price, confidence, df_with_indicators, current_price, error_msg = predict_eod_price(
                     df, 
                     model_type=st.session_state.selected_model,
                     timeframe=st.session_state.timeframe
@@ -990,7 +1031,7 @@ else:
                 
                 # Debug: Show prediction result
                 if predicted_price is None:
-                    st.warning(f"⚠️ {index_name}: Prediction failed (not enough data)")
+                    st.warning(f"⚠️ {index_name}: Prediction failed - {error_msg or 'unknown error'}")
                 else:
                     st.caption(f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}%")
                 
