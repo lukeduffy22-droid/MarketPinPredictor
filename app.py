@@ -40,7 +40,15 @@ INDEXES = {
     "Russell 2000 (RUT)": "RUT"
 }
 
-# ETF proxies for data fetching (indexes don't have direct price data)
+# Polygon index ticker format (with I: prefix for indices)
+INDEX_POLYGON_TICKERS = {
+    "SPX": "I:SPX",
+    "NDX": "I:NDX",
+    "DJI": "I:DJI",
+    "RUT": "I:RUT"
+}
+
+# ETF proxies as fallback (only used if direct index data unavailable)
 INDEX_ETFS = {
     "SPX": "SPY",
     "NDX": "QQQ",
@@ -289,8 +297,15 @@ def calculate_gex(api_key, ticker, spot_price):
         st.warning(f"Could not calculate GEX: {str(e)}")
         return None
 
-def fetch_market_data(api_key, ticker, days=60):
-    """Fetch historical market data from Polygon"""
+def fetch_market_data(api_key, ticker, days=60, use_index=True):
+    """Fetch historical market data from Polygon
+    
+    Args:
+        api_key: Polygon API key
+        ticker: Base ticker symbol (e.g., 'SPX', 'NDX', 'SPY')
+        days: Number of days of history
+        use_index: If True, try direct index data (I:SPX) first, then fall back to ETF
+    """
     try:
         client = RESTClient(api_key)
         
@@ -298,17 +313,62 @@ def fetch_market_data(api_key, ticker, days=60):
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
+        # Determine which ticker to use
+        polygon_ticker = ticker
+        is_index_data = False
+        
+        # If ticker is a base index (SPX, NDX, etc.), try direct index format first
+        if use_index and ticker in INDEX_POLYGON_TICKERS:
+            polygon_ticker = INDEX_POLYGON_TICKERS[ticker]
+            is_index_data = True
+        elif use_index and ticker in INDEX_ETFS:
+            # Ticker might be passed as SPX instead of SPY
+            polygon_ticker = INDEX_POLYGON_TICKERS.get(ticker, f"I:{ticker}")
+            is_index_data = True
+        
         # Fetch aggregates (daily bars)
-        aggs = client.get_aggs(
-            ticker=ticker,
-            from_=start_date.strftime("%Y-%m-%d"),
-            to=end_date.strftime("%Y-%m-%d"),
-            timespan='day',
-            multiplier=1,
-            adjusted=True,
-            sort='asc',
-            limit=50000
-        )
+        aggs = None
+        try:
+            aggs = client.get_aggs(
+                ticker=polygon_ticker,
+                from_=start_date.strftime("%Y-%m-%d"),
+                to=end_date.strftime("%Y-%m-%d"),
+                timespan='day',
+                multiplier=1,
+                adjusted=True,
+                sort='asc',
+                limit=50000
+            )
+        except Exception as e:
+            # If index data fails, fall back to ETF
+            if is_index_data and ticker in INDEX_ETFS:
+                etf_ticker = INDEX_ETFS[ticker]
+                print(f"Index data not available for {polygon_ticker}, falling back to {etf_ticker}")
+                aggs = client.get_aggs(
+                    ticker=etf_ticker,
+                    from_=start_date.strftime("%Y-%m-%d"),
+                    to=end_date.strftime("%Y-%m-%d"),
+                    timespan='day',
+                    multiplier=1,
+                    adjusted=True,
+                    sort='asc',
+                    limit=50000
+                )
+        
+        # If no data and this was an index, try ETF fallback
+        if (not aggs or len(list(aggs)) == 0) and is_index_data and ticker in INDEX_ETFS:
+            etf_ticker = INDEX_ETFS[ticker]
+            print(f"No index data for {polygon_ticker}, trying ETF {etf_ticker}")
+            aggs = client.get_aggs(
+                ticker=etf_ticker,
+                from_=start_date.strftime("%Y-%m-%d"),
+                to=end_date.strftime("%Y-%m-%d"),
+                timespan='day',
+                multiplier=1,
+                adjusted=True,
+                sort='asc',
+                limit=50000
+            )
         
         # Convert to DataFrame - new polygon API returns Agg objects
         data = []
@@ -320,12 +380,15 @@ def fetch_market_data(api_key, ticker, days=60):
                     'high': agg.high,
                     'low': agg.low,
                     'close': agg.close,
-                    'volume': agg.volume
+                    'volume': agg.volume if agg.volume else 1  # Indices may not have volume
                 })
         
         df = pd.DataFrame(data)
         if not df.empty:
             df = df.sort_values('timestamp').reset_index(drop=True)
+            # Ensure volume is never 0 (indices don't have volume data)
+            if 'volume' in df.columns:
+                df['volume'] = df['volume'].replace(0, 1).fillna(1)
         
         return df
     except Exception as e:
@@ -996,11 +1059,10 @@ else:
         
         for idx, index_name in enumerate(selected_indexes):
             index_ticker = INDEXES[index_name]  # Actual index ticker (SPX, NDX, etc.)
-            etf_ticker = INDEX_ETFS.get(index_ticker, index_ticker)  # ETF for price data
             status_text.text(f"Analyzing {index_name}...")
             
-            # Fetch price data using ETF proxy
-            df = fetch_market_data(st.session_state.api_key, etf_ticker, days_history)
+            # Fetch price data using direct index ticker (I:SPX format), falls back to ETF if needed
+            df = fetch_market_data(st.session_state.api_key, index_ticker, days_history, use_index=True)
             
             # Debug: Show data fetch result
             if df is None:
