@@ -131,6 +131,11 @@ async def startup():
     asyncio.create_task(poll_polygon_rest())
     asyncio.create_task(load_cached_snapshots())  # Secondary fallback from DB
     
+    # Start gamma pin scheduler to save snapshots throughout the day
+    from gamma_scheduler import start_gamma_scheduler
+    start_gamma_scheduler()
+    log.info("Gamma pin scheduler started")
+    
     log.info("API ready - WebSocket streams (stocks + options) + REST fallback starting")
 
 @app.get("/healthz")
