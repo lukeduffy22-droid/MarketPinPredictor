@@ -21,6 +21,7 @@ from ai_analysis import (
     analyze_prediction, analyze_streaming_data, 
     get_risk_assessment, explain_gamma_exposure
 )
+from gamma_viz import show_gamma_evolution_section
 
 # Initialize database
 init_db()
@@ -1532,6 +1533,9 @@ else:
                     # Key levels
                     if gex.get('key_levels'):
                         st.info(f"Key Support/Resistance: ${gex['key_levels'][0]:.2f} / ${gex['key_levels'][1]:.2f}")
+                
+                # Display Intraday Gamma Pin Evolution Chart
+                show_gamma_evolution_section(index_ticker, index_name)
                 
                 # Display VWAP and AMA
                 st.subheader("📊 Advanced Indicators")
