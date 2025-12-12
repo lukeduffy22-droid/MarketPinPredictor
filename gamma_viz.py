@@ -167,7 +167,7 @@ def display_gamma_history_table(ticker, trading_date_obj):
     # Display table
     st.dataframe(
         df,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=min(400, len(df) * 35 + 38)  # Auto-height based on rows
     )
@@ -281,7 +281,7 @@ def show_gamma_evolution_section(ticker, index_name):
                 "Real data from your Polygon API is clearly marked. Simulated sections shown with dashed lines."
             )
         
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         
         # Show table in expander
         with st.expander("📋 View Detailed Snapshots", expanded=False):

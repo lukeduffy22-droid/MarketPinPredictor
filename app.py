@@ -639,17 +639,19 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day', gex
         
         # Validate gamma pin is reasonable (within 15% of current price)
         if gamma_pin and abs(gamma_pin - current_price) / current_price < 0.15:
-            # Gamma weight increases based on pull strength and timeframe
-            # For 1-day predictions, gamma pin is highly influential
+            # Gamma weight is critical for EOD predictions - prices gravitate to pins
+            # Research shows gamma pinning is strongest effect in final 2 hours
             if timeframe == '1-day':
-                # Strong gamma: weight up to 60%, weak gamma: weight ~20%
-                gamma_weight = min(0.6, 0.2 + (pull_strength / 100) * 0.4)
+                # 1-day EOD predictions should heavily weight gamma pin
+                # Base weight 50% (gamma is dominant force near close)
+                # Additional weight up to 70% if pull_strength is high
+                gamma_weight = min(0.70, 0.50 + (pull_strength / 100) * 0.20)
             elif timeframe == '5-day':
                 # Multi-day: gamma less influential (pins shift daily)
-                gamma_weight = min(0.3, 0.1 + (pull_strength / 100) * 0.2)
+                gamma_weight = min(0.35, 0.20 + (pull_strength / 100) * 0.15)
             else:
                 # Weekly: minimal gamma influence
-                gamma_weight = min(0.15, 0.05 + (pull_strength / 100) * 0.1)
+                gamma_weight = min(0.20, 0.10 + (pull_strength / 100) * 0.10)
             
             print(f"DEBUG: Gamma pin at ${gamma_pin:.2f}, pull strength: {pull_strength}%, weight: {gamma_weight:.1%}")
         else:
@@ -1046,7 +1048,7 @@ with st.sidebar:
     
     st.divider()
     
-    analyze_button = st.button("🔄 Analyze & Predict", type="primary", use_container_width=True)
+    analyze_button = st.button("🔄 Analyze & Predict", type="primary", width='stretch')
     
     st.divider()
     
@@ -1080,7 +1082,7 @@ with st.sidebar:
             help="Model to use for backtesting"
         )
         
-        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", use_container_width=True)
+        run_backtest_analysis = st.button("🚀 Run Backtest", type="secondary", width='stretch')
     
     st.divider()
     st.caption("💡 This tool uses technical indicators and machine learning to predict closing prices. Predictions are estimates and should not be used as financial advice.")
@@ -1373,7 +1375,7 @@ else:
                 
                 # Create and display chart
                 fig = create_price_chart(pred['df'], pred['predicted_price'], index_name)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
                 
                 # Technical indicators summary
                 st.subheader("Technical Indicators Summary")
@@ -1448,7 +1450,7 @@ else:
                             'days_to_expiry': 'Days to Expiry'
                         })
                         
-                        st.dataframe(gamma_walls_display, use_container_width=True)
+                        st.dataframe(gamma_walls_display, width='stretch')
                     
                     # Create gamma exposure bar chart if we have strike-level data
                     if 'gex_by_strike' in gex and not gex['gex_by_strike'].empty:
@@ -1496,7 +1498,7 @@ else:
                             height=300
                         )
                         
-                        st.plotly_chart(fig_gex, use_container_width=True)
+                        st.plotly_chart(fig_gex, width='stretch')
                     
                     if 'summary' in gex:
                         st.info(f"💡 {gex['summary']}")
@@ -1601,7 +1603,7 @@ else:
                         display_df['error_pct'] = display_df['error_pct'].apply(lambda x: f"{x:.2f}%")
                         display_df['direction_correct'] = display_df['direction_correct'].apply(lambda x: "✓" if x else "✗")
                         
-                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        st.dataframe(display_df, width='stretch', hide_index=True)
                     
                     # Create accuracy chart
                     import plotly.graph_objects as go
@@ -1633,7 +1635,7 @@ else:
                         height=400
                     )
                     
-                    st.plotly_chart(fig_acc, use_container_width=True)
+                    st.plotly_chart(fig_acc, width='stretch')
                     
                     # Show best and worst predictions
                     st.write("**Best & Worst Predictions:**")
@@ -1707,7 +1709,7 @@ else:
                         })
                     
                     df_history = pd.DataFrame(history_data)
-                    st.dataframe(df_history, use_container_width=True, hide_index=True)
+                    st.dataframe(df_history, width='stretch', hide_index=True)
                     
                     st.caption(f"Showing {len(all_predictions)} most recent predictions")
                 else:
@@ -1745,7 +1747,7 @@ else:
                         })
                     
                     df_alerts = pd.DataFrame(alert_data)
-                    st.dataframe(df_alerts, use_container_width=True, hide_index=True)
+                    st.dataframe(df_alerts, width='stretch', hide_index=True)
             except Exception as e:
                 st.error(f"Error loading alerts: {str(e)}")
         
@@ -1786,7 +1788,7 @@ else:
                     
                     if ticker_stats:
                         df_stats = pd.DataFrame(ticker_stats)
-                        st.dataframe(df_stats, use_container_width=True, hide_index=True)
+                        st.dataframe(df_stats, width='stretch', hide_index=True)
                 else:
                     st.info("No completed predictions yet. Accuracy statistics will appear once predictions are verified with actual prices.")
             except Exception as e:
