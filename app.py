@@ -693,7 +693,7 @@ def create_price_chart(df, predicted_price, ticker_name):
         rows=3, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.05,
-        subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI', 'Volume'),
+        subplot_titles=(f'{ticker_name} Price & Indicators', 'RSI', 'MACD'),
         row_heights=[0.6, 0.2, 0.2]
     )
     
@@ -756,14 +756,26 @@ def create_price_chart(df, predicted_price, ticker_name):
     fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
     
-    # Volume
-    colors = ['red' if close < open else 'green' 
-              for close, open in zip(df['close'], df['open'])]
+    # MACD (more useful than volume for indices which don't have volume data)
     fig.add_trace(
-        go.Bar(x=df['timestamp'], y=df['volume'], 
-               name='Volume', marker_color=colors),
+        go.Scatter(x=df['timestamp'], y=df['MACD'], 
+                   name='MACD', line=dict(color='blue', width=1.5)),
         row=3, col=1
     )
+    fig.add_trace(
+        go.Scatter(x=df['timestamp'], y=df['Signal_Line'], 
+                   name='Signal', line=dict(color='orange', width=1.5)),
+        row=3, col=1
+    )
+    # MACD Histogram
+    macd_hist = df['MACD'] - df['Signal_Line']
+    colors = ['green' if val >= 0 else 'red' for val in macd_hist]
+    fig.add_trace(
+        go.Bar(x=df['timestamp'], y=macd_hist, 
+               name='MACD Histogram', marker_color=colors, opacity=0.5),
+        row=3, col=1
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=3, col=1)
     
     fig.update_layout(
         height=800,
@@ -774,7 +786,7 @@ def create_price_chart(df, predicted_price, ticker_name):
     
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1)
-    fig.update_yaxes(title_text="Volume", row=3, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
     
     return fig
 
