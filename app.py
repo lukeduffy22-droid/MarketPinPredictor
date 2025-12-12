@@ -637,15 +637,17 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day', gex
         gamma_pin = gex_data['pin_strike']
         pull_strength = gex_data.get('pull_strength', 0)
         
-        # Validate gamma pin is reasonable (within 15% of current price)
-        if gamma_pin and abs(gamma_pin - current_price) / current_price < 0.15:
-            # Gamma weight is critical for EOD predictions - prices gravitate to pins
-            # Research shows gamma pinning is strongest effect in final 2 hours
+        # Validate gamma pin is reasonable (within 5% of current price for same-day, 15% for multi-day)
+        max_deviation = 0.05 if timeframe == '1-day' else 0.15
+        if gamma_pin and abs(gamma_pin - current_price) / current_price < max_deviation:
+            # CRITICAL: For same-day EOD predictions, gamma pin is THE dominant factor
+            # Research shows prices are "magnetically" pulled to gamma pins at close
+            # The ML model predicts T+1 (next day), so for same-day EOD we rely primarily on gamma
             if timeframe == '1-day':
-                # 1-day EOD predictions should heavily weight gamma pin
-                # Base weight 50% (gamma is dominant force near close)
-                # Additional weight up to 70% if pull_strength is high
-                gamma_weight = min(0.70, 0.50 + (pull_strength / 100) * 0.20)
+                # SAME-DAY EOD: Gamma pin dominates (70-85% weight)
+                # ML model was trained on T+1 data, not same-day, so trust gamma more
+                # Higher pull_strength = stronger magnet effect = more weight
+                gamma_weight = min(0.85, 0.70 + (pull_strength / 100) * 0.15)
             elif timeframe == '5-day':
                 # Multi-day: gamma less influential (pins shift daily)
                 gamma_weight = min(0.35, 0.20 + (pull_strength / 100) * 0.15)
@@ -655,7 +657,8 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day', gex
             
             print(f"DEBUG: Gamma pin at ${gamma_pin:.2f}, pull strength: {pull_strength}%, weight: {gamma_weight:.1%}")
         else:
-            print(f"DEBUG: Gamma pin ${gamma_pin} rejected (>15% from current ${current_price:.2f})")
+            deviation_pct = abs(gamma_pin - current_price) / current_price * 100
+            print(f"DEBUG: Gamma pin ${gamma_pin} rejected ({deviation_pct:.1f}% from current ${current_price:.2f}, max allowed {max_deviation*100}%)")
             gamma_pin = None
     
     # Blend ML prediction with gamma pin
@@ -1143,10 +1146,17 @@ else:
                 st.caption(f"✓ {index_name}: Fetched {len(df)} rows")
             
             if df is not None and len(df) > 0:
+                # Preserve data source metadata before any operations
+                data_source = df.attrs.get('data_source', 'unknown') if hasattr(df, 'attrs') else 'unknown'
+                ticker_used = df.attrs.get('ticker_used', index_ticker) if hasattr(df, 'attrs') else index_ticker
+                
                 # Merge VIX data if available
                 if vix_df is not None and len(vix_df) > 0:
                     df = pd.merge(df, vix_df, on='timestamp', how='left')
-                    df['vix_close'] = df['vix_close'].fillna(method='ffill')
+                    df['vix_close'] = df['vix_close'].ffill()  # Fixed deprecated fillna(method='ffill')
+                    # Restore attrs after merge (merge loses them)
+                    df.attrs['data_source'] = data_source
+                    df.attrs['ticker_used'] = ticker_used
                 
                 # Get current price for GEX calculation
                 current_price = df['close'].iloc[-1]
@@ -1172,9 +1182,7 @@ else:
                 if predicted_price and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
-                    # Track data source for transparency
-                    data_source = df.attrs.get('data_source', 'unknown') if hasattr(df, 'attrs') else 'unknown'
-                    ticker_used = df.attrs.get('ticker_used', index_ticker) if hasattr(df, 'attrs') else index_ticker
+                    # data_source and ticker_used already captured before merge
                     
                     st.session_state.predictions[index_name] = {
                         'ticker': index_ticker,
