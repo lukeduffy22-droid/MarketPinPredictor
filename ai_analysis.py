@@ -10,11 +10,20 @@ import streamlit as st
 from datetime import datetime
 
 def get_openai_client():
-    """Initialize OpenAI client with API key from environment"""
+    """Initialize OpenAI client using Replit AI Integrations (preferred) or fallback to OPENAI_API_KEY"""
+    # First try Replit's integrated OpenAI (billed to Replit credits)
+    api_key = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY")
+    base_url = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
+    
+    if api_key and base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    
+    # Fallback to user's own OpenAI API key
     api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+    if api_key:
+        return OpenAI(api_key=api_key)
+    
+    return None
 
 def analyze_prediction(ticker_name, current_price, predicted_price, confidence, technical_indicators, gex_data=None, vix_value=None):
     """
