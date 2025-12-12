@@ -305,6 +305,9 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True):
         ticker: Base ticker symbol (e.g., 'SPX', 'NDX', 'SPY')
         days: Number of days of history
         use_index: If True, try direct index data (I:SPX) first, then fall back to ETF
+        
+    Returns:
+        tuple: (DataFrame, data_source) where data_source is 'index' or 'etf'
     """
     try:
         client = RESTClient(api_key)
@@ -316,18 +319,22 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True):
         # Determine which ticker to use
         polygon_ticker = ticker
         is_index_data = False
+        data_source = 'direct'  # Track whether we're using index or ETF data
         
         # If ticker is a base index (SPX, NDX, etc.), try direct index format first
         if use_index and ticker in INDEX_POLYGON_TICKERS:
             polygon_ticker = INDEX_POLYGON_TICKERS[ticker]
             is_index_data = True
+            data_source = 'index'
         elif use_index and ticker in INDEX_ETFS:
             # Ticker might be passed as SPX instead of SPY
             polygon_ticker = INDEX_POLYGON_TICKERS.get(ticker, f"I:{ticker}")
             is_index_data = True
+            data_source = 'index'
         
         # Fetch aggregates (daily bars)
         aggs = None
+        aggs_list = []
         try:
             aggs = client.get_aggs(
                 ticker=polygon_ticker,
@@ -339,11 +346,16 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True):
                 sort='asc',
                 limit=50000
             )
+            # Convert generator to list to check length
+            if aggs:
+                aggs_list = list(aggs)
         except Exception as e:
             # If index data fails, fall back to ETF
             if is_index_data and ticker in INDEX_ETFS:
                 etf_ticker = INDEX_ETFS[ticker]
-                print(f"Index data not available for {polygon_ticker}, falling back to {etf_ticker}")
+                st.warning(f"⚠️ INDEX DATA UNAVAILABLE for {polygon_ticker}, falling back to ETF {etf_ticker} - predictions may be less accurate")
+                print(f"[DATA SOURCE WARNING] Index data not available for {polygon_ticker}, falling back to {etf_ticker}")
+                data_source = 'etf_fallback'
                 aggs = client.get_aggs(
                     ticker=etf_ticker,
                     from_=start_date.strftime("%Y-%m-%d"),
@@ -354,11 +366,15 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True):
                     sort='asc',
                     limit=50000
                 )
+                if aggs:
+                    aggs_list = list(aggs)
         
         # If no data and this was an index, try ETF fallback
-        if (not aggs or len(list(aggs)) == 0) and is_index_data and ticker in INDEX_ETFS:
+        if len(aggs_list) == 0 and is_index_data and ticker in INDEX_ETFS:
             etf_ticker = INDEX_ETFS[ticker]
-            print(f"No index data for {polygon_ticker}, trying ETF {etf_ticker}")
+            st.warning(f"⚠️ NO INDEX DATA for {polygon_ticker}, falling back to ETF {etf_ticker} - predictions may be less accurate")
+            print(f"[DATA SOURCE WARNING] No index data for {polygon_ticker}, trying ETF {etf_ticker}")
+            data_source = 'etf_fallback'
             aggs = client.get_aggs(
                 ticker=etf_ticker,
                 from_=start_date.strftime("%Y-%m-%d"),
@@ -369,19 +385,20 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True):
                 sort='asc',
                 limit=50000
             )
+            if aggs:
+                aggs_list = list(aggs)
         
         # Convert to DataFrame - new polygon API returns Agg objects
         data = []
-        if aggs:
-            for agg in aggs:
-                data.append({
-                    'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
-                    'open': agg.open,
-                    'high': agg.high,
-                    'low': agg.low,
-                    'close': agg.close,
-                    'volume': agg.volume if agg.volume else 1  # Indices may not have volume
-                })
+        for agg in aggs_list:
+            data.append({
+                'timestamp': datetime.fromtimestamp(agg.timestamp / 1000),
+                'open': agg.open,
+                'high': agg.high,
+                'low': agg.low,
+                'close': agg.close,
+                'volume': agg.volume if agg.volume else 1  # Indices may not have volume
+            })
         
         df = pd.DataFrame(data)
         if not df.empty:
@@ -389,6 +406,9 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True):
             # Ensure volume is never 0 (indices don't have volume data)
             if 'volume' in df.columns:
                 df['volume'] = df['volume'].replace(0, 1).fillna(1)
+            # Add data source metadata
+            df.attrs['data_source'] = data_source
+            df.attrs['ticker_used'] = polygon_ticker if data_source == 'index' else INDEX_ETFS.get(ticker, ticker)
         
         return df
     except Exception as e:
@@ -523,8 +543,15 @@ async def setup_websocket_streaming(api_key, tickers, on_data_callback):
     except Exception as e:
         st.error(f"WebSocket connection failed: {e}")
 
-def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
-    """Predict end-of-day price using technical indicators and ML"""
+def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day', gex_data=None):
+    """Predict end-of-day price using technical indicators, ML, and gamma pin alignment
+    
+    Args:
+        df: DataFrame with OHLCV data
+        model_type: 'Linear Regression' or 'Random Forest'
+        timeframe: '1-day', '5-day', or '1-week'
+        gex_data: Optional gamma exposure data with pin_strike for EOD alignment
+    """
     if df is None or len(df) < 25:
         print(f"DEBUG: Initial check failed - df is None: {df is None}, len: {len(df) if df is not None else 0}")
         return None, None, None, None, "Initial data check failed (need 25+ rows)"
@@ -599,7 +626,44 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     # Predict future price using the most recent features
     latest_features = df_clean[feature_columns].iloc[-1].values.reshape(1, -1)
     latest_scaled = scaler.transform(latest_features)
-    predicted_price = model.predict(latest_scaled)[0]
+    ml_predicted_price = model.predict(latest_scaled)[0]
+    
+    # GAMMA PIN ALIGNMENT - Critical for EOD predictions
+    # Gamma pin exerts strong magnetic pull on prices, especially near close
+    gamma_pin = None
+    gamma_weight = 0.0
+    
+    if gex_data and 'pin_strike' in gex_data and gex_data['pin_strike']:
+        gamma_pin = gex_data['pin_strike']
+        pull_strength = gex_data.get('pull_strength', 0)
+        
+        # Validate gamma pin is reasonable (within 15% of current price)
+        if gamma_pin and abs(gamma_pin - current_price) / current_price < 0.15:
+            # Gamma weight increases based on pull strength and timeframe
+            # For 1-day predictions, gamma pin is highly influential
+            if timeframe == '1-day':
+                # Strong gamma: weight up to 60%, weak gamma: weight ~20%
+                gamma_weight = min(0.6, 0.2 + (pull_strength / 100) * 0.4)
+            elif timeframe == '5-day':
+                # Multi-day: gamma less influential (pins shift daily)
+                gamma_weight = min(0.3, 0.1 + (pull_strength / 100) * 0.2)
+            else:
+                # Weekly: minimal gamma influence
+                gamma_weight = min(0.15, 0.05 + (pull_strength / 100) * 0.1)
+            
+            print(f"DEBUG: Gamma pin at ${gamma_pin:.2f}, pull strength: {pull_strength}%, weight: {gamma_weight:.1%}")
+        else:
+            print(f"DEBUG: Gamma pin ${gamma_pin} rejected (>15% from current ${current_price:.2f})")
+            gamma_pin = None
+    
+    # Blend ML prediction with gamma pin
+    if gamma_pin and gamma_weight > 0:
+        # Weighted average: ML model + gamma pin attraction
+        predicted_price = (ml_predicted_price * (1 - gamma_weight)) + (gamma_pin * gamma_weight)
+        print(f"DEBUG: Blended prediction: ML=${ml_predicted_price:.2f} + Gamma=${gamma_pin:.2f} (weight={gamma_weight:.1%}) = ${predicted_price:.2f}")
+    else:
+        predicted_price = ml_predicted_price
+        print(f"DEBUG: Pure ML prediction (no valid gamma): ${predicted_price:.2f}")
     
     # Calculate confidence based on recent trend consistency and model performance
     recent_prices = df_clean['close'].tail(10).values
@@ -610,6 +674,10 @@ def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day'):
     # Confidence decreases with volatility and poor accuracy
     base_confidence = min(accuracy, 85)
     confidence = max(40, base_confidence - (volatility * 2))
+    
+    # Boost confidence if gamma alignment is strong
+    if gamma_pin and gamma_weight > 0.3:
+        confidence = min(95, confidence + 5)  # Slight confidence boost for strong gamma alignment
     
     print(f"DEBUG: Prediction successful! Price: {predicted_price:.2f}, Confidence: {confidence:.1f}%")
     return predicted_price, confidence, df_clean, current_price, None
@@ -1084,11 +1152,13 @@ else:
                 # Calculate GEX levels using actual index ticker for options
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
-                # Predict EOD price using selected model and timeframe
+                # Predict EOD price using selected model, timeframe, and GAMMA PIN DATA
+                # Pass gex_data so predictions align with gamma pin levels
                 predicted_price, confidence, df_with_indicators, current_price, error_msg = predict_eod_price(
                     df, 
                     model_type=st.session_state.selected_model,
-                    timeframe=st.session_state.timeframe
+                    timeframe=st.session_state.timeframe,
+                    gex_data=gex_data  # Critical: gamma pin influences EOD prediction
                 )
                 
                 # Debug: Show prediction result
@@ -1100,6 +1170,10 @@ else:
                 if predicted_price and current_price:
                     change_pct = ((predicted_price - current_price) / current_price) * 100
                     
+                    # Track data source for transparency
+                    data_source = df.attrs.get('data_source', 'unknown') if hasattr(df, 'attrs') else 'unknown'
+                    ticker_used = df.attrs.get('ticker_used', index_ticker) if hasattr(df, 'attrs') else index_ticker
+                    
                     st.session_state.predictions[index_name] = {
                         'ticker': index_ticker,
                         'current_price': current_price,
@@ -1110,7 +1184,9 @@ else:
                         'model_type': st.session_state.selected_model,
                         'timeframe': st.session_state.timeframe,
                         'gex_data': gex_data,  # Add GEX data
-                        'has_vix': vix_df is not None  # Track VIX availability
+                        'has_vix': vix_df is not None,  # Track VIX availability
+                        'data_source': data_source,  # Track if using index or ETF data
+                        'ticker_used': ticker_used  # Actual ticker used for data
                     }
                     
                     # Save prediction to database
@@ -1249,6 +1325,14 @@ else:
         
         for index_name, pred in st.session_state.predictions.items():
             with st.expander(f"📊 {index_name} ({pred['ticker']}) - Detailed Chart", expanded=True):
+                # Data source indicator - warn if using ETF fallback
+                data_source = pred.get('data_source', 'unknown')
+                ticker_used = pred.get('ticker_used', pred['ticker'])
+                if data_source == 'etf_fallback':
+                    st.warning(f"⚠️ Using ETF fallback data ({ticker_used}) - predictions may be less accurate")
+                elif data_source == 'index':
+                    st.success(f"✓ Using direct index data ({ticker_used})")
+                
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
