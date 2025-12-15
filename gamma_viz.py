@@ -281,7 +281,7 @@ def show_gamma_evolution_section(ticker, index_name):
                 "Real data from your Polygon API is clearly marked. Simulated sections shown with dashed lines."
             )
         
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True, key=f"gamma_evolution_{ticker}")
         
         # Show table in expander
         with st.expander("📋 View Detailed Snapshots", expanded=False):
