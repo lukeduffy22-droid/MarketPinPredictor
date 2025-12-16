@@ -250,15 +250,17 @@ def display_gamma_history_table(ticker, trading_date_obj):
             real_pct = (len(real_snapshots) / len(snapshots)) * 100
             st.metric("Real Data", f"{real_pct:.0f}%")
 
-def show_gamma_evolution_section(ticker, index_name):
+def show_gamma_evolution_section(ticker, index_name, unique_suffix=""):
     """
     Complete gamma evolution section with chart and table
     
     Args:
         ticker: Stock ticker (e.g., 'SPX')
         index_name: Display name (e.g., 'S&P 500 (SPX)')
+        unique_suffix: Optional unique suffix for chart keys to prevent duplicates
     """
     import pytz
+    import hashlib
     
     st.subheader(f"📊 {index_name} - Intraday Gamma Pin Evolution")
     
@@ -281,7 +283,10 @@ def show_gamma_evolution_section(ticker, index_name):
                 "Real data from your Polygon API is clearly marked. Simulated sections shown with dashed lines."
             )
         
-        st.plotly_chart(fig, use_container_width=True, key=f"gamma_evolution_{ticker}")
+        # Generate unique key using ticker, date, and optional suffix
+        key_base = f"gamma_evolution_{ticker}_{today_et.isoformat()}_{unique_suffix}"
+        chart_key = hashlib.md5(key_base.encode()).hexdigest()[:12]
+        st.plotly_chart(fig, use_container_width=True, key=f"gamma_evo_{ticker}_{chart_key}")
         
         # Show table in expander
         with st.expander("📋 View Detailed Snapshots", expanded=False):

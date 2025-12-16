@@ -1535,7 +1535,7 @@ else:
                         st.info(f"Key Support/Resistance: ${gex['key_levels'][0]:.2f} / ${gex['key_levels'][1]:.2f}")
                 
                 # Display Intraday Gamma Pin Evolution Chart
-                show_gamma_evolution_section(index_ticker, index_name)
+                show_gamma_evolution_section(pred['ticker'], index_name, unique_suffix=index_name)
                 
                 # Display VWAP and AMA
                 st.subheader("📊 Advanced Indicators")
