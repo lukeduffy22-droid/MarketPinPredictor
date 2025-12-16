@@ -14,6 +14,50 @@ log = logging.getLogger("ws_ingest")
 # Sub-second accumulator per symbol
 _accum: Dict[str, Dict[int, List]] = defaultdict(lambda: defaultdict(list))
 
+def parse_index_value(msg: dict) -> tuple:
+    """
+    Parse Polygon Value message for indices.
+    Value messages provide real-time index value updates.
+    Returns (symbol, IndexTick) or None if invalid.
+    
+    Format: {ev: "V", val: 3988.5, T: "I:SPX", t: 1678220098130}
+    """
+    from app.state.ring_buffers import IndexTick
+    
+    try:
+        # Get ticker with I: prefix
+        ticker = msg.get("T", "")
+        
+        # Extract symbol without I: prefix
+        if ticker.startswith("I:"):
+            symbol = ticker[2:]
+        else:
+            return None
+        
+        if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+            return None
+        
+        # Get value and timestamp
+        value = msg.get("val")  # Index value
+        ts_ms = msg.get("t")   # Timestamp in milliseconds
+        
+        if value is None or ts_ms is None:
+            return None
+        
+        # Convert to seconds
+        ts = ts_ms // 1000
+        
+        # Volume is N/A for value updates, use 1.0
+        size = 1.0
+        
+        tick = IndexTick(ts=ts, price=float(value), size=size)
+        
+        return (symbol, tick)
+        
+    except Exception as e:
+        log.warning(f"Failed to parse index value: {e}")
+        return None
+
 def parse_index_aggregate(msg: dict) -> tuple:
     """
     Parse Polygon aggregate message for indices.
@@ -156,7 +200,16 @@ async def ingest_message(msg: dict):
     """
     ev = msg.get("ev")
     
-    if ev == "A":  # Aggregate (index bars)
+    if ev == "V":  # Value update (primary index feed)
+        result = parse_index_value(msg)
+        if result:
+            symbol, tick = result
+            
+            # Accumulate by second
+            ts_second = tick.ts
+            _accum[symbol][ts_second].append(tick)
+    
+    elif ev == "A":  # Aggregate (index bars) - fallback
         result = parse_index_aggregate(msg)
         if result:
             symbol, tick = result

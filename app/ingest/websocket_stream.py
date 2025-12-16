@@ -30,11 +30,14 @@ class PolygonWebSocketStream:
         self.max_reconnects = settings.ws_max_reconnects
         self.running = False
         self.connected = False
+        # Use Value updates (V.) instead of Aggregates (A.) - more widely available
+        # V.I:XXX = real-time index value updates
+        # A.I:XXX = aggregate bars - requires higher tier plan
         self.subscriptions = [
-            "A.I:SPX",    # S&P 500 minute aggregates
-            "A.I:NDX",    # NASDAQ 100 minute aggregates
-            "A.I:DJI",    # Dow Jones minute aggregates
-            "A.I:RUT",    # Russell 2000 minute aggregates
+            "V.I:SPX",    # S&P 500 value updates
+            "V.I:NDX",    # NASDAQ 100 value updates
+            "V.I:DJI",    # Dow Jones value updates
+            "V.I:RUT",    # Russell 2000 value updates
         ]
     
     async def _send(self, action: str, params: str = None):
@@ -84,6 +87,10 @@ class PolygonWebSocketStream:
                 log.info(f"Subscription confirmed: {message}")
             else:
                 log.debug(f"Status message: {status} - {message}")
+        
+        elif ev == "V":
+            # Index value update - primary feed type
+            await ingest_message(msg)
         
         elif ev == "AM" or ev == "A":
             # Index aggregate message - pass to ingest
