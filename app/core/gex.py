@@ -1,8 +1,20 @@
 # app/core/gex.py
 """
 Canonical GEX (Gamma Exposure) computation module.
-This is the SINGLE SOURCE OF TRUTH for net/total GEX logic.
-All other files must import from this module.
+This is the SINGLE SOURCE OF TRUTH for ALL GEX logic.
+All other files MUST import from this module. No inline definitions anywhere.
+
+=== GLOBAL GEX DEFINITIONS (NON-NEGOTIABLE) ===
+
+Per-Strike:
+    net_gex_per_strike = call_gex - put_gex
+    
+Aggregate (across ALL strikes):
+    TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))   # Gross exposure magnitude
+    TOTAL_GEX_NET = sum(net_gex_per_strike)        # Net directional exposure
+
+These definitions must be used everywhere. No exceptions.
+UI labels must map 1:1 to these definitions.
 """
 from __future__ import annotations
 
@@ -125,3 +137,102 @@ def assert_gex_invariant(net_gex: float, total_gex: float, context: str = ""):
             f"GEX invariant violated{f' ({context})' if context else ''}: "
             f"total_gex ({total_gex}) must be >= abs(net_gex) ({abs(net_gex)})"
         )
+
+
+# =============================================================================
+# AGGREGATE GEX DEFINITIONS (across all strikes)
+# These are the ONLY functions that compute aggregate GEX. No exceptions.
+# =============================================================================
+
+from typing import List, Dict, Any
+
+
+@dataclass(frozen=True)
+class AggregateGexResult:
+    """Result of aggregate GEX computation across all strikes."""
+    total_gex_abs: float   # sum(abs(net_gex_per_strike)) - gross magnitude
+    total_gex_net: float   # sum(net_gex_per_strike) - net directional
+    strike_count: int      # number of strikes aggregated
+
+
+def compute_aggregate_gex(strikes_data: List[Dict[str, Any]]) -> AggregateGexResult:
+    """
+    Compute aggregate GEX across all strikes.
+    
+    DEFINITIONS (NON-NEGOTIABLE):
+        TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))
+        TOTAL_GEX_NET = sum(net_gex_per_strike)
+    
+    Args:
+        strikes_data: List of dicts, each with 'net_gex' key (net GEX for that strike)
+                      Expected format: [{'strike': 100, 'net_gex': 0.5}, ...]
+    
+    Returns:
+        AggregateGexResult with total_gex_abs and total_gex_net
+    
+    Raises:
+        ValueError: If input is invalid
+    """
+    if not isinstance(strikes_data, list):
+        raise ValueError("strikes_data must be a list")
+    
+    if len(strikes_data) == 0:
+        return AggregateGexResult(
+            total_gex_abs=0.0,
+            total_gex_net=0.0,
+            strike_count=0
+        )
+    
+    total_gex_abs = 0.0
+    total_gex_net = 0.0
+    
+    for strike_entry in strikes_data:
+        if not isinstance(strike_entry, dict):
+            raise ValueError(f"Each strike entry must be a dict, got {type(strike_entry)}")
+        
+        if 'net_gex' not in strike_entry:
+            raise ValueError(f"Strike entry missing 'net_gex' key: {strike_entry}")
+        
+        net_gex = float(strike_entry['net_gex'])
+        total_gex_abs += abs(net_gex)
+        total_gex_net += net_gex
+    
+    return AggregateGexResult(
+        total_gex_abs=total_gex_abs,
+        total_gex_net=total_gex_net,
+        strike_count=len(strikes_data)
+    )
+
+
+def compute_aggregate_gex_from_arrays(net_gex_per_strike: List[float]) -> AggregateGexResult:
+    """
+    Compute aggregate GEX from a simple list of net GEX values.
+    
+    DEFINITIONS (NON-NEGOTIABLE):
+        TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))
+        TOTAL_GEX_NET = sum(net_gex_per_strike)
+    
+    Args:
+        net_gex_per_strike: List of net GEX values, one per strike
+    
+    Returns:
+        AggregateGexResult with total_gex_abs and total_gex_net
+    """
+    if not isinstance(net_gex_per_strike, (list, tuple)):
+        raise ValueError("net_gex_per_strike must be a list or tuple")
+    
+    if len(net_gex_per_strike) == 0:
+        return AggregateGexResult(
+            total_gex_abs=0.0,
+            total_gex_net=0.0,
+            strike_count=0
+        )
+    
+    total_gex_abs = sum(abs(float(x)) for x in net_gex_per_strike)
+    total_gex_net = sum(float(x) for x in net_gex_per_strike)
+    
+    return AggregateGexResult(
+        total_gex_abs=total_gex_abs,
+        total_gex_net=total_gex_net,
+        strike_count=len(net_gex_per_strike)
+    )

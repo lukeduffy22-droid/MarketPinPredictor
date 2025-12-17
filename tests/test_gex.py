@@ -3,7 +3,10 @@ Unit tests for canonical GEX computation module.
 Tests the invariants and sign conventions required for correct gamma exposure calculation.
 """
 import pytest
-from app.core.gex import compute_gex, GexResult, validate_gex_invariant, assert_gex_invariant
+from app.core.gex import (
+    compute_gex, GexResult, validate_gex_invariant, assert_gex_invariant,
+    compute_aggregate_gex, compute_aggregate_gex_from_arrays, AggregateGexResult
+)
 
 
 class TestComputeGex:
@@ -192,6 +195,77 @@ class TestAssertGexInvariant:
         """Invalid invariant should raise AssertionError."""
         with pytest.raises(AssertionError, match="GEX invariant violated"):
             assert_gex_invariant(net_gex=15.0, total_gex=10.0)
+
+
+class TestAggregateGex:
+    """Tests for aggregate GEX functions - TOTAL_GEX_ABS and TOTAL_GEX_NET definitions."""
+    
+    def test_aggregate_gex_definition_abs(self):
+        """TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))."""
+        strikes = [
+            {'strike': 100, 'net_gex': 10.0},
+            {'strike': 105, 'net_gex': -5.0},
+            {'strike': 110, 'net_gex': 3.0},
+        ]
+        result = compute_aggregate_gex(strikes)
+        expected_abs = abs(10.0) + abs(-5.0) + abs(3.0)  # 18.0
+        assert result.total_gex_abs == expected_abs
+    
+    def test_aggregate_gex_definition_net(self):
+        """TOTAL_GEX_NET = sum(net_gex_per_strike)."""
+        strikes = [
+            {'strike': 100, 'net_gex': 10.0},
+            {'strike': 105, 'net_gex': -5.0},
+            {'strike': 110, 'net_gex': 3.0},
+        ]
+        result = compute_aggregate_gex(strikes)
+        expected_net = 10.0 + (-5.0) + 3.0  # 8.0
+        assert result.total_gex_net == expected_net
+    
+    def test_aggregate_gex_strike_count(self):
+        """Aggregate result includes strike count."""
+        strikes = [
+            {'strike': 100, 'net_gex': 10.0},
+            {'strike': 105, 'net_gex': -5.0},
+        ]
+        result = compute_aggregate_gex(strikes)
+        assert result.strike_count == 2
+    
+    def test_aggregate_gex_empty_list(self):
+        """Empty list returns zero aggregates."""
+        result = compute_aggregate_gex([])
+        assert result.total_gex_abs == 0.0
+        assert result.total_gex_net == 0.0
+        assert result.strike_count == 0
+    
+    def test_aggregate_gex_from_arrays(self):
+        """compute_aggregate_gex_from_arrays works with simple list."""
+        net_gex_values = [10.0, -5.0, 3.0]
+        result = compute_aggregate_gex_from_arrays(net_gex_values)
+        assert result.total_gex_abs == 18.0
+        assert result.total_gex_net == 8.0
+        assert result.strike_count == 3
+    
+    def test_aggregate_gex_all_negative(self):
+        """All negative net_gex values sum correctly."""
+        strikes = [
+            {'strike': 100, 'net_gex': -10.0},
+            {'strike': 105, 'net_gex': -5.0},
+        ]
+        result = compute_aggregate_gex(strikes)
+        assert result.total_gex_abs == 15.0
+        assert result.total_gex_net == -15.0
+    
+    def test_aggregate_gex_invalid_input_not_list(self):
+        """Non-list input raises ValueError."""
+        with pytest.raises(ValueError, match="must be a list"):
+            compute_aggregate_gex("not a list")
+    
+    def test_aggregate_gex_missing_net_gex_key(self):
+        """Missing net_gex key raises ValueError."""
+        strikes = [{'strike': 100}]  # Missing 'net_gex'
+        with pytest.raises(ValueError, match="missing 'net_gex' key"):
+            compute_aggregate_gex(strikes)
 
 
 if __name__ == "__main__":
