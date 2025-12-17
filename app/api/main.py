@@ -1215,12 +1215,57 @@ async def get_accuracy_ledger(symbol: Optional[str] = None, days: int = 30):
 # For backtesting and model validation
 # =============================================================================
 
+@app.post("/historical/build-today/{symbol}")
+async def build_today_snapshot_endpoint(symbol: str):
+    """
+    Build a gamma snapshot for TODAY using live options chain.
+    
+    This uses the current options chain snapshot which includes OI data.
+    Run this daily to build a historical validation dataset.
+    
+    Args:
+        symbol: Index symbol (SPX, NDX, DJI, RUT)
+    """
+    try:
+        symbol = symbol.upper()
+        if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+            raise HTTPException(400, f"Invalid symbol: {symbol}")
+        
+        from tools.historical_gamma import build_today_snapshot, save_historical_snapshot
+        
+        snapshot = build_today_snapshot(symbol)
+        if not snapshot:
+            raise HTTPException(503, f"Could not build today's snapshot for {symbol}")
+        
+        save_historical_snapshot(snapshot)
+        
+        return {
+            "status": "built",
+            "symbol": symbol,
+            "date": snapshot.date,
+            "spot": snapshot.spot,
+            "pin_strike": snapshot.pin_strike,
+            "contracts_count": snapshot.contracts_count,
+            "total_gex_abs": snapshot.total_gex_abs,
+            "total_gex_net": snapshot.total_gex_net,
+            "assumptions": snapshot.assumptions,
+            "timestamp": now_et().isoformat(),
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Build today's snapshot error: {e}")
+        raise HTTPException(503, f"Build error: {str(e)}")
+
+
 @app.post("/historical/build/{symbol}")
 async def build_historical_snapshot_endpoint(symbol: str, date: str):
     """
     Build a historical gamma snapshot for a specific date.
     
-    This builds a gamma snapshot using historical Polygon data.
+    NOTE: For historical dates (not today), this requires pre-built snapshots.
+    Use /historical/build-today/{symbol} to build snapshots during market hours.
     
     Args:
         symbol: Index symbol (SPX, NDX, DJI, RUT)
@@ -1238,7 +1283,7 @@ async def build_historical_snapshot_endpoint(symbol: str, date: str):
         
         snapshot = build_historical_snapshot(symbol, target_date)
         if not snapshot:
-            raise HTTPException(404, f"Could not build snapshot for {symbol} on {date}")
+            raise HTTPException(404, f"Could not build snapshot for {symbol} on {date}. For historical dates, snapshots must be pre-built during market hours.")
         
         save_historical_snapshot(snapshot)
         

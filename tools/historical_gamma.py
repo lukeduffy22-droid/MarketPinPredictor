@@ -216,6 +216,74 @@ def get_underlying_close(client, symbol: str, target_date: date) -> Optional[flo
         return None
 
 
+def get_options_chain_snapshot(
+    client,
+    symbol: str,
+    max_dte: int = 7
+) -> List[Dict[str, Any]]:
+    """
+    Get current options chain snapshot from Polygon with OI data.
+    
+    Uses list_snapshot_options_chain for real-time OI data.
+    This only works for current date (live snapshot).
+    
+    Args:
+        client: Polygon REST client
+        symbol: Index symbol (SPX, NDX, DJI, RUT)
+        max_dte: Maximum DTE to include (default 7)
+    
+    Returns:
+        List of contract data dicts with OI
+    """
+    contracts = []
+    today = date.today()
+    
+    try:
+        snapshot = client.list_snapshot_options_chain(symbol)
+        
+        for result in snapshot:
+            try:
+                details = getattr(result, 'details', None)
+                if not details:
+                    continue
+                
+                exp_date = getattr(details, 'expiration_date', None)
+                if not exp_date:
+                    continue
+                
+                if isinstance(exp_date, str):
+                    exp_date = datetime.strptime(exp_date, "%Y-%m-%d").date()
+                
+                dte = (exp_date - today).days
+                if dte < 0 or dte > max_dte:
+                    continue
+                
+                open_interest = getattr(result, 'open_interest', 0) or 0
+                if open_interest == 0:
+                    continue
+                
+                contracts.append({
+                    'ticker': getattr(details, 'ticker', ''),
+                    'strike': float(getattr(details, 'strike_price', 0)),
+                    'contract_type': getattr(details, 'contract_type', 'call'),
+                    'open_interest': int(open_interest),
+                    'expiration_date': str(exp_date),
+                    'dte': dte,
+                    'iv': getattr(result, 'implied_volatility', None),
+                })
+                
+            except Exception as e:
+                log.debug(f"Skipping contract: {e}")
+                continue
+        
+        log.info(f"Found {len(contracts)} contracts for {symbol} with 0-{max_dte} DTE")
+        return contracts
+        
+    except Exception as e:
+        log.error(f"Failed to get options snapshot for {symbol}: {e}")
+        return []
+
+
 def get_options_chain_historical(
     client,
     symbol: str,
@@ -223,7 +291,10 @@ def get_options_chain_historical(
     expiration_date: date
 ) -> List[Dict[str, Any]]:
     """
-    Get historical options chain data from Polygon.
+    Get options contracts for a specific expiration date.
+    
+    NOTE: This uses list_options_contracts which does NOT include OI.
+    For OI data, use get_options_chain_snapshot for current date only.
     
     Args:
         client: Polygon REST client
@@ -232,13 +303,11 @@ def get_options_chain_historical(
         expiration_date: Options expiration date
     
     Returns:
-        List of contract data dicts
+        List of contract data dicts (may not have OI)
     """
     contracts = []
     
     try:
-        root_symbol = "SPXW" if symbol == "SPX" else symbol
-        
         options = client.list_options_contracts(
             underlying_ticker=f"I:{symbol}",
             expiration_date=expiration_date.strftime("%Y-%m-%d"),
@@ -250,8 +319,6 @@ def get_options_chain_historical(
                 contract_ticker = opt.ticker
                 
                 oi = getattr(opt, 'open_interest', None) or 0
-                if oi == 0:
-                    continue
                 
                 contracts.append({
                     'ticker': contract_ticker,
@@ -304,29 +371,178 @@ def get_historical_iv(
         return None
 
 
+def build_today_snapshot(
+    symbol: str,
+    default_iv: float = 0.20,
+    max_dte: int = 7
+) -> Optional[HistoricalGammaSnapshot]:
+    """
+    Build a gamma snapshot for TODAY using current options chain.
+    
+    This uses list_snapshot_options_chain which includes OI data.
+    Save these snapshots daily to build a validation dataset.
+    
+    Args:
+        symbol: Index symbol (SPX, NDX, DJI, RUT)
+        default_iv: Default IV to use when unavailable
+        max_dte: Maximum DTE to include (default 7)
+    
+    Returns:
+        HistoricalGammaSnapshot or None on failure
+    """
+    today = date.today()
+    log.info(f"Building today's snapshot for {symbol} on {today}")
+    
+    try:
+        client = get_polygon_client()
+        
+        spot = get_underlying_close(client, symbol, today)
+        if spot is None:
+            log.warning(f"No close yet for {symbol} on {today}, using previous")
+            yesterday = today - timedelta(days=1)
+            spot = get_underlying_close(client, symbol, yesterday)
+            if spot is None:
+                log.error(f"Could not get spot price for {symbol}")
+                return None
+        
+        log.info(f"{symbol} spot: {spot}")
+        
+        all_contracts = get_options_chain_snapshot(client, symbol, max_dte)
+        
+        if not all_contracts:
+            log.warning(f"No contracts found for {symbol}")
+            return None
+        
+        log.info(f"Total contracts: {len(all_contracts)}")
+        
+        gamma_rows = []
+        strike_data = {}
+        
+        for c in all_contracts:
+            strike = c['strike']
+            oi = c['open_interest']
+            is_call = c['contract_type'].upper() == 'CALL'
+            dte = c.get('dte', 0)
+            
+            time_to_expiry = max(dte, 1) / 252.0
+            
+            iv = c.get('iv') or default_iv
+            if iv and iv > 1:
+                iv = iv / 100.0
+            
+            gamma_exposure = compute_contract_gamma(
+                spot=spot,
+                strike=strike,
+                iv=iv,
+                time_to_expiry=time_to_expiry,
+                open_interest=oi,
+                is_call=is_call
+            )
+            
+            if strike not in strike_data:
+                strike_data[strike] = {'call_gex': 0.0, 'put_gex': 0.0, 'oi': 0}
+            
+            if is_call:
+                strike_data[strike]['call_gex'] += gamma_exposure
+            else:
+                strike_data[strike]['put_gex'] += gamma_exposure
+            strike_data[strike]['oi'] += oi
+        
+        for strike, data in strike_data.items():
+            net_gex = data['call_gex'] - data['put_gex']
+            abs_gex = abs(net_gex)
+            
+            gamma_rows.append({
+                'strike': strike,
+                'net_gex': net_gex,
+                'abs_gex': abs_gex,
+                'call_gex': data['call_gex'],
+                'put_gex': data['put_gex'],
+                'oi': data['oi']
+            })
+        
+        gamma_rows.sort(key=lambda r: r['abs_gex'], reverse=True)
+        
+        pin_strike = find_gamma_pin_strike(spot, gamma_rows)
+        
+        from app.core.gex import compute_aggregate_gex
+        agg_result = compute_aggregate_gex(gamma_rows)
+        
+        snapshot = HistoricalGammaSnapshot(
+            symbol=symbol,
+            date=today.strftime("%Y-%m-%d"),
+            spot=spot,
+            pin_strike=pin_strike,
+            contracts_count=len(all_contracts),
+            gamma_rows=gamma_rows[:15],
+            total_gex_abs=agg_result.total_gex_abs,
+            total_gex_net=agg_result.total_gex_net,
+            assumptions={
+                "oi_source": "Live snapshot from Polygon list_snapshot_options_chain",
+                "dealer_positioning": "Dealer net sign unknown, tracking magnitude only",
+                "gamma_decay": f"0-{max_dte} DTE contracts included",
+                "iv_source": "Live IV from snapshot, or default if unavailable",
+                "not_for_trading": "Model validation only, not a tradable signal"
+            },
+            historical=True,
+            generated_at_utc=datetime.utcnow().isoformat()
+        )
+        
+        log.info(f"Today's snapshot built: pin={pin_strike}, contracts={len(all_contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}")
+        
+        return snapshot
+        
+    except Exception as e:
+        log.error(f"Failed to build today's snapshot for {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def build_historical_snapshot(
     symbol: str,
     target_date: date,
-    default_iv: float = 0.20
+    default_iv: float = 0.20,
+    max_dte: int = 7
 ) -> Optional[HistoricalGammaSnapshot]:
     """
-    Build a historical gamma snapshot for a given date.
+    Build a gamma snapshot for a historical date.
     
-    This function:
-    1. Gets the underlying close price
-    2. Gets option contracts expiring on that date
-    3. Computes gamma for each contract using Black-Scholes
-    4. Aggregates to find the gamma pin
+    NOTE: For historical dates (not today), OI data is NOT available from Polygon
+    standard endpoints. This function will:
+    - For today: Delegate to build_today_snapshot (uses live OI)
+    - For past dates: Attempt to load from stored snapshots
+    
+    To build a historical validation dataset:
+    1. Run build_today_snapshot daily during market hours
+    2. Save snapshots using save_historical_snapshot
+    3. Validate using stored snapshots
     
     Args:
         symbol: Index symbol (SPX, NDX, DJI, RUT)
         target_date: The trading date to analyze
         default_iv: Default IV to use when historical IV unavailable
+        max_dte: Maximum DTE to include (default 7)
     
     Returns:
         HistoricalGammaSnapshot or None on failure
     """
+    today = date.today()
+    
+    if target_date == today:
+        return build_today_snapshot(symbol, default_iv, max_dte)
+    
     log.info(f"Building historical snapshot for {symbol} on {target_date}")
+    
+    stored = load_historical_snapshot(symbol, target_date)
+    if stored:
+        log.info(f"Loaded stored snapshot for {symbol} on {target_date}")
+        return stored
+    
+    log.warning(
+        f"Historical OI data not available from Polygon for {target_date}. "
+        f"Snapshots must be pre-built during market hours using build_today_snapshot."
+    )
     
     try:
         client = get_polygon_client()
@@ -338,25 +554,33 @@ def build_historical_snapshot(
         
         log.info(f"{symbol} spot on {target_date}: {spot}")
         
-        contracts = get_options_chain_historical(client, symbol, target_date, target_date)
+        all_contracts = []
+        for dte in range(max_dte + 1):
+            exp_date = target_date + timedelta(days=dte)
+            contracts = get_options_chain_historical(client, symbol, target_date, exp_date)
+            if contracts:
+                for c in contracts:
+                    c['dte'] = dte
+                all_contracts.extend(contracts)
         
-        if not contracts:
-            log.warning(f"No contracts found for {symbol} expiring {target_date}")
+        if not all_contracts:
+            log.warning(f"No contracts found for {symbol} with 0-{max_dte} DTE from {target_date}")
             return None
         
-        time_to_expiry = 1 / 252
+        log.info(f"Total contracts across all DTEs: {len(all_contracts)}")
         
         gamma_rows = []
         strike_data = {}
         
-        for c in contracts:
+        for c in all_contracts:
             strike = c['strike']
             oi = c['open_interest']
             is_call = c['contract_type'].upper() == 'CALL'
+            dte = c.get('dte', 0)
             
-            iv = get_historical_iv(client, c['ticker'], target_date)
-            if iv is None or iv <= 0:
-                iv = default_iv
+            time_to_expiry = max(dte, 1) / 252.0
+            
+            iv = default_iv
             
             gamma_exposure = compute_contract_gamma(
                 spot=spot,
@@ -401,22 +625,22 @@ def build_historical_snapshot(
             date=target_date.strftime("%Y-%m-%d"),
             spot=spot,
             pin_strike=pin_strike,
-            contracts_count=len(contracts),
+            contracts_count=len(all_contracts),
             gamma_rows=gamma_rows[:15],
             total_gex_abs=agg_result.total_gex_abs,
             total_gex_net=agg_result.total_gex_net,
             assumptions={
                 "oi_static_intraday": "OI from end-of-day snapshot, assumed static during session",
                 "dealer_positioning": "Dealer net sign unknown, tracking magnitude only",
-                "gamma_decay": "Approximated from time-to-expiry (1/252 years for 0DTE)",
-                "iv_source": f"Historical IV from Polygon, default {default_iv*100:.0f}% if unavailable",
+                "gamma_decay": f"Approximated from DTE (0-{max_dte} DTE contracts included)",
+                "iv_source": f"Default IV {default_iv*100:.0f}% for all contracts",
                 "not_for_trading": "Model validation only, not a tradable signal"
             },
             historical=True,
             generated_at_utc=datetime.utcnow().isoformat()
         )
         
-        log.info(f"Historical snapshot built: pin={pin_strike}, contracts={len(contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}")
+        log.info(f"Historical snapshot built: pin={pin_strike}, contracts={len(all_contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}")
         
         return snapshot
         
