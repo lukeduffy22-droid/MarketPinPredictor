@@ -45,7 +45,7 @@ def generate_filename(timestamp_utc: Optional[datetime] = None) -> str:
     return timestamp_utc.strftime("%Y%m%d-%H%M%S") + ".json"
 
 
-def persist_audit_snapshot(snapshot: AuditSnapshot) -> Optional[Path]:
+def persist_audit_snapshot(snapshot: AuditSnapshot, force_write: bool = False) -> Optional[Path]:
     """
     Persist an audit snapshot to disk.
     
@@ -53,14 +53,27 @@ def persist_audit_snapshot(snapshot: AuditSnapshot) -> Optional[Path]:
     1. Never overwrites existing files (adds suffix if collision)
     2. Maintains FIFO cleanup (keeps last MAX_SNAPSHOTS_PER_SYMBOL)
     3. Files are named to be sortable by time
+    4. CRITICAL: Raises RuntimeError if market is closed (unless force_write=True)
     
     Args:
         snapshot: The AuditSnapshot to persist
+        force_write: If True, bypass market close check (USE ONLY FOR TESTING)
     
     Returns:
         Path to the written file, or None on failure
+    
+    Raises:
+        RuntimeError: If market is closed and force_write is False
     """
     try:
+        from app.utils.market_time import market_is_closed, get_freeze_status
+        
+        if market_is_closed() and not force_write:
+            is_frozen, reason = get_freeze_status()
+            error_msg = f"WRITE BLOCKED: {reason} — Snapshot write rejected for {snapshot.symbol}"
+            log.error(error_msg)
+            raise RuntimeError(error_msg)
+        
         audit_dir = get_audit_dir(snapshot.symbol)
         
         # Generate base filename
@@ -232,3 +245,60 @@ def list_snapshot_files(symbol: str) -> List[Path]:
 def get_snapshot_count(symbol: str) -> int:
     """Get the number of snapshots for a symbol."""
     return len(list_snapshot_files(symbol))
+
+
+def load_last_valid_snapshot(symbol: str) -> Optional[AuditSnapshot]:
+    """
+    Load the most recent VALID audit snapshot for a symbol.
+    
+    This function is used during market close freeze to provide
+    the last known good gamma state without any live data fetching.
+    
+    CRITICAL: Only returns snapshots where validation_is_valid=True
+    
+    Returns:
+        Valid AuditSnapshot if found, None otherwise
+    """
+    try:
+        audit_dir = get_audit_dir(symbol)
+        
+        files = sorted(audit_dir.glob("*.json"), reverse=True)
+        
+        for f in files:
+            try:
+                with open(f, 'r') as fp:
+                    data = json.load(fp)
+                
+                if data.get('validation_is_valid', False):
+                    snapshot = dict_to_audit_snapshot(data)
+                    log.info(f"Loaded last valid snapshot for {symbol}: {f.name}")
+                    return snapshot
+            except Exception as e:
+                log.warning(f"Failed to read snapshot {f}: {e}")
+                continue
+        
+        log.warning(f"No valid snapshots found for {symbol}")
+        return None
+        
+    except Exception as e:
+        log.error(f"Failed to load last valid snapshot for {symbol}: {e}")
+        return None
+
+
+def get_snapshot_by_file(filepath: str) -> Optional[AuditSnapshot]:
+    """
+    Load a specific snapshot file for offline analysis.
+    
+    Args:
+        filepath: Path to the snapshot JSON file
+    
+    Returns:
+        AuditSnapshot if valid, None otherwise
+    """
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        return dict_to_audit_snapshot(data)
+    except Exception as e:
+        log.error(f"Failed to load snapshot from {filepath}: {e}")
+        return None

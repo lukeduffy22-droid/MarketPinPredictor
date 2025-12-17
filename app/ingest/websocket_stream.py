@@ -114,6 +114,16 @@ class PolygonWebSocketStream:
             log.error("POLYGON_API_KEY not set, cannot start WebSocket")
             return
         
+        try:
+            from app.utils.market_time import market_is_closed, get_freeze_status
+            if market_is_closed():
+                is_frozen, reason = get_freeze_status()
+                log.warning(f"MARKET CLOSED — WebSocket disabled: {reason}")
+                log.warning("Live feeds disabled — use frozen snapshots only")
+                return
+        except ImportError:
+            pass
+        
         while self.running and self.reconnect_count < self.max_reconnects:
             try:
                 # Determine which feed to use

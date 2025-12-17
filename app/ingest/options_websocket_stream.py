@@ -196,13 +196,25 @@ class OptionsWebSocketStream:
         pass
     
     async def start(self):
-        """Start options WebSocket stream"""
+        """Start options WebSocket stream
+        
+        FREEZE GUARD: Disabled when market is closed.
+        """
         self.running = True
         api_key = settings.polygon_api_key
         
         if not api_key:
             log.error("POLYGON_API_KEY not set, cannot start Options WebSocket")
             return
+        
+        try:
+            from app.utils.market_time import market_is_closed, get_freeze_status
+            if market_is_closed():
+                is_frozen, reason = get_freeze_status()
+                log.warning(f"MARKET CLOSED — Options WebSocket disabled: {reason}")
+                return
+        except ImportError:
+            pass
         
         while self.running and self.reconnect_count < self.max_reconnects:
             try:

@@ -76,31 +76,76 @@ def get_adaptive_sample_interval():
 def is_market_hours():
     """Check if current time is during regular trading hours, respecting early close days"""
     try:
-        from app.utils.time_et import is_regular_hours, is_market_holiday
-        from datetime import datetime, timezone
-        
-        if is_market_holiday():
+        from app.utils.market_time import market_is_open
+        return market_is_open()
+    except ImportError:
+        try:
+            from app.utils.time_et import is_regular_hours, is_market_holiday
+            from datetime import datetime, timezone
+            
+            if is_market_holiday():
+                return False
+            
+            return is_regular_hours(datetime.now(timezone.utc))
+        except:
+            et_tz = pytz.timezone('US/Eastern')
+            now_et = datetime.now(et_tz)
+            current_time = now_et.time()
+            
+            if now_et.weekday() >= 5:
+                return False
+            
+            close_time = get_market_close_time()
+            if MARKET_OPEN_TIME <= current_time < close_time:
+                return True
+            
             return False
+
+
+def is_freeze_active():
+    """Check if post-close data freeze is active. When True, no live sampling allowed."""
+    try:
+        from app.utils.market_time import is_freeze_enforced, get_freeze_status
+        return is_freeze_enforced()
+    except ImportError:
+        return not is_market_hours()
+
+
+def get_frozen_snapshot(symbol: str):
+    """
+    Get the last valid snapshot for a symbol during freeze mode.
+    
+    CRITICAL: This is the ONLY way to get gamma data after market close.
+    No live API calls are allowed during freeze.
+    
+    Returns:
+        dict with gamma data if available, None otherwise
+    """
+    try:
+        from app.core.audit_persistence import load_last_valid_snapshot
         
-        return is_regular_hours(datetime.now(timezone.utc))
-    except:
-        # Fallback to simple check
-        et_tz = pytz.timezone('US/Eastern')
-        now_et = datetime.now(et_tz)
-        current_time = now_et.time()
-        
-        if now_et.weekday() >= 5:
-            return False
-        
-        close_time = get_market_close_time()
-        if MARKET_OPEN_TIME <= current_time < close_time:
-            return True
-        
-        return False
+        snapshot = load_last_valid_snapshot(symbol)
+        if snapshot:
+            return {
+                'pin_strike': snapshot.primary_gamma_pin_strike,
+                'total_gex': snapshot.total_gex_abs,
+                'net_gex': snapshot.total_gex_net,
+                'spot_price': snapshot.spot_last,
+                'is_frozen': True,
+                'snapshot_time': snapshot.timestamp_utc,
+            }
+        return None
+    except Exception as e:
+        print(f"Error loading frozen snapshot for {symbol}: {e}")
+        return None
 
 def fetch_and_save_gamma_snapshot(api_key, symbol):
     """
     Fetch current gamma data for a symbol, validate, create audit snapshot, and save.
+    
+    FREEZE GUARD (mandatory):
+    If market is closed, returns last valid frozen snapshot instead of live data.
+    No API calls are made during freeze mode.
     
     AUDIT PIPELINE (mandatory):
     1. Fetch spot price and options chain
@@ -113,8 +158,26 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
     Returns True if successful, False otherwise
     """
     from datetime import timezone
+    
+    if is_freeze_active():
+        try:
+            from app.utils.market_time import get_freeze_status
+            is_frozen, reason = get_freeze_status()
+            print(f"  🔒 FREEZE ACTIVE for {symbol}: {reason}")
+            print(f"  🔒 Using last valid snapshot (no live API calls)")
+            
+            frozen_data = get_frozen_snapshot(symbol)
+            if frozen_data:
+                print(f"  ✓ Frozen snapshot loaded: pin=${frozen_data['pin_strike']:.2f}, time={frozen_data['snapshot_time']}")
+                return True
+            else:
+                print(f"  ⚠️ No frozen snapshot available for {symbol}")
+                return False
+        except Exception as e:
+            print(f"  Error in freeze mode for {symbol}: {e}")
+            return False
+    
     try:
-        # Import audit modules
         from app.core.audit_persistence import persist_audit_snapshot
         from app.core.sanity_checks import apply_validation_to_snapshot, should_use_gamma_in_model
         

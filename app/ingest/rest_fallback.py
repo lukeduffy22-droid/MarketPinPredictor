@@ -42,8 +42,20 @@ async def poll_polygon_rest():
     """
     Poll Polygon REST API as backup when WebSocket is primary.
     With premium Polygon subscription (unlimited API calls), polls every 1 second.
+    
+    FREEZE GUARD: Disabled when market is closed.
     """
     global _poll_count
+    
+    try:
+        from app.utils.market_time import market_is_closed, get_freeze_status
+        if market_is_closed():
+            is_frozen, reason = get_freeze_status()
+            log.warning(f"MARKET CLOSED — REST polling disabled: {reason}")
+            log.warning("Live feeds disabled — use frozen snapshots only")
+            return
+    except ImportError:
+        pass
     
     from polygon import RESTClient
     
