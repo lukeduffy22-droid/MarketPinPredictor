@@ -10,6 +10,25 @@ Preferred communication style: Simple, everyday language.
 
 ## Recent Changes (December 2025)
 
+### Audit Observability Layer (Dec 17, 2025)
+- **Purpose**: Make gamma calculations fully traceable and verifiable with comprehensive audit infrastructure
+- **New Modules**:
+  - `app/core/gex.py`: Canonical GEX definitions with aggregate functions (TOTAL_GEX_ABS, TOTAL_GEX_NET)
+  - `app/core/audit_snapshot.py`: Pure AuditSnapshot dataclass capturing spot state, options chain identity, top 15 strikes
+  - `app/core/audit_persistence.py`: JSON file persistence with FIFO cleanup (200 files per symbol)
+  - `app/core/sanity_checks.py`: Validation gates with symbol-specific thresholds
+- **Pipeline Integration**:
+  - Audit snapshot created on every gamma refresh
+  - Sanity validation runs BEFORE database persistence
+  - Invalid gamma excluded from model but audit still persisted
+- **New API Endpoint**: `GET /debug/reconcile/{symbol}` - read-only verification without UI
+- **Canonical GEX Definitions**:
+  - Per-Strike: `net_gex = call_gex - put_gex`, `total_gex = |call_gex| + |put_gex|`
+  - Aggregate: `TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))`, `TOTAL_GEX_NET = sum(net_gex_per_strike)`
+  - Invariant: `total_gex >= |net_gex|` (enforced at runtime)
+- **Tests**: 22 unit tests covering GEX invariants and aggregate computations
+- **Audit Files**: Stored at `./logs/audit/{symbol}/{YYYYMMDD-HHMMSS}.json`
+
 ### Critical GEX Sign Convention Fix (Dec 17, 2025)
 - **Issue**: Net_GEX was incorrectly equal to Total_GEX across timestamps (sign lost or absolute value applied too early)
 - **Root Cause**: The original code merged calls and puts before computing exposure: `net_oi = oi_call - oi_put; gex = gamma * net_oi * 100`. This destroyed sign fidelity.
@@ -26,7 +45,7 @@ Preferred communication style: Simple, everyday language.
   - `options_gamma.py`: Per-row aggregation with proper sign convention
   - `database.py`: Runtime invariant validation at snapshot save
   - `app/state/oi_cache.py`: Added `ALLOW_SIMULATED_OI` flag for fail-closed on simulated data
-- **Tests Added**: `tests/test_gex.py` with 14 unit tests covering invariants and sign conventions
+- **Tests Added**: `tests/test_gex.py` with 22 unit tests covering invariants and sign conventions
 - **Result**: GEX values now mathematically correct; net_gex and total_gex are no longer identical
 
 ### Real-Time WebSocket Fix (Dec 3, 2025)
