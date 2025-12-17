@@ -19,8 +19,13 @@ This module validates the measurement system by:
 - Do errors cluster on high-vol days?
 - Does pin accuracy degrade with skew?
 
+=== HARD RULES ===
+1. Do NOT invent missing historical OI - validation requires pre-built snapshots
+2. Do NOT imply this recreates dealer positioning - we track magnitude only
+
 === WHAT THIS DOES NOT DO ===
-- Does NOT reconstruct true dealer inventory
+- Does NOT reconstruct true dealer inventory or positioning
+- Does NOT invent or estimate historical OI data
 - Does NOT capture intraday OI changes
 - Does NOT imply tradable historical signal
 """

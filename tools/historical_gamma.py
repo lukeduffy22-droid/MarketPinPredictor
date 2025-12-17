@@ -8,11 +8,15 @@ It uses the canonical GEX functions from app/core/gex.py.
 === IMPORTANT DISCLAIMERS ===
 This is MODEL VALIDATION infrastructure, NOT a backtest for PnL.
 
+=== HARD RULES ===
+1. Do NOT invent missing historical OI - if OI data is unavailable, return None
+2. Do NOT imply this recreates dealer positioning - we track magnitude only
+
 Assumptions (explicit, logged):
-- OI is static intraday (end-of-day snapshot)
-- Dealer net positioning sign unknown (track magnitude only)
+- OI is from live snapshot only (NOT reconstructed for past dates)
+- Dealer net positioning sign is UNKNOWN (track magnitude only)
 - Gamma decay approximated from time-to-expiry
-- Historical IV from end-of-day snapshots
+- Historical IV from end-of-day snapshots when available
 
 What this validates:
 - Does the live pin consistently overshoot?
@@ -21,7 +25,8 @@ What this validates:
 - Does pin accuracy degrade with skew?
 
 What this does NOT do:
-- Does NOT reconstruct true dealer inventory
+- Does NOT reconstruct true dealer inventory or positioning
+- Does NOT invent or estimate historical OI data
 - Does NOT capture intraday OI changes
 - Does NOT imply tradable historical signal
 """
@@ -541,114 +546,10 @@ def build_historical_snapshot(
     
     log.warning(
         f"Historical OI data not available from Polygon for {target_date}. "
-        f"Snapshots must be pre-built during market hours using build_today_snapshot."
+        f"Snapshots must be pre-built during market hours using build_today_snapshot. "
+        f"Refusing to build snapshot with missing/invented OI data."
     )
-    
-    try:
-        client = get_polygon_client()
-        
-        spot = get_underlying_close(client, symbol, target_date)
-        if spot is None:
-            log.error(f"Could not get spot price for {symbol} on {target_date}")
-            return None
-        
-        log.info(f"{symbol} spot on {target_date}: {spot}")
-        
-        all_contracts = []
-        for dte in range(max_dte + 1):
-            exp_date = target_date + timedelta(days=dte)
-            contracts = get_options_chain_historical(client, symbol, target_date, exp_date)
-            if contracts:
-                for c in contracts:
-                    c['dte'] = dte
-                all_contracts.extend(contracts)
-        
-        if not all_contracts:
-            log.warning(f"No contracts found for {symbol} with 0-{max_dte} DTE from {target_date}")
-            return None
-        
-        log.info(f"Total contracts across all DTEs: {len(all_contracts)}")
-        
-        gamma_rows = []
-        strike_data = {}
-        
-        for c in all_contracts:
-            strike = c['strike']
-            oi = c['open_interest']
-            is_call = c['contract_type'].upper() == 'CALL'
-            dte = c.get('dte', 0)
-            
-            time_to_expiry = max(dte, 1) / 252.0
-            
-            iv = default_iv
-            
-            gamma_exposure = compute_contract_gamma(
-                spot=spot,
-                strike=strike,
-                iv=iv,
-                time_to_expiry=time_to_expiry,
-                open_interest=oi,
-                is_call=is_call
-            )
-            
-            if strike not in strike_data:
-                strike_data[strike] = {'call_gex': 0.0, 'put_gex': 0.0, 'oi': 0}
-            
-            if is_call:
-                strike_data[strike]['call_gex'] += gamma_exposure
-            else:
-                strike_data[strike]['put_gex'] += gamma_exposure
-            strike_data[strike]['oi'] += oi
-        
-        for strike, data in strike_data.items():
-            net_gex = data['call_gex'] - data['put_gex']
-            abs_gex = abs(net_gex)
-            
-            gamma_rows.append({
-                'strike': strike,
-                'net_gex': net_gex,
-                'abs_gex': abs_gex,
-                'call_gex': data['call_gex'],
-                'put_gex': data['put_gex'],
-                'oi': data['oi']
-            })
-        
-        gamma_rows.sort(key=lambda r: r['abs_gex'], reverse=True)
-        
-        pin_strike = find_gamma_pin_strike(spot, gamma_rows)
-        
-        from app.core.gex import compute_aggregate_gex
-        agg_result = compute_aggregate_gex(gamma_rows)
-        
-        snapshot = HistoricalGammaSnapshot(
-            symbol=symbol,
-            date=target_date.strftime("%Y-%m-%d"),
-            spot=spot,
-            pin_strike=pin_strike,
-            contracts_count=len(all_contracts),
-            gamma_rows=gamma_rows[:15],
-            total_gex_abs=agg_result.total_gex_abs,
-            total_gex_net=agg_result.total_gex_net,
-            assumptions={
-                "oi_static_intraday": "OI from end-of-day snapshot, assumed static during session",
-                "dealer_positioning": "Dealer net sign unknown, tracking magnitude only",
-                "gamma_decay": f"Approximated from DTE (0-{max_dte} DTE contracts included)",
-                "iv_source": f"Default IV {default_iv*100:.0f}% for all contracts",
-                "not_for_trading": "Model validation only, not a tradable signal"
-            },
-            historical=True,
-            generated_at_utc=datetime.utcnow().isoformat()
-        )
-        
-        log.info(f"Historical snapshot built: pin={pin_strike}, contracts={len(all_contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}")
-        
-        return snapshot
-        
-    except Exception as e:
-        log.error(f"Failed to build historical snapshot for {symbol} on {target_date}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    return None
 
 
 def save_historical_snapshot(snapshot: HistoricalGammaSnapshot) -> Optional[str]:
