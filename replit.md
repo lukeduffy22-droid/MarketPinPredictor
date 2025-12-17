@@ -58,3 +58,27 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
 ### Database
 
 -   **PostgreSQL**: For persistent storage of model parameters, performance metrics, and historical predictions.
+
+## Recent Changes (December 2025)
+
+### Historical Gamma Validation System (Dec 17, 2025)
+- **Purpose**: Validate measurement system by comparing historical gamma pins against actual closes
+- **New Modules**:
+  - `tools/historical_gamma.py`: Historical gamma builder using canonical GEX functions and Polygon historical data
+  - `tools/historical_validation.py`: Validation pipeline with error metrics (MAE, bias, direction accuracy)
+- **New API Endpoints**:
+  - `POST /historical/build/{symbol}?date=YYYY-MM-DD`: Build single historical snapshot
+  - `POST /historical/batch/{symbol}?days=30`: Build batch of historical snapshots
+  - `GET /historical/validate/{symbol}?days=30`: Get validation metrics
+  - `GET /historical/snapshot/{symbol}/{date}`: Get saved historical snapshot
+- **Validation Metrics**: MAE (points/%), bias, direction accuracy, error distribution
+- **Historical Snapshots**: Stored at `./logs/historical/{symbol}/{YYYY-MM-DD}.json`
+
+### Market-Close Data Freeze System (Dec 17, 2025)
+- **Purpose**: Ensure data integrity for audit compliance by preventing live data ingestion after market close
+- **New Modules**:
+  - `app/utils/market_time.py`: Market time utilities with `now_et()`, `market_is_open()`, `market_is_closed()`, `is_freeze_enforced()`, `get_freeze_status()`
+  - `app/core/accuracy_ledger.py`: CSV-based accuracy tracking with `record_accuracy()`, `get_accuracy_stats()`
+- **Freeze Enforcement**: All feeds (WebSocket, Options WebSocket, REST) check freeze status continuously
+- **New API Endpoints**: `/accuracy/freeze-status`, `/accuracy/record/{symbol}`, `/accuracy/stats/{symbol}`, `/accuracy/ledger`
+- **Accuracy Ledger**: Stored at `logs/accuracy_ledger.csv`
