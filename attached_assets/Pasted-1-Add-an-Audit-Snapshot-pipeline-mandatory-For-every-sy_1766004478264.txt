@@ -1,0 +1,175 @@
+1. Add an “Audit Snapshot” pipeline (mandatory)
+
+For every symbol on every refresh, create and persist an audit object.
+
+File: audit_snapshot.py
+
+Function:
+build_audit_snapshot(symbol: str) -> dict
+
+The snapshot MUST include:
+
+A. Core market state
+
+symbol
+
+timestamp_utc
+
+spot_last
+
+spot_timestamp
+
+B. Options chain identity
+
+chain_symbol_used (exact string passed to Polygon)
+
+underlying_reported (from options payload if present)
+
+expirations_included (list or min/max days)
+
+contracts_count
+
+C. Per-strike gamma aggregation (TOP 15 by abs GEX)
+
+For each strike:
+
+strike
+
+expiration_days
+
+call_open_interest
+
+put_open_interest
+
+call_gamma
+
+put_gamma
+
+call_gex
+
+put_gex
+
+net_gex
+
+abs_gex
+
+D. Derived gamma metrics
+
+primary_gamma_pin_strike
+
+primary_gamma_pin_abs_gex
+
+zero_gamma_level
+
+zero_gamma_method (cumulative / local / smoothed)
+
+total_gex_abs (definition explicitly stated)
+
+total_gex_net (definition explicitly stated)
+
+2. Persist audit snapshots to disk
+
+Path:
+./logs/audit/{symbol}/{YYYYMMDD-HHMMSS}.json
+
+Keep last 200 snapshots per symbol.
+
+Overwrite nothing.
+
+This is not optional.
+
+3. Add a reconciliation endpoint (mandatory)
+
+Route:
+GET /debug/reconcile/{symbol}
+
+Return exactly:
+
+symbol
+
+spot_last
+
+predicted_close
+
+delta_from_gamma
+
+gamma_pull
+
+gamma_pin_strength
+
+gamma_net_level
+
+primary_gamma_pin_strike
+
+zero_gamma_level
+
+top_3_strikes_by_abs_gex (strike, abs_gex, net_gex)
+
+This endpoint must run without UI and must be callable independently.
+
+4. Add symbol-level sanity gates (hard fail)
+
+Create sanity_checks.py.
+
+For RUT, NDX, SPX (symbol-specific thresholds allowed):
+
+Fail gamma ingestion if ANY are true:
+
+abs(primary_pin - spot) / spot > 0.10
+
+top strike abs GEX > 90% of total abs GEX
+
+strike domain scale incompatible with spot (order-of-magnitude check)
+
+contracts_count outside rolling 30-day percentile bounds
+
+On failure:
+
+Mark gamma data INVALID
+
+Exclude gamma features from prediction
+
+Surface failure reason in audit snapshot
+
+5. Make 0DTE handling explicit
+
+If UI shows “0 days”:
+
+Gamma aggregation must be nearest expiration only
+
+If aggregation uses multiple expirations:
+
+UI must display “All expirations (≤90D)”
+
+No silent mixing allowed.
+
+6. Disambiguate GEX definitions globally
+
+Define once in code:
+
+TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))
+
+TOTAL_GEX_NET = sum(net_gex_per_strike)
+
+Use these definitions everywhere or rename the fields. No exceptions.
+
+7. Do NOT tune coefficients until this is complete
+
+No parameter tuning.
+No confidence tweaks.
+No UI polish.
+
+This task is about observability and correctness, not prediction accuracy.
+
+END INSTRUCTION
+Final reality check
+
+If Replit cannot implement this cleanly:
+
+Your model is not debuggable
+
+Your confidence numbers are fiction
+
+Any trading decision derived from it is noise
+
+This audit layer is what separates a dashboard from a system.
