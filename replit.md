@@ -66,13 +66,19 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
 - **New Modules**:
   - `tools/historical_gamma.py`: Historical gamma builder using canonical GEX functions and Polygon historical data
   - `tools/historical_validation.py`: Validation pipeline with error metrics (MAE, bias, direction accuracy)
+- **Key Functions**:
+  - `build_today_snapshot(symbol)`: Build gamma snapshot for TODAY using live OI data
+  - `build_historical_snapshot(symbol, date)`: Load stored snapshot or build for today
+  - `validate_historical_snapshots(symbol, days)`: Compare stored pins to actual closes
 - **New API Endpoints**:
-  - `POST /historical/build/{symbol}?date=YYYY-MM-DD`: Build single historical snapshot
+  - `POST /historical/build-today/{symbol}`: Build today's snapshot (uses live OI data)
+  - `POST /historical/build/{symbol}?date=YYYY-MM-DD`: Build/load historical snapshot
   - `POST /historical/batch/{symbol}?days=30`: Build batch of historical snapshots
   - `GET /historical/validate/{symbol}?days=30`: Get validation metrics
   - `GET /historical/snapshot/{symbol}/{date}`: Get saved historical snapshot
 - **Validation Metrics**: MAE (points/%), bias, direction accuracy, error distribution
 - **Historical Snapshots**: Stored at `./logs/historical/{symbol}/{YYYY-MM-DD}.json`
+- **IMPORTANT**: Historical OI data is NOT available from Polygon standard endpoints. Snapshots must be pre-built daily using `/historical/build-today/{symbol}` to build a validation dataset.
 
 ### Market-Close Data Freeze System (Dec 17, 2025)
 - **Purpose**: Ensure data integrity for audit compliance by preventing live data ingestion after market close
