@@ -256,7 +256,13 @@ def choose_effective_expiry(now_et, expiries, total_oi_by_expiry, oi_min=50_000)
 
 def calculate_gamma_exposure(options_df, spot_price):
     """
-    Calculate net gamma exposure by strike and identify pin levels
+    Calculate net gamma exposure by strike and identify pin levels.
+    
+    Uses canonical GEX computation:
+    - row_gex = gamma * OI * 100 (per contract, unsigned magnitude)
+    - net_gex = sum(call_gex) - sum(put_gex)
+    - total_gex = sum(|call_gex|) + sum(|put_gex|)
+    - Invariant: total_gex >= |net_gex|
     
     Returns dictionary with:
     - pin_strike: Strike with highest absolute GEX
@@ -266,22 +272,43 @@ def calculate_gamma_exposure(options_df, spot_price):
     - gex_by_strike: DataFrame of GEX by strike
     - gamma_walls: Top strikes by absolute GEX
     """
+    from app.core.gex import assert_gex_invariant
     
     CONTRACT_MULTIPLIER = 100
     
-    # Calculate GEX for each option
-    options_df['gex'] = options_df.apply(
-        lambda row: row['gamma'] * row['open_interest'] * CONTRACT_MULTIPLIER * (spot_price ** 2) / 1e9,  # In billions
-        axis=1
+    # Calculate per-row GEX: gamma * OI * multiplier (unsigned magnitude)
+    # Scaling to billions uses (spot_price ** 2) / 1e9 for dollar-weighted GEX
+    options_df['row_gex'] = (
+        options_df['gamma'].astype(float) * 
+        options_df['open_interest'].astype(float) * 
+        CONTRACT_MULTIPLIER * 
+        (spot_price ** 2) / 1e9  # Scale to billions
     )
     
-    # Apply sign convention: 
-    # Calls: positive if dealers are short (customers long)
-    # Puts: negative if dealers are short (customers long)
+    # Calculate call and put sums separately (canonical approach)
+    call_mask = options_df['type'] == 'call'
+    put_mask = options_df['type'] == 'put'
+    
+    call_gex_sum = options_df.loc[call_mask, 'row_gex'].sum()
+    put_gex_sum = options_df.loc[put_mask, 'row_gex'].sum()
+    
+    # Canonical GEX aggregation:
+    # net_gex = call_sum - put_sum (puts contribute negative to net)
+    # total_gex = |call_sum| + |put_sum| (sum of magnitudes)
+    overall_net_gex = call_gex_sum - put_gex_sum
+    overall_total_gex = abs(call_gex_sum) + abs(put_gex_sum)
+    
+    # Assert invariant at top level
+    assert_gex_invariant(overall_net_gex, overall_total_gex, "calculate_gamma_exposure overall")
+    
+    # For per-strike aggregation, also apply sign convention
+    # signed_gex: calls positive, puts negative
     options_df['signed_gex'] = options_df.apply(
-        lambda row: row['gex'] if row['type'] == 'call' else -row['gex'],
+        lambda row: row['row_gex'] if row['type'] == 'call' else -row['row_gex'],
         axis=1
     )
+    # Keep 'gex' for backward compatibility (unsigned magnitude)
+    options_df['gex'] = options_df['row_gex']
     
     # Get current time in ET
     import pytz
@@ -301,15 +328,27 @@ def calculate_gamma_exposure(options_df, spot_price):
     else:
         filtered_df = options_df
     
-    # Aggregate by strike for the selected expiry
-    gex_by_strike = filtered_df.groupby('strike').agg({
-        'signed_gex': 'sum',
-        'gex': lambda x: abs(x).sum(),  # Total absolute GEX
-        'expiry': 'first',
-        'days_to_expiry': 'min'
-    }).reset_index()
+    # Aggregate by strike for the selected expiry using canonical GEX formula
+    # Per-strike: net_gex = call_sum - put_sum, total_gex = |call_sum| + |put_sum|
+    def aggregate_gex_by_strike(group):
+        call_rows = group[group['type'] == 'call']
+        put_rows = group[group['type'] == 'put']
+        
+        call_sum = call_rows['row_gex'].sum() if len(call_rows) > 0 else 0.0
+        put_sum = put_rows['row_gex'].sum() if len(put_rows) > 0 else 0.0
+        
+        # Canonical formula: net = call - put, total = |call| + |put|
+        net_gex = call_sum - put_sum
+        total_gex = abs(call_sum) + abs(put_sum)
+        
+        return pd.Series({
+            'net_gex': net_gex,
+            'total_gex': total_gex,
+            'expiry': group['expiry'].iloc[0],
+            'days_to_expiry': group['days_to_expiry'].min()
+        })
     
-    gex_by_strike.columns = ['strike', 'net_gex', 'total_gex', 'expiry', 'days_to_expiry']
+    gex_by_strike = filtered_df.groupby('strike').apply(aggregate_gex_by_strike, include_groups=False).reset_index()
     
     # Find pin strike (highest absolute GEX NEAR current price)
     # Filter to strikes within ±10% of spot (realistic pin range for indices)
@@ -351,6 +390,9 @@ def calculate_gamma_exposure(options_df, spot_price):
     # These are NEW fields - won't break existing consumers
     aggregate_total_gex = gex_by_strike['total_gex'].sum()  # Sum of absolute GEX (gross market gamma)
     aggregate_net_gex = gex_by_strike['net_gex'].sum()      # Sum of signed GEX (net dealer position)
+    
+    # Assert GEX invariant for aggregate values
+    assert_gex_invariant(aggregate_net_gex, aggregate_total_gex, "calculate_gamma_exposure aggregate")
     
     # Direction of pull
     direction = 'above' if pin_strike > spot_price else 'below' if pin_strike < spot_price else 'at'

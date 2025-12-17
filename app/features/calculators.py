@@ -82,10 +82,12 @@ def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
     gamma_pin_strength: 0-1, higher means stronger pinning
     flip_distance: dollars to nearest gamma flip point
     
+    Uses canonical GEX computation from app/core/gex.py.
     Optimized: Uses numpy approximation instead of scipy for <10ms latency.
     """
     from app.state.oi_cache import oi_cache
     from app.state.ring_buffers import get_latest_price
+    from app.core.gex import compute_gex
     import math
     
     current_price = get_latest_price(symbol)
@@ -101,8 +103,9 @@ def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
         """Fast standard normal PDF approximation"""
         return np.exp(-0.5 * x * x) / np.sqrt(2 * np.pi)
     
-    # Calculate gamma exposure for each strike
+    # Calculate gamma exposure for each strike using canonical GEX computation
     total_gamma_exposure = 0.0
+    net_gamma_exposure = 0.0
     gamma_by_strike = {}
     
     for K, snapshot in strikes.items():
@@ -118,24 +121,38 @@ def calc_gamma_pinning(symbol: str) -> Tuple[float, float]:
         d1 = (math.log(S/K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
         
         # Gamma = N'(d1) / (S * sigma * sqrt(T))
+        # This is an unsigned magnitude (same for calls and puts at same strike)
         gamma = norm_pdf_fast(d1) / (S * sigma * math.sqrt(T))
         
-        # Gamma exposure = gamma * OI * 100 (per contract)
-        net_oi = snapshot.oi_call - snapshot.oi_put
-        gex = gamma * net_oi * 100
-        
-        gamma_by_strike[K] = gex
-        total_gamma_exposure += abs(gex)
+        # Use canonical GEX computation: compute call and put exposure separately
+        # gamma is the same for calls/puts at the same strike (Black-Scholes)
+        try:
+            res = compute_gex(
+                gamma_call=gamma,
+                oi_call=float(snapshot.oi_call),
+                gamma_put=gamma,
+                oi_put=float(snapshot.oi_put),
+                multiplier=100.0,
+            )
+            
+            # Store total_gex magnitude for pin finding (not net_gex)
+            gamma_by_strike[K] = res.total_gex
+            net_gamma_exposure += res.net_gex
+            total_gamma_exposure += res.total_gex
+        except (ValueError, TypeError) as e:
+            log.warning(f"GEX computation failed for strike {K}: {e}")
+            continue
     
     if not gamma_by_strike:
         return 0.0, 0.0
     
-    # Find strike with max gamma exposure (likely pin point)
-    max_gex_strike = max(gamma_by_strike, key=lambda k: abs(gamma_by_strike[k]))
+    # Find strike with max gamma exposure magnitude (likely pin point)
+    # Uses total_gex, not net_gex, to find the pin strike
+    max_gex_strike = max(gamma_by_strike, key=lambda k: gamma_by_strike[k])
     max_gex = gamma_by_strike[max_gex_strike]
     
     # Pin strength: normalized gamma exposure
-    pin_strength = min(1.0, abs(max_gex) / (total_gamma_exposure + 1e-9))
+    pin_strength = min(1.0, max_gex / (total_gamma_exposure + 1e-9))
     
     # Distance to pin point
     flip_distance = abs(current_price - max_gex_strike)

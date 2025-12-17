@@ -1,0 +1,239 @@
+Step 0 — Locate all current GEX implementations and call sites
+
+Search the repo for any GEX math, net/total logic, or sign application:
+
+rg -n "net_oi|net_gex|total_gex|total_gamma_exposure|signed_gex|call_gex|put_gex|gamma.*oi|abs\\(gex\\)" .
+
+Identify every function that produces or consumes:
+
+net_gex, total_gex, signed_gex, pin_strike, calc_gamma_pinning, “gamma pull”, “pinning”, “gravity”, Ridge features.
+
+Do not change behavior elsewhere yet. Proceed to Step 1.
+
+Step 1 — Create a single canonical GEX calculator module
+
+Create a new file:
+
+app/core/gex.py (create directories if needed)
+
+Paste this exact code:
+
+# app/core/gex.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class GexResult:
+    net_gex: float
+    total_gex: float
+    call_gex: float
+    put_gex: float
+
+
+def compute_gex(
+    gamma_call: float,
+    oi_call: float,
+    gamma_put: float,
+    oi_put: float,
+    multiplier: float = 100.0,
+) -> GexResult:
+    """
+    Canonical GEX computation.
+
+    Rules:
+    - Gamma inputs must be unsigned magnitudes (>= 0).
+    - Exposure is computed separately for calls and puts.
+    - Sign convention applied after exposure:
+        net_gex = +call_gex - put_gex
+        total_gex = |call_gex| + |put_gex|
+    - Invariant: total_gex >= abs(net_gex)
+    """
+    # Defensive checks (fail closed; do not silently proceed on bad inputs)
+    for name, v in (
+        ("gamma_call", gamma_call),
+        ("gamma_put", gamma_put),
+        ("oi_call", oi_call),
+        ("oi_put", oi_put),
+        ("multiplier", multiplier),
+    ):
+        if v is None:
+            raise ValueError(f"{name} is None")
+        if not isinstance(v, (int, float)):
+            raise TypeError(f"{name} must be numeric, got {type(v)}")
+
+    if gamma_call < 0 or gamma_put < 0:
+        raise ValueError("Gamma inputs must be unsigned magnitudes (>= 0).")
+    if oi_call < 0 or oi_put < 0:
+        raise ValueError("Open interest must be >= 0.")
+    if multiplier <= 0:
+        raise ValueError("Multiplier must be > 0.")
+
+    call_gex = float(gamma_call) * float(oi_call) * float(multiplier)
+    put_gex = float(gamma_put) * float(oi_put) * float(multiplier)
+
+    net_gex = call_gex - put_gex
+    total_gex = abs(call_gex) + abs(put_gex)
+
+    # Hard invariant check
+    if total_gex + 1e-12 < abs(net_gex):
+        raise AssertionError("Invariant violated: total_gex must be >= abs(net_gex)")
+
+    return GexResult(net_gex=net_gex, total_gex=total_gex, call_gex=call_gex, put_gex=put_gex)
+
+
+This module becomes the only source of truth for net/total GEX.
+
+Step 2 — Fix calc_gamma_pinning() to use canonical computation
+
+Open:
+
+app/features/calculators.py
+
+Find the broken block:
+
+net_oi = snapshot.oi_call - snapshot.oi_put
+gex = gamma * net_oi * 100
+total_gamma_exposure += abs(gex)
+
+
+Replace the entire per-strike accumulation section with this pattern (adapt variable names only; keep logic identical):
+
+from app.core.gex import compute_gex
+
+
+Then, inside the strike loop:
+
+# gamma_call and gamma_put must be unsigned magnitudes.
+# If your snapshot only has one gamma field (same for call/put), use it for both.
+gamma_call = float(snapshot.gamma_call if hasattr(snapshot, "gamma_call") else snapshot.gamma)
+gamma_put  = float(snapshot.gamma_put  if hasattr(snapshot, "gamma_put")  else snapshot.gamma)
+
+oi_call = float(snapshot.oi_call)
+oi_put  = float(snapshot.oi_put)
+
+res = compute_gex(
+    gamma_call=gamma_call,
+    oi_call=oi_call,
+    gamma_put=gamma_put,
+    oi_put=oi_put,
+    multiplier=100.0,
+)
+
+net_gamma_exposure += res.net_gex
+total_gamma_exposure += res.total_gex
+
+
+Also ensure any previously named variables (net_gex, total_gex, etc.) match your function’s return structure.
+
+Do NOT apply abs() to net_gamma_exposure. Total already includes absolute magnitudes.
+
+Step 3 — Remove simulated OI from any live calculation path (fail closed)
+
+Open:
+
+app/state/oi_cache.py
+
+If it currently sets oi_call == oi_put (or otherwise fabricates OI), change it so:
+
+In “live mode” it must return real call/put OI, or raise.
+
+Simulation is allowed only if explicitly requested for local testing.
+
+Implement this rule:
+
+Add a config flag (if you already have config, reuse it):
+
+ALLOW_SIMULATED_OI = False by default
+
+Where simulated OI would be returned in a live request path, replace with:
+
+raise RuntimeError("OI cache is returning simulated OI. Disable simulation or wire real OI for live runs.")
+
+
+No silent fallback. No “best effort.” This is required to prevent corrupted signals.
+
+Step 4 — Ensure options_gamma.py uses the same canonical function (dedupe)
+
+Open:
+
+options_gamma.py (or wherever your correct path lives)
+
+Replace the existing sign application logic:
+
+# signed_gex = gex if call else -gex
+
+
+with canonical outputs by computing per-row call/put exposures via compute_gex OR (if options_df['gex'] is already a magnitude exposure per option contract type) enforce this consistent convention:
+
+net_gex = sum(call_gex) - sum(put_gex)
+
+total_gex = sum(abs(call_gex)) + sum(abs(put_gex))
+
+Preferred: call compute_gex at the aggregation layer per strike/expiry bucket so both paths share the same invariant logic.
+
+Goal: after this commit, there should be exactly one definition of net/total GEX across the repo.
+
+Step 5 — Add guardrails to detect regression (unit test + runtime assertion)
+
+Create:
+
+tests/test_gex.py (or your repo’s test folder)
+
+Add this exact test:
+
+from app.core.gex import compute_gex
+
+def test_gex_invariants_and_sign():
+    # Case: equal OI and gamma => net 0, total > 0
+    r = compute_gex(gamma_call=0.01, oi_call=1000, gamma_put=0.01, oi_put=1000, multiplier=100)
+    assert abs(r.net_gex) < 1e-9
+    assert r.total_gex > 0
+    assert r.total_gex >= abs(r.net_gex)
+
+    # Case: calls dominate => net positive
+    r = compute_gex(gamma_call=0.02, oi_call=2000, gamma_put=0.01, oi_put=1000, multiplier=100)
+    assert r.net_gex > 0
+    assert r.total_gex >= abs(r.net_gex)
+
+    # Case: puts dominate => net negative
+    r = compute_gex(gamma_call=0.01, oi_call=1000, gamma_put=0.02, oi_put=2000, multiplier=100)
+    assert r.net_gex < 0
+    assert r.total_gex >= abs(r.net_gex)
+
+
+Add a runtime assertion wherever you publish/export snapshot metrics:
+
+assert total_gex >= abs(net_gex) - 1e-9
+
+If violated, mark snapshot invalid and do not publish.
+
+Step 6 — Acceptance criteria (must be verified before you stop)
+
+Run the app and confirm:
+
+Total_GEX_Billions >= abs(Net_GEX_Billions) always
+
+Net_GEX_Billions is no longer identical to Total_GEX_Billions across timestamps
+
+If live OI is missing, the app fails with an explicit error (no simulated OI in production)
+
+Unit tests pass
+
+Only one canonical net/total GEX implementation remains (app/core/gex.py)
+
+Step 7 — Output a short report for me in the console
+
+After changes, print:
+
+files changed
+
+the exact before/after snippet from calc_gamma_pinning()
+
+confirmation that simulated OI can no longer leak into live runs
+
+a sample of 3 consecutive snapshots showing net vs total GEX and the invariant holding
+
+Execute now.

@@ -10,6 +10,25 @@ Preferred communication style: Simple, everyday language.
 
 ## Recent Changes (December 2025)
 
+### Critical GEX Sign Convention Fix (Dec 17, 2025)
+- **Issue**: Net_GEX was incorrectly equal to Total_GEX across timestamps (sign lost or absolute value applied too early)
+- **Root Cause**: The original code merged calls and puts before computing exposure: `net_oi = oi_call - oi_put; gex = gamma * net_oi * 100`. This destroyed sign fidelity.
+- **Solution**: Created canonical GEX computation module (`app/core/gex.py`) as single source of truth
+- **Correct Formula**:
+  - `call_gex = gamma_call * oi_call * 100` (positive exposure)
+  - `put_gex = gamma_put * oi_put * 100` (positive magnitude)
+  - `net_gex = call_gex - put_gex` (signed net)
+  - `total_gex = |call_gex| + |put_gex|` (sum of magnitudes)
+  - Invariant: `total_gex >= |net_gex|` (always enforced)
+- **Files Changed**:
+  - `app/core/gex.py`: New canonical GEX module with `compute_gex()` function and `GexResult` dataclass
+  - `app/features/calculators.py`: `calc_gamma_pinning()` now uses `compute_gex()`
+  - `options_gamma.py`: Per-row aggregation with proper sign convention
+  - `database.py`: Runtime invariant validation at snapshot save
+  - `app/state/oi_cache.py`: Added `ALLOW_SIMULATED_OI` flag for fail-closed on simulated data
+- **Tests Added**: `tests/test_gex.py` with 14 unit tests covering invariants and sign conventions
+- **Result**: GEX values now mathematically correct; net_gex and total_gex are no longer identical
+
 ### Real-Time WebSocket Fix (Dec 3, 2025)
 - **Issue**: Polygon SDK's `WebSocketClient` class was failing with DNS resolution errors in Replit
 - **Root Cause**: The Polygon SDK's WebSocket implementation had compatibility issues, but raw `websockets` library works perfectly

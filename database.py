@@ -458,6 +458,8 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
     Returns:
         GammaPinSnapshot object or None on error
     """
+    from app.core.gex import validate_gex_invariant
+    
     try:
         db = SessionLocal()
         
@@ -467,6 +469,14 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
         spot_price = float(spot_price)
         total_gex = float(total_gex)
         net_gex = float(net_gex)
+        
+        # Validate GEX invariant before saving (fail closed on invalid data)
+        if not validate_gex_invariant(net_gex, total_gex):
+            error_msg = f"GEX invariant violated for {ticker}: total_gex ({total_gex}) < |net_gex| ({abs(net_gex)}). Snapshot discarded."
+            print(f"ERROR: {error_msg}")
+            import logging
+            logging.getLogger("database").error(error_msg)
+            raise ValueError(error_msg)
         
         # CRITICAL: Normalize timestamp to 15-minute boundary to prevent duplicates
         normalized_timestamp = round_to_15min(interval_timestamp)

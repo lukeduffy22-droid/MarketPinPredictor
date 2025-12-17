@@ -3,12 +3,18 @@ Options open interest cache service.
 Loads OI at 09:35 ET and 13:00 ET to avoid REST calls in prediction path.
 """
 import logging
+import os
 from typing import Dict, Optional
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass
 import asyncio
 
 log = logging.getLogger("oi_cache")
+
+# CRITICAL: Simulated OI must NOT leak into production
+# Default to True until real OI data source is wired
+# Set ALLOW_SIMULATED_OI=false in production when real OI is available
+ALLOW_SIMULATED_OI = os.environ.get("ALLOW_SIMULATED_OI", "true").lower() == "true"
 
 @dataclass
 class OISnapshot:
@@ -28,10 +34,13 @@ class OICache:
     
     def __init__(self):
         self._data: Dict[str, Dict[int, OISnapshot]] = {
-            s: {} for s in ("SPX", "NDX", "DJI", "RUT")
+            s: {} for s in ("SPX", "NDX", "DJI", "RUT", "VIX")
         }
         self._last_refresh: Dict[str, Optional[datetime]] = {
-            s: None for s in ("SPX", "NDX", "DJI", "RUT")
+            s: None for s in ("SPX", "NDX", "DJI", "RUT", "VIX")
+        }
+        self._is_simulated: Dict[str, bool] = {
+            s: False for s in ("SPX", "NDX", "DJI", "RUT", "VIX")
         }
         self._refresh_in_progress = False
     
@@ -56,11 +65,13 @@ class OICache:
             
             # Use simulated data for now (real data requires higher API tier)
             # In production, use: polygon_client.list_options_contracts()
+            # IMPORTANT: Mark this data as simulated
             self._data[symbol] = self._generate_simulated_oi(symbol)
+            self._is_simulated[symbol] = True  # Mark as simulated data
             
             self._last_refresh[symbol] = now_et()
             
-            log.info(f"OI cache refreshed for {symbol}: {len(self._data[symbol])} strikes")
+            log.info(f"OI cache refreshed for {symbol}: {len(self._data[symbol])} strikes (SIMULATED)")
             
         except Exception as e:
             log.error(f"Failed to refresh OI cache for {symbol}: {e}")
@@ -104,10 +115,27 @@ class OICache:
     
     def get_oi(self, symbol: str, strike: int) -> Optional[OISnapshot]:
         """Get OI snapshot for specific strike"""
+        # Fail closed: don't return simulated OI in live mode
+        if not ALLOW_SIMULATED_OI and self._is_simulated.get(symbol, False):
+            log.warning(f"Simulated OI requested for {symbol} strike {strike} but ALLOW_SIMULATED_OI=false")
+            return None
         return self._data.get(symbol, {}).get(strike)
     
     def get_all_strikes(self, symbol: str) -> Dict[int, OISnapshot]:
-        """Get all strikes for symbol"""
+        """
+        Get all strikes for symbol.
+        
+        IMPORTANT: Fails closed if simulated OI would be returned in live mode.
+        Set ALLOW_SIMULATED_OI=true in environment for local testing only.
+        """
+        # Fail closed: don't return simulated OI in live mode
+        if not ALLOW_SIMULATED_OI and self._is_simulated.get(symbol, False):
+            log.warning(
+                f"OI cache is returning simulated OI for {symbol}. "
+                "Disable simulation or wire real OI for live runs. "
+                "Set ALLOW_SIMULATED_OI=true for testing."
+            )
+            return {}  # Return empty dict to fail closed
         return self._data.get(symbol, {})
     
     def is_fresh(self, symbol: str, max_age_minutes: int = 120) -> bool:
