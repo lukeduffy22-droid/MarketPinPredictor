@@ -386,10 +386,15 @@ def calculate_gamma_exposure(options_df, spot_price):
     total_gex = pin_row['total_gex']  # GEX at pin strike
     net_gex = pin_row['net_gex']      # Net GEX at pin strike
     
-    # Calculate AGGREGATE GEX across ALL strikes (for exports/display)
-    # These are NEW fields - won't break existing consumers
-    aggregate_total_gex = gex_by_strike['total_gex'].sum()  # Sum of absolute GEX (gross market gamma)
-    aggregate_net_gex = gex_by_strike['net_gex'].sum()      # Sum of signed GEX (net dealer position)
+    # Calculate AGGREGATE GEX using CANONICAL definitions from app/core/gex.py
+    # TOTAL_GEX_ABS = sum(abs(net_gex_per_strike)) - gross magnitude
+    # TOTAL_GEX_NET = sum(net_gex_per_strike) - net directional
+    from app.core.gex import compute_aggregate_gex_from_arrays
+    
+    net_gex_values = gex_by_strike['net_gex'].tolist()
+    agg_result = compute_aggregate_gex_from_arrays(net_gex_values)
+    aggregate_total_gex = agg_result.total_gex_abs  # CANONICAL: sum(abs(net_gex_per_strike))
+    aggregate_net_gex = agg_result.total_gex_net    # CANONICAL: sum(net_gex_per_strike)
     
     # Assert GEX invariant for aggregate values
     assert_gex_invariant(aggregate_net_gex, aggregate_total_gex, "calculate_gamma_exposure aggregate")
@@ -454,6 +459,18 @@ def calculate_gamma_exposure(options_df, spot_price):
         else:
             zero_gamma_level = spot_price
     
+    # Determine expiration scope (FIRST-CLASS FIELD - no silent mixing)
+    if effective_expiry:
+        days_to_exp = (effective_expiry.date() - datetime.now().date()).days
+        if days_to_exp == 0:
+            expiration_scope = '0DTE'
+        else:
+            expiration_scope = f'{days_to_exp}DTE'
+    else:
+        # Fallback: using all expirations
+        max_dte = gex_by_strike['days_to_expiry'].max() if not gex_by_strike.empty else 90
+        expiration_scope = f'ALL<={max_dte}D'
+    
     return {
         'pin_strike': pin_strike,
         'pin_expiry': pin_expiry,
@@ -466,7 +483,9 @@ def calculate_gamma_exposure(options_df, spot_price):
         'gex_by_strike': gex_by_strike,
         'gamma_walls': gamma_walls,
         'zero_gamma': zero_gamma_level,
-        'spot_price': spot_price
+        'spot_price': spot_price,
+        'expiration_scope': expiration_scope,  # FIRST-CLASS FIELD: '0DTE', '1DTE', or 'ALL<=90D'
+        'contracts_count': len(options_df),
     }
 
 def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
@@ -596,11 +615,13 @@ def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
             # Get top walls (already filtered to meaningful GEX)
             top_walls = gex_by_strike.nlargest(3, 'total_gex')[['strike', 'net_gex', 'total_gex']].to_dict('records')
             
-            # Calculate TOTAL GEX across ALL strikes for this expiry (gross market gamma)
-            total_gex_sum = float(gex_by_strike['total_gex'].sum())
-            
-            # Calculate NET GEX across ALL strikes for this expiry (net directional gamma)
-            net_gex_sum = float(gex_by_strike['net_gex'].sum())
+            # Calculate AGGREGATE GEX using CANONICAL definitions from app/core/gex.py
+            # TOTAL_GEX_ABS = sum(abs(net_gex_per_strike)), TOTAL_GEX_NET = sum(net_gex_per_strike)
+            from app.core.gex import compute_aggregate_gex_from_arrays
+            expiry_net_gex_values = gex_by_strike['net_gex'].tolist()
+            expiry_agg_result = compute_aggregate_gex_from_arrays(expiry_net_gex_values)
+            total_gex_sum = expiry_agg_result.total_gex_abs  # CANONICAL: sum(abs(net_gex_per_strike))
+            net_gex_sum = expiry_agg_result.total_gex_net    # CANONICAL: sum(net_gex_per_strike)
             
             # Pin strike's GEX for reference
             pin_gex = float(pin_row['total_gex'])

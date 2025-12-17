@@ -100,11 +100,24 @@ def is_market_hours():
 
 def fetch_and_save_gamma_snapshot(api_key, symbol):
     """
-    Fetch current gamma data for a symbol and save to database
+    Fetch current gamma data for a symbol, validate, create audit snapshot, and save.
+    
+    AUDIT PIPELINE (mandatory):
+    1. Fetch spot price and options chain
+    2. Calculate gamma exposure
+    3. Build audit snapshot (pure function, no recomputation)
+    4. Apply sanity validation gates (hard fail)
+    5. Persist audit snapshot to disk (ALWAYS, even if invalid)
+    6. Save to database only if sanity checks pass
     
     Returns True if successful, False otherwise
     """
+    from datetime import timezone
     try:
+        # Import audit modules
+        from app.core.audit_persistence import persist_audit_snapshot
+        from app.core.sanity_checks import apply_validation_to_snapshot, should_use_gamma_in_model
+        
         # Get current price using snapshot API
         polygon_ticker = f"I:{symbol}"
         print(f"  Fetching snapshot for {polygon_ticker}...")
@@ -137,28 +150,110 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             print(f"Warning: Could not calculate gamma exposure for {symbol}, skipping gamma sample")
             return False
         
-        # Save to database (timestamp will be auto-rounded to 15-min boundary)
+        # === AUDIT PIPELINE START ===
+        # CRITICAL: Use canonical values from gex_analysis - NO recomputation
+        
         et_tz = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et_tz)
+        
+        # Use CANONICAL aggregate GEX values directly from calculate_gamma_exposure
+        # These are already computed using app/core/gex.py definitions
+        aggregate_total_gex = gex_analysis.get('aggregate_total_gex', 0)
+        aggregate_net_gex = gex_analysis.get('aggregate_net_gex', 0)
+        expiration_scope = gex_analysis.get('expiration_scope', 'UNKNOWN')
+        contracts_count = gex_analysis.get('contracts_count', len(options_df))
+        
+        # Convert gex_by_strike DataFrame to list for audit (read-only, no recomputation)
+        gex_by_strike = gex_analysis.get('gex_by_strike')
+        strikes_data = []
+        if gex_by_strike is not None and not gex_by_strike.empty:
+            for _, row in gex_by_strike.iterrows():
+                strikes_data.append({
+                    'strike': float(row.get('strike', 0)),
+                    'expiration_days': int(row.get('days_to_expiry', 0)),
+                    'net_gex': float(row.get('net_gex', 0)),
+                    'total_gex': float(row.get('total_gex', 0)),
+                })
+        
+        # Build audit snapshot using CANONICAL values (no recomputation)
+        from app.core.audit_snapshot import AuditSnapshot
+        
+        # Sort strikes by abs(net_gex) descending for top 15
+        sorted_strikes = sorted(strikes_data, key=lambda s: abs(s.get('net_gex', 0)), reverse=True)[:15]
+        
+        # Get expiration days for scope metadata
+        exp_days = list(set(s.get('expiration_days', 0) for s in strikes_data)) if strikes_data else [0]
+        
+        audit_snapshot = AuditSnapshot(
+            symbol=symbol,
+            timestamp_utc=now_et.isoformat(),
+            spot_last=current_price,
+            spot_timestamp=now_et.isoformat(),
+            spot_source='polygon_rest',
+            chain_symbol_used=symbol,
+            expirations_min_days=min(exp_days) if exp_days else 0,
+            expirations_max_days=max(exp_days) if exp_days else 0,
+            contracts_count=contracts_count,
+            expiration_scope=expiration_scope,  # Use canonical value from gamma_result
+            top_strikes_by_abs_gex=[
+                {
+                    'strike': s['strike'],
+                    'expiration_days': s.get('expiration_days', 0),
+                    'net_gex': s['net_gex'],
+                    'abs_gex': abs(s['net_gex']),
+                }
+                for s in sorted_strikes
+            ],
+            primary_gamma_pin_strike=gex_analysis.get('pin_strike', 0),
+            primary_gamma_pin_abs_gex=abs(gex_analysis.get('net_gex', 0)),
+            zero_gamma_level=gex_analysis.get('zero_gamma'),
+            zero_gamma_method='cumulative',
+            total_gex_abs=aggregate_total_gex,  # CANONICAL value from gex_analysis
+            total_gex_net=aggregate_net_gex,    # CANONICAL value from gex_analysis
+        )
+        
+        # Step 1: Apply sanity validation BEFORE any persistence
+        audit_snapshot = apply_validation_to_snapshot(audit_snapshot)
+        
+        # Step 2: Persist audit snapshot to disk (ALWAYS, even if invalid)
+        audit_file = persist_audit_snapshot(audit_snapshot)
+        if audit_file:
+            print(f"  📝 Audit snapshot saved: {audit_file}")
+        
+        # Step 3: Check if gamma should be used in the model
+        # If validation fails, gamma is EXCLUDED from model but audit is persisted
+        if not should_use_gamma_in_model(audit_snapshot):
+            print(f"  ⚠️ Gamma INVALID for {symbol}: {audit_snapshot.validation_failure_reasons}")
+            print(f"  ⚠️ Gamma excluded from model, audit snapshot persisted (no DB save)")
+            # Return True - audit was successful, just gamma excluded from model
+            # Do NOT save to DB - this prevents invalid gamma from entering predictions
+            return True
+        
+        # === AUDIT PIPELINE END ===
+        
+        # Save to database ONLY if validation passed
         snapshot_result = save_gamma_snapshot(
             ticker=symbol,
-            interval_timestamp=datetime.now(et_tz),
+            interval_timestamp=now_et,
             pin_strike=gex_analysis['pin_strike'],
             pull_strength=gex_analysis.get('pull_strength', 0.5),
             spot_price=current_price,
-            total_gex=gex_analysis.get('total_gex', 0),
-            net_gex=gex_analysis.get('net_gex', 0),
+            total_gex=aggregate_total_gex,  # Use canonical aggregate
+            net_gex=aggregate_net_gex,      # Use canonical aggregate
             is_mock_data=is_mock
         )
         
         if snapshot_result:
-            print(f"✓ Gamma snapshot saved for {symbol}: pin=${gex_analysis['pin_strike']:.2f}, spot=${current_price:.2f}, mock={is_mock}")
+            print(f"✓ Gamma snapshot saved for {symbol}: pin=${gex_analysis['pin_strike']:.2f}, spot=${current_price:.2f}, scope={expiration_scope}, mock={is_mock}")
             return True
         else:
             print(f"✗ Failed to save gamma snapshot for {symbol}")
             return False
             
     except Exception as e:
+        import traceback
         print(f"Error fetching gamma snapshot for {symbol}: {str(e)}")
+        traceback.print_exc()
         return False
 
 def gamma_sampling_loop():
