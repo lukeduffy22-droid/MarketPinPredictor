@@ -1080,6 +1080,8 @@ async def record_accuracy_endpoint(symbol: str, official_close: float):
     This endpoint should be called after 4 PM ET with the official closing price
     to log the prediction accuracy for the day.
     
+    Security: Server-side snapshot retrieval (no client payload trusted).
+    
     Args:
         symbol: Index symbol (SPX, NDX, DJI, RUT)
         official_close: Official closing price from data provider
@@ -1089,14 +1091,24 @@ async def record_accuracy_endpoint(symbol: str, official_close: float):
         if symbol not in ("SPX", "NDX", "DJI", "RUT"):
             raise HTTPException(400, f"Invalid symbol: {symbol}")
         
+        # Validate official_close is reasonable
+        if official_close <= 0 or official_close > 100000:
+            raise HTTPException(400, f"Invalid official_close: {official_close}")
+        
         from app.core.audit_persistence import load_last_valid_snapshot
         from app.core.accuracy_ledger import record_accuracy
-        from app.utils.market_time import is_freeze_enforced
+        from app.utils.market_time import is_freeze_enforced, market_is_closed
         
+        # Validate freeze state - accuracy should only be recorded after market close
+        if not market_is_closed():
+            raise HTTPException(400, "Cannot record accuracy while market is open")
+        
+        # Server-side snapshot retrieval (no client payload trusted)
         snapshot = load_last_valid_snapshot(symbol)
         if not snapshot:
             raise HTTPException(404, f"No valid snapshot found for {symbol}")
         
+        # Build snapshot dict from server-retrieved data only
         snapshot_dict = {
             'timestamp_utc': snapshot.timestamp_utc,
             'primary_gamma_pin_strike': snapshot.primary_gamma_pin_strike,

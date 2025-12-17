@@ -218,6 +218,11 @@ class OptionsWebSocketStream:
         
         while self.running and self.reconnect_count < self.max_reconnects:
             try:
+                from app.utils.market_time import market_is_closed as check_closed
+                if check_closed():
+                    log.warning("Market closed during Options WebSocket — terminating")
+                    return
+                
                 dt_utc = datetime.utcnow()
                 self.is_market_hours = is_regular_hours(dt_utc)
                 

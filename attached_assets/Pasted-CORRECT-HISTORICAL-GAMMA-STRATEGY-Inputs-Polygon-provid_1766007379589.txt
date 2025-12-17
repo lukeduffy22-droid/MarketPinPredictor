@@ -1,0 +1,186 @@
+CORRECT HISTORICAL GAMMA STRATEGY
+Inputs (Polygon provides these)
+
+For a given date D:
+
+Underlying spot close at time T
+
+Option chain for expiry D
+
+Historical IV per strike
+
+Option price per strike
+
+Open Interest (end-of-day snapshot)
+
+Assumptions (explicit, logged)
+
+OI is static intraday
+
+Dealer net positioning sign unknown (track magnitude only)
+
+Gamma decay approximated from time-to-expiry
+
+These assumptions are acceptable for validation, not trading.
+
+HOW THIS FITS YOUR APP ARCHITECTURE
+
+You already have:
+
+gex.py (canonical gamma math)
+
+audit_snapshot schema
+
+recompute_gamma.py
+
+We will add:
+
+historical_gamma.py
+
+A historical audit snapshot generator
+
+A comparison pipeline
+
+IMPLEMENTATION — AGENT READY
+1. Historical Gamma Builder
+
+tools/historical_gamma.py
+
+import polygon
+from datetime import datetime
+from app.core.gex import compute_contract_gamma, aggregate_gamma
+
+client = polygon.RESTClient()
+
+def build_historical_snapshot(symbol, date):
+    # 1. Get underlying close
+    spot = client.get_index_close(symbol, date)
+
+    # 2. Get option contracts for same-day expiry
+    contracts = client.list_options_contracts(
+        underlying_ticker=symbol,
+        expiration_date=date,
+        limit=1000
+    )
+
+    gamma_rows = []
+
+    for c in contracts:
+        # 3. Historical IV
+        iv = client.get_option_iv(c.ticker, date)
+        if iv is None:
+            continue
+
+        # 4. Open interest (proxy)
+        oi = c.open_interest or 0
+        if oi == 0:
+            continue
+
+        gamma = compute_contract_gamma(
+            spot=spot,
+            strike=c.strike_price,
+            iv=iv,
+            time_to_expiry=1/252,
+            open_interest=oi
+        )
+
+        gamma_rows.append({
+            "strike": c.strike_price,
+            "gamma": gamma,
+            "oi": oi
+        })
+
+    pin = aggregate_gamma(spot, gamma_rows)
+
+    return {
+        "symbol": symbol,
+        "date": date,
+        "spot": spot,
+        "pin": pin,
+        "contracts": gamma_rows,
+        "historical": True
+    }
+
+2. Persist as Audit Snapshot
+
+Reuse your existing persistence logic:
+
+from app.core.audit_persistence import save_snapshot
+
+snapshot = build_historical_snapshot("SPX", "2025-12-13")
+save_snapshot(snapshot)
+
+
+Mark explicitly:
+
+"historical": true
+
+
+This prevents contamination with live data.
+
+3. Compare Against Actual Close
+
+tools/historical_validation.py
+
+def validate(snapshot, actual_close):
+    error = actual_close - snapshot["pin"]
+
+    print(f"Date: {snapshot['date']}")
+    print(f"Pin: {snapshot['pin']}")
+    print(f"Close: {actual_close}")
+    print(f"Error: {error}")
+
+
+This feeds directly into your accuracy ledger.
+
+WHAT THIS VALIDATES (IMPORTANT)
+
+This answers real questions:
+
+Does your live pin consistently overshoot?
+
+Is RUT structurally noisier than SPX?
+
+Do errors cluster on high-vol days?
+
+Does truncation bias matter more in small caps?
+
+Does pin accuracy degrade with skew?
+
+This is model intelligence, not hindsight bias.
+
+WHAT THIS DOES NOT DO
+
+Be explicit in code comments and docs:
+
+❌ Does not reconstruct true dealer inventory
+
+❌ Does not capture intraday OI changes
+
+❌ Does not imply tradable historical signal
+
+This is model validation infrastructure, not a backtest for PnL.
+
+HOW TO USE THIS PRACTICALLY
+Immediate workflow
+
+Pull last 30 trading days
+
+Generate historical gamma snapshots
+
+Populate accuracy ledger
+
+Plot error distributions
+
+Compare against live-day behavior
+
+If historical and live error profiles match, your live data is correct.
+If they diverge, your ingestion or timing is wrong.
+
+FINAL ASSESSMENT
+
+Yes — you absolutely should do this.
+No — you are not “backtesting dealer gamma”.
+You are auditing and validating your measurement system.
+
+That is the correct use of historical Polygon data.

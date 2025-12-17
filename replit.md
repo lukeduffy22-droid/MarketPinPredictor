@@ -2,200 +2,57 @@
 
 ## Overview
 
-This project is a dual-model stock market prediction system for major stock indices (SPX, NDX, DJI, RUT). It combines a Time-Adaptive Ridge Regression model, optimized for the final trading hour, with traditional machine learning models for earlier predictions. Key features include adaptive model selection, gamma exposure analytics, real-time WebSocket streaming, comprehensive technical analysis, 1-hour Opening Range Breakout (ORB) tracking, AI market event scanning, and an AI-powered prediction enhancement layer. The system aims to provide accurate price predictions, with a focus on improving accuracy in the last 30 minutes of trading.
+This project is a dual-model stock market prediction system for major stock indices (SPX, NDX, DJI, RUT). It combines a Time-Adaptive Ridge Regression model, optimized for the final trading hour, with traditional machine learning models for earlier predictions. The system features adaptive model selection, gamma exposure analytics, real-time WebSocket streaming, comprehensive technical analysis, 1-hour Opening Range Breakout (ORB) tracking, AI market event scanning, and an AI-powered prediction enhancement layer. Its primary goal is to provide accurate price predictions, with a particular focus on improving accuracy in the last 30 minutes of trading.
 
 ## User Preferences
 
 Preferred communication style: Simple, everyday language.
 
-## Recent Changes (December 2025)
-
-### Audit Observability Layer (Dec 17, 2025)
-- **Purpose**: Make gamma calculations fully traceable and verifiable with comprehensive audit infrastructure
-- **New Modules**:
-  - `app/core/gex.py`: Canonical GEX definitions with aggregate functions (TOTAL_GEX_ABS, TOTAL_GEX_NET)
-  - `app/core/audit_snapshot.py`: Pure AuditSnapshot dataclass capturing spot state, options chain identity, top 15 strikes
-  - `app/core/audit_persistence.py`: JSON file persistence with FIFO cleanup (200 files per symbol)
-  - `app/core/sanity_checks.py`: Validation gates with symbol-specific thresholds
-- **Pipeline Integration**:
-  - Audit snapshot created on every gamma refresh
-  - Sanity validation runs BEFORE database persistence
-  - Invalid gamma excluded from model but audit still persisted
-- **New API Endpoint**: `GET /debug/reconcile/{symbol}` - read-only verification without UI
-- **Canonical GEX Definitions**:
-  - Per-Strike: `net_gex = call_gex - put_gex`, `total_gex = |call_gex| + |put_gex|`
-  - Aggregate: `TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))`, `TOTAL_GEX_NET = sum(net_gex_per_strike)`
-  - Invariant: `total_gex >= |net_gex|` (enforced at runtime)
-- **Tests**: 22 unit tests covering GEX invariants and aggregate computations
-- **Audit Files**: Stored at `./logs/audit/{symbol}/{YYYYMMDD-HHMMSS}.json`
-
-### Critical GEX Sign Convention Fix (Dec 17, 2025)
-- **Issue**: Net_GEX was incorrectly equal to Total_GEX across timestamps (sign lost or absolute value applied too early)
-- **Root Cause**: The original code merged calls and puts before computing exposure: `net_oi = oi_call - oi_put; gex = gamma * net_oi * 100`. This destroyed sign fidelity.
-- **Solution**: Created canonical GEX computation module (`app/core/gex.py`) as single source of truth
-- **Correct Formula**:
-  - `call_gex = gamma_call * oi_call * 100` (positive exposure)
-  - `put_gex = gamma_put * oi_put * 100` (positive magnitude)
-  - `net_gex = call_gex - put_gex` (signed net)
-  - `total_gex = |call_gex| + |put_gex|` (sum of magnitudes)
-  - Invariant: `total_gex >= |net_gex|` (always enforced)
-- **Files Changed**:
-  - `app/core/gex.py`: New canonical GEX module with `compute_gex()` function and `GexResult` dataclass
-  - `app/features/calculators.py`: `calc_gamma_pinning()` now uses `compute_gex()`
-  - `options_gamma.py`: Per-row aggregation with proper sign convention
-  - `database.py`: Runtime invariant validation at snapshot save
-  - `app/state/oi_cache.py`: Added `ALLOW_SIMULATED_OI` flag for fail-closed on simulated data
-- **Tests Added**: `tests/test_gex.py` with 22 unit tests covering invariants and sign conventions
-- **Result**: GEX values now mathematically correct; net_gex and total_gex are no longer identical
-
-### Real-Time WebSocket Fix (Dec 3, 2025)
-- **Issue**: Polygon SDK's `WebSocketClient` class was failing with DNS resolution errors in Replit
-- **Root Cause**: The Polygon SDK's WebSocket implementation had compatibility issues, but raw `websockets` library works perfectly
-- **Solution**: Replaced Polygon SDK's `WebSocketClient` with raw `websockets` library for direct WebSocket connections
-- **Implementation**:
-  - `app/ingest/websocket_stream.py`: Uses raw `websockets` library to connect to `wss://socket.polygon.io/indices`
-  - `app/ingest/options_websocket_stream.py`: Uses raw `websockets` for `wss://socket.polygon.io/options`
-  - Both streams now connect successfully and receive real-time data
-  - REST polling (`app/ingest/rest_fallback.py`) remains as backup fallback
-- **Health Endpoint**:
-  - `data_age_seconds`: Shows how old the latest tick is (0-2 seconds with WebSocket)
-  - `buffer_length`: Number of seconds of data in ring buffer
-  - `mode`: Shows "WebSocket" when connected, "REST" as fallback
-- **Result**: TRUE real-time streaming is now active, maximizing the $350/month premium Polygon subscription value
-
-## Recent Changes (November 2025)
-
-### 1-Hour Opening Range Breakout (ORB) Tracking
-- **ORB Tracker Module** (`app/state/orb_tracker.py`): Captures high/low during 9:30-10:30 AM ET for each trading day
-- **ORB Features in ML Model**: Position in range, breakout direction (bullish/bearish/inside), range width percentage
-- **ML Integration**: ORB breakout signals now influence Time-Adaptive Ridge predictions
-- **Confidence Boost**: When ORB direction aligns with other signals (VWAP, microtrend), confidence increases
-- **API Endpoints**: `/orb/{symbol}` and `/orb` for accessing ORB data
-
-### AI Market Event Scanner
-- **Event Scanner Module** (`app/services/market_event_scanner.py`): Scans for macro/micro events affecting indices
-- **Event Categories**: Fed announcements (FOMC, rate decisions), economic data (CPI, jobs, GDP), earnings, geopolitical, market structure (options expiration)
-- **Calendar Integration**: Automatically detects monthly OPEX, weekly options expiration, NFP report days
-- **AI Analysis**: Uses OpenAI to analyze news context and identify market-moving events
-- **Risk Level Assessment**: Low/Normal/Elevated/High based on event count and impact
-- **Sidebar Display**: Shows top 3 events with impact level and expected direction
-- **AI Prompt Integration**: Events are passed to AI prediction enhancement for context-aware adjustments
-- **API Endpoints**: `/market-events` and `/market-events/summary`
-
-### Enhanced AI Prediction Analysis
-- AI now receives ORB data (high/low, position in range, breakout status)
-- AI now receives market events context for event-aware prediction adjustments
-- Combined with historical accuracy data for comprehensive prediction critique
-
-### GEX Calculation Fix (Based on External Feedback)
-- **Fixed Total GEX vs Net GEX**: Now correctly calculates aggregate sums across ALL strikes
-  - `total_gex` / `net_gex`: Pin-level values (backward compatible)
-  - `aggregate_total_gex` / `aggregate_net_gex`: NEW fields with sum across all strikes (gross and net)
-  - Multi-expiry gamma also updated with `expiry_total_gex` / `expiry_net_gex` fields
-
-### Half-Day Session Fix (Nov 28, 2025)
-- **Fixed Time Countdown Bug**: Previously showed wrong minutes remaining on early close days
-- **Root Cause**: `ridge_predictor.get_minutes_to_close()` was hardcoded to 4 PM, now delegates to `time_et.minutes_to_close_et()`
-- **Prediction Formula Fix**: `predict()` function now uses `close_time_et()` for correct close time
-- **Half-Day Detection**: UI now prominently displays when market closes early (1 PM ET)
-- **Close Time Display**: Shows actual close time in countdown (e.g., "Market closes in 2h 15m (01:00 PM ET)")
-- **Holiday-Aware**: Uses `app/utils/time_et.py` for accurate holiday/early close detection
-
-### Regime-Aware Predictions (Nov 28, 2025)
-- **Regime Flags**: Model now detects and adjusts for special session types:
-  - `regime_half_day`: Early close sessions (1 PM ET) - reduces VWAP influence, increases gamma weight
-  - `regime_holiday_adjacent`: Day before/after holidays - reduces microtrend weight, increases flow weight
-  - `regime_eom`: End of month (last 3 days) - allows more drift, reduces mean-reversion
-  - `regime_eow`: End of week (Thu/Fri) - tracked for pattern analysis
-  - `regime_vix`: VIX level placeholder for volatility regime
-- **Gamma Snapshot Features**: Added distance_to_pin, net_gamma_level, aggregate GEX for better short-horizon predictions
-- **Coefficient Adjustments**: Model coefficients now adapt based on regime flags
-
-### MAE-by-Regime Error Tracking (Nov 28, 2025)
-- **PredictionLog Schema**: Added regime flag columns for historical analysis
-- **get_mae_by_regime()**: New function to compute MAE/bias by session type
-- **API Endpoint**: `/prediction-accuracy/by-regime` returns MAE statistics by regime type
-- **Bias Detection**: Helps identify systematic under/over-prediction in specific session types
-
-### Enhanced CSV Export
-- **New Columns**: IndexSymbol, SessionDate, Distance_Points, Distance_Pct, Pin_Drift_Per_Hour
-- **Raw Values**: Export includes raw numeric values for analysis (not formatted strings)
-- **Download Button**: Added CSV download button in gamma history table
-
-### Adaptive Gamma Sampling
-- **Intelligent Intervals**: Sampling frequency increases as market close approaches
-  - Regular: 15-minute intervals
-  - Last hour: 5-minute intervals
-  - Last 30 minutes: 3-minute intervals
-  - Last 15 minutes: 2-minute intervals
-- **Early Close Aware**: Uses proper close time for half-day sessions
-
-### Prediction Accuracy Improvements
-- **Timeframe-Adaptive Bounds**: Predictions now use adaptive limits based on timeframe:
-  - 1-day: ±3% maximum move
-  - 5-day: ±5% maximum move  
-  - 1-week: ±8% maximum move
-- **VIX Volatility Override**: When VIX > 35 (crash/panic), allows 2x normal range; VIX > 25 allows 1.5x
-- **Gamma Pin Validation**: Rejects gamma pins more than 15% from current spot price (prevents showing unrealistic values like $2800 for SPX at $6800)
-
-### AI Enhancement Layer Improvements
-- **Historical Accuracy Feedback**: AI now receives historical model accuracy data including:
-  - Average accuracy percentage from past predictions
-  - Prediction bias (bullish/bearish/neutral)
-  - Consistency rating (highly_consistent/moderately_consistent/variable)
-  - Last 3 predictions with predicted/actual/accuracy details
-- This allows AI to calibrate adjustments based on past model performance
-
-### Database Functions Added
-- `get_historical_accuracy_for_ai()` - Fetches rich historical accuracy data for AI context
-- `get_predictions_needing_actuals()` - Find predictions missing actual EOD prices
-- `batch_update_prediction_actuals()` - Batch update predictions with actuals
-
 ## System Architecture
 
 ### Frontend Architecture
 
-The frontend uses Streamlit (port 5000) as a pure API client, consuming only FastAPI endpoints. It features adaptive refresh rates and strictly separates the UI from prediction logic.
+The frontend uses Streamlit as a pure API client, consuming only FastAPI endpoints. It features adaptive refresh rates and strictly separates the UI from prediction logic.
 
 ### Backend Architecture
 
-The backend is built with FastAPI (port 8000) using an async/await pattern.
+The backend is built with FastAPI using an async/await pattern.
 
 **Core Components**:
--   **Per-Symbol Ring Buffers**: Stores 90 minutes of 1-second index bars and options flow data for rapid access.
--   **WebSocket Ingestion**: Normalizes incoming messages, aggregates sub-second data into 1-second bars, and intelligently switches between real-time and delayed feeds.
--   **Feature Calculators**: Computes critical features such as VWAP Deviation, Microtrend, Gamma Pinning (Black-Scholes), and Flow Urgency. Includes a 150ms circuit breaker.
--   **AI Enhancement Layer**: Integrates a swappable AI provider architecture (e.g., OpenAI) to act as a "critic and corrector" on base model predictions. It analyzes live gamma, VWAP, microtrend, options flow data, AND historical accuracy feedback to suggest confidence-weighted adjustments and provides natural language explanations.
--   **Multi-Expiry Gamma Analysis**: Analyzes gamma across 0-7 DTE expirations with time-weighted aggregation to identify unified gamma walls and an aggregate pin strike for enhanced EOD predictions.
+-   **Per-Symbol Ring Buffers**: Stores 90 minutes of 1-second index bars and options flow data.
+-   **WebSocket Ingestion**: Normalizes incoming messages, aggregates data into 1-second bars, and intelligently switches between real-time and delayed feeds. Includes a market-close data freeze system for audit compliance.
+-   **Feature Calculators**: Computes critical features such as VWAP Deviation, Microtrend, Gamma Pinning (Black-Scholes), and Flow Urgency, with a 150ms circuit breaker.
+-   **AI Enhancement Layer**: Integrates a swappable AI provider architecture to act as a "critic and corrector" on base model predictions. It analyzes live gamma, VWAP, microtrend, options flow data, historical accuracy feedback, ORB data, and market event context to suggest confidence-weighted adjustments and provides natural language explanations.
+-   **Multi-Expiry Gamma Analysis**: Analyzes gamma across 0-7 DTE expirations with time-weighted aggregation to identify unified gamma walls and an aggregate pin strike for enhanced EOD predictions. Includes canonical GEX definitions and an audit observability layer for traceability.
 -   **Advanced Gamma-Based EOD Prediction**: Incorporates Wall-Weighted Magnet (WWM), Pin Stability Index (PSI), Zero-Gamma Magnet, and Volatility-Adjusted Close Predictor (VACP) for highly accurate end-of-day predictions.
 -   **OI Cache Service**: Refreshes Open Interest (OI) data in the background.
--   **Database Models**: SQLAlchemy models for `CalibrationCoeff`, `RMSEBucket`, `PredictionLog`, and `Prediction` with accuracy tracking.
--   **FastAPI Endpoints**: Provides health checks, gamma exposure levels, and prediction endpoints.
+-   **Database Models**: SQLAlchemy models for `CalibrationCoeff`, `RMSEBucket`, `PredictionLog`, and `Prediction` with accuracy tracking, including regime-aware error tracking.
+-   **FastAPI Endpoints**: Provides health checks, gamma exposure levels, prediction endpoints, market event summaries, ORB data, and accuracy statistics.
 
 ### Prediction Model
 
-The primary prediction model is Ridge Regression with time-adaptive weights, incorporating `vwap_dev`, `microtrend`, `gamma_pin`, and `flow_urgency`. Weights adjust based on minutes to market close.
+The primary prediction model is Ridge Regression with time-adaptive weights, incorporating `vwap_dev`, `microtrend`, `gamma_pin`, and `flow_urgency`. Weights adjust based on minutes to market close, with regime-aware adjustments for special session types (e.g., half-day, holiday-adjacent, end-of-month). Prediction accuracy improvements include timeframe-adaptive bounds and VIX volatility overrides.
 
 ### Guards and Validation
 
-The system enforces prediction cadence, performs freshness checks on market data, requires minimum data availability, includes a circuit breaker for feature computation, validates gamma pins within ±15% of spot price, and applies timeframe-adaptive prediction bounds with VIX volatility overrides.
+The system enforces prediction cadence, performs freshness checks on market data, requires minimum data availability, includes a circuit breaker for feature computation, validates gamma pins within ±15% of spot price, applies timeframe-adaptive prediction bounds with VIX volatility overrides, and includes a market-close data freeze.
 
 ### Time Utilities
 
-Comprehensive Eastern Time management for `minutes_to_close_et()`, market holidays, and early close dates.
+Comprehensive Eastern Time management for `minutes_to_close_et()`, market holidays, and early close dates. Adaptive gamma sampling frequency increases as market close approaches.
 
 ## External Dependencies
 
 ### Third-Party APIs
 
--   **Polygon.io REST & WebSocket APIs**: For real-time and historical stock market data for indices and options. Features smart feed switching.
+-   **Polygon.io REST & WebSocket APIs**: For real-time and historical stock market data for indices and options.
 -   **OpenAI (via Replit AI Integrations)**: Used for the AI prediction enhancement layer.
 
 ### Python Libraries
 
 -   **Core**: `fastapi`, `uvicorn`, `streamlit`, `sqlalchemy`, `pydantic-settings`.
 -   **ML/Data**: `scikit-learn`, `numpy`, `pandas`, `scipy`.
--   **API/Streaming**: `polygon`, `requests`.
+-   **API/Streaming**: `polygon`, `requests`, `websockets`.
 -   **Time Management**: `pytz`.
 
 ### Database

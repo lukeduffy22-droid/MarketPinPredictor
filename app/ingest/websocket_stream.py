@@ -90,6 +90,15 @@ class PolygonWebSocketStream:
         
         elif ev == "V":
             # Index value update - primary feed type
+            # Continuous freeze check
+            try:
+                from app.utils.market_time import market_is_closed
+                if market_is_closed():
+                    log.warning("Market closed — dropping incoming data")
+                    self.running = False
+                    return
+            except ImportError:
+                pass
             await ingest_message(msg)
         
         elif ev == "AM" or ev == "A":

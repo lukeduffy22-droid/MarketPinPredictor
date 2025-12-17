@@ -75,6 +75,11 @@ async def poll_polygon_rest():
     
     while True:
         try:
+            from app.utils.market_time import market_is_closed as check_closed
+            if check_closed():
+                log.warning("Market closed during REST polling — terminating feed")
+                return
+            
             if not is_regular_hours(datetime.utcnow()):
                 await asyncio.sleep(60)
                 continue
