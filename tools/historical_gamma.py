@@ -58,6 +58,16 @@ class HistoricalGammaSnapshot:
     historical: bool = True
     generated_at_utc: str = ""
     
+    # Diagnostic metrics (observational only - do NOT use to adjust gamma math)
+    skew_metrics: Optional[Dict[str, float]] = None
+    gamma_by_distance: Optional[Dict[str, float]] = None
+    vol_regime: Optional[str] = None
+    vol_regime_iv: Optional[float] = None
+    truncation: Optional[Dict[str, Any]] = None
+    confidence: Optional[float] = None
+    confidence_factors: Optional[List[str]] = None
+    dispersion_ratio: Optional[float] = None
+    
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
     
@@ -473,6 +483,46 @@ def build_today_snapshot(
         from app.core.gex import compute_aggregate_gex
         agg_result = compute_aggregate_gex(gamma_rows)
         
+        # Compute diagnostic metrics (observational only - do NOT adjust gamma)
+        from app.core.audit_snapshot import (
+            compute_skew_metrics,
+            compute_gamma_by_distance,
+            classify_vol_regime,
+            compute_confidence_score,
+            compute_dispersion_ratio
+        )
+        
+        # F.1 Skew metrics
+        skew_metrics = compute_skew_metrics(all_contracts, spot)
+        
+        # F.2 Gamma by distance
+        gamma_by_distance = compute_gamma_by_distance(gamma_rows, spot)
+        
+        # F.3 Volatility regime
+        ivs = [float(iv) for iv in [c.get('iv') for c in all_contracts] if iv is not None]
+        avg_iv = sum(ivs) / len(ivs) if ivs else None
+        vol_regime = classify_vol_regime(avg_iv) if avg_iv else None
+        
+        # F.4 Truncation metrics (no truncation for live snapshots)
+        truncation = {
+            "contracts_used": len(all_contracts),
+            "contracts_available": len(all_contracts),
+            "excluded_above": 0,
+            "excluded_below": 0,
+            "truncation_pct": 0.0
+        }
+        
+        # F.5 Confidence score
+        confidence, confidence_factors = compute_confidence_score(
+            contracts_used=len(all_contracts),
+            validation_failed=False,
+            vol_regime=vol_regime or "MEDIUM",
+            truncation_pct=0.0
+        )
+        
+        # F.6 Dispersion ratio
+        dispersion_ratio = compute_dispersion_ratio(gamma_by_distance) if gamma_by_distance else None
+        
         snapshot = HistoricalGammaSnapshot(
             symbol=symbol,
             date=today.strftime("%Y-%m-%d"),
@@ -490,10 +540,18 @@ def build_today_snapshot(
                 "not_for_trading": "Model validation only, not a tradable signal"
             },
             historical=True,
-            generated_at_utc=datetime.utcnow().isoformat()
+            generated_at_utc=datetime.utcnow().isoformat(),
+            skew_metrics=skew_metrics,
+            gamma_by_distance=gamma_by_distance,
+            vol_regime=vol_regime,
+            vol_regime_iv=round(avg_iv, 4) if avg_iv else None,
+            truncation=truncation,
+            confidence=confidence,
+            confidence_factors=confidence_factors,
+            dispersion_ratio=dispersion_ratio
         )
         
-        log.info(f"Today's snapshot built: pin={pin_strike}, contracts={len(all_contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}")
+        log.info(f"Today's snapshot built: pin={pin_strike}, contracts={len(all_contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}, confidence={confidence}")
         
         return snapshot
         

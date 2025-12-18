@@ -88,3 +88,20 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
 - **Freeze Enforcement**: All feeds (WebSocket, Options WebSocket, REST) check freeze status continuously
 - **New API Endpoints**: `/accuracy/freeze-status`, `/accuracy/record/{symbol}`, `/accuracy/stats/{symbol}`, `/accuracy/ledger`
 - **Accuracy Ledger**: Stored at `logs/accuracy_ledger.csv`
+
+### Diagnostic Metrics Enhancement (Dec 18, 2025)
+- **Purpose**: Add 6 observational-only diagnostic metrics to audit snapshots for all symbols (SPX, NDX, DJI, RUT)
+- **CRITICAL RULE**: These metrics are DIAGNOSTIC ONLY - do NOT use to adjust gamma math or tune parameters
+- **New Diagnostic Fields in AuditSnapshot**:
+  1. **skew_metrics**: ATM call vs put IV spread (`call_iv_mean`, `put_iv_mean`, `skew`)
+  2. **gamma_by_distance**: Gamma contribution per strike-distance bucket (ATM, NEAR, MID, FAR as percentages)
+  3. **vol_regime**: Volatility regime classification (LOW < 15%, MEDIUM 15-25%, HIGH > 25%)
+  4. **truncation**: Truncation bias metrics (`contracts_used`, `contracts_available`, `excluded_above`, `excluded_below`, `truncation_pct`)
+  5. **confidence**: Self-diagnostic confidence score (0.0-1.0) with `confidence_factors` explaining deductions
+  6. **dispersion_ratio**: Structural noise metric (FAR/ATM gamma ratio) - higher indicates noisier predictions
+- **Implementation Files**:
+  - `app/core/audit_snapshot.py`: Added diagnostic functions and fields to AuditSnapshot
+  - `tools/historical_gamma.py`: Added diagnostic metrics to HistoricalGammaSnapshot
+- **Hard Rules Enforced**:
+  1. Do NOT invent missing historical OI - system refuses to build snapshots for past dates without pre-built data
+  2. Do NOT imply this recreates dealer positioning - all disclaimers state "Dealer net sign unknown, tracking magnitude only"

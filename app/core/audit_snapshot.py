@@ -73,6 +73,222 @@ class ValidationResult:
     gamma_excluded_from_model: bool = False
 
 
+# ============================================================================
+# DIAGNOSTIC METRIC FUNCTIONS (observational only - do NOT modify gamma math)
+# ============================================================================
+
+def compute_skew_metrics(contracts: List[Dict[str, Any]], spot: float) -> Optional[Dict[str, float]]:
+    """
+    Compute ATM call vs put IV spread.
+    DIAGNOSTIC ONLY - do NOT use to adjust gamma.
+    
+    Args:
+        contracts: List of contract dicts with 'strike', 'iv', 'contract_type' keys
+        spot: Current spot price
+    
+    Returns:
+        Dict with call_iv_mean, put_iv_mean, skew or None if insufficient data
+    """
+    atm_window = [c for c in contracts if abs(c.get('strike', 0) - spot) / max(spot, 1) < 0.01]
+    
+    call_ivs = [c.get('iv', 0) for c in atm_window if c.get('contract_type', '').upper() == 'CALL' and c.get('iv')]
+    put_ivs = [c.get('iv', 0) for c in atm_window if c.get('contract_type', '').upper() == 'PUT' and c.get('iv')]
+    
+    if not call_ivs or not put_ivs:
+        return None
+    
+    call_iv_mean = sum(call_ivs) / len(call_ivs)
+    put_iv_mean = sum(put_ivs) / len(put_ivs)
+    
+    return {
+        "call_iv_mean": round(call_iv_mean, 4),
+        "put_iv_mean": round(put_iv_mean, 4),
+        "skew": round(put_iv_mean - call_iv_mean, 4)
+    }
+
+
+def strike_distance_bucket(strike: float, spot: float) -> str:
+    """
+    Classify strike by distance from spot.
+    
+    Args:
+        strike: Strike price
+        spot: Spot price
+    
+    Returns:
+        Bucket name: ATM, NEAR, MID, or FAR
+    """
+    if spot <= 0:
+        return "FAR"
+    pct = abs(strike - spot) / spot
+    if pct < 0.002:
+        return "ATM"
+    if pct < 0.01:
+        return "NEAR"
+    if pct < 0.03:
+        return "MID"
+    return "FAR"
+
+
+def compute_gamma_by_distance(strikes_data: List[Dict[str, Any]], spot: float) -> Dict[str, float]:
+    """
+    Aggregate gamma contribution per strike-distance bucket.
+    DIAGNOSTIC ONLY - do NOT use to adjust gamma.
+    
+    Args:
+        strikes_data: List of strike dicts with 'strike' and 'abs_gex' or 'net_gex'
+        spot: Current spot price
+    
+    Returns:
+        Dict with ATM, NEAR, MID, FAR gamma contributions as percentages
+    """
+    buckets = {"ATM": 0.0, "NEAR": 0.0, "MID": 0.0, "FAR": 0.0}
+    
+    for s in strikes_data:
+        strike = s.get('strike', 0)
+        abs_gex = abs(s.get('net_gex', 0))
+        bucket = strike_distance_bucket(strike, spot)
+        buckets[bucket] += abs_gex
+    
+    total = sum(buckets.values())
+    if total > 0:
+        return {k: round(v / total * 100, 1) for k, v in buckets.items()}
+    return buckets
+
+
+def classify_vol_regime(iv: float) -> str:
+    """
+    Classify volatility regime based on IV.
+    
+    Args:
+        iv: Implied volatility (decimal, e.g., 0.20 for 20%)
+    
+    Returns:
+        Regime: LOW, MEDIUM, or HIGH
+    """
+    if iv < 0.15:
+        return "LOW"
+    if iv < 0.25:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def compute_truncation_metrics(
+    contracts_used: int,
+    contracts_available: int,
+    strikes_used: List[float],
+    strikes_available: List[float]
+) -> Dict[str, Any]:
+    """
+    Compute truncation bias metrics.
+    DIAGNOSTIC ONLY - quantifies bias from contract caps.
+    
+    Args:
+        contracts_used: Number of contracts actually used
+        contracts_available: Total contracts available
+        strikes_used: List of strikes used in calculation
+        strikes_available: List of all available strikes
+    
+    Returns:
+        Dict with truncation metrics
+    """
+    if not strikes_used or not strikes_available:
+        return {
+            "contracts_used": contracts_used,
+            "contracts_available": contracts_available,
+            "excluded_above": 0,
+            "excluded_below": 0,
+            "truncation_pct": 0.0
+        }
+    
+    max_used = max(strikes_used)
+    min_used = min(strikes_used)
+    max_available = max(strikes_available)
+    min_available = min(strikes_available)
+    
+    excluded_above = max_available - max_used if max_available > max_used else 0
+    excluded_below = min_used - min_available if min_used > min_available else 0
+    
+    truncation_pct = 0.0
+    if contracts_available > 0:
+        truncation_pct = round((1 - contracts_used / contracts_available) * 100, 1)
+    
+    return {
+        "contracts_used": contracts_used,
+        "contracts_available": contracts_available,
+        "excluded_above": round(excluded_above, 2),
+        "excluded_below": round(excluded_below, 2),
+        "truncation_pct": truncation_pct
+    }
+
+
+def compute_confidence_score(
+    contracts_used: int,
+    validation_failed: bool,
+    vol_regime: str,
+    truncation_pct: float = 0.0
+) -> tuple:
+    """
+    Compute self-diagnostic confidence score.
+    DIAGNOSTIC ONLY - do NOT use for trading decisions.
+    
+    Args:
+        contracts_used: Number of contracts in snapshot
+        validation_failed: Whether sanity validation failed
+        vol_regime: Volatility regime (LOW, MEDIUM, HIGH)
+        truncation_pct: Percentage of contracts truncated
+    
+    Returns:
+        Tuple of (confidence score 0.0-1.0, list of factors)
+    """
+    confidence = 1.0
+    factors = []
+    
+    if contracts_used < 400:
+        confidence -= 0.2
+        factors.append(f"Low contract count ({contracts_used} < 400)")
+    
+    if validation_failed:
+        confidence -= 0.4
+        factors.append("Sanity validation failed")
+    
+    if vol_regime == "HIGH":
+        confidence -= 0.1
+        factors.append("High volatility regime")
+    
+    if truncation_pct > 20:
+        confidence -= 0.15
+        factors.append(f"High truncation ({truncation_pct:.1f}% excluded)")
+    
+    confidence = max(confidence, 0.0)
+    
+    if not factors:
+        factors.append("No confidence degradation factors")
+    
+    return round(confidence, 2), factors
+
+
+def compute_dispersion_ratio(gamma_by_distance: Dict[str, float]) -> float:
+    """
+    Compute dispersion ratio (FAR/ATM gamma ratio).
+    DIAGNOSTIC ONLY - tracks structural noise.
+    
+    Higher dispersion indicates more gamma spread to far strikes,
+    which may indicate noisier pin predictions.
+    
+    Args:
+        gamma_by_distance: Dict with ATM, NEAR, MID, FAR percentages
+    
+    Returns:
+        Dispersion ratio (FAR/ATM or 0 if ATM is zero)
+    """
+    atm = gamma_by_distance.get("ATM", 0)
+    far = gamma_by_distance.get("FAR", 0)
+    if atm < 0.001:
+        return far  # If ATM is effectively zero, return FAR as ratio
+    return round(far / atm, 3)
+
+
 @dataclass
 class AuditSnapshot:
     """Complete audit snapshot for a symbol at a point in time."""
@@ -113,6 +329,27 @@ class AuditSnapshot:
     validation_failure_reasons: List[str] = field(default_factory=list)
     gamma_excluded_from_model: bool = False
     
+    # F. Diagnostic Metrics (observational only - do NOT use to adjust gamma math)
+    # F.1 Skew Metrics - ATM call vs put IV spread
+    skew_metrics: Optional[Dict[str, float]] = None  # call_iv_mean, put_iv_mean, skew
+    
+    # F.2 Gamma by Distance - contribution per strike-distance bucket
+    gamma_by_distance: Optional[Dict[str, float]] = None  # ATM, NEAR, MID, FAR
+    
+    # F.3 Volatility Regime - LOW, MEDIUM, HIGH
+    vol_regime: Optional[str] = None
+    vol_regime_iv: Optional[float] = None  # IV value used for classification
+    
+    # F.4 Truncation Metrics - bias from contract caps
+    truncation: Optional[Dict[str, Any]] = None  # contracts_used, contracts_available, excluded_above, excluded_below
+    
+    # F.5 Confidence Score - self-diagnostic 0.0-1.0
+    confidence: Optional[float] = None
+    confidence_factors: Optional[List[str]] = None  # reasons for confidence adjustments
+    
+    # F.6 Dispersion Ratio - structural noise metric (FAR/ATM gamma ratio)
+    dispersion_ratio: Optional[float] = None
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
@@ -127,6 +364,9 @@ def build_audit_snapshot(
     spot_state: Dict[str, Any],
     chain_snapshot: Dict[str, Any],
     gamma_surface: Dict[str, Any],
+    raw_contracts: Optional[List[Dict[str, Any]]] = None,
+    contracts_available: Optional[int] = None,
+    strikes_available: Optional[List[float]] = None,
 ) -> AuditSnapshot:
     """
     Build a complete audit snapshot from existing computed data.
@@ -142,20 +382,25 @@ def build_audit_snapshot(
         gamma_surface: Dict with keys: strikes (list of strike dicts), 
                       pin_strike, pin_abs_gex, zero_gamma_level, zero_gamma_method,
                       total_gex_abs, total_gex_net
+        raw_contracts: Optional list of raw contract dicts for skew calculation
+        contracts_available: Optional total contracts available before truncation
+        strikes_available: Optional list of all available strikes before truncation
     
     Returns:
         AuditSnapshot: Complete, deterministic snapshot
     """
     now_utc = datetime.now(timezone.utc).isoformat()
+    spot_price = float(spot_state.get('price', 0.0))
+    contracts_count = int(chain_snapshot.get('contracts_count', 0))
     
     snapshot = AuditSnapshot(
-        snapshot_version="1.0",
+        snapshot_version="1.1",  # Bumped for diagnostic metrics
         generated_at_utc=now_utc,
         
         # A. Core market state
         symbol=symbol,
         timestamp_utc=now_utc,
-        spot_last=float(spot_state.get('price', 0.0)),
+        spot_last=spot_price,
         spot_timestamp=str(spot_state.get('timestamp_utc', now_utc)),
         spot_source=str(spot_state.get('source', 'unknown')),
         
@@ -164,7 +409,7 @@ def build_audit_snapshot(
         underlying_reported=chain_snapshot.get('underlying_reported'),
         expirations_min_days=int(min(chain_snapshot.get('expirations', [0])) if chain_snapshot.get('expirations') else 0),
         expirations_max_days=int(max(chain_snapshot.get('expirations', [0])) if chain_snapshot.get('expirations') else 0),
-        contracts_count=int(chain_snapshot.get('contracts_count', 0)),
+        contracts_count=contracts_count,
         expiration_scope=str(chain_snapshot.get('expiration_scope', 'UNKNOWN')),
         
         # D. Derived gamma metrics
@@ -201,6 +446,63 @@ def build_audit_snapshot(
             }
             for s in sorted_strikes
         ]
+    
+    # =========================================================================
+    # F. DIAGNOSTIC METRICS (observational only - do NOT use to adjust gamma)
+    # =========================================================================
+    
+    # F.1 Skew Metrics - ATM call vs put IV spread
+    if raw_contracts and spot_price > 0:
+        snapshot.skew_metrics = compute_skew_metrics(raw_contracts, spot_price)
+    
+    # F.2 Gamma by Distance - contribution per strike-distance bucket
+    if strikes and spot_price > 0:
+        snapshot.gamma_by_distance = compute_gamma_by_distance(strikes, spot_price)
+    
+    # F.3 Volatility Regime - classify based on average IV from contracts
+    avg_iv = gamma_surface.get('avg_iv', None)
+    if avg_iv is None and raw_contracts:
+        ivs = [c.get('iv', 0) for c in raw_contracts if c.get('iv')]
+        if ivs:
+            avg_iv = sum(ivs) / len(ivs)
+    if avg_iv is not None:
+        snapshot.vol_regime = classify_vol_regime(avg_iv)
+        snapshot.vol_regime_iv = round(avg_iv, 4)
+    
+    # F.4 Truncation Metrics - bias from contract caps
+    strikes_used = [s.get('strike', 0) for s in strikes] if strikes else []
+    if contracts_available is not None or strikes_available is not None:
+        snapshot.truncation = compute_truncation_metrics(
+            contracts_used=contracts_count,
+            contracts_available=contracts_available or contracts_count,
+            strikes_used=strikes_used,
+            strikes_available=strikes_available or strikes_used
+        )
+    else:
+        # Default truncation with no exclusion info
+        snapshot.truncation = {
+            "contracts_used": contracts_count,
+            "contracts_available": contracts_count,
+            "excluded_above": 0,
+            "excluded_below": 0,
+            "truncation_pct": 0.0
+        }
+    
+    # F.5 Confidence Score - self-diagnostic
+    truncation_pct = snapshot.truncation.get('truncation_pct', 0.0) if snapshot.truncation else 0.0
+    vol_regime = snapshot.vol_regime or "MEDIUM"
+    confidence, factors = compute_confidence_score(
+        contracts_used=contracts_count,
+        validation_failed=False,  # Will be updated by sanity_checks.py
+        vol_regime=vol_regime,
+        truncation_pct=truncation_pct
+    )
+    snapshot.confidence = confidence
+    snapshot.confidence_factors = factors
+    
+    # F.6 Dispersion Ratio - structural noise metric
+    if snapshot.gamma_by_distance:
+        snapshot.dispersion_ratio = compute_dispersion_ratio(snapshot.gamma_by_distance)
     
     return snapshot
 
