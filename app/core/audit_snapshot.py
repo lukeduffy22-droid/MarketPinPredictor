@@ -319,10 +319,26 @@ class AuditSnapshot:
     primary_gamma_pin_abs_gex: float = 0.0
     zero_gamma_level: Optional[float] = None
     zero_gamma_method: Optional[str] = None
-    total_gex_abs: float = 0.0  # sum(abs(net_gex_per_strike))
-    total_gex_net: float = 0.0  # sum(net_gex_per_strike)
-    total_gex_abs_definition: str = "sum(abs(net_gex_per_strike))"
-    total_gex_net_definition: str = "sum(net_gex_per_strike)"
+    
+    # D.1 Corrected GEX fields (signed call/put separation)
+    call_gex_total: float = 0.0  # Aggregate call gamma exposure
+    put_gex_total: float = 0.0   # Aggregate put gamma exposure
+    gross_gex: float = 0.0       # call_gex_total + put_gex_total (total magnitude)
+    net_gex: float = 0.0         # call_gex_total - put_gex_total (signed directional)
+    gross_gex_definition: str = "sum(call_gex) + sum(put_gex)"
+    net_gex_definition: str = "sum(call_gex) - sum(put_gex)"
+    
+    # D.2 Legacy fields (kept for backward compatibility)
+    total_gex_abs: float = 0.0  # Legacy: same as gross_gex
+    total_gex_net: float = 0.0  # Legacy: same as net_gex
+    total_gex_abs_definition: str = "sum(call_gex) + sum(put_gex) [CORRECTED]"
+    total_gex_net_definition: str = "sum(call_gex) - sum(put_gex) [CORRECTED]"
+    
+    # D.3 Pin Drift Tracking (intraday gamma pin migration)
+    pin_drift_points_per_hour: Optional[float] = None  # (pin_now - pin_prev) / hours_elapsed
+    pin_change_points: Optional[float] = None  # Simple difference: pin_now - pin_prev
+    prev_pin_strike: Optional[float] = None  # Previous snapshot's pin strike
+    prev_snapshot_timestamp: Optional[str] = None  # Previous snapshot's timestamp
     
     # E. Validation result (populated by sanity_checks.py)
     validation_is_valid: bool = True
@@ -367,6 +383,7 @@ def build_audit_snapshot(
     raw_contracts: Optional[List[Dict[str, Any]]] = None,
     contracts_available: Optional[int] = None,
     strikes_available: Optional[List[float]] = None,
+    prev_snapshot: Optional['AuditSnapshot'] = None,
 ) -> AuditSnapshot:
     """
     Build a complete audit snapshot from existing computed data.
@@ -381,10 +398,11 @@ def build_audit_snapshot(
                        expirations (list of ints), contracts_count, expiration_scope
         gamma_surface: Dict with keys: strikes (list of strike dicts), 
                       pin_strike, pin_abs_gex, zero_gamma_level, zero_gamma_method,
-                      total_gex_abs, total_gex_net
+                      call_gex_total, put_gex_total, gross_gex, net_gex
         raw_contracts: Optional list of raw contract dicts for skew calculation
         contracts_available: Optional total contracts available before truncation
         strikes_available: Optional list of all available strikes before truncation
+        prev_snapshot: Optional previous AuditSnapshot for pin drift calculation
     
     Returns:
         AuditSnapshot: Complete, deterministic snapshot
@@ -393,8 +411,20 @@ def build_audit_snapshot(
     spot_price = float(spot_state.get('price', 0.0))
     contracts_count = int(chain_snapshot.get('contracts_count', 0))
     
+    # Extract GEX values from gamma_surface
+    call_gex_total = float(gamma_surface.get('call_gex_total', 0.0))
+    put_gex_total = float(gamma_surface.get('put_gex_total', 0.0))
+    gross_gex = float(gamma_surface.get('gross_gex', call_gex_total + put_gex_total))
+    net_gex = float(gamma_surface.get('net_gex', call_gex_total - put_gex_total))
+    
+    # Legacy fields (for backward compatibility)
+    total_gex_abs = gross_gex
+    total_gex_net = net_gex
+    
+    pin_strike = float(gamma_surface.get('pin_strike', 0.0))
+    
     snapshot = AuditSnapshot(
-        snapshot_version="1.1",  # Bumped for diagnostic metrics
+        snapshot_version="1.2",  # Bumped for GEX correction and pin drift
         generated_at_utc=now_utc,
         
         # A. Core market state
@@ -413,13 +443,46 @@ def build_audit_snapshot(
         expiration_scope=str(chain_snapshot.get('expiration_scope', 'UNKNOWN')),
         
         # D. Derived gamma metrics
-        primary_gamma_pin_strike=float(gamma_surface.get('pin_strike', 0.0)),
+        primary_gamma_pin_strike=pin_strike,
         primary_gamma_pin_abs_gex=float(gamma_surface.get('pin_abs_gex', 0.0)),
         zero_gamma_level=gamma_surface.get('zero_gamma_level'),
         zero_gamma_method=gamma_surface.get('zero_gamma_method'),
-        total_gex_abs=float(gamma_surface.get('total_gex_abs', 0.0)),
-        total_gex_net=float(gamma_surface.get('total_gex_net', 0.0)),
+        
+        # D.1 Corrected GEX fields
+        call_gex_total=call_gex_total,
+        put_gex_total=put_gex_total,
+        gross_gex=gross_gex,
+        net_gex=net_gex,
+        
+        # D.2 Legacy fields
+        total_gex_abs=total_gex_abs,
+        total_gex_net=total_gex_net,
     )
+    
+    # D.3 Pin Drift Calculation
+    if prev_snapshot is not None and prev_snapshot.primary_gamma_pin_strike > 0:
+        prev_pin = prev_snapshot.primary_gamma_pin_strike
+        prev_timestamp_str = prev_snapshot.generated_at_utc
+        
+        snapshot.prev_pin_strike = prev_pin
+        snapshot.prev_snapshot_timestamp = prev_timestamp_str
+        snapshot.pin_change_points = pin_strike - prev_pin
+        
+        # Calculate hours elapsed for drift per hour
+        try:
+            # Parse timestamps
+            if prev_timestamp_str:
+                prev_dt = datetime.fromisoformat(prev_timestamp_str.replace('Z', '+00:00'))
+                now_dt = datetime.fromisoformat(now_utc.replace('Z', '+00:00'))
+                hours_elapsed = (now_dt - prev_dt).total_seconds() / 3600.0
+                
+                if hours_elapsed > 0.01:  # At least ~36 seconds elapsed
+                    snapshot.pin_drift_points_per_hour = round((pin_strike - prev_pin) / hours_elapsed, 2)
+                else:
+                    snapshot.pin_drift_points_per_hour = 0.0
+        except Exception:
+            # If timestamp parsing fails, just record the point change
+            snapshot.pin_drift_points_per_hour = None
     
     # C. Top 15 strikes by abs GEX
     strikes = gamma_surface.get('strikes', [])
@@ -514,6 +577,7 @@ def snapshot_from_gamma_exposure_result(
     spot_source: str,
     chain_symbol: str,
     gamma_result: Dict[str, Any],
+    prev_snapshot: Optional['AuditSnapshot'] = None,
 ) -> AuditSnapshot:
     """
     Convenience function to build audit snapshot from calculate_gamma_exposure result.
@@ -525,11 +589,12 @@ def snapshot_from_gamma_exposure_result(
         spot_source: Source of spot data
         chain_symbol: Symbol used to fetch options chain
         gamma_result: Result from calculate_gamma_exposure()
+        prev_snapshot: Optional previous snapshot for pin drift calculation
     
     Returns:
         AuditSnapshot
     """
-    from app.core.gex import compute_aggregate_gex_from_arrays
+    from app.core.gex import compute_aggregate_gex
     
     # Extract strikes data from gamma_result if available
     strikes_data = gamma_result.get('gex_by_strike', [])
@@ -543,9 +608,8 @@ def snapshot_from_gamma_exposure_result(
     else:
         expiration_scope = f'ALL<={max(exp_days) if exp_days else 90}D'
     
-    # Compute aggregate GEX using canonical function
-    net_gex_values = [float(s.get('net_gex', 0)) for s in strikes_data]
-    agg_result = compute_aggregate_gex_from_arrays(net_gex_values)
+    # Compute aggregate GEX using canonical function (with call/put separation)
+    agg_result = compute_aggregate_gex(strikes_data)
     
     spot_state = {
         'price': spot_price,
@@ -567,8 +631,14 @@ def snapshot_from_gamma_exposure_result(
         'pin_abs_gex': abs(gamma_result.get('net_gex', 0)),
         'zero_gamma_level': gamma_result.get('zero_gamma_level'),
         'zero_gamma_method': gamma_result.get('zero_gamma_method'),
-        'total_gex_abs': agg_result.total_gex_abs,
-        'total_gex_net': agg_result.total_gex_net,
+        # Corrected GEX fields
+        'call_gex_total': agg_result.call_gex_total,
+        'put_gex_total': agg_result.put_gex_total,
+        'gross_gex': agg_result.gross_gex,
+        'net_gex': agg_result.net_gex,
+        # Legacy fields
+        'total_gex_abs': agg_result.gross_gex,
+        'total_gex_net': agg_result.net_gex,
     }
     
-    return build_audit_snapshot(symbol, spot_state, chain_snapshot, gamma_surface)
+    return build_audit_snapshot(symbol, spot_state, chain_snapshot, gamma_surface, prev_snapshot=prev_snapshot)

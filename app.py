@@ -996,29 +996,61 @@ with st.sidebar:
                         st.success("🧊 Frozen Snapshot")
                     
                     # Display gamma metrics from snapshot
+                    # Row 1: Pin, Gross GEX, Net GEX
                     metric_col1, metric_col2, metric_col3 = st.columns(3)
                     
                     with metric_col1:
                         st.metric("📍 Primary Gamma Pin", f"${snapshot.primary_gamma_pin_strike:,.0f}")
                     
                     with metric_col2:
-                        total_gex_display = snapshot.total_gex_abs / 1e9 if snapshot.total_gex_abs > 1e6 else snapshot.total_gex_abs
-                        unit = "B" if snapshot.total_gex_abs > 1e6 else ""
-                        st.metric("Total GEX", f"${total_gex_display:.2f}{unit}")
+                        # Use gross_gex if available, fall back to total_gex_abs for backward compatibility
+                        gross_gex = getattr(snapshot, 'gross_gex', None) or snapshot.total_gex_abs
+                        gross_gex_display = gross_gex / 1e9 if gross_gex > 1e6 else gross_gex
+                        unit = "B" if gross_gex > 1e6 else ""
+                        st.metric("Gross GEX", f"${gross_gex_display:.2f}{unit}", help="sum(call_gex) + sum(put_gex)")
                     
                     with metric_col3:
-                        net_gex_display = snapshot.total_gex_net / 1e9 if abs(snapshot.total_gex_net) > 1e6 else snapshot.total_gex_net
-                        unit = "B" if abs(snapshot.total_gex_net) > 1e6 else ""
-                        sign = "+" if snapshot.total_gex_net > 0 else ""
-                        st.metric("Net GEX", f"{sign}${net_gex_display:.2f}{unit}")
+                        # Use net_gex if available, fall back to total_gex_net for backward compatibility
+                        net_gex = getattr(snapshot, 'net_gex', None)
+                        if net_gex is None:
+                            net_gex = snapshot.total_gex_net
+                        net_gex_display = net_gex / 1e9 if abs(net_gex) > 1e6 else net_gex
+                        unit = "B" if abs(net_gex) > 1e6 else ""
+                        sign = "+" if net_gex > 0 else ""
+                        st.metric("Net GEX", f"{sign}${net_gex_display:.2f}{unit}", help="sum(call_gex) - sum(put_gex)")
                     
-                    # Additional metrics row
-                    add_col1, add_col2 = st.columns(2)
-                    with add_col1:
+                    # Row 2: Call GEX, Put GEX, Zero Gamma
+                    gex_col1, gex_col2, gex_col3 = st.columns(3)
+                    with gex_col1:
+                        call_gex = getattr(snapshot, 'call_gex_total', 0)
+                        if call_gex > 0:
+                            call_gex_display = call_gex / 1e9 if call_gex > 1e6 else call_gex
+                            unit = "B" if call_gex > 1e6 else ""
+                            st.metric("Call GEX", f"${call_gex_display:.2f}{unit}")
+                    with gex_col2:
+                        put_gex = getattr(snapshot, 'put_gex_total', 0)
+                        if put_gex > 0:
+                            put_gex_display = put_gex / 1e9 if put_gex > 1e6 else put_gex
+                            unit = "B" if put_gex > 1e6 else ""
+                            st.metric("Put GEX", f"${put_gex_display:.2f}{unit}")
+                    with gex_col3:
                         if snapshot.zero_gamma_level:
                             st.metric("Zero Gamma", f"${snapshot.zero_gamma_level:,.0f}")
-                    with add_col2:
+                    
+                    # Row 3: Spot, Pin Drift
+                    spot_col1, spot_col2 = st.columns(2)
+                    with spot_col1:
                         st.metric("Spot (at freeze)", f"${snapshot.spot_last:,.2f}")
+                    with spot_col2:
+                        # Display pin drift if available
+                        pin_drift = getattr(snapshot, 'pin_drift_points_per_hour', None)
+                        pin_change = getattr(snapshot, 'pin_change_points', None)
+                        if pin_drift is not None and pin_drift != 0:
+                            sign = "+" if pin_drift > 0 else ""
+                            st.metric("Pin Drift", f"{sign}{pin_drift:.1f} pts/hr", help="Rate of pin migration")
+                        elif pin_change is not None and pin_change != 0:
+                            sign = "+" if pin_change > 0 else ""
+                            st.metric("Pin Change", f"{sign}{pin_change:.0f} pts", help="Change since last snapshot")
                     
                     # Validation status
                     if snapshot.validation_is_valid:

@@ -105,3 +105,39 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
 - **Hard Rules Enforced**:
   1. Do NOT invent missing historical OI - system refuses to build snapshots for past dates without pre-built data
   2. Do NOT imply this recreates dealer positioning - all disclaimers state "Dealer net sign unknown, tracking magnitude only"
+
+### GEX Calculation Bug Fix & Pin Drift Implementation (Dec 18, 2025)
+- **Purpose**: Fix two critical bugs in the audit snapshot system
+- **Bug Fix A - Total_GEX == Net_GEX**:
+  - **Problem**: Both fields were identical because we weren't separating call and put gamma before aggregation
+  - **Solution**: Track `call_gex_total` and `put_gex_total` separately, then compute:
+    - `gross_gex = sum(call_gex) + sum(put_gex)` (total gamma magnitude, always positive)
+    - `net_gex = sum(call_gex) - sum(put_gex)` (signed directional exposure)
+  - **New Fields in AuditSnapshot**:
+    - `call_gex_total`: Aggregate call gamma exposure
+    - `put_gex_total`: Aggregate put gamma exposure
+    - `gross_gex`: Total gamma magnitude (replaces confusing `total_gex_abs`)
+    - `net_gex`: Signed net exposure (replaces confusing `total_gex_net`)
+  - **Backward Compatibility**: Legacy `total_gex_abs` and `total_gex_net` still available as aliases
+- **Bug Fix B - Pin_Drift_Per_Hour = 0.0**:
+  - **Problem**: Pin drift was not being calculated despite pin clearly moving intraday
+  - **Solution**: Load previous snapshot and compute drift using timestamps:
+    - `pin_change_points = pin_now - pin_prev` (simple point difference)
+    - `pin_drift_points_per_hour = (pin_now - pin_prev) / hours_elapsed` (rate of migration)
+  - **New Fields in AuditSnapshot**:
+    - `pin_drift_points_per_hour`: Rate of pin migration (most important intraday signal)
+    - `pin_change_points`: Simple difference from previous snapshot
+    - `prev_pin_strike`: Previous snapshot's pin strike
+    - `prev_snapshot_timestamp`: Previous snapshot's timestamp
+  - **New Functions in historical_gamma.py**:
+    - `load_last_snapshot_for_day(symbol, date)`: Load most recent intraday snapshot
+    - `save_intraday_snapshot(snapshot)`: Save with timestamp in filename (YYYY-MM-DD_HHMMSS.json)
+- **UI Updates (Frozen Gamma Tab)**:
+  - Now displays "Gross GEX" and "Net GEX" with correct semantics
+  - Shows separate "Call GEX" and "Put GEX" fields
+  - Displays "Pin Drift" (pts/hr) or "Pin Change" (pts) when available
+- **Modified Files**:
+  - `app/core/gex.py`: Updated `AggregateGexResult` and `compute_aggregate_gex()` with call/put separation
+  - `app/core/audit_snapshot.py`: Added new GEX fields and pin drift tracking
+  - `tools/historical_gamma.py`: Updated snapshot generation with pin drift calculation
+  - `app.py`: Updated Frozen Gamma tab UI to display corrected metrics

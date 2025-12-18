@@ -149,26 +149,53 @@ from typing import List, Dict, Any
 
 @dataclass(frozen=True)
 class AggregateGexResult:
-    """Result of aggregate GEX computation across all strikes."""
-    total_gex_abs: float   # sum(abs(net_gex_per_strike)) - gross magnitude
-    total_gex_net: float   # sum(net_gex_per_strike) - net directional
+    """Result of aggregate GEX computation across all strikes.
+    
+    CORRECTED DEFINITIONS:
+    - gross_gex = sum(call_gex) + sum(put_gex)  # Total gamma magnitude (always positive)
+    - net_gex = sum(call_gex) - sum(put_gex)    # Net directional exposure (signed)
+    - call_gex_total = sum(call_gex)            # Aggregate call gamma
+    - put_gex_total = sum(put_gex)              # Aggregate put gamma
+    
+    Legacy fields (kept for compatibility):
+    - total_gex_abs = gross_gex (same)
+    - total_gex_net = net_gex (same)
+    """
+    gross_gex: float       # sum(call_gex) + sum(put_gex) - total gamma magnitude
+    net_gex: float         # sum(call_gex) - sum(put_gex) - signed net exposure
+    call_gex_total: float  # aggregate call gamma exposure
+    put_gex_total: float   # aggregate put gamma exposure
     strike_count: int      # number of strikes aggregated
+    
+    # Legacy aliases for backward compatibility
+    @property
+    def total_gex_abs(self) -> float:
+        """Legacy alias for gross_gex."""
+        return self.gross_gex
+    
+    @property
+    def total_gex_net(self) -> float:
+        """Legacy alias for net_gex."""
+        return self.net_gex
 
 
 def compute_aggregate_gex(strikes_data: List[Dict[str, Any]]) -> AggregateGexResult:
     """
     Compute aggregate GEX across all strikes.
     
-    DEFINITIONS (NON-NEGOTIABLE):
-        TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))
-        TOTAL_GEX_NET = sum(net_gex_per_strike)
+    CORRECTED DEFINITIONS:
+        gross_gex = sum(call_gex) + sum(put_gex)  # Total gamma magnitude
+        net_gex = sum(call_gex) - sum(put_gex)    # Signed net exposure
+        call_gex_total = sum(call_gex)
+        put_gex_total = sum(put_gex)
     
     Args:
-        strikes_data: List of dicts, each with 'net_gex' key (net GEX for that strike)
-                      Expected format: [{'strike': 100, 'net_gex': 0.5}, ...]
+        strikes_data: List of dicts with 'call_gex' and 'put_gex' keys.
+                      Falls back to 'net_gex' for backward compatibility.
+                      Expected format: [{'strike': 100, 'call_gex': 0.5, 'put_gex': 0.3}, ...]
     
     Returns:
-        AggregateGexResult with total_gex_abs and total_gex_net
+        AggregateGexResult with gross_gex, net_gex, call_gex_total, put_gex_total
     
     Raises:
         ValueError: If input is invalid
@@ -178,61 +205,97 @@ def compute_aggregate_gex(strikes_data: List[Dict[str, Any]]) -> AggregateGexRes
     
     if len(strikes_data) == 0:
         return AggregateGexResult(
-            total_gex_abs=0.0,
-            total_gex_net=0.0,
+            gross_gex=0.0,
+            net_gex=0.0,
+            call_gex_total=0.0,
+            put_gex_total=0.0,
             strike_count=0
         )
     
-    total_gex_abs = 0.0
-    total_gex_net = 0.0
+    call_gex_total = 0.0
+    put_gex_total = 0.0
     
     for strike_entry in strikes_data:
         if not isinstance(strike_entry, dict):
             raise ValueError(f"Each strike entry must be a dict, got {type(strike_entry)}")
         
-        if 'net_gex' not in strike_entry:
-            raise ValueError(f"Strike entry missing 'net_gex' key: {strike_entry}")
-        
-        net_gex = float(strike_entry['net_gex'])
-        total_gex_abs += abs(net_gex)
-        total_gex_net += net_gex
+        # Use call_gex/put_gex if available, otherwise fall back to net_gex
+        if 'call_gex' in strike_entry and 'put_gex' in strike_entry:
+            call_gex_total += float(strike_entry['call_gex'])
+            put_gex_total += float(strike_entry['put_gex'])
+        elif 'net_gex' in strike_entry:
+            # Backward compatibility: if only net_gex provided
+            # Treat positive net_gex as call-dominated, negative as put-dominated
+            net_gex = float(strike_entry['net_gex'])
+            if net_gex >= 0:
+                call_gex_total += net_gex
+            else:
+                put_gex_total += abs(net_gex)
+        else:
+            raise ValueError(f"Strike entry missing 'call_gex'/'put_gex' or 'net_gex' keys: {strike_entry}")
+    
+    gross_gex = call_gex_total + put_gex_total
+    net_gex = call_gex_total - put_gex_total
     
     return AggregateGexResult(
-        total_gex_abs=total_gex_abs,
-        total_gex_net=total_gex_net,
+        gross_gex=gross_gex,
+        net_gex=net_gex,
+        call_gex_total=call_gex_total,
+        put_gex_total=put_gex_total,
         strike_count=len(strikes_data)
     )
 
 
-def compute_aggregate_gex_from_arrays(net_gex_per_strike: List[float]) -> AggregateGexResult:
+def compute_aggregate_gex_from_arrays(
+    net_gex_per_strike: List[float],
+    call_gex_per_strike: Optional[List[float]] = None,
+    put_gex_per_strike: Optional[List[float]] = None
+) -> AggregateGexResult:
     """
-    Compute aggregate GEX from a simple list of net GEX values.
+    Compute aggregate GEX from arrays.
     
-    DEFINITIONS (NON-NEGOTIABLE):
-        TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))
-        TOTAL_GEX_NET = sum(net_gex_per_strike)
+    CORRECTED DEFINITIONS:
+        gross_gex = sum(call_gex) + sum(put_gex)  # Total gamma magnitude
+        net_gex = sum(call_gex) - sum(put_gex)    # Signed net exposure
     
     Args:
-        net_gex_per_strike: List of net GEX values, one per strike
+        net_gex_per_strike: List of net GEX values (for backward compatibility)
+        call_gex_per_strike: Optional list of call GEX values
+        put_gex_per_strike: Optional list of put GEX values
     
     Returns:
-        AggregateGexResult with total_gex_abs and total_gex_net
+        AggregateGexResult with gross_gex, net_gex, call_gex_total, put_gex_total
     """
     if not isinstance(net_gex_per_strike, (list, tuple)):
         raise ValueError("net_gex_per_strike must be a list or tuple")
     
     if len(net_gex_per_strike) == 0:
         return AggregateGexResult(
-            total_gex_abs=0.0,
-            total_gex_net=0.0,
+            gross_gex=0.0,
+            net_gex=0.0,
+            call_gex_total=0.0,
+            put_gex_total=0.0,
             strike_count=0
         )
     
-    total_gex_abs = sum(abs(float(x)) for x in net_gex_per_strike)
-    total_gex_net = sum(float(x) for x in net_gex_per_strike)
+    # If call/put arrays provided, use them for accurate computation
+    if call_gex_per_strike is not None and put_gex_per_strike is not None:
+        call_gex_total = sum(float(x) for x in call_gex_per_strike)
+        put_gex_total = sum(float(x) for x in put_gex_per_strike)
+        gross_gex = call_gex_total + put_gex_total
+        net_gex = call_gex_total - put_gex_total
+    else:
+        # Backward compatibility: estimate from net_gex
+        # Positive net_gex -> call-dominated, negative -> put-dominated
+        call_gex_total = sum(float(x) for x in net_gex_per_strike if x >= 0)
+        put_gex_total = sum(abs(float(x)) for x in net_gex_per_strike if x < 0)
+        gross_gex = call_gex_total + put_gex_total
+        net_gex = sum(float(x) for x in net_gex_per_strike)
     
     return AggregateGexResult(
-        total_gex_abs=total_gex_abs,
-        total_gex_net=total_gex_net,
+        gross_gex=gross_gex,
+        net_gex=net_gex,
+        call_gex_total=call_gex_total,
+        put_gex_total=put_gex_total,
         strike_count=len(net_gex_per_strike)
     )

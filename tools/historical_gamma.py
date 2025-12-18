@@ -52,8 +52,23 @@ class HistoricalGammaSnapshot:
     pin_strike: Optional[float]
     contracts_count: int
     gamma_rows: List[Dict[str, Any]] = field(default_factory=list)
-    total_gex_abs: float = 0.0
-    total_gex_net: float = 0.0
+    
+    # Corrected GEX fields (signed call/put separation)
+    call_gex_total: float = 0.0  # Aggregate call gamma exposure
+    put_gex_total: float = 0.0   # Aggregate put gamma exposure
+    gross_gex: float = 0.0       # call_gex_total + put_gex_total (total magnitude)
+    net_gex: float = 0.0         # call_gex_total - put_gex_total (signed directional)
+    
+    # Legacy fields (kept for backward compatibility)
+    total_gex_abs: float = 0.0  # Legacy: same as gross_gex
+    total_gex_net: float = 0.0  # Legacy: same as net_gex
+    
+    # Pin Drift Tracking
+    pin_drift_points_per_hour: Optional[float] = None  # (pin_now - pin_prev) / hours_elapsed
+    pin_change_points: Optional[float] = None  # Simple difference: pin_now - pin_prev
+    prev_pin_strike: Optional[float] = None  # Previous snapshot's pin strike
+    prev_snapshot_timestamp: Optional[str] = None  # Previous snapshot's timestamp
+    
     assumptions: Dict[str, str] = field(default_factory=dict)
     historical: bool = True
     generated_at_utc: str = ""
@@ -523,6 +538,32 @@ def build_today_snapshot(
         # F.6 Dispersion ratio
         dispersion_ratio = compute_dispersion_ratio(gamma_by_distance) if gamma_by_distance else None
         
+        # Load previous snapshot for pin drift calculation
+        prev_snapshot = load_last_snapshot_for_day(symbol, today)
+        pin_drift_points_per_hour = None
+        pin_change_points = None
+        prev_pin_strike = None
+        prev_snapshot_timestamp = None
+        
+        if prev_snapshot is not None and prev_snapshot.pin_strike is not None and pin_strike is not None:
+            prev_pin_strike = prev_snapshot.pin_strike
+            prev_snapshot_timestamp = prev_snapshot.generated_at_utc
+            pin_change_points = pin_strike - prev_pin_strike
+            
+            # Calculate hours elapsed for drift per hour
+            try:
+                if prev_snapshot_timestamp:
+                    prev_dt = datetime.fromisoformat(prev_snapshot_timestamp.replace('Z', '+00:00'))
+                    now_dt = datetime.utcnow()
+                    hours_elapsed = (now_dt - prev_dt).total_seconds() / 3600.0
+                    
+                    if hours_elapsed > 0.01:  # At least ~36 seconds elapsed
+                        pin_drift_points_per_hour = round(pin_change_points / hours_elapsed, 2)
+            except Exception as e:
+                log.debug(f"Failed to compute pin drift: {e}")
+        
+        now_utc = datetime.utcnow().isoformat()
+        
         snapshot = HistoricalGammaSnapshot(
             symbol=symbol,
             date=today.strftime("%Y-%m-%d"),
@@ -530,8 +571,19 @@ def build_today_snapshot(
             pin_strike=pin_strike,
             contracts_count=len(all_contracts),
             gamma_rows=gamma_rows[:15],
-            total_gex_abs=agg_result.total_gex_abs,
-            total_gex_net=agg_result.total_gex_net,
+            # Corrected GEX fields
+            call_gex_total=agg_result.call_gex_total,
+            put_gex_total=agg_result.put_gex_total,
+            gross_gex=agg_result.gross_gex,
+            net_gex=agg_result.net_gex,
+            # Legacy fields
+            total_gex_abs=agg_result.gross_gex,
+            total_gex_net=agg_result.net_gex,
+            # Pin drift fields
+            pin_drift_points_per_hour=pin_drift_points_per_hour,
+            pin_change_points=pin_change_points,
+            prev_pin_strike=prev_pin_strike,
+            prev_snapshot_timestamp=prev_snapshot_timestamp,
             assumptions={
                 "oi_source": "Live snapshot from Polygon list_snapshot_options_chain",
                 "dealer_positioning": "Dealer net sign unknown, tracking magnitude only",
@@ -540,7 +592,7 @@ def build_today_snapshot(
                 "not_for_trading": "Model validation only, not a tradable signal"
             },
             historical=True,
-            generated_at_utc=datetime.utcnow().isoformat(),
+            generated_at_utc=now_utc,
             skew_metrics=skew_metrics,
             gamma_by_distance=gamma_by_distance,
             vol_regime=vol_regime,
@@ -551,7 +603,7 @@ def build_today_snapshot(
             dispersion_ratio=dispersion_ratio
         )
         
-        log.info(f"Today's snapshot built: pin={pin_strike}, contracts={len(all_contracts)}, total_gex_abs={agg_result.total_gex_abs:.2f}, confidence={confidence}")
+        log.info(f"Today's snapshot built: pin={pin_strike}, gross_gex={agg_result.gross_gex:.2f}B, net_gex={agg_result.net_gex:.2f}B, drift={pin_drift_points_per_hour} pts/hr")
         
         return snapshot
         
@@ -666,6 +718,88 @@ def load_historical_snapshot(symbol: str, target_date: date) -> Optional[Histori
         
     except Exception as e:
         log.error(f"Failed to load historical snapshot: {e}")
+        return None
+
+
+def load_last_snapshot_for_day(symbol: str, target_date: date) -> Optional[HistoricalGammaSnapshot]:
+    """
+    Load the most recent snapshot for a given day (for pin drift calculation).
+    
+    This function looks for intraday snapshots stored with timestamps.
+    Falls back to the daily snapshot if no intraday snapshots exist.
+    
+    Args:
+        symbol: Index symbol
+        target_date: The date to search
+    
+    Returns:
+        HistoricalGammaSnapshot or None
+    """
+    try:
+        from pathlib import Path
+        import glob
+        
+        snapshot_dir = Path(HISTORICAL_SNAPSHOT_DIR) / symbol
+        
+        if not snapshot_dir.exists():
+            return None
+        
+        date_str = target_date.strftime('%Y-%m-%d')
+        
+        # Look for intraday snapshots (pattern: YYYY-MM-DD_HHMMSS.json)
+        intraday_pattern = str(snapshot_dir / f"{date_str}_*.json")
+        intraday_files = sorted(glob.glob(intraday_pattern), reverse=True)
+        
+        if intraday_files:
+            # Return the most recent intraday snapshot
+            with open(intraday_files[0], 'r') as f:
+                data = json.load(f)
+            return HistoricalGammaSnapshot(**data)
+        
+        # Fall back to daily snapshot
+        return load_historical_snapshot(symbol, target_date)
+        
+    except Exception as e:
+        log.debug(f"Failed to load last snapshot for {symbol} on {target_date}: {e}")
+        return None
+
+
+def save_intraday_snapshot(snapshot: HistoricalGammaSnapshot) -> Optional[str]:
+    """
+    Save an intraday snapshot with timestamp in filename.
+    
+    Filename format: YYYY-MM-DD_HHMMSS.json
+    
+    Args:
+        snapshot: The snapshot to save
+    
+    Returns:
+        Path to saved file or None
+    """
+    try:
+        from pathlib import Path
+        
+        snapshot_dir = Path(HISTORICAL_SNAPSHOT_DIR) / snapshot.symbol
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Parse timestamp from generated_at_utc
+        try:
+            dt = datetime.fromisoformat(snapshot.generated_at_utc.replace('Z', '+00:00'))
+            time_suffix = dt.strftime('%H%M%S')
+        except:
+            time_suffix = datetime.utcnow().strftime('%H%M%S')
+        
+        filename = f"{snapshot.date}_{time_suffix}.json"
+        filepath = snapshot_dir / filename
+        
+        with open(filepath, 'w') as f:
+            f.write(snapshot.to_json())
+        
+        log.info(f"Intraday snapshot saved: {filepath}")
+        return str(filepath)
+        
+    except Exception as e:
+        log.error(f"Failed to save intraday snapshot: {e}")
         return None
 
 
