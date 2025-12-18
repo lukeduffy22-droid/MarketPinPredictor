@@ -1,0 +1,136 @@
+{
+  "snapshot_version": "1.0",
+  "generated_at_utc": "",
+  "symbol": "NDX",
+  "timestamp_utc": "2025-12-18T15:10:09.633197-05:00",
+  "spot_last": 25018.98994178145,
+  "spot_timestamp": "2025-12-18T15:10:09.633197-05:00",
+  "spot_source": "polygon_rest",
+  "chain_symbol_used": "NDX",
+  "underlying_reported": null,
+  "expirations_min_days": 0,
+  "expirations_max_days": 0,
+  "contracts_count": 500,
+  "expiration_scope": "0DTE",
+  "top_strikes_by_abs_gex": [
+    {
+      "strike": 25000.0,
+      "expiration_days": 0,
+      "net_gex": 46.09436719498848,
+      "abs_gex": 46.09436719498848
+    },
+    {
+      "strike": 25020.0,
+      "expiration_days": 0,
+      "net_gex": 26.4079601368204,
+      "abs_gex": 26.4079601368204
+    },
+    {
+      "strike": 25010.0,
+      "expiration_days": 0,
+      "net_gex": 11.574108156809682,
+      "abs_gex": 11.574108156809682
+    },
+    {
+      "strike": 25030.0,
+      "expiration_days": 0,
+      "net_gex": 6.85685240863161,
+      "abs_gex": 6.85685240863161
+    },
+    {
+      "strike": 25040.0,
+      "expiration_days": 0,
+      "net_gex": 6.170818915282815,
+      "abs_gex": 6.170818915282815
+    },
+    {
+      "strike": 25050.0,
+      "expiration_days": 0,
+      "net_gex": 0.6569195089781938,
+      "abs_gex": 0.6569195089781938
+    },
+    {
+      "strike": 24990.0,
+      "expiration_days": 0,
+      "net_gex": 0.1426395559333675,
+      "abs_gex": 0.1426395559333675
+    },
+    {
+      "strike": 24980.0,
+      "expiration_days": 0,
+      "net_gex": 0.01188440517413822,
+      "abs_gex": 0.01188440517413822
+    },
+    {
+      "strike": 25060.0,
+      "expiration_days": 0,
+      "net_gex": 0.008626718987441275,
+      "abs_gex": 0.008626718987441275
+    },
+    {
+      "strike": 25070.0,
+      "expiration_days": 0,
+      "net_gex": 0.0002918269937518019,
+      "abs_gex": 0.0002918269937518019
+    },
+    {
+      "strike": 24970.0,
+      "expiration_days": 0,
+      "net_gex": 0.00016159011089864137,
+      "abs_gex": 0.00016159011089864137
+    },
+    {
+      "strike": 24960.0,
+      "expiration_days": 0,
+      "net_gex": 2.5992975150877003e-05,
+      "abs_gex": 2.5992975150877003e-05
+    },
+    {
+      "strike": 25080.0,
+      "expiration_days": 0,
+      "net_gex": 9.804291106558082e-06,
+      "abs_gex": 9.804291106558082e-06
+    },
+    {
+      "strike": 24950.0,
+      "expiration_days": 0,
+      "net_gex": 8.233385993499618e-09,
+      "abs_gex": 8.233385993499618e-09
+    },
+    {
+      "strike": 25090.0,
+      "expiration_days": 0,
+      "net_gex": 1.1023563752736545e-09,
+      "abs_gex": 1.1023563752736545e-09
+    }
+  ],
+  "primary_gamma_pin_strike": 25000.0,
+  "primary_gamma_pin_abs_gex": 46.09436719498848,
+  "zero_gamma_level": 25020.0,
+  "zero_gamma_method": "cumulative",
+  "call_gex_total": 0.0,
+  "put_gex_total": 0.0,
+  "gross_gex": 0.0,
+  "net_gex": 0.0,
+  "gross_gex_definition": "sum(call_gex) + sum(put_gex)",
+  "net_gex_definition": "sum(call_gex) - sum(put_gex)",
+  "total_gex_abs": 97.9246662253279,
+  "total_gex_net": 97.9246662253279,
+  "total_gex_abs_definition": "sum(call_gex) + sum(put_gex) [CORRECTED]",
+  "total_gex_net_definition": "sum(call_gex) - sum(put_gex) [CORRECTED]",
+  "pin_drift_points_per_hour": null,
+  "pin_change_points": null,
+  "prev_pin_strike": null,
+  "prev_snapshot_timestamp": null,
+  "validation_is_valid": true,
+  "validation_failure_reasons": [],
+  "gamma_excluded_from_model": false,
+  "skew_metrics": null,
+  "gamma_by_distance": null,
+  "vol_regime": null,
+  "vol_regime_iv": null,
+  "truncation": null,
+  "confidence": null,
+  "confidence_factors": null,
+  "dispersion_ratio": null
+}

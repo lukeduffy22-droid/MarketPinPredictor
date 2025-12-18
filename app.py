@@ -1004,35 +1004,31 @@ with st.sidebar:
                     
                     with metric_col2:
                         # Use gross_gex if available, fall back to total_gex_abs for backward compatibility
+                        # Values are already in billions - no scaling needed
                         gross_gex = getattr(snapshot, 'gross_gex', None) or snapshot.total_gex_abs
-                        gross_gex_display = gross_gex / 1e9 if gross_gex > 1e6 else gross_gex
-                        unit = "B" if gross_gex > 1e6 else ""
-                        st.metric("Gross GEX", f"${gross_gex_display:.2f}{unit}", help="sum(call_gex) + sum(put_gex)")
+                        st.metric("Gross GEX", f"${gross_gex:.2f}B", help="sum(call_gex) + sum(put_gex)")
                     
                     with metric_col3:
                         # Use net_gex if available, fall back to total_gex_net for backward compatibility
+                        # Values are already in billions - no scaling needed
                         net_gex = getattr(snapshot, 'net_gex', None)
                         if net_gex is None:
                             net_gex = snapshot.total_gex_net
-                        net_gex_display = net_gex / 1e9 if abs(net_gex) > 1e6 else net_gex
-                        unit = "B" if abs(net_gex) > 1e6 else ""
                         sign = "+" if net_gex > 0 else ""
-                        st.metric("Net GEX", f"{sign}${net_gex_display:.2f}{unit}", help="sum(call_gex) - sum(put_gex)")
+                        st.metric("Net GEX", f"{sign}${net_gex:.2f}B", help="sum(call_gex) - sum(put_gex)")
                     
                     # Row 2: Call GEX, Put GEX, Zero Gamma
                     gex_col1, gex_col2, gex_col3 = st.columns(3)
                     with gex_col1:
+                        # Values are already in billions - no scaling needed
                         call_gex = getattr(snapshot, 'call_gex_total', 0)
                         if call_gex > 0:
-                            call_gex_display = call_gex / 1e9 if call_gex > 1e6 else call_gex
-                            unit = "B" if call_gex > 1e6 else ""
-                            st.metric("Call GEX", f"${call_gex_display:.2f}{unit}")
+                            st.metric("Call GEX", f"${call_gex:.2f}B")
                     with gex_col2:
+                        # Values are already in billions - no scaling needed
                         put_gex = getattr(snapshot, 'put_gex_total', 0)
                         if put_gex > 0:
-                            put_gex_display = put_gex / 1e9 if put_gex > 1e6 else put_gex
-                            unit = "B" if put_gex > 1e6 else ""
-                            st.metric("Put GEX", f"${put_gex_display:.2f}{unit}")
+                            st.metric("Put GEX", f"${put_gex:.2f}B")
                     with gex_col3:
                         if snapshot.zero_gamma_level:
                             st.metric("Zero Gamma", f"${snapshot.zero_gamma_level:,.0f}")
@@ -1064,8 +1060,9 @@ with st.sidebar:
                             for strike_data in snapshot.top_strikes_by_abs_gex[:5]:
                                 if isinstance(strike_data, dict):
                                     strike = strike_data.get('strike', 0)
+                                    # Values are already in billions - no scaling needed
                                     gex = strike_data.get('abs_gex', 0)
-                                    st.caption(f"${strike:,.0f}: ${gex/1e9:.3f}B")
+                                    st.caption(f"${strike:,.0f}: ${gex:.3f}B")
                                 else:
                                     st.caption(str(strike_data))
                     
