@@ -22,6 +22,8 @@ from ai_analysis import (
     get_risk_assessment, explain_gamma_exposure
 )
 from gamma_viz import show_gamma_evolution_section
+from app.core.audit_persistence import load_last_valid_snapshot
+from app.utils.market_time import market_is_closed, get_freeze_status
 
 # Initialize database
 init_db()
@@ -943,8 +945,8 @@ with st.sidebar:
     
     st.divider()
     
-    # WebSocket streaming control
-    st.header("🔌 Real-time Streaming")
+    # Streaming & Frozen Gamma Tabs
+    st.header("🔌 Market Data")
     
     # Check market status (informational only)
     market_is_open = is_market_open()
@@ -952,10 +954,99 @@ with st.sidebar:
     market_status_text = "OPEN" if market_is_open else "CLOSED"
     st.info(f"Market Status: {market_status_color} {market_status_text}")
     
-    if not market_is_open:
-        st.info("ℹ️ Market closed - streaming available 24/7 for after-hours data")
+    # Create tabs for Live Streaming and Frozen Gamma
+    streaming_tab, frozen_gamma_tab = st.tabs(["📡 Live Streaming", "🧊 Frozen Gamma (Audit)"])
     
-    enable_streaming = st.checkbox(
+    # === FROZEN GAMMA TAB ===
+    with frozen_gamma_tab:
+        st.markdown("**Read-only audit snapshot view** — Shows last valid gamma state from persisted snapshots.")
+        
+        # Check freeze status
+        is_frozen, freeze_reason = get_freeze_status()
+        if is_frozen:
+            st.info(f"🔒 Market Freeze Active: {freeze_reason}")
+        
+        if selected_indexes:
+            for index_name in selected_indexes:
+                symbol = INDEXES[index_name]
+                
+                st.subheader(f"{symbol}")
+                
+                # Load last valid audit snapshot
+                snapshot = load_last_valid_snapshot(symbol)
+                
+                if snapshot is None:
+                    st.warning("⚠️ No frozen gamma snapshot available")
+                    st.caption("Build snapshots during market hours using the historical API endpoints.")
+                else:
+                    # Display frozen status with timestamp
+                    snapshot_time = snapshot.generated_at_utc
+                    if snapshot_time:
+                        try:
+                            # Parse and format timestamp
+                            if isinstance(snapshot_time, str):
+                                dt = datetime.fromisoformat(snapshot_time.replace('Z', '+00:00'))
+                                time_str = dt.strftime('%I:%M:%S %p ET')
+                            else:
+                                time_str = str(snapshot_time)
+                            st.success(f"🧊 Frozen at {time_str}")
+                        except:
+                            st.success(f"🧊 Frozen: {snapshot_time}")
+                    else:
+                        st.success("🧊 Frozen Snapshot")
+                    
+                    # Display gamma metrics from snapshot
+                    metric_col1, metric_col2, metric_col3 = st.columns(3)
+                    
+                    with metric_col1:
+                        st.metric("📍 Primary Gamma Pin", f"${snapshot.primary_gamma_pin_strike:,.0f}")
+                    
+                    with metric_col2:
+                        total_gex_display = snapshot.total_gex_abs / 1e9 if snapshot.total_gex_abs > 1e6 else snapshot.total_gex_abs
+                        unit = "B" if snapshot.total_gex_abs > 1e6 else ""
+                        st.metric("Total GEX", f"${total_gex_display:.2f}{unit}")
+                    
+                    with metric_col3:
+                        net_gex_display = snapshot.total_gex_net / 1e9 if abs(snapshot.total_gex_net) > 1e6 else snapshot.total_gex_net
+                        unit = "B" if abs(snapshot.total_gex_net) > 1e6 else ""
+                        sign = "+" if snapshot.total_gex_net > 0 else ""
+                        st.metric("Net GEX", f"{sign}${net_gex_display:.2f}{unit}")
+                    
+                    # Additional metrics row
+                    add_col1, add_col2 = st.columns(2)
+                    with add_col1:
+                        if snapshot.zero_gamma_level:
+                            st.metric("Zero Gamma", f"${snapshot.zero_gamma_level:,.0f}")
+                    with add_col2:
+                        st.metric("Spot (at freeze)", f"${snapshot.spot_last:,.2f}")
+                    
+                    # Validation status
+                    if snapshot.validation_is_valid:
+                        st.caption("✅ Snapshot validated")
+                    else:
+                        st.caption(f"⚠️ Validation issues: {', '.join(snapshot.validation_failure_reasons or [])}")
+                    
+                    # Top gamma walls (if available)
+                    if snapshot.top_strikes_by_abs_gex:
+                        with st.expander("🧱 Top Gamma Walls", expanded=False):
+                            for strike_data in snapshot.top_strikes_by_abs_gex[:5]:
+                                if isinstance(strike_data, dict):
+                                    strike = strike_data.get('strike', 0)
+                                    gex = strike_data.get('abs_gex', 0)
+                                    st.caption(f"${strike:,.0f}: ${gex/1e9:.3f}B")
+                                else:
+                                    st.caption(str(strike_data))
+                    
+                    st.divider()
+        else:
+            st.info("Select indexes in the sidebar to view frozen gamma snapshots.")
+    
+    # === LIVE STREAMING TAB ===
+    with streaming_tab:
+        if not market_is_open:
+            st.info("ℹ️ Market closed - streaming available 24/7 for after-hours data")
+        
+        enable_streaming = st.checkbox(
         "Enable WebSocket Streaming", 
         value=st.session_state.streaming_active,
         help="Connect to real-time data feed from Massive.com - works 24/7, including after hours",
@@ -1030,37 +1121,37 @@ with st.sidebar:
                     else:
                         st.caption("No messages yet...")
     
-    # Show recommendations
-    with st.expander("💡 Streaming Tips", expanded=False):
-        st.markdown(get_streaming_recommendations())
-    
-    # Snapshot data fallback
-    if not st.session_state.streaming_active:
-        st.caption("**Snapshot Data (Backup Method)**")
-        if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via REST API"):
-            if selected_indexes and st.session_state.api_key:
-                tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
-                with st.spinner("Fetching snapshot data..."):
-                    snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
-                    if snapshot_data:
-                        st.success(f"✅ Fetched prices for {len(snapshot_data)} tickers")
-                        # Display snapshot data
-                        cols = st.columns(len(snapshot_data))
-                        for i, (ticker, data) in enumerate(snapshot_data.items()):
-                            with cols[i]:
-                                if data['price']:
-                                    change = ((data['price'] - data['prev_close']) / data['prev_close'] * 100) if data['prev_close'] else 0
-                                    st.metric(
-                                        ticker, 
-                                        f"${data['price']:.2f}",
-                                        f"{change:+.2f}%"
-                                    )
-                                else:
-                                    st.metric(ticker, "N/A")
-                    else:
-                        st.error("Failed to fetch snapshot data. Check your API key.")
-            else:
-                st.warning("Please enter API key and select indexes first!")
+        # Show recommendations
+        with st.expander("💡 Streaming Tips", expanded=False):
+            st.markdown(get_streaming_recommendations())
+        
+        # Snapshot data fallback
+        if not st.session_state.streaming_active:
+            st.caption("**Snapshot Data (Backup Method)**")
+            if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via REST API"):
+                if selected_indexes and st.session_state.api_key:
+                    tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                    with st.spinner("Fetching snapshot data..."):
+                        snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
+                        if snapshot_data:
+                            st.success(f"✅ Fetched prices for {len(snapshot_data)} tickers")
+                            # Display snapshot data
+                            cols = st.columns(len(snapshot_data))
+                            for i, (ticker, data) in enumerate(snapshot_data.items()):
+                                with cols[i]:
+                                    if data['price']:
+                                        change = ((data['price'] - data['prev_close']) / data['prev_close'] * 100) if data['prev_close'] else 0
+                                        st.metric(
+                                            ticker, 
+                                            f"${data['price']:.2f}",
+                                            f"{change:+.2f}%"
+                                        )
+                                    else:
+                                        st.metric(ticker, "N/A")
+                        else:
+                            st.error("Failed to fetch snapshot data. Check your API key.")
+                else:
+                    st.warning("Please enter API key and select indexes first!")
     
     st.divider()
     
