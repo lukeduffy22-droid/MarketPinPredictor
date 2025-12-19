@@ -1135,7 +1135,7 @@ with st.sidebar:
         st.caption("**Snapshot Data (REST API Fallback)**")
         if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via Polygon REST API"):
             if selected_indexes and st.session_state.api_key:
-                tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                tickers_to_fetch = [INDEX_POLYGON_TICKERS[INDEXES[idx]] for idx in selected_indexes]
                 with st.spinner("Fetching snapshot data..."):
                     snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
                     if snapshot_data:
