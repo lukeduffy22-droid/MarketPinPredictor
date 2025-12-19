@@ -342,6 +342,8 @@ def calculate_gamma_exposure(options_df, spot_price):
         total_gex = abs(call_sum) + abs(put_sum)
         
         return pd.Series({
+            'call_gex': call_sum,
+            'put_gex': put_sum,
             'net_gex': net_gex,
             'total_gex': total_gex,
             'expiry': group['expiry'].iloc[0],
@@ -471,13 +473,23 @@ def calculate_gamma_exposure(options_df, spot_price):
         max_dte = gex_by_strike['days_to_expiry'].max() if not gex_by_strike.empty else 90
         expiration_scope = f'ALL<={max_dte}D'
     
+    # Calculate aggregate call/put GEX totals from per-strike data
+    call_gex_total = gex_by_strike['call_gex'].sum() if 'call_gex' in gex_by_strike.columns else 0.0
+    put_gex_total = gex_by_strike['put_gex'].sum() if 'put_gex' in gex_by_strike.columns else 0.0
+    gross_gex = call_gex_total + put_gex_total
+    net_gex_aggregate = call_gex_total - put_gex_total
+    
     return {
         'pin_strike': pin_strike,
         'pin_expiry': pin_expiry,
         'total_gex': total_gex,  # GEX at pin strike (original semantics)
         'net_gex': net_gex,      # Net GEX at pin strike (original semantics)
-        'aggregate_total_gex': aggregate_total_gex,  # NEW: Sum of absolute GEX across ALL strikes
-        'aggregate_net_gex': aggregate_net_gex,      # NEW: Sum of signed GEX across ALL strikes
+        'aggregate_total_gex': aggregate_total_gex,  # Legacy: Sum of absolute GEX across ALL strikes
+        'aggregate_net_gex': aggregate_net_gex,      # Legacy: Sum of signed GEX across ALL strikes
+        'call_gex_total': call_gex_total,    # NEW: Aggregate call gamma exposure
+        'put_gex_total': put_gex_total,      # NEW: Aggregate put gamma exposure
+        'gross_gex': gross_gex,              # NEW: call_gex_total + put_gex_total
+        'net_gex_total': net_gex_aggregate,  # NEW: call_gex_total - put_gex_total
         'direction': direction,
         'pull_strength': abs(pin_strike - spot_price) / spot_price * 100,  # % distance
         'gex_by_strike': gex_by_strike,

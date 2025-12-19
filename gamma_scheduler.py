@@ -234,9 +234,17 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
                 strikes_data.append({
                     'strike': float(row.get('strike', 0)),
                     'expiration_days': int(row.get('days_to_expiry', 0)),
+                    'call_gex': float(row.get('call_gex', 0)),
+                    'put_gex': float(row.get('put_gex', 0)),
                     'net_gex': float(row.get('net_gex', 0)),
                     'total_gex': float(row.get('total_gex', 0)),
                 })
+        
+        # Extract NEW call/put aggregate GEX from gex_analysis
+        call_gex_total = gex_analysis.get('call_gex_total', 0.0)
+        put_gex_total = gex_analysis.get('put_gex_total', 0.0)
+        gross_gex = gex_analysis.get('gross_gex', call_gex_total + put_gex_total)
+        net_gex_total = gex_analysis.get('net_gex_total', call_gex_total - put_gex_total)
         
         # Build audit snapshot using CANONICAL values (no recomputation)
         from app.core.audit_snapshot import AuditSnapshot
@@ -262,6 +270,8 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
                 {
                     'strike': s['strike'],
                     'expiration_days': s.get('expiration_days', 0),
+                    'call_gex': s.get('call_gex', 0),
+                    'put_gex': s.get('put_gex', 0),
                     'net_gex': s['net_gex'],
                     'abs_gex': abs(s['net_gex']),
                 }
@@ -271,8 +281,14 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             primary_gamma_pin_abs_gex=abs(gex_analysis.get('net_gex', 0)),
             zero_gamma_level=gex_analysis.get('zero_gamma'),
             zero_gamma_method='cumulative',
-            total_gex_abs=aggregate_total_gex,  # CANONICAL value from gex_analysis
-            total_gex_net=aggregate_net_gex,    # CANONICAL value from gex_analysis
+            # NEW: Corrected GEX fields with call/put separation
+            call_gex_total=call_gex_total,
+            put_gex_total=put_gex_total,
+            gross_gex=gross_gex,
+            net_gex=net_gex_total,
+            # Legacy fields for backward compatibility
+            total_gex_abs=aggregate_total_gex,
+            total_gex_net=aggregate_net_gex,
         )
         
         # Step 1: Apply sanity validation BEFORE any persistence

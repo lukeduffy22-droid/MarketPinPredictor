@@ -226,6 +226,12 @@ def dict_to_audit_snapshot(data: dict) -> AuditSnapshot:
         primary_gamma_pin_abs_gex=float(data.get('primary_gamma_pin_abs_gex', 0)),
         zero_gamma_level=data.get('zero_gamma_level'),
         zero_gamma_method=data.get('zero_gamma_method'),
+        # NEW: Corrected GEX fields with call/put separation
+        call_gex_total=float(data.get('call_gex_total', 0)),
+        put_gex_total=float(data.get('put_gex_total', 0)),
+        gross_gex=float(data.get('gross_gex', 0)),
+        net_gex=float(data.get('net_gex', 0)),
+        # Legacy fields for backward compatibility
         total_gex_abs=float(data.get('total_gex_abs', 0)),
         total_gex_net=float(data.get('total_gex_net', 0)),
         total_gex_abs_definition=data.get('total_gex_abs_definition', 'sum(abs(net_gex_per_strike))'),
@@ -233,6 +239,20 @@ def dict_to_audit_snapshot(data: dict) -> AuditSnapshot:
         validation_is_valid=data.get('validation_is_valid', True),
         validation_failure_reasons=data.get('validation_failure_reasons', []),
         gamma_excluded_from_model=data.get('gamma_excluded_from_model', False),
+        # Pin drift fields
+        pin_drift_points_per_hour=data.get('pin_drift_points_per_hour'),
+        pin_change_points=data.get('pin_change_points'),
+        prev_pin_strike=data.get('prev_pin_strike'),
+        prev_snapshot_timestamp=data.get('prev_snapshot_timestamp'),
+        # Diagnostic fields
+        truncation=data.get('truncation'),
+        gamma_by_distance=data.get('gamma_by_distance'),
+        confidence=data.get('confidence'),
+        confidence_factors=data.get('confidence_factors'),
+        dispersion_ratio=data.get('dispersion_ratio'),
+        skew_metrics=data.get('skew_metrics'),
+        vol_regime=data.get('vol_regime'),
+        vol_regime_iv=data.get('vol_regime_iv'),
     )
 
 
