@@ -1158,6 +1158,108 @@ with st.sidebar:
             else:
                 st.warning("Please enter API key and select indexes first!")
         
+        # Live Gamma Monitor
+        st.divider()
+        st.subheader("🧲 Live Gamma Pull Monitor")
+        if st.button("📊 Analyze Gamma Pull", type="primary", help="Calculate real-time gamma pin and dealer hedging direction"):
+            if st.session_state.api_key and selected_indexes:
+                with st.spinner("Calculating gamma structure..."):
+                    from polygon import RESTClient
+                    import numpy as np
+                    from scipy.stats import norm
+                    
+                    def bs_gamma(S, K, T, sigma=0.25):
+                        if T <= 0 or S <= 0: return 0
+                        d1 = (np.log(S/K) + (0.05 + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+                        return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+                    
+                    client = RESTClient(st.session_state.api_key)
+                    today = datetime.now().strftime('%Y-%m-%d')
+                    
+                    # Get prices
+                    tickers = [f"I:{INDEXES[idx]}" for idx in selected_indexes]
+                    try:
+                        results = list(client.get_snapshot_indices(ticker_any_of=tickers))
+                        prices = {r.ticker.replace('I:', ''): r.value for r in results}
+                    except:
+                        prices = {}
+                    
+                    gamma_cols = st.columns(len(selected_indexes))
+                    
+                    for i, idx_name in enumerate(selected_indexes):
+                        symbol = INDEXES[idx_name]
+                        spot = prices.get(symbol)
+                        
+                        with gamma_cols[i]:
+                            if not spot:
+                                st.warning(f"{symbol}: No price")
+                                continue
+                            
+                            st.markdown(f"**{symbol}** ${spot:,.2f}")
+                            
+                            # Fetch options
+                            low, high = spot * 0.95, spot * 1.05
+                            contracts = []
+                            count = 0
+                            try:
+                                for c in client.list_snapshot_options_chain(symbol):
+                                    count += 1
+                                    if count > 1500: break
+                                    if hasattr(c, 'details') and c.details:
+                                        if c.details.expiration_date == today:
+                                            s = c.details.strike_price
+                                            if low <= s <= high:
+                                                oi = getattr(c, 'open_interest', 0) or 0
+                                                iv = c.implied_volatility if hasattr(c, 'implied_volatility') and c.implied_volatility else 0.25
+                                                gamma = bs_gamma(spot, s, 0.003, iv if iv > 0 else 0.25)
+                                                gex = gamma * oi * 100 * (spot**2) / 1e9
+                                                contracts.append({'strike': s, 'type': c.details.contract_type, 'gex': gex})
+                            except Exception as e:
+                                st.error(f"Error: {str(e)[:30]}")
+                                continue
+                            
+                            if not contracts:
+                                st.info("No 0DTE contracts")
+                                continue
+                            
+                            # Aggregate
+                            gex_by_strike = {}
+                            call_gex = {}
+                            put_gex = {}
+                            for c in contracts:
+                                s = c['strike']
+                                gex_by_strike[s] = gex_by_strike.get(s, 0) + c['gex']
+                                if c['type'] == 'call':
+                                    call_gex[s] = call_gex.get(s, 0) + c['gex']
+                                else:
+                                    put_gex[s] = put_gex.get(s, 0) + c['gex']
+                            
+                            pin = max(gex_by_strike.keys(), key=lambda s: abs(gex_by_strike[s]))
+                            above = sum(g for s, g in gex_by_strike.items() if s > spot)
+                            below = sum(g for s, g in gex_by_strike.items() if s < spot)
+                            
+                            pin_dist = (pin - spot) / spot * 100
+                            st.metric("Gamma Pin", f"${pin:,.0f}", f"{pin_dist:+.2f}%")
+                            
+                            if above > below:
+                                pull_pct = above / (above + below) * 100
+                                st.success(f"⬆️ PULL UP ({pull_pct:.0f}%)")
+                            else:
+                                pull_pct = below / (above + below) * 100
+                                st.error(f"⬇️ PULL DOWN ({pull_pct:.0f}%)")
+                            
+                            # Dealer hedge
+                            pin_call = call_gex.get(pin, 0)
+                            pin_put = put_gex.get(pin, 0)
+                            if pin_call > pin_put:
+                                st.caption("🏦 Call-heavy → Resistance")
+                            else:
+                                st.caption("🏦 Put-heavy → Support")
+                    
+                    st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S ET')}")
+            else:
+                st.warning("Enter API key and select indexes first")
+        
         # Show tips
         with st.expander("💡 Streaming Architecture", expanded=False):
             st.markdown("""
