@@ -345,9 +345,9 @@ def gamma_sampling_loop():
     """
     global _scheduler_running
     
-    api_key = os.getenv('POLYGON_API_KEY')
+    api_key = os.getenv('Massive_API') or os.getenv('POLYGON_API_KEY')
     if not api_key:
-        print("ERROR: POLYGON_API_KEY not found in environment, gamma sampling disabled")
+        print("ERROR: Massive_API not found in environment, gamma sampling disabled")
         return
     
     print("🚀 Gamma sampling scheduler started (adaptive intervals)")

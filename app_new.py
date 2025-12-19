@@ -77,11 +77,11 @@ def get_metrics():
 st.title("📈 0-Day Index Price Predictor")
 st.markdown("*Institutional-grade predictions with time-adaptive accuracy*")
 
-# Check API key
+# Check API key (Polygon rebranded to Massive Oct 2025)
 import os
-polygon_key = os.getenv("POLYGON_API_KEY", "")
+polygon_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY", "")
 if not polygon_key:
-    st.error("⚠️ POLYGON_API_KEY not found in environment variables. Please add it to Replit Secrets.")
+    st.error("⚠️ Massive_API not found in environment variables. Please add it to Replit Secrets.")
     st.stop()
 
 # Sidebar

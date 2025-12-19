@@ -120,7 +120,7 @@ class PolygonWebSocketStream:
         api_key = settings.polygon_api_key
         
         if not api_key:
-            log.error("POLYGON_API_KEY not set, cannot start WebSocket")
+            log.error("Massive_API not set, cannot start WebSocket")
             return
         
         try:

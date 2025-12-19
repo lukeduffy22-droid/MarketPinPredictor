@@ -131,9 +131,9 @@ def get_actual_close(symbol: str, target_date: date) -> Optional[float]:
     """
     try:
         from polygon import RESTClient
-        api_key = os.getenv("POLYGON_API_KEY")
+        api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")
         if not api_key:
-            raise ValueError("POLYGON_API_KEY not set")
+            raise ValueError("Massive_API not set")
         
         client = RESTClient(api_key)
         ticker = f"I:{symbol}"

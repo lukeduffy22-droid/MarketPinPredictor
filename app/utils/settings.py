@@ -3,14 +3,15 @@ Application settings using pydantic-settings for type-safe configuration.
 Loads from environment variables with fail-fast validation.
 """
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import Optional
 import os
 
 class Settings(BaseSettings):
     """Application configuration"""
     
-    # API Keys
-    polygon_api_key: str
+    # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
+    polygon_api_key: str = Field(validation_alias="Massive_API")
     database_url: Optional[str] = None
     
     # Environment
@@ -48,7 +49,7 @@ class Settings(BaseSettings):
         
         # Use Replit secrets if available
         if not self.polygon_api_key:
-            self.polygon_api_key = os.getenv("POLYGON_API_KEY", "")
+            self.polygon_api_key = os.getenv("Massive_API", "")
         
         if not self.database_url:
             self.database_url = os.getenv("DATABASE_URL")
@@ -58,4 +59,4 @@ settings = Settings()
 
 # Validate critical settings on import
 if not settings.polygon_api_key:
-    raise ValueError("POLYGON_API_KEY environment variable is required")
+    raise ValueError("Massive_API environment variable is required")

@@ -59,9 +59,9 @@ async def poll_polygon_rest():
     
     from polygon import RESTClient
     
-    api_key = os.getenv("POLYGON_API_KEY")
+    api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")
     if not api_key:
-        log.error("POLYGON_API_KEY not set, cannot poll REST API")
+        log.error("Massive_API not set, cannot poll REST API")
         return
     
     client = RESTClient(api_key)

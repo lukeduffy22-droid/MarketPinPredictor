@@ -7,10 +7,10 @@ import sys
 from datetime import datetime, timedelta
 import pytz
 
-# Get API key from environment
-api_key = os.getenv('POLYGON_API_KEY')
+# Get API key from environment (Polygon rebranded to Massive Oct 2025)
+api_key = os.getenv('Massive_API') or os.getenv('POLYGON_API_KEY')
 if not api_key:
-    print("❌ ERROR: POLYGON_API_KEY not set")
+    print("❌ ERROR: Massive_API not set")
     sys.exit(1)
 
 try:
