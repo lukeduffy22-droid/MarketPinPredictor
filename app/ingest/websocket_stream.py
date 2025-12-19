@@ -1,11 +1,15 @@
 """
 WebSocket streaming with intelligent feed switching and reconnection logic.
 Uses raw websockets library for maximum compatibility with Replit environment.
+
+SINGLETON PATTERN: Only one WebSocket connection per API key.
+SUBSCRIPTION CACHE: Channels are only subscribed once per connection.
 """
 import asyncio
 import json
 import logging
 import random
+import threading
 from datetime import datetime
 import os
 
@@ -18,10 +22,16 @@ from app.ingest.rest_fallback import set_websocket_connected
 
 log = logging.getLogger("ws_stream")
 
+# Singleton lock to prevent race conditions
+_singleton_lock = threading.Lock()
+
 class PolygonWebSocketStream:
     """
     Manages WebSocket connection with smart feed switching and reconnection.
     Uses raw websockets library for Replit compatibility.
+    
+    SINGLETON: Only one instance should exist per API key.
+    SUBSCRIPTION CACHE: Prevents duplicate subscribe messages.
     """
     
     def __init__(self):
@@ -30,6 +40,9 @@ class PolygonWebSocketStream:
         self.max_reconnects = settings.ws_max_reconnects
         self.running = False
         self.connected = False
+        self.authenticated = False  # Track auth state
+        # Subscription cache - prevents duplicate subscriptions (Polygon 1008 error)
+        self._subscribed_channels: set = set()
         # Use Value updates (V.) instead of Aggregates (A.) - more widely available
         # V.I:XXX = real-time index value updates
         # A.I:XXX = aggregate bars - requires higher tier plan
@@ -39,6 +52,15 @@ class PolygonWebSocketStream:
             "V.I:DJI",    # Dow Jones value updates
             "V.I:RUT",    # Russell 2000 value updates
         ]
+    
+    def is_active(self) -> bool:
+        """Check if WebSocket is already active (connected + authenticated + subscribed)"""
+        return (
+            self.ws is not None and 
+            self.connected and 
+            self.authenticated and 
+            len(self._subscribed_channels) > 0
+        )
     
     async def _send(self, action: str, params: str = None):
         """Send a message to WebSocket"""
@@ -75,15 +97,26 @@ class PolygonWebSocketStream:
             if status == "connected":
                 log.info(f"WebSocket connected: {message}")
             elif status == "auth_success":
-                log.info("WebSocket authentication successful - subscribing to channels")
                 self.connected = True
+                self.authenticated = True
                 set_websocket_connected(True)  # Mark WebSocket as active
-                # Subscribe to index aggregates
-                await self._send("subscribe", ",".join(self.subscriptions))
+                
+                # Subscribe only to channels not already subscribed (prevents 1008 error)
+                channels_to_subscribe = [ch for ch in self.subscriptions if ch not in self._subscribed_channels]
+                if channels_to_subscribe:
+                    log.info(f"WebSocket authenticated - subscribing to {len(channels_to_subscribe)} new channels")
+                    await self._send("subscribe", ",".join(channels_to_subscribe))
+                else:
+                    log.info("WebSocket authenticated - all channels already subscribed, skipping")
             elif status == "auth_failed":
                 log.error(f"WebSocket authentication failed: {message}")
                 self.connected = False
+                self.authenticated = False
             elif status == "success":
+                # Track successful subscriptions in cache
+                if "subscribed to:" in message:
+                    channel = message.replace("subscribed to: ", "").strip()
+                    self._subscribed_channels.add(channel)
                 log.info(f"Subscription confirmed: {message}")
             else:
                 log.debug(f"Status message: {status} - {message}")
@@ -115,12 +148,27 @@ class PolygonWebSocketStream:
                 await ingest_message(msg)
     
     async def start(self):
-        """Start WebSocket stream with automatic reconnection"""
+        """Start WebSocket stream with automatic reconnection
+        
+        GUARD: Returns immediately if already active (connected + authenticated + subscribed).
+        This prevents duplicate connections and the Polygon 1008 error.
+        """
+        # GUARD: Return immediately if already active
+        if self.is_active():
+            log.info("WebSocket already active - skipping connection (prevents 1008 error)")
+            return
+        
+        # GUARD: Prevent concurrent start attempts
+        if self.running:
+            log.info("WebSocket start already in progress - skipping")
+            return
+        
         self.running = True
         api_key = settings.polygon_api_key
         
         if not api_key:
             log.error("Massive_API not set, cannot start WebSocket")
+            self.running = False
             return
         
         try:
@@ -129,6 +177,7 @@ class PolygonWebSocketStream:
                 is_frozen, reason = get_freeze_status()
                 log.warning(f"MARKET CLOSED — WebSocket disabled: {reason}")
                 log.warning("Live feeds disabled — use frozen snapshots only")
+                self.running = False
                 return
         except ImportError:
             pass
@@ -182,21 +231,37 @@ class PolygonWebSocketStream:
             log.error("Max WebSocket reconnection attempts reached - falling back to REST")
     
     async def stop(self):
-        """Stop WebSocket stream"""
+        """Stop WebSocket stream and reset state"""
         self.running = False
+        self.connected = False
+        self.authenticated = False
+        # Keep subscription cache - prevents resubscribing on reconnect
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
             log.info("WebSocket stream stopped")
 
-# Global stream instance
-_ws_stream = None
+# SINGLETON: Global stream instance - only one can exist
+_ws_stream: PolygonWebSocketStream = None
 
 async def start_websocket_stream():
-    """Start the global WebSocket stream"""
+    """Start the global WebSocket stream (singleton pattern)
+    
+    SINGLETON: Only creates one instance. If already running, returns immediately.
+    This function is safe to call multiple times without creating duplicates.
+    """
     global _ws_stream
     
-    if _ws_stream is None:
-        _ws_stream = PolygonWebSocketStream()
+    with _singleton_lock:
+        if _ws_stream is None:
+            _ws_stream = PolygonWebSocketStream()
+            log.info("Created singleton WebSocket instance")
+        elif _ws_stream.is_active():
+            log.info("WebSocket singleton already active - no action needed")
+            return
     
     await _ws_stream.start()
 
@@ -206,3 +271,8 @@ async def stop_websocket_stream():
     
     if _ws_stream:
         await _ws_stream.stop()
+
+def is_websocket_active() -> bool:
+    """Check if the singleton WebSocket is currently active"""
+    global _ws_stream
+    return _ws_stream is not None and _ws_stream.is_active()
