@@ -253,6 +253,11 @@ def dict_to_audit_snapshot(data: dict) -> AuditSnapshot:
         skew_metrics=data.get('skew_metrics'),
         vol_regime=data.get('vol_regime'),
         vol_regime_iv=data.get('vol_regime_iv'),
+        # Pre-gate explanation fields
+        strike_count=data.get('strike_count'),
+        nonzero_strike_count=data.get('nonzero_strike_count'),
+        top_strike_share=data.get('top_strike_share'),
+        pregate_reason=data.get('pregate_reason'),
     )
 
 

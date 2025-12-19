@@ -214,81 +214,83 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             return False
         
         # === AUDIT PIPELINE START ===
-        # CRITICAL: Use canonical values from gex_analysis - NO recomputation
+        # CRITICAL: Use canonical build_audit_snapshot() - single source of truth
+        
+        from app.core.audit_snapshot import build_audit_snapshot
+        from app.core.audit_persistence import get_latest_snapshot
         
         et_tz = pytz.timezone('US/Eastern')
         now_et = datetime.now(et_tz)
+        now_utc_str = now_et.isoformat()
         
-        # Use CANONICAL aggregate GEX values directly from calculate_gamma_exposure
-        # These are already computed using app/core/gex.py definitions
-        aggregate_total_gex = gex_analysis.get('aggregate_total_gex', 0)
-        aggregate_net_gex = gex_analysis.get('aggregate_net_gex', 0)
+        # Get canonical values from calculate_gamma_exposure
         expiration_scope = gex_analysis.get('expiration_scope', 'UNKNOWN')
         contracts_count = gex_analysis.get('contracts_count', len(options_df))
         
-        # Convert gex_by_strike DataFrame to list for audit (read-only, no recomputation)
+        # Convert gex_by_strike DataFrame to list for audit
         gex_by_strike = gex_analysis.get('gex_by_strike')
         strikes_data = []
+        exp_days = []
         if gex_by_strike is not None and not gex_by_strike.empty:
             for _, row in gex_by_strike.iterrows():
+                exp_day = int(row.get('days_to_expiry', 0))
+                exp_days.append(exp_day)
                 strikes_data.append({
                     'strike': float(row.get('strike', 0)),
-                    'expiration_days': int(row.get('days_to_expiry', 0)),
+                    'expiration_days': exp_day,
                     'call_gex': float(row.get('call_gex', 0)),
                     'put_gex': float(row.get('put_gex', 0)),
                     'net_gex': float(row.get('net_gex', 0)),
-                    'total_gex': float(row.get('total_gex', 0)),
+                    'call_open_interest': int(row.get('call_oi', 0)),
+                    'put_open_interest': int(row.get('put_oi', 0)),
+                    'call_gamma': float(row.get('call_gamma', 0)),
+                    'put_gamma': float(row.get('put_gamma', 0)),
                 })
         
-        # Extract NEW call/put aggregate GEX from gex_analysis
-        call_gex_total = gex_analysis.get('call_gex_total', 0.0)
-        put_gex_total = gex_analysis.get('put_gex_total', 0.0)
-        gross_gex = gex_analysis.get('gross_gex', call_gex_total + put_gex_total)
-        net_gex_total = gex_analysis.get('net_gex_total', call_gex_total - put_gex_total)
+        # Prepare data structures for canonical build_audit_snapshot()
+        spot_state = {
+            'price': current_price,
+            'timestamp_utc': now_utc_str,
+            'source': 'polygon_rest',
+        }
         
-        # Build audit snapshot using CANONICAL values (no recomputation)
-        from app.core.audit_snapshot import AuditSnapshot
+        chain_snapshot = {
+            'chain_symbol_used': symbol,
+            'underlying_reported': symbol,
+            'expirations': list(set(exp_days)) if exp_days else [0],
+            'contracts_count': contracts_count,
+            'expiration_scope': expiration_scope,
+        }
         
-        # Sort strikes by abs(net_gex) descending for top 15
-        sorted_strikes = sorted(strikes_data, key=lambda s: abs(s.get('net_gex', 0)), reverse=True)[:15]
+        gamma_surface = {
+            'strikes': strikes_data,
+            'pin_strike': gex_analysis.get('pin_strike', 0),
+            'pin_abs_gex': abs(gex_analysis.get('net_gex', 0)),
+            'zero_gamma_level': gex_analysis.get('zero_gamma'),
+            'zero_gamma_method': 'cumulative',
+            'call_gex_total': gex_analysis.get('call_gex_total', 0.0),
+            'put_gex_total': gex_analysis.get('put_gex_total', 0.0),
+            'gross_gex': gex_analysis.get('gross_gex', 0.0),
+            'net_gex': gex_analysis.get('net_gex_total', 0.0),
+        }
         
-        # Get expiration days for scope metadata
-        exp_days = list(set(s.get('expiration_days', 0) for s in strikes_data)) if strikes_data else [0]
+        # Get previous snapshot for pin drift calculation
+        prev_snapshot = None
+        try:
+            prev_snapshot = get_latest_snapshot(symbol)
+        except Exception:
+            pass  # No previous snapshot available
         
-        audit_snapshot = AuditSnapshot(
+        # Build audit snapshot using CANONICAL builder (single source of truth)
+        audit_snapshot = build_audit_snapshot(
             symbol=symbol,
-            timestamp_utc=now_et.isoformat(),
-            spot_last=current_price,
-            spot_timestamp=now_et.isoformat(),
-            spot_source='polygon_rest',
-            chain_symbol_used=symbol,
-            expirations_min_days=min(exp_days) if exp_days else 0,
-            expirations_max_days=max(exp_days) if exp_days else 0,
-            contracts_count=contracts_count,
-            expiration_scope=expiration_scope,  # Use canonical value from gamma_result
-            top_strikes_by_abs_gex=[
-                {
-                    'strike': s['strike'],
-                    'expiration_days': s.get('expiration_days', 0),
-                    'call_gex': s.get('call_gex', 0),
-                    'put_gex': s.get('put_gex', 0),
-                    'net_gex': s['net_gex'],
-                    'abs_gex': abs(s['net_gex']),
-                }
-                for s in sorted_strikes
-            ],
-            primary_gamma_pin_strike=gex_analysis.get('pin_strike', 0),
-            primary_gamma_pin_abs_gex=abs(gex_analysis.get('net_gex', 0)),
-            zero_gamma_level=gex_analysis.get('zero_gamma'),
-            zero_gamma_method='cumulative',
-            # NEW: Corrected GEX fields with call/put separation
-            call_gex_total=call_gex_total,
-            put_gex_total=put_gex_total,
-            gross_gex=gross_gex,
-            net_gex=net_gex_total,
-            # Legacy fields for backward compatibility
-            total_gex_abs=aggregate_total_gex,
-            total_gex_net=aggregate_net_gex,
+            spot_state=spot_state,
+            chain_snapshot=chain_snapshot,
+            gamma_surface=gamma_surface,
+            raw_contracts=None,  # Could pass options_df.to_dict('records') for skew
+            contracts_available=len(options_df),
+            strikes_available=[s['strike'] for s in strikes_data],
+            prev_snapshot=prev_snapshot,
         )
         
         # Step 1: Apply sanity validation BEFORE any persistence
@@ -311,14 +313,15 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         # === AUDIT PIPELINE END ===
         
         # Save to database ONLY if validation passed
+        # Use values from the canonical audit_snapshot (single source of truth)
         snapshot_result = save_gamma_snapshot(
             ticker=symbol,
             interval_timestamp=now_et,
-            pin_strike=gex_analysis['pin_strike'],
+            pin_strike=audit_snapshot.primary_gamma_pin_strike,
             pull_strength=gex_analysis.get('pull_strength', 0.5),
-            spot_price=current_price,
-            total_gex=aggregate_total_gex,  # Use canonical aggregate
-            net_gex=aggregate_net_gex,      # Use canonical aggregate
+            spot_price=audit_snapshot.spot_last,
+            total_gex=audit_snapshot.gross_gex,  # Use canonical gross_gex
+            net_gex=audit_snapshot.net_gex,       # Use canonical net_gex
             is_mock_data=is_mock
         )
         

@@ -922,8 +922,8 @@ with st.sidebar:
     market_status_text = "OPEN" if market_is_open else "CLOSED"
     st.info(f"Market Status: {market_status_color} {market_status_text}")
     
-    # Create tabs for Live Streaming and Frozen Gamma
-    streaming_tab, frozen_gamma_tab = st.tabs(["📡 Live Streaming", "🧊 Frozen Gamma (Audit)"])
+    # Create tabs for Live Streaming, Frozen Gamma, and Debug Snapshot Viewer
+    streaming_tab, frozen_gamma_tab, debug_snapshot_tab = st.tabs(["📡 Live Streaming", "🧊 Frozen Gamma (Audit)", "🔍 Debug Snapshot"])
     
     # === FROZEN GAMMA TAB ===
     with frozen_gamma_tab:
@@ -1144,6 +1144,95 @@ with st.sidebar:
             2. Incoming data is aggregated into 1-second bars
             3. Streamlit polls the backend for latest cached data
             """)
+    
+    # === DEBUG SNAPSHOT VIEWER TAB ===
+    with debug_snapshot_tab:
+        st.markdown("**Raw Audit Snapshot Viewer** — Shows exact values from the latest audit JSON for debugging.")
+        st.caption("When UI looks wrong, use this to prove whether backend stored wrong values or UI displayed wrong values.")
+        
+        if selected_indexes:
+            debug_symbol = st.selectbox("Select Index for Debug View", [INDEXES[idx] for idx in selected_indexes])
+            
+            if debug_symbol:
+                snapshot = load_last_valid_snapshot(debug_symbol)
+                
+                if snapshot is None:
+                    st.warning(f"No snapshot available for {debug_symbol}")
+                else:
+                    # Show snapshot file path
+                    st.code(f"logs/audit/{debug_symbol}/latest.json", language="text")
+                    
+                    # Core GEX values section
+                    st.subheader("Core GEX Values")
+                    gex_col1, gex_col2, gex_col3, gex_col4 = st.columns(4)
+                    with gex_col1:
+                        st.metric("gross_gex", f"{snapshot.gross_gex:.6f}")
+                    with gex_col2:
+                        st.metric("net_gex", f"{snapshot.net_gex:.6f}")
+                    with gex_col3:
+                        st.metric("call_gex_total", f"{snapshot.call_gex_total:.6f}")
+                    with gex_col4:
+                        st.metric("put_gex_total", f"{snapshot.put_gex_total:.6f}")
+                    
+                    # Invariant check
+                    invariant_ok = snapshot.gross_gex >= abs(snapshot.net_gex) - 1e-10
+                    sum_ok = abs(snapshot.gross_gex - (snapshot.call_gex_total + snapshot.put_gex_total)) < 1e-10
+                    if invariant_ok and sum_ok:
+                        st.success("✅ GEX invariants hold: gross_gex >= |net_gex|, gross = call + put")
+                    else:
+                        st.error("❌ GEX invariant violated!")
+                    
+                    # Pre-gate explanation
+                    st.subheader("Pre-Gate Explanation")
+                    pg_col1, pg_col2, pg_col3 = st.columns(3)
+                    with pg_col1:
+                        st.metric("strike_count", snapshot.strike_count or 0)
+                    with pg_col2:
+                        st.metric("nonzero_strike_count", snapshot.nonzero_strike_count or 0)
+                    with pg_col3:
+                        st.metric("top_strike_share", f"{(snapshot.top_strike_share or 0)*100:.1f}%")
+                    
+                    if snapshot.pregate_reason:
+                        st.warning(f"⚠️ Pre-gate issue: {snapshot.pregate_reason}")
+                    else:
+                        st.success("✅ No pre-gate issues detected")
+                    
+                    # Top 5 strikes
+                    st.subheader("Top 5 Strikes by |GEX|")
+                    if snapshot.top_strikes_by_abs_gex:
+                        for i, strike_data in enumerate(snapshot.top_strikes_by_abs_gex[:5]):
+                            st.caption(f"#{i+1}: Strike ${strike_data.get('strike', 0):,.0f} | net_gex: {strike_data.get('net_gex', 0):.6f} | abs_gex: {strike_data.get('abs_gex', 0):.6f}")
+                    else:
+                        st.caption("No strike data available")
+                    
+                    # Diagnostics
+                    st.subheader("Diagnostic Fields")
+                    diag_col1, diag_col2 = st.columns(2)
+                    with diag_col1:
+                        st.json({
+                            "gamma_by_distance": snapshot.gamma_by_distance,
+                            "truncation": snapshot.truncation,
+                            "vol_regime": snapshot.vol_regime,
+                        })
+                    with diag_col2:
+                        st.json({
+                            "confidence": snapshot.confidence,
+                            "confidence_factors": snapshot.confidence_factors,
+                            "dispersion_ratio": snapshot.dispersion_ratio,
+                        })
+                    
+                    # Validation status
+                    st.subheader("Validation Status")
+                    if snapshot.validation_is_valid:
+                        st.success("✅ Snapshot is valid")
+                    else:
+                        st.error(f"❌ Validation failed: {snapshot.validation_failure_reasons}")
+                    
+                    # Raw JSON expander
+                    with st.expander("📄 Full Raw JSON", expanded=False):
+                        st.json(snapshot.to_dict())
+        else:
+            st.info("Select indexes in the sidebar to view debug snapshot data.")
     
     st.divider()
     

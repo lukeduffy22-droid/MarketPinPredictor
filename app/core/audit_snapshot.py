@@ -366,6 +366,13 @@ class AuditSnapshot:
     # F.6 Dispersion Ratio - structural noise metric (FAR/ATM gamma ratio)
     dispersion_ratio: Optional[float] = None
     
+    # G. Pre-Gate Explanation Fields (for sanity check transparency)
+    # These fields explain WHY a snapshot might fail sanity checks
+    strike_count: Optional[int] = None  # Total number of strikes in snapshot
+    nonzero_strike_count: Optional[int] = None  # Strikes with non-zero GEX
+    top_strike_share: Optional[float] = None  # Percentage of total GEX in top strike
+    pregate_reason: Optional[str] = None  # Explanation if chain is thin/concentrated
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
@@ -566,6 +573,31 @@ def build_audit_snapshot(
     # F.6 Dispersion Ratio - structural noise metric
     if snapshot.gamma_by_distance:
         snapshot.dispersion_ratio = compute_dispersion_ratio(snapshot.gamma_by_distance)
+    
+    # G. Pre-Gate Explanation Fields
+    # These help explain WHY sanity checks might fail
+    snapshot.strike_count = len(strikes) if strikes else 0
+    
+    # Count strikes with non-zero GEX
+    nonzero_strikes = [s for s in strikes if abs(s.get('net_gex', 0)) > 1e-10] if strikes else []
+    snapshot.nonzero_strike_count = len(nonzero_strikes)
+    
+    # Calculate top strike's share of total GEX
+    if snapshot.top_strikes_by_abs_gex and gross_gex > 0:
+        top_strike_gex = abs(snapshot.top_strikes_by_abs_gex[0].get('net_gex', 0))
+        snapshot.top_strike_share = round(top_strike_gex / gross_gex, 4)
+    else:
+        snapshot.top_strike_share = 0.0
+    
+    # Determine pregate_reason if chain appears problematic
+    if snapshot.strike_count < 30:
+        snapshot.pregate_reason = f"CHAIN_TOO_THIN: Only {snapshot.strike_count} strikes (min: 30)"
+    elif snapshot.nonzero_strike_count < 10:
+        snapshot.pregate_reason = f"TOO_FEW_ACTIVE_STRIKES: Only {snapshot.nonzero_strike_count} strikes with non-zero GEX"
+    elif snapshot.top_strike_share > 0.9:
+        snapshot.pregate_reason = f"EXTREME_CONCENTRATION: Top strike has {snapshot.top_strike_share*100:.1f}% of total GEX"
+    else:
+        snapshot.pregate_reason = None
     
     return snapshot
 
