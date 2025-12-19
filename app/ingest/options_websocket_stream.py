@@ -1,11 +1,15 @@
 """
 Options WebSocket streaming for real-time gamma exposure updates.
 Uses raw websockets library for Replit compatibility.
+
+SINGLETON PATTERN: Only one Options WebSocket connection per API key.
+SUBSCRIPTION CACHE: Channels are only subscribed once per connection.
 """
 import asyncio
 import json
 import logging
 import random
+import threading
 from datetime import datetime
 from typing import Dict, Optional, Callable
 
@@ -16,6 +20,9 @@ from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
 
 log = logging.getLogger("options_ws_stream")
+
+# Singleton lock to prevent race conditions
+_options_singleton_lock = threading.Lock()
 
 _gamma_update_callback: Optional[Callable] = None
 
@@ -73,6 +80,9 @@ class OptionsWebSocketStream:
     """
     Manages dedicated options WebSocket connection for real-time gamma tracking.
     Uses raw websockets library for Replit compatibility.
+    
+    SINGLETON: Only one instance should exist per API key.
+    SUBSCRIPTION CACHE: Prevents duplicate subscribe messages.
     """
     
     def __init__(self):
@@ -80,13 +90,26 @@ class OptionsWebSocketStream:
         self.reconnect_count = 0
         self.max_reconnects = settings.ws_max_reconnects
         self.running = False
+        self.connected = False
+        self.authenticated = False  # Track auth state
         self.is_market_hours = False
         self._last_trade_time = 0
+        # Subscription cache - prevents duplicate subscriptions (Polygon 1008 error)
+        self._subscribed_channels: set = set()
         self.subscriptions = [
             "T.O:SPX*",   # SPX options trades
             "T.O:NDX*",   # NDX options trades
             "T.O:SPXW*",  # SPX weekly options
         ]
+    
+    def is_active(self) -> bool:
+        """Check if WebSocket is already active (connected + authenticated + subscribed)"""
+        return (
+            self.ws is not None and 
+            self.connected and 
+            self.authenticated and 
+            len(self._subscribed_channels) > 0
+        )
     
     async def _send(self, action: str, params: str = None):
         """Send a message to WebSocket"""
@@ -123,11 +146,25 @@ class OptionsWebSocketStream:
             if status == "connected":
                 log.info(f"Options WebSocket connected: {message}")
             elif status == "auth_success":
-                log.info("Options WebSocket authentication successful - subscribing to channels")
-                await self._send("subscribe", ",".join(self.subscriptions))
+                self.connected = True
+                self.authenticated = True
+                
+                # Subscribe only to channels not already subscribed (prevents 1008 error)
+                channels_to_subscribe = [ch for ch in self.subscriptions if ch not in self._subscribed_channels]
+                if channels_to_subscribe:
+                    log.info(f"Options WebSocket authenticated - subscribing to {len(channels_to_subscribe)} new channels")
+                    await self._send("subscribe", ",".join(channels_to_subscribe))
+                else:
+                    log.info("Options WebSocket authenticated - all channels already subscribed, skipping")
             elif status == "auth_failed":
                 log.error(f"Options WebSocket authentication failed: {message}")
+                self.connected = False
+                self.authenticated = False
             elif status == "success":
+                # Track successful subscriptions in cache
+                if "subscribed to:" in message:
+                    channel = message.replace("subscribed to: ", "").strip()
+                    self._subscribed_channels.add(channel)
                 log.info(f"Options subscription confirmed: {message}")
             else:
                 log.debug(f"Options status: {status} - {message}")
@@ -198,13 +235,26 @@ class OptionsWebSocketStream:
     async def start(self):
         """Start options WebSocket stream
         
+        GUARD: Returns immediately if already active (connected + authenticated + subscribed).
         FREEZE GUARD: Disabled when market is closed.
+        This prevents duplicate connections and the Polygon 1008 error.
         """
+        # GUARD: Return immediately if already active
+        if self.is_active():
+            log.info("Options WebSocket already active - skipping connection (prevents 1008 error)")
+            return
+        
+        # GUARD: Prevent concurrent start attempts
+        if self.running:
+            log.info("Options WebSocket start already in progress - skipping")
+            return
+        
         self.running = True
         api_key = settings.polygon_api_key
         
         if not api_key:
             log.error("Massive_API not set, cannot start Options WebSocket")
+            self.running = False
             return
         
         try:
@@ -212,6 +262,7 @@ class OptionsWebSocketStream:
             if market_is_closed():
                 is_frozen, reason = get_freeze_status()
                 log.warning(f"MARKET CLOSED — Options WebSocket disabled: {reason}")
+                self.running = False
                 return
         except ImportError:
             pass
@@ -266,21 +317,38 @@ class OptionsWebSocketStream:
             log.error("Options WebSocket max reconnection attempts reached")
     
     async def stop(self):
-        """Stop options WebSocket stream"""
+        """Stop options WebSocket stream and reset state"""
         self.running = False
+        self.connected = False
+        self.authenticated = False
+        # Keep subscription cache - prevents resubscribing on reconnect
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
             log.info("Options WebSocket stream stopped")
 
 
-_options_stream = None
+# SINGLETON: Global stream instance - only one can exist
+_options_stream: OptionsWebSocketStream = None
 
 async def start_options_websocket_stream():
-    """Start the global options WebSocket stream"""
+    """Start the global options WebSocket stream (singleton pattern)
+    
+    SINGLETON: Only creates one instance. If already running, returns immediately.
+    This function is safe to call multiple times without creating duplicates.
+    """
     global _options_stream
     
-    if _options_stream is None:
-        _options_stream = OptionsWebSocketStream()
+    with _options_singleton_lock:
+        if _options_stream is None:
+            _options_stream = OptionsWebSocketStream()
+            log.info("Created singleton Options WebSocket instance")
+        elif _options_stream.is_active():
+            log.info("Options WebSocket singleton already active - no action needed")
+            return
     
     await _options_stream.start()
 
@@ -290,6 +358,11 @@ async def stop_options_websocket_stream():
     
     if _options_stream:
         await _options_stream.stop()
+
+def is_options_websocket_active() -> bool:
+    """Check if the singleton Options WebSocket is currently active"""
+    global _options_stream
+    return _options_stream is not None and _options_stream.is_active()
 
 def set_gamma_update_callback(callback: Callable):
     """Set callback for real-time gamma updates"""
