@@ -400,32 +400,32 @@ def format_websocket_message(msg) -> str:
         return f"Message: {str(msg)[:100]}"
 
 
-def start_streaming_session(api_key: str, tickers: List[str], stream_type: str = "all") -> RealTimeDataStream:
+def start_streaming_session(api_key: str, tickers: List[str], stream_type: str = "all") -> None:
     """
-    DEPRECATED: WebSocket connections are now managed by the FastAPI backend.
+    DISABLED: WebSocket connections are now managed by the FastAPI backend ONLY.
     
-    This function should NOT be called from Streamlit - it will cause duplicate
-    WebSocket connections and Polygon 1008 errors.
+    This function raises an error to prevent duplicate WebSocket connections
+    that cause Polygon 1008 errors.
     
     USE INSTEAD:
-    - Backend REST endpoints: /buffer/latest, /gex/{symbol}
+    - Backend REST endpoints: /buffer/latest, /gex/{symbol}, /health
     - Backend singleton: app/ingest/websocket_stream.py
     
     Args:
         api_key: Polygon/Massive API key
-        tickers: List of tickers to stream (actual index tickers: SPX, NDX, DJI, RUT)
-        stream_type: Type of stream - "indices", "options", or "all"
+        tickers: List of tickers to stream
+        stream_type: Type of stream
     
-    Returns:
-        RealTimeDataStream instance (new or reused)
+    Raises:
+        RuntimeError: Always - this function is disabled
     """
-    warnings.warn(
-        "start_streaming_session is DEPRECATED. "
-        "WebSocket connections are now managed by the FastAPI backend only. "
-        "Use the /buffer/latest or /gex/{symbol} REST endpoints instead.",
-        DeprecationWarning,
-        stacklevel=2
+    raise RuntimeError(
+        "start_streaming_session is DISABLED. "
+        "WebSocket connections are managed by the FastAPI backend only. "
+        "Use the /buffer/latest or /gex/{symbol} REST endpoints to read cached data. "
+        "See: app/ingest/websocket_stream.py for backend singleton pattern."
     )
+    # NOTE: Code below is unreachable - kept for documentation only
     stream = RealTimeDataStream(api_key)
     
     def message_callback(msg):

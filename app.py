@@ -13,11 +13,9 @@ from database import init_db, save_prediction, get_predictions_by_ticker, get_al
 from models import train_linear_regression, train_random_forest
 from options_gamma import get_gamma_analysis
 from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
-# BACKEND-ONLY WEBSOCKET: The functions below are used for REST-based helpers only
-# RealTimeDataStream and start_streaming_session are NOT used (WebSocket is backend-only)
-from websocket_streaming import (
-    is_market_open, get_snapshot_data  # Only REST helpers, no WebSocket creation
-)
+# BACKEND-ONLY WEBSOCKET: Only REST-based helpers are imported here
+# WebSocket creation functions are NOT imported - all WebSocket is backend-only
+from websocket_streaming import is_market_open, get_snapshot_data
 from ai_analysis import (
     analyze_prediction, analyze_streaming_data, 
     get_risk_assessment, explain_gamma_exposure
@@ -69,12 +67,9 @@ if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
     st.session_state.selected_model = 'Linear Regression'
-# NOTE: WebSocket connections are now backend-only (singleton pattern)
-# These session state vars are DEPRECATED - kept for backward compatibility
-if 'ws_stream' not in st.session_state:
-    st.session_state.ws_stream = None  # DEPRECATED: WebSocket is backend-only
-if 'streaming_active' not in st.session_state:
-    st.session_state.streaming_active = False  # DEPRECATED: WebSocket is backend-only
+# REMOVED: ws_stream and streaming_active session state
+# WebSocket connections are now managed exclusively by the FastAPI backend
+# Streamlit uses REST endpoints to read cached data from the backend
 if 'timeframe' not in st.session_state:
     st.session_state.timeframe = '1-day'
 if 'alerts' not in st.session_state:
