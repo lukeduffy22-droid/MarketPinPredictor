@@ -1080,11 +1080,11 @@ with st.sidebar:
         # Fetch latest cached data from backend
         st.subheader("Latest Cached Data")
         
-        if st.button("🔄 Refresh Cached Data", type="secondary"):
+        if st.button("🔄 Reload from Cache", type="secondary", help="Repaint UI from backend memory - no live data fetch"):
             try:
                 for idx_name in selected_indexes:
                     ticker = INDEXES[idx_name]
-                    # Try to get buffer data from backend
+                    # Read from in-memory ring buffer only (no Polygon call, no socket)
                     try:
                         buffer_resp = requests.get(f"http://localhost:8000/buffer/latest/{ticker}", timeout=2)
                         if buffer_resp.status_code == 200:
@@ -1097,7 +1097,7 @@ with st.sidebar:
                                 )
                     except Exception:
                         pass
-                st.success("Data refreshed from backend cache")
+                st.success("UI repainted from backend cache")
             except Exception as e:
                 st.error(f"Error fetching cached data: {str(e)[:50]}")
         
