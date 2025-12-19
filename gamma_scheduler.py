@@ -10,7 +10,7 @@ Respects early close days (1 PM ET) like Black Friday and Christmas Eve.
 import threading
 import time
 import os
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time
 import pytz
 from database import save_gamma_snapshot
 from websocket_streaming import get_snapshot_data
@@ -30,7 +30,7 @@ _scheduler_thread = None
 def get_market_close_time():
     """Get today's market close time, accounting for early close days"""
     try:
-        from app.utils.time_et import is_early_close, close_time_et
+        from app.utils.time_et import is_early_close
         if is_early_close():
             return MARKET_CLOSE_EARLY
         return MARKET_CLOSE_REGULAR
@@ -157,14 +157,13 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
     
     Returns True if successful, False otherwise
     """
-    from datetime import timezone
     
     if is_freeze_active():
         try:
             from app.utils.market_time import get_freeze_status
             is_frozen, reason = get_freeze_status()
             print(f"  🔒 FREEZE ACTIVE for {symbol}: {reason}")
-            print(f"  🔒 Using last valid snapshot (no live API calls)")
+            print("  🔒 Using last valid snapshot (no live API calls)")
             
             frozen_data = get_frozen_snapshot(symbol)
             if frozen_data:
@@ -305,7 +304,7 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         # If validation fails, gamma is EXCLUDED from model but audit is persisted
         if not should_use_gamma_in_model(audit_snapshot):
             print(f"  ⚠️ Gamma INVALID for {symbol}: {audit_snapshot.validation_failure_reasons}")
-            print(f"  ⚠️ Gamma excluded from model, audit snapshot persisted (no DB save)")
+            print("  ⚠️ Gamma excluded from model, audit snapshot persisted (no DB save)")
             # Return True - audit was successful, just gamma excluded from model
             # Do NOT save to DB - this prevents invalid gamma from entering predictions
             return True

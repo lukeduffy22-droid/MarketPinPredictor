@@ -34,15 +34,43 @@ def recompute_aggregate_gex(snapshot_data: Dict[str, Any]) -> AggregateGexResult
     Recompute aggregate GEX from snapshot data using canonical functions.
     
     This uses ONLY the data in the snapshot - no external API calls.
+    
+    CRITICAL: Uses call_gex and put_gex arrays when available to ensure
+    gross_gex = call_gex_total + put_gex_total (NOT derived from net_gex).
     """
     top_strikes = snapshot_data.get('top_strikes_by_abs_gex', [])
     
     if not top_strikes:
-        return AggregateGexResult(total_gex_abs=0, total_gex_net=0, strike_count=0)
+        return AggregateGexResult(
+            gross_gex=0.0, 
+            net_gex=0.0, 
+            call_gex_total=0.0, 
+            put_gex_total=0.0, 
+            strike_count=0
+        )
     
-    net_gex_values = [float(s.get('net_gex', 0)) for s in top_strikes]
+    # Extract call_gex and put_gex arrays when available (preferred path)
+    # This ensures gross_gex = sum(call) + sum(put), not abs(net)
+    # Filter to strikes that have BOTH call_gex and put_gex (skip malformed rows)
+    strikes_with_call_put = [
+        s for s in top_strikes 
+        if 'call_gex' in s and 'put_gex' in s
+    ]
     
-    return compute_aggregate_gex_from_arrays(net_gex_values)
+    if strikes_with_call_put:
+        # Use call/put separation for all strikes that have it
+        call_gex_values = [float(s['call_gex']) for s in strikes_with_call_put]
+        put_gex_values = [float(s['put_gex']) for s in strikes_with_call_put]
+        net_gex_values = [float(s.get('net_gex', s['call_gex'] - s['put_gex'])) for s in strikes_with_call_put]
+        return compute_aggregate_gex_from_arrays(
+            net_gex_per_strike=net_gex_values,
+            call_gex_per_strike=call_gex_values,
+            put_gex_per_strike=put_gex_values
+        )
+    else:
+        # Legacy fallback for old snapshots without call/put separation
+        net_gex_values = [float(s.get('net_gex', 0)) for s in top_strikes]
+        return compute_aggregate_gex_from_arrays(net_gex_values)
 
 
 def verify_snapshot(filepath: str, verbose: bool = True) -> Dict[str, Any]:
