@@ -1,6 +1,24 @@
 """
 Real-time WebSocket streaming for live market data
 Uses Polygon/Massive.com WebSocket API for real-time updates
+
+================================================================================
+DEPRECATED: WebSocket connections are now managed by FastAPI backend ONLY
+================================================================================
+
+This module's WebSocket functionality should NOT be used directly by Streamlit.
+All WebSocket connections are now managed by the backend singleton pattern to
+prevent Polygon 1008 "duplicate connection" errors.
+
+USE INSTEAD:
+- Backend: app/ingest/websocket_stream.py (singleton pattern)
+- Backend: app/ingest/options_websocket_stream.py (singleton pattern)
+- Streamlit: Call backend REST endpoints (/buffer/latest, /gex/{symbol})
+
+STILL USABLE:
+- is_market_open() - Market hours check (no WebSocket)
+- get_snapshot_data() - REST API fallback (no WebSocket)
+================================================================================
 """
 
 import streamlit as st
@@ -10,6 +28,7 @@ import threading
 import queue
 from datetime import datetime
 import time
+import warnings
 
 class RealTimeDataStream:
     """
@@ -383,7 +402,14 @@ def format_websocket_message(msg) -> str:
 
 def start_streaming_session(api_key: str, tickers: List[str], stream_type: str = "all") -> RealTimeDataStream:
     """
-    Start a new streaming session or return existing one if already connected
+    DEPRECATED: WebSocket connections are now managed by the FastAPI backend.
+    
+    This function should NOT be called from Streamlit - it will cause duplicate
+    WebSocket connections and Polygon 1008 errors.
+    
+    USE INSTEAD:
+    - Backend REST endpoints: /buffer/latest, /gex/{symbol}
+    - Backend singleton: app/ingest/websocket_stream.py
     
     Args:
         api_key: Polygon/Massive API key
@@ -393,6 +419,13 @@ def start_streaming_session(api_key: str, tickers: List[str], stream_type: str =
     Returns:
         RealTimeDataStream instance (new or reused)
     """
+    warnings.warn(
+        "start_streaming_session is DEPRECATED. "
+        "WebSocket connections are now managed by the FastAPI backend only. "
+        "Use the /buffer/latest or /gex/{symbol} REST endpoints instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     stream = RealTimeDataStream(api_key)
     
     def message_callback(msg):

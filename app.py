@@ -13,9 +13,10 @@ from database import init_db, save_prediction, get_predictions_by_ticker, get_al
 from models import train_linear_regression, train_random_forest
 from options_gamma import get_gamma_analysis
 from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
+# BACKEND-ONLY WEBSOCKET: The functions below are used for REST-based helpers only
+# RealTimeDataStream and start_streaming_session are NOT used (WebSocket is backend-only)
 from websocket_streaming import (
-    RealTimeDataStream, is_market_open, format_websocket_message, 
-    start_streaming_session, get_streaming_recommendations, get_snapshot_data
+    is_market_open, get_snapshot_data  # Only REST helpers, no WebSocket creation
 )
 from ai_analysis import (
     analyze_prediction, analyze_streaming_data, 
@@ -68,10 +69,12 @@ if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
     st.session_state.selected_model = 'Linear Regression'
+# NOTE: WebSocket connections are now backend-only (singleton pattern)
+# These session state vars are DEPRECATED - kept for backward compatibility
 if 'ws_stream' not in st.session_state:
-    st.session_state.ws_stream = None
+    st.session_state.ws_stream = None  # DEPRECATED: WebSocket is backend-only
 if 'streaming_active' not in st.session_state:
-    st.session_state.streaming_active = False
+    st.session_state.streaming_active = False  # DEPRECATED: WebSocket is backend-only
 if 'timeframe' not in st.session_state:
     st.session_state.timeframe = '1-day'
 if 'alerts' not in st.session_state:
@@ -501,50 +504,20 @@ def export_to_csv(predictions_data, include_indicators=True):
         return csv
     return None
 
-async def setup_websocket_streaming(api_key, tickers, on_data_callback):
-    """Setup WebSocket connection for real-time data streaming"""
-    import asyncio
-    import websocket
-    import json
+# DISABLED: WebSocket connections are now backend-only (singleton pattern)
+# Streamlit must NOT create WebSocket connections directly - this causes Polygon 1008 errors
+# All streaming data is read from the FastAPI backend via REST endpoints
+def setup_websocket_streaming_DISABLED(api_key, tickers, on_data_callback):
+    """
+    DISABLED - WebSocket connections are now managed by the FastAPI backend only.
     
-    ws_url = "wss://socket.polygon.io/stocks"
-    
-    def on_open(ws):
-        # Authenticate
-        auth_msg = {"action": "auth", "params": api_key}
-        ws.send(json.dumps(auth_msg))
-        
-        # Subscribe to minute aggregates for tickers
-        subscribe_params = ",".join([f"AM.{ticker}" for ticker in tickers])
-        subscribe_msg = {"action": "subscribe", "params": subscribe_params}
-        ws.send(json.dumps(subscribe_msg))
-        st.success(f"Connected to real-time data stream for {', '.join(tickers)}")
-    
-    def on_message(ws, message):
-        data = json.loads(message)
-        if isinstance(data, list):
-            for item in data:
-                if item.get('ev') == 'AM':  # Minute aggregate
-                    on_data_callback(item)
-    
-    def on_error(ws, error):
-        st.error(f"WebSocket error: {error}")
-    
-    def on_close(ws):
-        st.info("WebSocket connection closed")
-    
-    # Create WebSocket connection
-    ws = websocket.WebSocketApp(ws_url,
-                                on_open=on_open,
-                                on_message=on_message,
-                                on_error=on_error,
-                                on_close=on_close)
-    
-    # Run WebSocket (this blocks, so run in a thread in production)
-    try:
-        ws.run_forever()
-    except Exception as e:
-        st.error(f"WebSocket connection failed: {e}")
+    Streamlit should use /api/buffer/latest or /api/gex/{symbol} endpoints 
+    to read cached streaming data from the backend.
+    """
+    raise NotImplementedError(
+        "WebSocket connections are managed by the FastAPI backend only. "
+        "Use the /api/buffer/latest endpoint to read cached streaming data."
+    )
 
 def predict_eod_price(df, model_type='Linear Regression', timeframe='1-day', gex_data=None):
     """Predict end-of-day price using technical indicators, ML, and gamma pin alignment
@@ -1071,116 +1044,109 @@ with st.sidebar:
             st.info("Select indexes in the sidebar to view frozen gamma snapshots.")
     
     # === LIVE STREAMING TAB ===
+    # NOTE: WebSocket connections are managed by the FastAPI backend ONLY
+    # Streamlit reads cached data via REST endpoints (no direct WebSocket creation)
     with streaming_tab:
-        if not market_is_open:
-            st.info("ℹ️ Market closed - streaming available 24/7 for after-hours data")
+        st.info("📡 **Live data is streamed via the backend service**")
+        st.caption("The FastAPI backend manages all WebSocket connections to prevent duplicate connections.")
         
-        enable_streaming = st.checkbox(
-        "Enable WebSocket Streaming", 
-        value=st.session_state.streaming_active,
-        help="Connect to real-time data feed from Massive.com - works 24/7, including after hours",
-        key="streaming_checkbox"
-    )
-    
-    if enable_streaming and not st.session_state.streaming_active:
-        # Start streaming
-        if st.button("🚀 Start Streaming", type="secondary"):
-            if selected_indexes and st.session_state.api_key:
-                # Get actual index tickers (not ETF proxies) for streaming
-                tickers_to_stream = [INDEXES[idx] for idx in selected_indexes]
+        if not market_is_open:
+            st.warning("ℹ️ Market closed - showing cached data from last session")
+        
+        # Show backend streaming status
+        st.subheader("Backend Streaming Status")
+        
+        # Fetch status from backend API
+        try:
+            import requests
+            health_resp = requests.get("http://localhost:8000/health", timeout=2)
+            if health_resp.status_code == 200:
+                health_data = health_resp.json()
                 
-                with st.spinner("Connecting to WebSocket for indices and options..."):
-                    # Stream both indices and options data
-                    stream = start_streaming_session(st.session_state.api_key, tickers_to_stream, stream_type="all")
-                    
-                    if stream:
-                        st.session_state.ws_stream = stream
-                        st.session_state.streaming_active = True
-                        st.success(f"✅ Streaming started for indices: {', '.join(tickers_to_stream)} (with options)")
-                        time.sleep(2)
-                        st.rerun()
+                status_col1, status_col2, status_col3 = st.columns(3)
+                with status_col1:
+                    ws_status = health_data.get("websocket", "unknown")
+                    if ws_status == "active":
+                        st.success("✅ WebSocket: Connected")
                     else:
-                        st.error("Failed to start streaming. Check your API key and options/index data subscription.")
+                        st.info(f"WebSocket: {ws_status}")
+                with status_col2:
+                    buffer_status = health_data.get("buffer_health", "unknown")
+                    st.metric("Buffer Status", buffer_status)
+                with status_col3:
+                    st.metric("Uptime", health_data.get("uptime", "N/A"))
+            else:
+                st.warning("Backend not responding")
+        except Exception as e:
+            st.error(f"Cannot reach backend: {str(e)[:50]}")
+        
+        # Fetch latest cached data from backend
+        st.subheader("Latest Cached Data")
+        
+        if st.button("🔄 Refresh Cached Data", type="secondary"):
+            try:
+                for idx_name in selected_indexes:
+                    ticker = INDEXES[idx_name]
+                    # Try to get buffer data from backend
+                    try:
+                        buffer_resp = requests.get(f"http://localhost:8000/buffer/latest/{ticker}", timeout=2)
+                        if buffer_resp.status_code == 200:
+                            buffer_data = buffer_resp.json()
+                            if buffer_data and buffer_data.get("price"):
+                                st.metric(
+                                    f"{ticker}",
+                                    f"${buffer_data['price']:,.2f}",
+                                    help=f"Last update: {buffer_data.get('timestamp', 'N/A')}"
+                                )
+                    except Exception:
+                        pass
+                st.success("Data refreshed from backend cache")
+            except Exception as e:
+                st.error(f"Error fetching cached data: {str(e)[:50]}")
+        
+        # Snapshot data fallback using REST API
+        st.divider()
+        st.caption("**Snapshot Data (REST API Fallback)**")
+        if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via Polygon REST API"):
+            if selected_indexes and st.session_state.api_key:
+                tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
+                with st.spinner("Fetching snapshot data..."):
+                    snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
+                    if snapshot_data:
+                        st.success(f"✅ Fetched prices for {len(snapshot_data)} tickers")
+                        # Display snapshot data
+                        cols = st.columns(len(snapshot_data))
+                        for i, (ticker, data) in enumerate(snapshot_data.items()):
+                            with cols[i]:
+                                if data['price']:
+                                    change = ((data['price'] - data['prev_close']) / data['prev_close'] * 100) if data['prev_close'] else 0
+                                    st.metric(
+                                        ticker, 
+                                        f"${data['price']:.2f}",
+                                        f"{change:+.2f}%"
+                                    )
+                                else:
+                                    st.metric(ticker, "N/A")
+                    else:
+                        st.error("Failed to fetch snapshot data. Check your API key.")
             else:
                 st.warning("Please enter API key and select indexes first!")
-    
-    elif st.session_state.streaming_active:
-        # Show streaming status
-        if st.session_state.ws_stream:
-            # Check for errors
-            if st.session_state.ws_stream.error_message:
-                st.error(st.session_state.ws_stream.error_message)
-                # Clean up connection
-                st.session_state.ws_stream.disconnect()
-                st.session_state.ws_stream = None
-                st.session_state.streaming_active = False
-            else:
-                stats = st.session_state.ws_stream.get_stats()
-                
-                # Show connection status
-                if st.session_state.ws_stream.connection_status == "connected":
-                    st.success(f"✅ Streaming Active - {stats['indices_tracked']} indices, {stats['options_tracked']} options")
-                else:
-                    st.info(f"Connection Status: {st.session_state.ws_stream.connection_status}")
-                
-                # Streaming stats
-                stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
-                with stats_col1:
-                    st.metric("Index Updates", stats.get('index_count', 0))
-                with stats_col2:
-                    st.metric("Options Updates", stats.get('options_count', 0))
-                with stats_col3:
-                    st.metric("Trades", stats.get('trade_count', 0))
-                with stats_col4:
-                    st.metric("Quotes", stats.get('quote_count', 0))
-                
-                # Stop streaming button
-                if st.button("⏹ Stop Streaming", type="secondary"):
-                    st.session_state.ws_stream.disconnect()
-                    st.session_state.ws_stream = None
-                    st.session_state.streaming_active = False
-                    st.rerun()
-                
-                # Show recent messages
-                with st.expander("📡 Recent Messages", expanded=False):
-                    recent_msgs = st.session_state.ws_stream.get_recent_messages(5)
-                    if recent_msgs:
-                        for msg in recent_msgs:
-                            st.caption(format_websocket_message(msg))
-                    else:
-                        st.caption("No messages yet...")
-    
-        # Show recommendations
-        with st.expander("💡 Streaming Tips", expanded=False):
-            st.markdown(get_streaming_recommendations())
         
-        # Snapshot data fallback
-        if not st.session_state.streaming_active:
-            st.caption("**Snapshot Data (Backup Method)**")
-            if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via REST API"):
-                if selected_indexes and st.session_state.api_key:
-                    tickers_to_fetch = [INDEX_ETFS[INDEXES[idx]] for idx in selected_indexes]
-                    with st.spinner("Fetching snapshot data..."):
-                        snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
-                        if snapshot_data:
-                            st.success(f"✅ Fetched prices for {len(snapshot_data)} tickers")
-                            # Display snapshot data
-                            cols = st.columns(len(snapshot_data))
-                            for i, (ticker, data) in enumerate(snapshot_data.items()):
-                                with cols[i]:
-                                    if data['price']:
-                                        change = ((data['price'] - data['prev_close']) / data['prev_close'] * 100) if data['prev_close'] else 0
-                                        st.metric(
-                                            ticker, 
-                                            f"${data['price']:.2f}",
-                                            f"{change:+.2f}%"
-                                        )
-                                    else:
-                                        st.metric(ticker, "N/A")
-                        else:
-                            st.error("Failed to fetch snapshot data. Check your API key.")
-                else:
-                    st.warning("Please enter API key and select indexes first!")
+        # Show tips
+        with st.expander("💡 Streaming Architecture", expanded=False):
+            st.markdown("""
+            **Backend-Only WebSocket Pattern**
+            
+            - The FastAPI backend manages a single WebSocket connection per API key
+            - This prevents the Polygon 1008 "duplicate connection" error
+            - Streamlit reads cached data via REST endpoints
+            - Live data is buffered in ring buffers on the backend
+            
+            **Data Flow:**
+            1. FastAPI backend connects to Polygon WebSocket (singleton)
+            2. Incoming data is aggregated into 1-second bars
+            3. Streamlit polls the backend for latest cached data
+            """)
     
     st.divider()
     
