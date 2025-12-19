@@ -49,6 +49,109 @@ def black_scholes_gamma(S, K, T, r, sigma):
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
 
+
+def calculate_max_pain(options_df, spot_price):
+    """
+    Calculate the Max Pain strike price.
+    
+    Max Pain = Strike where total $ value of expiring options is minimized
+    (i.e., where option writers have least payout to option holders)
+    
+    Formula: For each strike K, calculate total pain:
+        pain(K) = sum(call_OI * max(0, K - strike)) + sum(put_OI * max(0, strike - K))
+    
+    The strike with minimum pain is the Max Pain level.
+    
+    NOTE: This calculation is INDEPENDENT of gamma calculation.
+    It uses only strike prices and open interest - no Greeks involved.
+    
+    Args:
+        options_df: DataFrame with columns ['strike', 'type', 'open_interest', 'expiry']
+        spot_price: Current spot price (used for filtering range)
+    
+    Returns:
+        dict with max_pain_strike, max_pain_value, pain_by_strike DataFrame
+    """
+    if options_df.empty:
+        return None
+    
+    CONTRACT_MULTIPLIER = 100
+    
+    # Get unique strikes
+    strikes = sorted(options_df['strike'].unique())
+    
+    if not strikes:
+        return None
+    
+    # Build call/put OI lookup by strike
+    call_oi_by_strike = {}
+    put_oi_by_strike = {}
+    
+    for strike in strikes:
+        call_mask = (options_df['strike'] == strike) & (options_df['type'] == 'call')
+        put_mask = (options_df['strike'] == strike) & (options_df['type'] == 'put')
+        
+        call_oi_by_strike[strike] = options_df.loc[call_mask, 'open_interest'].sum()
+        put_oi_by_strike[strike] = options_df.loc[put_mask, 'open_interest'].sum()
+    
+    # Calculate pain at each potential settlement price
+    pain_data = []
+    
+    for settlement_price in strikes:
+        total_call_pain = 0
+        total_put_pain = 0
+        
+        for strike in strikes:
+            call_oi = call_oi_by_strike.get(strike, 0)
+            put_oi = put_oi_by_strike.get(strike, 0)
+            
+            # Call pain: call holders exercise if settlement > strike
+            # Pain to writers = OI * max(0, settlement - strike) * multiplier
+            if settlement_price > strike:
+                total_call_pain += call_oi * (settlement_price - strike) * CONTRACT_MULTIPLIER
+            
+            # Put pain: put holders exercise if settlement < strike
+            # Pain to writers = OI * max(0, strike - settlement) * multiplier
+            if settlement_price < strike:
+                total_put_pain += put_oi * (strike - settlement_price) * CONTRACT_MULTIPLIER
+        
+        total_pain = total_call_pain + total_put_pain
+        pain_data.append({
+            'strike': settlement_price,
+            'call_pain': total_call_pain,
+            'put_pain': total_put_pain,
+            'total_pain': total_pain
+        })
+    
+    pain_df = pd.DataFrame(pain_data)
+    
+    if pain_df.empty:
+        return None
+    
+    # Find strike with minimum total pain
+    min_pain_idx = pain_df['total_pain'].idxmin()
+    max_pain_strike = pain_df.loc[min_pain_idx, 'strike']
+    max_pain_value = pain_df.loc[min_pain_idx, 'total_pain']
+    
+    # Calculate direction relative to spot
+    if max_pain_strike > spot_price:
+        direction = 'above'
+    elif max_pain_strike < spot_price:
+        direction = 'below'
+    else:
+        direction = 'at'
+    
+    # Distance from spot
+    distance_pct = abs(max_pain_strike - spot_price) / spot_price * 100
+    
+    return {
+        'max_pain_strike': max_pain_strike,
+        'max_pain_value': max_pain_value,
+        'max_pain_direction': direction,
+        'max_pain_distance_pct': distance_pct,
+        'pain_by_strike': pain_df
+    }
+
 def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90, max_retries=3):
     """
     Fetch REAL options chain data from Polygon Snapshot API with actual OI and IV
@@ -507,7 +610,11 @@ def calculate_gamma_exposure(options_df, spot_price):
     gross_gex = call_gex_total + put_gex_total
     net_gex_aggregate = call_gex_total - put_gex_total
     
-    return {
+    # Calculate Max Pain (INDEPENDENT of gamma calculation)
+    # Uses only strike prices and open interest - no Greeks involved
+    max_pain_result = calculate_max_pain(filtered_df, spot_price)
+    
+    result = {
         'pin_strike': pin_strike,
         'pin_expiry': pin_expiry,
         'total_gex': total_gex,  # GEX at pin strike (original semantics)
@@ -527,6 +634,15 @@ def calculate_gamma_exposure(options_df, spot_price):
         'expiration_scope': expiration_scope,  # FIRST-CLASS FIELD: '0DTE', '1DTE', or 'ALL<=90D'
         'contracts_count': len(options_df),
     }
+    
+    # Add max pain data if calculated successfully
+    if max_pain_result:
+        result['max_pain_strike'] = max_pain_result['max_pain_strike']
+        result['max_pain_value'] = max_pain_result['max_pain_value']
+        result['max_pain_direction'] = max_pain_result['max_pain_direction']
+        result['max_pain_distance_pct'] = max_pain_result['max_pain_distance_pct']
+    
+    return result
 
 def calculate_multi_expiry_gamma(options_df, spot_price, max_dte=7):
     """

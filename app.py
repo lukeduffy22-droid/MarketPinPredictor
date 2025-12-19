@@ -1544,18 +1544,18 @@ else:
                 conf_color = "green" if pred['confidence'] > 70 else "orange" if pred['confidence'] > 50 else "red"
                 st.markdown(f"<div style='background-color: #f0f0f0; border-radius: 5px; padding: 2px;'><div style='background-color: {conf_color}; width: {pred['confidence']:.0f}%; height: 10px; border-radius: 5px;'></div></div>", unsafe_allow_html=True)
                 
-                # Display gamma pinning info if available
+                # Display gamma pinning and max pain info if available
                 if 'gex_data' in pred and pred['gex_data']:
                     gex = pred['gex_data']
                     if 'pin_strike' in gex:
                         pin_symbol = "📍"
                         direction_arrow = "⬆️" if gex['direction'] == 'above' else "⬇️" if gex['direction'] == 'below' else "↔️"
                         st.markdown(f"**{pin_symbol} Gamma Pin:** ${gex['pin_strike']:.0f} {direction_arrow}")
-                        if 'pin_expiry' in gex and gex['pin_expiry']:
-                            expiry_str = gex['pin_expiry'].strftime('%m/%d') if hasattr(gex['pin_expiry'], 'strftime') else str(gex['pin_expiry'])
-                            st.caption(f"Expires: {expiry_str}")
-                        if 'summary' in gex:
-                            st.caption(gex['summary'])
+                    if 'max_pain_strike' in gex:
+                        pain_arrow = "⬆️" if gex.get('max_pain_direction') == 'above' else "⬇️" if gex.get('max_pain_direction') == 'below' else "↔️"
+                        st.markdown(f"**💰 Max Pain:** ${gex['max_pain_strike']:.0f} {pain_arrow}")
+                    if 'summary' in gex:
+                        st.caption(gex['summary'])
         
         st.divider()
         
@@ -1663,26 +1663,32 @@ else:
                     else:
                         st.subheader("🎯 Gamma Exposure Analysis")
                     
-                    # Main gamma pin information
-                    gamma_col1, gamma_col2, gamma_col3 = st.columns(3)
+                    # Main gamma pin and max pain information
+                    gamma_col1, gamma_col2, gamma_col3, gamma_col4 = st.columns(4)
                     
                     with gamma_col1:
                         if 'pin_strike' in gex:
-                            st.metric("📍 Primary Gamma Pin", f"${gex['pin_strike']:.0f}")
+                            st.metric("📍 Gamma Pin", f"${gex['pin_strike']:.0f}")
                             if 'pin_expiry' in gex and gex['pin_expiry']:
                                 expiry_str = gex['pin_expiry'].strftime('%m/%d') if hasattr(gex['pin_expiry'], 'strftime') else str(gex['pin_expiry'])
                                 st.caption(f"Expires: {expiry_str}")
                     
                     with gamma_col2:
+                        if 'max_pain_strike' in gex:
+                            st.metric("💰 Max Pain", f"${gex['max_pain_strike']:.0f}")
+                            direction_arrow = "⬆️" if gex.get('max_pain_direction') == 'above' else "⬇️" if gex.get('max_pain_direction') == 'below' else "↔️"
+                            st.caption(f"{direction_arrow} {gex.get('max_pain_distance_pct', 0):.1f}% from spot")
+                    
+                    with gamma_col3:
                         if 'total_gex' in gex:
                             st.metric("Total GEX", f"${gex['total_gex']:.1f}B")
                             if 'net_gex' in gex:
                                 net_sign = "+" if gex['net_gex'] > 0 else ""
                                 st.caption(f"Net: {net_sign}${gex['net_gex']:.1f}B")
                     
-                    with gamma_col3:
+                    with gamma_col4:
                         if 'zero_gamma' in gex:
-                            st.metric("Zero Gamma Level", f"${gex['zero_gamma']:.0f}")
+                            st.metric("Zero Gamma", f"${gex['zero_gamma']:.0f}")
                             if 'direction' in gex and 'pull_strength' in gex:
                                 st.caption(f"Pull: {gex['direction'].upper()} ({gex['pull_strength']:.1f}%)")
                     
@@ -1744,8 +1750,18 @@ else:
                                 annotation_text=f"Pin: ${gex['pin_strike']:.0f}"
                             )
                         
+                        # Add max pain line
+                        if 'max_pain_strike' in gex:
+                            fig_gex.add_vline(
+                                x=gex['max_pain_strike'],
+                                line_dash="dot",
+                                line_color="purple",
+                                line_width=2,
+                                annotation_text=f"Max Pain: ${gex['max_pain_strike']:.0f}"
+                            )
+                        
                         fig_gex.update_layout(
-                            title="Gamma Exposure by Strike Price",
+                            title="Gamma Exposure by Strike (w/ Gamma Pin & Max Pain)",
                             xaxis_title="Strike Price",
                             yaxis_title="Net Gamma Exposure (Billions)",
                             showlegend=False,
