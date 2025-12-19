@@ -7,11 +7,17 @@ All other files MUST import from this module. No inline definitions anywhere.
 === GLOBAL GEX DEFINITIONS (NON-NEGOTIABLE) ===
 
 Per-Strike:
-    net_gex_per_strike = call_gex - put_gex
+    call_gex = gamma_call * oi_call * multiplier   # Call gamma exposure (positive)
+    put_gex = gamma_put * oi_put * multiplier      # Put gamma exposure (positive)
+    net_gex_per_strike = call_gex - put_gex        # Net at this strike
     
-Aggregate (across ALL strikes):
-    TOTAL_GEX_ABS = sum(abs(net_gex_per_strike))   # Gross exposure magnitude
-    TOTAL_GEX_NET = sum(net_gex_per_strike)        # Net directional exposure
+Aggregate (across ALL strikes) - CORRECTED Dec 2024:
+    call_gex_total = sum(call_gex)                 # Total call gamma
+    put_gex_total = sum(put_gex)                   # Total put gamma
+    gross_gex = call_gex_total + put_gex_total     # Total gamma magnitude (always positive)
+    net_gex = call_gex_total - put_gex_total       # Net directional exposure (signed)
+    
+Invariant: gross_gex >= abs(net_gex)
 
 These definitions must be used everywhere. No exceptions.
 UI labels must map 1:1 to these definitions.
