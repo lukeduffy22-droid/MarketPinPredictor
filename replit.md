@@ -141,3 +141,25 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
   - `app/core/audit_snapshot.py`: Added new GEX fields and pin drift tracking
   - `tools/historical_gamma.py`: Updated snapshot generation with pin drift calculation
   - `app.py`: Updated Frozen Gamma tab UI to display corrected metrics
+
+### Backend-Only WebSocket Singleton Pattern (Dec 19, 2025)
+- **Purpose**: Fix Polygon 1008 "duplicate connection" error by enforcing single WebSocket per API key
+- **Architecture Change**: All WebSocket connections are now managed exclusively by FastAPI backend
+  - Streamlit reads cached data via REST endpoints only (no direct WebSocket creation)
+- **New Features in Backend WebSocket Classes**:
+  - **Singleton Pattern**: Thread-safe `_singleton_lock` ensures only one instance exists
+  - **is_active() Method**: Checks if connection is already established
+  - **Guard Checks in start()**: Returns immediately if already connected
+  - **Subscription Cache**: `_subscribed_channels` set prevents duplicate channel subscriptions
+  - **Authenticated State Tracking**: Tracks `connected` and `authenticated` flags
+- **Modified Files**:
+  - `app/ingest/websocket_stream.py`: Added singleton pattern, subscription cache, guard checks
+  - `app/ingest/options_websocket_stream.py`: Same changes for options WebSocket
+  - `app.py`: Removed WebSocket imports/session state, streaming tab now reads from backend
+  - `websocket_streaming.py`: `start_streaming_session()` now raises RuntimeError
+- **API Integration**:
+  - `is_websocket_active()` function to check singleton status
+  - `is_options_websocket_active()` function for options WebSocket
+- **IMPORTANT**: 
+  - Streamlit MUST NOT import or use RealTimeDataStream or start_streaming_session
+  - All live data should be fetched via `/buffer/latest`, `/gex/{symbol}`, or `/health` endpoints
