@@ -947,21 +947,23 @@ with st.sidebar:
                     st.warning("⚠️ No frozen gamma snapshot available")
                     st.caption("Build snapshots during market hours using the historical API endpoints.")
                 else:
-                    # Display frozen status with timestamp
+                    # Display frozen status with full timestamp (date + time)
                     snapshot_time = snapshot.generated_at_utc
                     if snapshot_time:
                         try:
-                            # Parse and format timestamp
+                            # Parse and format timestamp with full date
                             if isinstance(snapshot_time, str):
                                 dt = datetime.fromisoformat(snapshot_time.replace('Z', '+00:00'))
-                                time_str = dt.strftime('%I:%M:%S %p ET')
                             else:
-                                time_str = str(snapshot_time)
-                            st.success(f"🧊 Frozen at {time_str}")
+                                dt = snapshot_time
+                            # Format: "Dec 19, 2025 at 10:30:25 AM ET"
+                            date_str = dt.strftime('%b %d, %Y')
+                            time_str = dt.strftime('%I:%M:%S %p ET')
+                            st.success(f"🧊 Snapshot recorded: {date_str} at {time_str}")
                         except:
-                            st.success(f"🧊 Frozen: {snapshot_time}")
+                            st.success(f"🧊 Snapshot recorded: {snapshot_time}")
                     else:
-                        st.success("🧊 Frozen Snapshot")
+                        st.success("🧊 Frozen Snapshot (no timestamp)")
                     
                     # Display gamma metrics from snapshot
                     # Row 1: Pin, Gross GEX, Net GEX
