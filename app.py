@@ -35,10 +35,11 @@ st.set_page_config(
 )
 
 # Major stock indexes - Using actual index tickers
+# NOTE: DJI uses DIA ETF options (no direct index options exist)
 INDEXES = {
     "S&P 500 (SPX)": "SPX",
     "NASDAQ 100 (NDX)": "NDX", 
-    "Dow Jones (DJI)": "DJI",
+    "Dow Jones (DJI via DIA options)": "DJI",
     "Russell 2000 (RUT)": "RUT"
 }
 
@@ -258,6 +259,16 @@ def calculate_gex(api_key, ticker, spot_price):
         gex_analysis = get_gamma_analysis(api_key, ticker, spot_price)
         
         if gex_analysis:
+            # Check if data is unavailable
+            if gex_analysis.get('data_unavailable'):
+                return {
+                    'data_unavailable': True,
+                    'underlying': ticker,
+                    'summary': gex_analysis.get('summary', 'Gamma data unavailable'),
+                    'options_root': gex_analysis.get('options_root', ticker),
+                    'is_etf_proxy': gex_analysis.get('is_etf_proxy', False),
+                }
+            
             # Convert to the expected format for the app
             gex_levels = {
                 'total_gex': gex_analysis['total_gex'],
@@ -269,7 +280,10 @@ def calculate_gex(api_key, ticker, spot_price):
                 'pull_strength': gex_analysis['pull_strength'],
                 'summary': gex_analysis['summary'],
                 'gamma_walls': gex_analysis['gamma_walls'],
-                'gex_by_strike': gex_analysis['gex_by_strike']
+                'gex_by_strike': gex_analysis['gex_by_strike'],
+                # ETF proxy info - MUST be displayed explicitly in UI
+                'options_root': gex_analysis.get('options_root', ticker),
+                'is_etf_proxy': gex_analysis.get('is_etf_proxy', False),
             }
             
             # Add key support/resistance levels from gamma walls
@@ -943,6 +957,11 @@ with st.sidebar:
                 # Load last valid audit snapshot
                 snapshot = load_last_valid_snapshot(symbol)
                 
+                # Display ETF proxy notice if applicable
+                if snapshot and getattr(snapshot, 'is_etf_proxy', False):
+                    options_root = getattr(snapshot, 'chain_symbol_used', '')
+                    st.info(f"Note: {symbol} gamma data sourced from {options_root} ETF options (no direct index options exist)")
+                
                 if snapshot is None:
                     st.warning("⚠️ No frozen gamma snapshot available")
                     st.caption("Build snapshots during market hours using the historical API endpoints.")
@@ -1022,7 +1041,17 @@ with st.sidebar:
                     if snapshot.validation_is_valid:
                         st.caption("✅ Snapshot validated")
                     else:
-                        st.caption(f"⚠️ Validation issues: {', '.join(snapshot.validation_failure_reasons or [])}")
+                        failure_reasons = snapshot.validation_failure_reasons or []
+                        pregate = getattr(snapshot, 'pregate_reason', '') or ''
+                        # Check for GEX concentration failure (common for NDX due to thin liquidity)
+                        has_concentration_failure = (
+                            any('CONCENTRATION' in r for r in failure_reasons) or
+                            'CONCENTRATION' in pregate
+                        )
+                        if has_concentration_failure and snapshot.symbol == 'NDX':
+                            st.warning("⚠️ NDX gamma rejected due to extreme strike concentration (thin options liquidity). This is a feature, not a bug - the validation gate correctly blocks unreliable data.")
+                        else:
+                            st.caption(f"⚠️ Validation issues: {', '.join(failure_reasons)}")
                     
                     # Top gamma walls (if available)
                     if snapshot.top_strikes_by_abs_gex:
@@ -1182,14 +1211,29 @@ with st.sidebar:
                     else:
                         st.error("❌ GEX invariant violated!")
                     
+                    # Chain Identity (includes ETF proxy info)
+                    st.subheader("Chain Identity")
+                    chain_col1, chain_col2, chain_col3 = st.columns(3)
+                    with chain_col1:
+                        st.metric("chain_symbol_used", snapshot.chain_symbol_used or "N/A")
+                    with chain_col2:
+                        st.metric("underlying_reported", snapshot.underlying_reported or snapshot.symbol)
+                    with chain_col3:
+                        is_etf = getattr(snapshot, 'is_etf_proxy', False)
+                        st.metric("is_etf_proxy", "Yes" if is_etf else "No")
+                    if getattr(snapshot, 'is_etf_proxy', False):
+                        st.info(f"Options data sourced from {snapshot.chain_symbol_used} ETF (not direct index options)")
+                    
                     # Pre-gate explanation
                     st.subheader("Pre-Gate Explanation")
-                    pg_col1, pg_col2, pg_col3 = st.columns(3)
+                    pg_col1, pg_col2, pg_col3, pg_col4 = st.columns(4)
                     with pg_col1:
-                        st.metric("strike_count", snapshot.strike_count or 0)
+                        st.metric("contracts_count", snapshot.contracts_count or 0)
                     with pg_col2:
-                        st.metric("nonzero_strike_count", snapshot.nonzero_strike_count or 0)
+                        st.metric("strike_count", snapshot.strike_count or 0)
                     with pg_col3:
+                        st.metric("nonzero_strikes", snapshot.nonzero_strike_count or 0)
+                    with pg_col4:
                         st.metric("top_strike_share", f"{(snapshot.top_strike_share or 0)*100:.1f}%")
                     
                     if snapshot.pregate_reason:
@@ -1226,7 +1270,17 @@ with st.sidebar:
                     if snapshot.validation_is_valid:
                         st.success("✅ Snapshot is valid")
                     else:
-                        st.error(f"❌ Validation failed: {snapshot.validation_failure_reasons}")
+                        failure_reasons = snapshot.validation_failure_reasons or []
+                        pregate = getattr(snapshot, 'pregate_reason', '') or ''
+                        has_concentration_failure = (
+                            any('CONCENTRATION' in r for r in failure_reasons) or
+                            'CONCENTRATION' in pregate
+                        )
+                        if has_concentration_failure and snapshot.symbol == 'NDX':
+                            st.error("❌ NDX gamma rejected due to extreme strike concentration")
+                            st.info("This is expected for NDX due to thin options liquidity. The validation gate correctly blocks unreliable gamma data when a single strike dominates >90% of total GEX.")
+                        else:
+                            st.error(f"❌ Validation failed: {failure_reasons}")
                     
                     # Raw JSON expander
                     with st.expander("📄 Full Raw JSON", expanded=False):
@@ -1600,7 +1654,14 @@ else:
                 if 'gex_data' in pred and pred['gex_data']:
                     gex = pred['gex_data']
                     st.divider()
-                    st.subheader("🎯 Gamma Exposure Analysis")
+                    
+                    # Display ETF proxy notice if applicable
+                    if gex.get('is_etf_proxy'):
+                        options_root = gex.get('options_root', '')
+                        st.subheader(f"🎯 Gamma Exposure Analysis (via {options_root} options)")
+                        st.info(f"Note: {index_ticker} options are traded via {options_root} ETF. All gamma metrics below use {options_root} options data.")
+                    else:
+                        st.subheader("🎯 Gamma Exposure Analysis")
                     
                     # Main gamma pin information
                     gamma_col1, gamma_col2, gamma_col3 = st.columns(3)

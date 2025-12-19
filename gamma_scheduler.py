@@ -14,7 +14,7 @@ from datetime import datetime, time as dt_time
 import pytz
 from database import save_gamma_snapshot
 from websocket_streaming import get_snapshot_data
-from options_gamma import fetch_options_chain, calculate_gamma_exposure
+from options_gamma import fetch_options_chain, calculate_gamma_exposure, get_options_root
 
 # Market hours in Eastern Time
 MARKET_OPEN_TIME = dt_time(9, 30)  # 9:30 AM ET
@@ -198,11 +198,14 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             print(f"  Warning: No price in snapshot for {symbol}. Data: {snapshot[polygon_ticker]}")
             return False
         
+        # Get the actual options root (e.g., DJI → DIA for ETF proxy)
+        options_root, is_etf_proxy = get_options_root(symbol)
+        
         # Fetch options chain and calculate gamma exposure
         options_df, is_mock = fetch_options_chain(api_key, symbol, current_price)
         
         if options_df is None or len(options_df) == 0:
-            print(f"Warning: No options data for {symbol}, skipping gamma sample")
+            print(f"Warning: No options data for {symbol} (chain: {options_root}), skipping gamma sample")
             return False
         
         # Calculate gamma exposure
@@ -254,8 +257,9 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         }
         
         chain_snapshot = {
-            'chain_symbol_used': symbol,
-            'underlying_reported': symbol,
+            'chain_symbol_used': options_root,  # Actual symbol used for options chain (e.g., DIA for DJI)
+            'underlying_reported': symbol,  # Original index symbol (e.g., DJI)
+            'is_etf_proxy': is_etf_proxy,  # True if using ETF proxy (e.g., DJI→DIA)
             'expirations': list(set(exp_days)) if exp_days else [0],
             'contracts_count': contracts_count,
             'expiration_scope': expiration_scope,

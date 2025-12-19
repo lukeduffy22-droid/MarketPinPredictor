@@ -45,8 +45,9 @@ class SpotState:
 @dataclass
 class ChainIdentity:
     """Options chain identity and metadata."""
-    chain_symbol_used: str  # Exact string passed to Polygon
-    underlying_reported: Optional[str]  # From options payload if present
+    chain_symbol_used: str  # Exact string passed to Polygon (e.g., DIA for DJI)
+    underlying_reported: Optional[str]  # From options payload if present (e.g., DJI)
+    is_etf_proxy: bool  # True if using ETF proxy (e.g., DJI→DIA)
     expirations_included: List[int]  # List of days to expiry, or [min, max]
     contracts_count: int
     expiration_scope: str  # '0DTE' or 'ALL<=90D'
@@ -304,8 +305,9 @@ class AuditSnapshot:
     spot_source: str = ""
     
     # B. Options chain identity
-    chain_symbol_used: str = ""
-    underlying_reported: Optional[str] = None
+    chain_symbol_used: str = ""  # Actual symbol used for options chain (e.g., DIA for DJI)
+    underlying_reported: Optional[str] = None  # Original index symbol (e.g., DJI)
+    is_etf_proxy: bool = False  # True if using ETF proxy (e.g., DJI→DIA)
     expirations_min_days: int = 0
     expirations_max_days: int = 0
     contracts_count: int = 0
@@ -444,6 +446,7 @@ def build_audit_snapshot(
         # B. Options chain identity
         chain_symbol_used=str(chain_snapshot.get('chain_symbol_used', symbol)),
         underlying_reported=chain_snapshot.get('underlying_reported'),
+        is_etf_proxy=bool(chain_snapshot.get('is_etf_proxy', False)),
         expirations_min_days=int(min(chain_snapshot.get('expirations', [0])) if chain_snapshot.get('expirations') else 0),
         expirations_max_days=int(max(chain_snapshot.get('expirations', [0])) if chain_snapshot.get('expirations') else 0),
         contracts_count=contracts_count,

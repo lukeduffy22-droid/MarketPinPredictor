@@ -12,6 +12,26 @@ import time
 import pytz
 from database import get_latest_gamma_snapshot
 
+# Index to Options Root Mapping
+# Some indices don't have direct options - they trade via ETFs
+# This mapping is EXPLICIT and NEVER silent - UI must display the substitution
+INDEX_TO_OPTIONS_ROOT = {
+    'DJI': 'DIA',  # Dow Jones Industrial Average → SPDR Dow Jones ETF
+}
+
+def get_options_root(symbol: str) -> tuple[str, bool]:
+    """
+    Get the options root symbol for a given index.
+    
+    Returns:
+        tuple: (options_root, is_etf_proxy)
+        - options_root: The symbol to use for options chain lookups
+        - is_etf_proxy: True if this is an ETF proxy (must be labeled in UI)
+    """
+    if symbol in INDEX_TO_OPTIONS_ROOT:
+        return INDEX_TO_OPTIONS_ROOT[symbol], True
+    return symbol, False
+
 def black_scholes_gamma(S, K, T, r, sigma):
     """
     Calculate Black-Scholes gamma for an option
@@ -40,8 +60,16 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90, max_retr
     
     IMPORTANT: This function NEVER returns mock data. If the API fails after retries,
     it returns an empty DataFrame with is_mock_data=False to let the UI handle it gracefully.
+    
+    NOTE: Some indices (e.g., DJI) don't have direct options - they trade via ETFs.
+    This function uses INDEX_TO_OPTIONS_ROOT mapping to fetch ETF options instead.
+    The substitution is ALWAYS logged explicitly - never silent.
     """
     import time
+    
+    options_root, is_etf_proxy = get_options_root(underlying)
+    if is_etf_proxy:
+        print(f"[INFO] {underlying} uses ETF proxy: fetching {options_root} options instead")
     
     last_error = None
     
@@ -49,11 +77,11 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90, max_retr
         try:
             client = RESTClient(api_key)
             
-            print(f"[Attempt {attempt}/{max_retries}] Fetching options chain snapshot for {underlying}...")
+            print(f"[Attempt {attempt}/{max_retries}] Fetching options chain snapshot for {options_root}...")
             start_time = time.time()
             timeout_seconds = 15  # Increased timeout for premium API
             
-            snapshot = client.list_snapshot_options_chain(underlying)
+            snapshot = client.list_snapshot_options_chain(options_root)
             
             options_data = []
             contract_count = 0
@@ -782,7 +810,12 @@ def get_gamma_analysis(api_key, underlying, spot_price):
     
     IMPORTANT: This function NEVER returns mock data. If no real data is available,
     it returns a special 'data_unavailable' response for the UI to handle gracefully.
+    
+    NOTE: Some indices (e.g., DJI) use ETF proxies for options data (e.g., DIA).
+    The `options_root` and `is_etf_proxy` fields indicate the actual symbol used
+    and whether this was a substitution. The UI MUST display this explicitly.
     """
+    options_root, is_etf_proxy = get_options_root(underlying)
     options_df, is_mock_data = fetch_options_chain(api_key, underlying, spot_price)
     
     if options_df.empty:
@@ -821,6 +854,10 @@ def get_gamma_analysis(api_key, underlying, spot_price):
                 pin_strike = gex_analysis['pin_strike']
                 gex_analysis['summary'] = f"Price is being {strength_desc}ly pulled {direction} to ${pin_strike:.0f} (Cached EOD data)"
                 
+                # Add ETF proxy information for explicit UI labeling
+                gex_analysis['options_root'] = options_root
+                gex_analysis['is_etf_proxy'] = is_etf_proxy
+                
                 return gex_analysis
             elif snapshot and snapshot.is_mock_data:
                 print(f"✗ Found stored snapshot for {underlying} but it contains MOCK data - ignoring")
@@ -834,6 +871,8 @@ def get_gamma_analysis(api_key, underlying, spot_price):
                 'spot_price': spot_price,
                 'is_mock_data': False,
                 'is_cached_data': False,
+                'options_root': options_root,
+                'is_etf_proxy': is_etf_proxy,
                 'summary': f"Gamma data temporarily unavailable for {underlying}. Real-time data will be available during next market session.",
                 'error_message': f"No real options data available for {underlying}. The Polygon API may be experiencing issues or the symbol may not have options data."
             }
@@ -845,6 +884,8 @@ def get_gamma_analysis(api_key, underlying, spot_price):
                 'spot_price': spot_price,
                 'is_mock_data': False,
                 'is_cached_data': False,
+                'options_root': options_root,
+                'is_etf_proxy': is_etf_proxy,
                 'summary': f"Gamma data temporarily unavailable for {underlying}.",
                 'error_message': f"Error retrieving gamma data: {str(e)[:100]}"
             }
@@ -869,5 +910,9 @@ def get_gamma_analysis(api_key, underlying, spot_price):
         strength_desc = "weak"
     
     gex_analysis['summary'] = f"Price is being {strength_desc}ly pulled {direction} to ${pin_strike:.0f} (Pin at {gex_analysis['pin_expiry'].strftime('%m/%d')})"
+    
+    # Add ETF proxy information for explicit UI labeling
+    gex_analysis['options_root'] = options_root
+    gex_analysis['is_etf_proxy'] = is_etf_proxy
     
     return gex_analysis
