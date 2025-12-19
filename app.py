@@ -1659,7 +1659,7 @@ else:
                     if gex.get('is_etf_proxy'):
                         options_root = gex.get('options_root', '')
                         st.subheader(f"🎯 Gamma Exposure Analysis (via {options_root} options)")
-                        st.info(f"Note: {index_ticker} options are traded via {options_root} ETF. All gamma metrics below use {options_root} options data.")
+                        st.info(f"Note: {pred['ticker']} options are traded via {options_root} ETF. All gamma metrics below use {options_root} options data.")
                     else:
                         st.subheader("🎯 Gamma Exposure Analysis")
                     
