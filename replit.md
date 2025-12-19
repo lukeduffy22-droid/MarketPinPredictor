@@ -30,6 +30,7 @@ The backend is built with FastAPI using an async/await pattern.
 -   **FastAPI Endpoints**: Provides health checks, gamma exposure levels, prediction endpoints, market event summaries, ORB data, and accuracy statistics.
 -   **Unified Canonical Gamma Pipeline**: A single source of truth for snapshot generation (`build_audit_snapshot()`) ensuring consistent GEX calculations, including pre-gate diagnostic fields explaining sanity check failures.
 -   **Historical Gamma Validation System**: Allows building and validating historical gamma pins against actual closes for model efficacy.
+-   **NDJSON Snapshot Export**: Append-only export of audit snapshots to `exports/{symbol}/{YYYY-MM-DD}.ndjson` for full-day observability. Controlled by `EXPORT_SNAPSHOTS` feature flag. Exports occur immediately after persist, even for invalid snapshots.
 
 ### Prediction Model
 

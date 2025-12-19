@@ -23,9 +23,63 @@ MARKET_CLOSE_EARLY = dt_time(13, 0)   # 1:00 PM ET (early close)
 
 TRACKED_SYMBOLS = ['SPX', 'NDX', 'DJI', 'RUT']
 
+# Feature flag for NDJSON export of audit snapshots
+EXPORT_SNAPSHOTS = True
+
 # Global flag to control scheduler
 _scheduler_running = False
 _scheduler_thread = None
+
+
+def export_snapshot_ndjson(snapshot) -> bool:
+    """
+    Append audit snapshot to daily NDJSON file for full-day observability.
+    
+    Format: exports/{symbol}/{YYYY-MM-DD}.ndjson
+    Each line = snapshot.to_json() (no indentation for NDJSON)
+    
+    This is append-only and runs even if snapshot is invalid.
+    Does NOT modify, recompute, or derive any values.
+    
+    Returns:
+        True if export succeeded, False otherwise
+    """
+    if not EXPORT_SNAPSHOTS:
+        return False
+    
+    try:
+        symbol = snapshot.symbol
+        
+        # Get date from snapshot timestamp or use current date
+        timestamp = snapshot.generated_at_utc
+        if timestamp:
+            if isinstance(timestamp, str):
+                date_str = timestamp[:10]  # YYYY-MM-DD from ISO string
+            else:
+                date_str = timestamp.strftime('%Y-%m-%d')
+        else:
+            from datetime import datetime, timezone
+            date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        
+        # Build file path: exports/{symbol}/{YYYY-MM-DD}.ndjson
+        export_dir = os.path.join('exports', symbol)
+        os.makedirs(export_dir, exist_ok=True)
+        
+        export_file = os.path.join(export_dir, f'{date_str}.ndjson')
+        
+        # Get JSON without indentation for NDJSON (one object per line)
+        json_line = snapshot.to_json(indent=None)
+        
+        # Append to file (never overwrite)
+        with open(export_file, 'a') as f:
+            f.write(json_line + '\n')
+        
+        print(f"  📤 Snapshot exported: {export_file}")
+        return True
+        
+    except Exception as e:
+        print(f"  ⚠️ Export failed: {e}")
+        return False
 
 def get_market_close_time():
     """Get today's market close time, accounting for early close days"""
@@ -303,6 +357,9 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         audit_file = persist_audit_snapshot(audit_snapshot)
         if audit_file:
             print(f"  📝 Audit snapshot saved: {audit_file}")
+        
+        # Step 2b: Export to NDJSON for full-day observability (always, even if invalid)
+        export_snapshot_ndjson(audit_snapshot)
         
         # Step 3: Check if gamma should be used in the model
         # If validation fails, gamma is EXCLUDED from model but audit is persisted
