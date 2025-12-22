@@ -2171,145 +2171,53 @@ else:
                             mime="application/x-ndjson"
                         )
                     with dl_col2:
-                        # Example training code for ML
-                        example_code = '''import sys
-import json
-import pandas as pd
-import numpy as np
-from typing import List
+                        # Load actual training script from file
+                        try:
+                            with open('train_gamma_model.py', 'r') as f:
+                                train_code = f.read()
+                            st.download_button(
+                                label="📜 Training Script",
+                                data=train_code,
+                                file_name="train_gamma_model.py",
+                                mime="text/x-python"
+                            )
+                        except FileNotFoundError:
+                            st.button("📜 Training Script (not found)", disabled=True)
+                    
+                    # Second row: Prediction script + Usage instructions
+                    dl_col3, dl_col4 = st.columns(2)
+                    with dl_col3:
+                        try:
+                            with open('predict_gamma_model.py', 'r') as f:
+                                predict_code = f.read()
+                            st.download_button(
+                                label="🔮 Prediction Script",
+                                data=predict_code,
+                                file_name="predict_gamma_model.py",
+                                mime="text/x-python"
+                            )
+                        except FileNotFoundError:
+                            st.button("🔮 Prediction Script (not found)", disabled=True)
+                    
+                    with dl_col4:
+                        with st.popover("📖 How to Use"):
+                            st.markdown("""
+**Training (run for each index):**
+```bash
+python train_gamma_model.py prices.csv gamma.csv SPX
+python train_gamma_model.py prices.csv gamma.csv NDX
+python train_gamma_model.py prices.csv gamma.csv RUT
+```
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+**Prediction:**
+```bash
+python predict_gamma_model.py prices.csv gamma.csv SPX
+```
 
-# -----------------------------
-# Config
-# -----------------------------
-TARGET_COLUMN = "next_close"   # what we want to predict
-INDEX_FILTER = "S&P 500 (SPX)" # or "NASDAQ 100 (NDX)"
-BATCH_SIZE = 64
-EPOCHS = 40
-LR = 1e-3
-VALIDATION_SPLIT = 0.2
-RANDOM_SEED = 42
-
-torch.manual_seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-
-# -----------------------------
-# Dataset
-# -----------------------------
-class TabularDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32).view(-1, 1)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# -----------------------------
-# Model
-# -----------------------------
-class MLP(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-# -----------------------------
-# Feature Selection
-# -----------------------------
-def select_feature_columns(df: pd.DataFrame) -> List[str]:
-    exclude = {
-        TARGET_COLUMN, "predicted_price", "confidence",
-        "index_name", "timestamp", "prediction_date", "Time",
-    }
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    return [c for c in numeric_cols if c not in exclude]
-
-# -----------------------------
-# Training Function
-# -----------------------------
-def train_one_model(csv_path: str, model_output_path: str, meta_output_path: str):
-    print(f"[INFO] Loading data from {csv_path}")
-    df = pd.read_csv(csv_path)
-
-    if "index_name" in df.columns:
-        df = df[df["index_name"] == INDEX_FILTER].copy()
-        print(f"[INFO] Filtered to {INDEX_FILTER}, rows = {len(df)}")
-
-    df = df.dropna(subset=[TARGET_COLUMN])
-    feature_cols = select_feature_columns(df)
-    print(f"[INFO] Using {len(feature_cols)} features")
-
-    X = df[feature_cols].values.astype(np.float32)
-    y = df[TARGET_COLUMN].values.astype(np.float32)
-
-    # Train/Val Split
-    n = len(X)
-    idx = np.arange(n)
-    np.random.shuffle(idx)
-    split = int(n * (1 - VALIDATION_SPLIT))
-    train_idx, val_idx = idx[:split], idx[split:]
-
-    train_ds = TabularDataset(X[train_idx], y[train_idx])
-    val_ds = TabularDataset(X[val_idx], y[val_idx])
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-
-    model = MLP(input_dim=X.shape[1])
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.MSELoss()
-
-    print("[INFO] Training...")
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        train_losses = []
-        for xb, yb in train_loader:
-            optimizer.zero_grad()
-            preds = model(xb)
-            loss = criterion(preds, yb)
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                val_losses.append(criterion(model(xb), yb).item())
-
-        print(f"Epoch {epoch:03d}/{EPOCHS} Train: {np.mean(train_losses):.4f} Val: {np.mean(val_losses):.4f}")
-
-    torch.save(model.state_dict(), model_output_path)
-    meta = {"feature_columns": feature_cols, "target_column": TARGET_COLUMN, "index_filter": INDEX_FILTER}
-    with open(meta_output_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"[INFO] Saved model to {model_output_path}")
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python train_gamma_model.py <input_csv>")
-        sys.exit(1)
-    train_one_model(sys.argv[1], "gamma_model.pt", "gamma_model_meta.json")
-'''
-                        st.download_button(
-                            label="📜 Download Example Training Code",
-                            data=example_code,
-                            file_name="train_gamma_model.py",
-                            mime="text/x-python"
-                        )
+**Output files:**
+- `gamma_model_SPX.pt` - Trained model
+- `gamma_model_SPX_meta.json` - Feature metadata
+                            """)
                     
                     # CSV Export row
                     st.caption("CSV Exports")
