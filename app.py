@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from polygon import RESTClient
@@ -2054,6 +2055,100 @@ else:
                     st.caption("Predictions with confidence < 50%")
                 
                 st.info(f"💡 Recommendation: {optimization['recommendation']}")
+    
+    # === NDJSON Snapshot Export Viewer ===
+    st.divider()
+    st.header("📁 Daily Snapshot Exports")
+    st.caption("View and download intraday gamma snapshots saved throughout the trading day")
+    
+    # Get available export files
+    export_base = "./exports"
+    available_symbols = []
+    if os.path.exists(export_base):
+        available_symbols = [d for d in os.listdir(export_base) if os.path.isdir(os.path.join(export_base, d))]
+    
+    if available_symbols:
+        export_col1, export_col2 = st.columns(2)
+        
+        with export_col1:
+            export_symbol = st.selectbox("Select Index", available_symbols, key="export_symbol_select")
+        
+        with export_col2:
+            # Get available dates for selected symbol
+            symbol_dir = os.path.join(export_base, export_symbol)
+            available_files = []
+            if os.path.exists(symbol_dir):
+                available_files = sorted([f.replace('.ndjson', '') for f in os.listdir(symbol_dir) if f.endswith('.ndjson')], reverse=True)
+            
+            if available_files:
+                export_date = st.selectbox("Select Date", available_files, key="export_date_select")
+            else:
+                export_date = None
+                st.info("No export files found")
+        
+        if export_date:
+            ndjson_path = os.path.join(symbol_dir, f"{export_date}.ndjson")
+            
+            if os.path.exists(ndjson_path):
+                # Read and parse NDJSON
+                snapshots = []
+                with open(ndjson_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                snapshots.append(json.loads(line))
+                            except:
+                                pass
+                
+                st.success(f"Found {len(snapshots)} snapshots for {export_symbol} on {export_date}")
+                
+                # Summary metrics
+                if snapshots:
+                    sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
+                    
+                    first_snap = snapshots[0]
+                    last_snap = snapshots[-1]
+                    
+                    with sum_col1:
+                        st.metric("First Snapshot", first_snap.get('timestamp_et', 'N/A')[:8] if first_snap.get('timestamp_et') else 'N/A')
+                    with sum_col2:
+                        st.metric("Last Snapshot", last_snap.get('timestamp_et', 'N/A')[:8] if last_snap.get('timestamp_et') else 'N/A')
+                    with sum_col3:
+                        valid_count = sum(1 for s in snapshots if s.get('validation_is_valid', False))
+                        st.metric("Valid Snapshots", f"{valid_count}/{len(snapshots)}")
+                    with sum_col4:
+                        if last_snap.get('gamma_pin_strike'):
+                            st.metric("Final Pin", f"${last_snap['gamma_pin_strike']:,.0f}")
+                        else:
+                            st.metric("Final Pin", "N/A")
+                    
+                    # Detailed view
+                    with st.expander("View Snapshot Details", expanded=False):
+                        display_data = []
+                        for snap in snapshots:
+                            display_data.append({
+                                'Time': snap.get('timestamp_et', 'N/A')[:8] if snap.get('timestamp_et') else 'N/A',
+                                'Spot': f"${snap.get('spot_last', 0):,.2f}",
+                                'Gamma Pin': f"${snap.get('gamma_pin_strike', 0):,.0f}" if snap.get('gamma_pin_strike') else 'N/A',
+                                'Gross GEX': f"${snap.get('gross_gex', 0):.3f}B",
+                                'Net GEX': f"${snap.get('net_gex', 0):.3f}B",
+                                'Valid': '✅' if snap.get('validation_is_valid') else '❌'
+                            })
+                        st.dataframe(pd.DataFrame(display_data), hide_index=True, use_container_width=True)
+                    
+                    # Download button
+                    with open(ndjson_path, 'r') as f:
+                        file_content = f.read()
+                    
+                    st.download_button(
+                        label=f"📥 Download {export_symbol}_{export_date}.ndjson",
+                        data=file_content,
+                        file_name=f"{export_symbol}_{export_date}.ndjson",
+                        mime="application/x-ndjson"
+                    )
+    else:
+        st.info("No snapshot exports available yet. Exports are created during market hours when the gamma scheduler runs.")
     
     # Add tabs for additional features
     if st.session_state.api_key:
