@@ -517,6 +517,141 @@ def export_to_csv(predictions_data, include_indicators=True):
         return csv
     return None
 
+def load_daily_pin_history(symbol: str, date_str: str = None) -> pd.DataFrame:
+    """
+    Load all snapshots from NDJSON for a specific symbol and date.
+    Returns a DataFrame with pin history (Time, Pin Strike, Spot, Distance, Pull Strength, etc.)
+    """
+    import os
+    import json
+    from datetime import datetime, timezone
+    import pytz
+    
+    if date_str is None:
+        date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    
+    ndjson_path = os.path.join('exports', symbol, f'{date_str}.ndjson')
+    
+    if not os.path.exists(ndjson_path):
+        return pd.DataFrame()
+    
+    rows = []
+    et_tz = pytz.timezone('US/Eastern')
+    
+    with open(ndjson_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                snap = json.loads(line)
+                
+                # Parse timestamp and convert to ET
+                ts_str = snap.get('generated_at_utc', '')
+                if ts_str:
+                    try:
+                        dt_utc = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        dt_et = dt_utc.astimezone(et_tz)
+                        time_et = dt_et.strftime('%I:%M %p ET')
+                    except:
+                        time_et = ts_str[:8] if len(ts_str) >= 8 else 'N/A'
+                else:
+                    time_et = 'N/A'
+                
+                # Get values with backward compatibility
+                pin_strike = snap.get('primary_gamma_pin_strike') or snap.get('gamma_pin_strike', 0)
+                spot = snap.get('spot_last', 0)
+                gross_gex = snap.get('gross_gex', 0)
+                net_gex = snap.get('net_gex', 0)
+                call_gex = snap.get('call_gex_total', 0)
+                put_gex = snap.get('put_gex_total', 0)
+                
+                # Calculate distance and pull strength
+                distance_pct = ((spot - pin_strike) / pin_strike * 100) if pin_strike else 0
+                pull_strength = abs(net_gex / gross_gex * 100) if gross_gex else 0
+                
+                rows.append({
+                    'Time': time_et,
+                    'Pin Strike': pin_strike,
+                    'Spot Price': spot,
+                    'Distance': f"{distance_pct:+.2f}%",
+                    'Pull Strength': f"{pull_strength:.2f}",
+                    'Total GEX': f"${gross_gex:.3f}B",
+                    'Net GEX': f"${net_gex:.3f}B",
+                    'Valid': '✅' if snap.get('validation_is_valid', False) else '❌',
+                    # Raw values for CSV export
+                    '_pin_strike': pin_strike,
+                    '_spot': spot,
+                    '_distance_pct': distance_pct,
+                    '_pull_strength': pull_strength,
+                    '_gross_gex': gross_gex,
+                    '_net_gex': net_gex,
+                    '_call_gex': call_gex,
+                    '_put_gex': put_gex,
+                    '_timestamp_utc': ts_str,
+                    '_is_valid': snap.get('validation_is_valid', False)
+                })
+            except Exception as e:
+                continue
+    
+    return pd.DataFrame(rows)
+
+def create_eod_zip_export(date_str: str = None) -> bytes:
+    """
+    Create a ZIP file with all daily data for download.
+    Includes: NDJSON files, combined CSV, pin history CSVs
+    """
+    import io
+    import zipfile
+    import os
+    import json
+    from datetime import datetime, timezone
+    
+    if date_str is None:
+        date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    
+    buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        symbols = ['SPX', 'NDX', 'RUT']
+        all_data = []
+        
+        for symbol in symbols:
+            ndjson_path = os.path.join('exports', symbol, f'{date_str}.ndjson')
+            
+            # Add NDJSON file if exists
+            if os.path.exists(ndjson_path):
+                with open(ndjson_path, 'r') as f:
+                    zf.writestr(f'{symbol}_{date_str}.ndjson', f.read())
+                
+                # Also create pin history CSV
+                pin_df = load_daily_pin_history(symbol, date_str)
+                if not pin_df.empty:
+                    # Export clean CSV (without display formatting)
+                    export_df = pd.DataFrame({
+                        'symbol': symbol,
+                        'timestamp_utc': pin_df['_timestamp_utc'],
+                        'pin_strike': pin_df['_pin_strike'],
+                        'spot': pin_df['_spot'],
+                        'distance_pct': pin_df['_distance_pct'],
+                        'pull_strength': pin_df['_pull_strength'],
+                        'gross_gex': pin_df['_gross_gex'],
+                        'net_gex': pin_df['_net_gex'],
+                        'call_gex': pin_df['_call_gex'],
+                        'put_gex': pin_df['_put_gex'],
+                        'is_valid': pin_df['_is_valid']
+                    })
+                    zf.writestr(f'{symbol}_pin_history_{date_str}.csv', export_df.to_csv(index=False))
+                    all_data.append(export_df)
+        
+        # Add combined CSV
+        if all_data:
+            combined_df = pd.concat(all_data, ignore_index=True)
+            zf.writestr(f'all_indices_{date_str}.csv', combined_df.to_csv(index=False))
+    
+    buffer.seek(0)
+    return buffer.getvalue()
+
 # DISABLED: WebSocket connections are now backend-only (singleton pattern)
 # Streamlit must NOT create WebSocket connections directly - this causes Polygon 1008 errors
 # All streaming data is read from the FastAPI backend via REST endpoints
@@ -1069,7 +1204,64 @@ with st.sidebar:
                                 else:
                                     st.caption(str(strike_data))
                     
+                    # Pin History Table (from NDJSON)
+                    today_str = datetime.now().strftime('%Y-%m-%d')
+                    pin_history = load_daily_pin_history(symbol, today_str)
+                    
+                    if not pin_history.empty:
+                        with st.expander(f"📊 Intraday Pin History ({len(pin_history)} samples)", expanded=False):
+                            # Display table (hide internal columns)
+                            display_cols = ['Time', 'Pin Strike', 'Spot Price', 'Distance', 'Pull Strength', 'Total GEX', 'Net GEX', 'Valid']
+                            st.dataframe(pin_history[display_cols], hide_index=True, use_container_width=True)
+                            
+                            # Export button for this symbol
+                            export_df = pd.DataFrame({
+                                'symbol': symbol,
+                                'timestamp_utc': pin_history['_timestamp_utc'],
+                                'pin_strike': pin_history['_pin_strike'],
+                                'spot': pin_history['_spot'],
+                                'distance_pct': pin_history['_distance_pct'],
+                                'pull_strength': pin_history['_pull_strength'],
+                                'gross_gex': pin_history['_gross_gex'],
+                                'net_gex': pin_history['_net_gex'],
+                                'is_valid': pin_history['_is_valid']
+                            })
+                            st.download_button(
+                                f"💾 Save {symbol} Pin History",
+                                export_df.to_csv(index=False),
+                                f"{symbol}_pin_history_{today_str}.csv",
+                                "text/csv"
+                            )
+                    
                     st.divider()
+            
+            # End of Day Export (after all symbols)
+            st.subheader("📦 End of Day Export")
+            st.caption("Download everything in one click - all NDJSON files, CSVs, and pin history")
+            
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            
+            # Check if any data exists
+            has_data = any(
+                os.path.exists(os.path.join('exports', sym, f'{today_str}.ndjson'))
+                for sym in ['SPX', 'NDX', 'RUT']
+            )
+            
+            if has_data:
+                try:
+                    zip_data = create_eod_zip_export(today_str)
+                    st.download_button(
+                        "📥 Download ALL Data (ZIP)",
+                        zip_data,
+                        f"gamma_data_{today_str}.zip",
+                        "application/zip",
+                        type="primary"
+                    )
+                    st.success(f"ZIP includes: NDJSON files, pin history CSVs, combined all_indices.csv")
+                except Exception as e:
+                    st.error(f"Error creating ZIP: {str(e)[:50]}")
+            else:
+                st.info("No data available for today. Run gamma sampling during market hours to collect data.")
         else:
             st.info("Select indexes in the sidebar to view frozen gamma snapshots.")
     
