@@ -1,0 +1,131 @@
+import sys
+import json
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+
+# ============================================================
+# MODEL DEFINITION (must match training)
+# ============================================================
+
+class MLP(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ============================================================
+# FEATURE EXTRACTION
+# ============================================================
+
+def compute_gamma_features(df):
+    df["gamma_pin"] = df["Gamma Pin"].replace("[\$,]", "", regex=True).astype(float)
+    df["distance_to_pin"] = df["close"] - df["gamma_pin"]
+    df["zero_gamma_distance"] = df["close"] - df["Spot"]
+    df["net_gex_norm"] = df["Net GEX"] / df["close"]
+    return df
+
+def select_feature_columns(df, feature_list):
+    return df[feature_list].values.astype(np.float32)
+
+# ============================================================
+# INFERENCE FUNCTION
+# ============================================================
+
+def run_inference(price_csv, gamma_csv, index_name):
+
+    # Load metadata
+    meta_file = f"gamma_model_{index_name.replace(' ', '_').replace('(', '').replace(')', '')}_meta.json"
+    model_file = f"gamma_model_{index_name.replace(' ', '_').replace('(', '').replace(')', '')}.pt"
+
+    with open(meta_file, "r") as f:
+        meta = json.load(f)
+
+    feature_cols = meta["feature_columns"]
+
+    # Load model
+    model = MLP(input_dim=len(feature_cols))
+    model.load_state_dict(torch.load(model_file, map_location="cpu"))
+    model.eval()
+
+    # Load price + gamma
+    df = pd.read_csv(price_csv)
+    gamma = pd.read_csv(gamma_csv)
+
+    # Strict index filtering
+    if "index_name" not in df.columns:
+        raise ValueError("index_name column missing — cannot filter index safely.")
+
+    df = df[df["index_name"].str.strip() == index_name]
+    if df.empty:
+        raise ValueError(f"No rows found for index: {index_name}")
+
+    # Clean gamma fields
+    gamma["Spot"] = gamma["Spot"].replace("[\$,]", "", regex=True).astype(float)
+    gamma["Gross GEX"] = gamma["Gross GEX"].replace("[\$,B]", "", regex=True).astype(float)
+    gamma["Net GEX"] = gamma["Net GEX"].replace("[\$,B]", "", regex=True).astype(float)
+
+    # Merge nearest timestamp
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    gamma["Time"] = pd.to_datetime(gamma["Time"])
+    df = pd.merge_asof(df.sort_values("timestamp"),
+                       gamma.sort_values("Time"),
+                       left_on="timestamp",
+                       right_on="Time",
+                       direction="nearest")
+
+    # Compute gamma features
+    df = compute_gamma_features(df)
+
+    # Extract features
+    X = select_feature_columns(df, feature_cols)
+    X_tensor = torch.tensor(X, dtype=torch.float32)
+
+    # Predict distance to pin
+    with torch.no_grad():
+        pred_distance = model(X_tensor).numpy().flatten()
+
+    # Reconstruct predicted close
+    predicted_close = pred_distance + df["gamma_pin"].values
+
+    # Confidence metric (simple inverse error proxy)
+    # You can replace this with a calibrated uncertainty model later
+    confidence = 1 / (1 + np.abs(pred_distance))
+
+    # Build output DataFrame
+    out = pd.DataFrame({
+        "timestamp": df["timestamp"],
+        "index_name": df["index_name"],
+        "spot": df["close"],
+        "gamma_pin": df["gamma_pin"],
+        "predicted_distance_to_pin": pred_distance,
+        "predicted_close": predicted_close,
+        "confidence": confidence
+    })
+
+    print(out.tail(10))
+    return out
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python predict_gamma_model.py <price_csv> <gamma_csv> <index_name>")
+        sys.exit(1)
+
+    price_csv = sys.argv[1]
+    gamma_csv = sys.argv[2]
+    index_name = sys.argv[3]
+
+    run_inference(price_csv, gamma_csv, index_name)
