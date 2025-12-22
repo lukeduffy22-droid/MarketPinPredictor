@@ -2263,17 +2263,29 @@ else:
         available_symbols = [d for d in os.listdir(export_base) if os.path.isdir(os.path.join(export_base, d))]
     
     if available_symbols:
+        # Add "All Indices" option at the start
+        symbol_options = ["📦 All Indices"] + available_symbols
+        
         export_col1, export_col2 = st.columns(2)
         
         with export_col1:
-            export_symbol = st.selectbox("Select Index", available_symbols, key="export_symbol_select")
+            export_symbol = st.selectbox("Select Index", symbol_options, key="export_symbol_select")
         
         with export_col2:
-            # Get available dates for selected symbol
-            symbol_dir = os.path.join(export_base, export_symbol)
-            available_files = []
-            if os.path.exists(symbol_dir):
-                available_files = sorted([f.replace('.ndjson', '') for f in os.listdir(symbol_dir) if f.endswith('.ndjson')], reverse=True)
+            # Get available dates - for "All Indices", combine dates from all symbols
+            if export_symbol == "📦 All Indices":
+                all_dates = set()
+                for sym in available_symbols:
+                    sym_dir = os.path.join(export_base, sym)
+                    if os.path.exists(sym_dir):
+                        all_dates.update(f.replace('.ndjson', '') for f in os.listdir(sym_dir) if f.endswith('.ndjson'))
+                available_files = sorted(list(all_dates), reverse=True)
+                symbol_dir = None
+            else:
+                symbol_dir = os.path.join(export_base, export_symbol)
+                available_files = []
+                if os.path.exists(symbol_dir):
+                    available_files = sorted([f.replace('.ndjson', '') for f in os.listdir(symbol_dir) if f.endswith('.ndjson')], reverse=True)
             
             if available_files:
                 export_date = st.selectbox("Select Date", available_files, key="export_date_select")
@@ -2281,7 +2293,79 @@ else:
                 export_date = None
                 st.info("No export files found")
         
-        if export_date:
+        # Handle "All Indices" view
+        if export_date and export_symbol == "📦 All Indices":
+            st.success(f"📦 All Indices export for {export_date}")
+            
+            # Collect data from all symbols
+            all_snapshots = []
+            symbol_counts = {}
+            
+            for sym in available_symbols:
+                sym_path = os.path.join(export_base, sym, f"{export_date}.ndjson")
+                if os.path.exists(sym_path):
+                    count = 0
+                    with open(sym_path, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    snap = json.loads(line)
+                                    snap['_symbol'] = sym
+                                    all_snapshots.append(snap)
+                                    count += 1
+                                except:
+                                    pass
+                    symbol_counts[sym] = count
+            
+            # Summary metrics
+            if all_snapshots:
+                sum_col1, sum_col2, sum_col3 = st.columns(3)
+                with sum_col1:
+                    st.metric("Total Snapshots", len(all_snapshots))
+                with sum_col2:
+                    st.metric("Symbols", ", ".join(symbol_counts.keys()))
+                with sum_col3:
+                    valid_count = sum(1 for s in all_snapshots if s.get('validation_is_valid', False))
+                    st.metric("Valid", f"{valid_count}/{len(all_snapshots)}")
+                
+                # Breakdown by symbol
+                st.caption(f"Per symbol: {', '.join(f'{k}: {v}' for k, v in symbol_counts.items())}")
+                
+                # Combined data table
+                with st.expander("View All Snapshots", expanded=False):
+                    display_data = []
+                    for snap in all_snapshots:
+                        snap_time = snap.get('generated_at_utc', '')
+                        time_display = snap_time[11:19] if len(snap_time) > 19 else snap_time[:8] if snap_time else 'N/A'
+                        gamma_pin_val = snap.get('primary_gamma_pin_strike') or snap.get('gamma_pin_strike')
+                        display_data.append({
+                            'Symbol': snap.get('_symbol', ''),
+                            'Time': time_display,
+                            'Spot': f"${snap.get('spot_last', 0):,.2f}",
+                            'Gamma Pin': f"${gamma_pin_val:,.0f}" if gamma_pin_val else 'N/A',
+                            'Gross GEX': f"${snap.get('gross_gex', 0):.3f}B",
+                            'Net GEX': f"${snap.get('net_gex', 0):.3f}B",
+                            'Valid': '✅' if snap.get('validation_is_valid') else '❌'
+                        })
+                    st.dataframe(pd.DataFrame(display_data), hide_index=True, use_container_width=True)
+                
+                # Download ZIP with everything
+                st.subheader("📥 Download All Data")
+                try:
+                    zip_data = create_eod_zip_export(export_date)
+                    st.download_button(
+                        "📦 Download Complete ZIP",
+                        zip_data,
+                        f"gamma_data_{export_date}.zip",
+                        "application/zip",
+                        type="primary"
+                    )
+                    st.caption("Includes: NDJSON files, pin history CSVs, combined all_indices.csv")
+                except Exception as e:
+                    st.error(f"Error creating ZIP: {str(e)[:50]}")
+        
+        elif export_date and symbol_dir:
             ndjson_path = os.path.join(symbol_dir, f"{export_date}.ndjson")
             
             if os.path.exists(ndjson_path):
