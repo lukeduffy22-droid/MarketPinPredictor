@@ -59,7 +59,7 @@ def extract_fields(df):
     out["date"] = pd.to_datetime(df.get("generated_at_utc", df.get("timestamp_utc", ""))).dt.date
     out["timestamp_utc"] = pd.to_datetime(df.get("generated_at_utc", df.get("timestamp_utc", "")))
     out["spot"] = df.get("spot_last", df.get("spot", 0))
-    out["gamma_pin"] = df.get("gamma_pin_strike", df.get("primary_gamma_pin_strike", None))
+    out["gamma_pin"] = df.get("primary_gamma_pin_strike", df.get("gamma_pin_strike", None))
     out["gross_gex"] = df.get("gross_gex", 0)
     out["net_gex"] = df.get("net_gex", 0)
     out["call_gex"] = df.get("call_gex", 0)

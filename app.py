@@ -2133,8 +2133,10 @@ else:
                         valid_count = sum(1 for s in snapshots if s.get('validation_is_valid', False))
                         st.metric("Valid Snapshots", f"{valid_count}/{len(snapshots)}")
                     with sum_col4:
-                        if last_snap.get('gamma_pin_strike'):
-                            st.metric("Final Pin", f"${last_snap['gamma_pin_strike']:,.0f}")
+                        # Support both field names for backward compatibility
+                        final_pin = last_snap.get('primary_gamma_pin_strike') or last_snap.get('gamma_pin_strike')
+                        if final_pin:
+                            st.metric("Final Pin", f"${final_pin:,.0f}")
                         else:
                             st.metric("Final Pin", "N/A")
                     
@@ -2148,10 +2150,12 @@ else:
                                 time_display = snap_time[11:19] if len(snap_time) > 19 else snap_time[:8]
                             else:
                                 time_display = 'N/A'
+                            # Support both field names for backward compatibility
+                            gamma_pin_val = snap.get('primary_gamma_pin_strike') or snap.get('gamma_pin_strike')
                             display_data.append({
                                 'Time': time_display,
                                 'Spot': f"${snap.get('spot_last', 0):,.2f}",
-                                'Gamma Pin': f"${snap.get('gamma_pin_strike', 0):,.0f}" if snap.get('gamma_pin_strike') else 'N/A',
+                                'Gamma Pin': f"${gamma_pin_val:,.0f}" if gamma_pin_val else 'N/A',
                                 'Gross GEX': f"${snap.get('gross_gex', 0):.3f}B",
                                 'Net GEX': f"${snap.get('net_gex', 0):.3f}B",
                                 'Valid': '✅' if snap.get('validation_is_valid') else '❌'
@@ -2238,7 +2242,7 @@ python predict_gamma_model.py all_indices.csv SPX
                                 'date': export_date,
                                 'timestamp_utc': snap.get('generated_at_utc', ''),
                                 'spot': snap.get('spot_last', 0),
-                                'gamma_pin': snap.get('gamma_pin_strike', None),
+                                'gamma_pin': snap.get('primary_gamma_pin_strike') or snap.get('gamma_pin_strike'),
                                 'gross_gex': snap.get('gross_gex', 0),
                                 'net_gex': snap.get('net_gex', 0),
                                 'call_gex': snap.get('call_gex', 0),
@@ -2273,7 +2277,7 @@ python predict_gamma_model.py all_indices.csv SPX
                                                     'date': export_date,
                                                     'timestamp_utc': snap.get('generated_at_utc', ''),
                                                     'spot': snap.get('spot_last', 0),
-                                                    'gamma_pin': snap.get('gamma_pin_strike', None),
+                                                    'gamma_pin': snap.get('primary_gamma_pin_strike') or snap.get('gamma_pin_strike'),
                                                     'gross_gex': snap.get('gross_gex', 0),
                                                     'net_gex': snap.get('net_gex', 0),
                                                     'call_gex': snap.get('call_gex', 0),
