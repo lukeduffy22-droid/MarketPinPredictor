@@ -2310,6 +2310,78 @@ if __name__ == "__main__":
                             file_name="train_gamma_model.py",
                             mime="text/x-python"
                         )
+                    
+                    # CSV Export row
+                    st.caption("CSV Exports")
+                    csv_col1, csv_col2 = st.columns(2)
+                    
+                    with csv_col1:
+                        # Convert current snapshots to CSV
+                        csv_data = []
+                        for snap in snapshots:
+                            csv_data.append({
+                                'symbol': export_symbol,
+                                'date': export_date,
+                                'timestamp_utc': snap.get('generated_at_utc', ''),
+                                'spot': snap.get('spot_last', 0),
+                                'gamma_pin': snap.get('gamma_pin_strike', None),
+                                'gross_gex': snap.get('gross_gex', 0),
+                                'net_gex': snap.get('net_gex', 0),
+                                'call_gex': snap.get('call_gex', 0),
+                                'put_gex': snap.get('put_gex', 0),
+                                'max_pain': snap.get('max_pain_strike', None),
+                                'is_valid': snap.get('validation_is_valid', False)
+                            })
+                        csv_df = pd.DataFrame(csv_data)
+                        csv_content = csv_df.to_csv(index=False)
+                        
+                        st.download_button(
+                            label=f"📊 Export {export_symbol} to CSV",
+                            data=csv_content,
+                            file_name=f"{export_symbol}_{export_date}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with csv_col2:
+                        # Combine all symbols for selected date
+                        all_symbols_data = []
+                        for sym in available_symbols:
+                            sym_file = os.path.join(export_base, sym, f"{export_date}.ndjson")
+                            if os.path.exists(sym_file):
+                                with open(sym_file, 'r') as f:
+                                    for line in f:
+                                        line = line.strip()
+                                        if line:
+                                            try:
+                                                snap = json.loads(line)
+                                                all_symbols_data.append({
+                                                    'symbol': sym,
+                                                    'date': export_date,
+                                                    'timestamp_utc': snap.get('generated_at_utc', ''),
+                                                    'spot': snap.get('spot_last', 0),
+                                                    'gamma_pin': snap.get('gamma_pin_strike', None),
+                                                    'gross_gex': snap.get('gross_gex', 0),
+                                                    'net_gex': snap.get('net_gex', 0),
+                                                    'call_gex': snap.get('call_gex', 0),
+                                                    'put_gex': snap.get('put_gex', 0),
+                                                    'max_pain': snap.get('max_pain_strike', None),
+                                                    'is_valid': snap.get('validation_is_valid', False)
+                                                })
+                                            except:
+                                                pass
+                        
+                        if all_symbols_data:
+                            all_csv_df = pd.DataFrame(all_symbols_data)
+                            all_csv_content = all_csv_df.to_csv(index=False)
+                            
+                            st.download_button(
+                                label=f"📊 Export ALL Indices ({export_date})",
+                                data=all_csv_content,
+                                file_name=f"all_indices_{export_date}.csv",
+                                mime="text/csv"
+                            )
+                        else:
+                            st.button("📊 No data for other indices", disabled=True)
     else:
         st.info("No snapshot exports available yet. Exports are created during market hours when the gamma scheduler runs.")
     
