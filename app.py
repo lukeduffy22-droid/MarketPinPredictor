@@ -41,7 +41,8 @@ INDEXES = {
     "S&P 500 (SPX)": "SPX",
     "NASDAQ 100 (NDX)": "NDX", 
     "Dow Jones (DJI via DIA options)": "DJI",
-    "Russell 2000 (RUT)": "RUT"
+    "Russell 2000 (RUT)": "RUT",
+    "VIX (Volatility)": "VIX"
 }
 
 # Polygon index ticker format (with I: prefix for indices)
@@ -49,7 +50,8 @@ INDEX_POLYGON_TICKERS = {
     "SPX": "I:SPX",
     "NDX": "I:NDX",
     "DJI": "I:DJI",
-    "RUT": "I:RUT"
+    "RUT": "I:RUT",
+    "VIX": "I:VIX"
 }
 
 # ETF proxies as fallback (only used if direct index data unavailable)
@@ -57,7 +59,8 @@ INDEX_ETFS = {
     "SPX": "SPY",
     "NDX": "QQQ",
     "DJI": "DIA",
-    "RUT": "IWM"
+    "RUT": "IWM",
+    "VIX": "UVXY"  # VIX ETF proxy (though VIX options trade directly)
 }
 
 import os
