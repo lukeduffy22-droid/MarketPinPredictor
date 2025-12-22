@@ -161,11 +161,6 @@ def train_model(full_csv, index_name, model_out, meta_out):
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python train_gamma_model.py <full_dataset_csv> <index_name>")
-        print("")
-        print("Examples:")
-        print("  python train_gamma_model.py all_indices_2025-12-22.csv SPX")
-        print("  python train_gamma_model.py all_indices_2025-12-22.csv NDX")
-        print("  python train_gamma_model.py all_indices_2025-12-22.csv RUT")
         sys.exit(1)
 
     full_csv = sys.argv[1]

@@ -1,0 +1,73 @@
+import os
+import json
+import ndjson
+import pandas as pd
+from glob import glob
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SNAPSHOT_FOLDER = "snapshots/"  # Folder containing SPX_*.ndjson, NDX_*.ndjson, etc.
+OUTPUT_CSV = "all_indices_2025-12-22.csv"
+VALID_SYMBOLS = {"SPX", "NDX", "RUT"}
+
+# ============================================================
+# LOAD SNAPSHOTS
+# ============================================================
+
+def load_ndjson_files(folder):
+    rows = []
+    for file in glob(f"{folder}/*.ndjson"):
+        with open(file, "r") as f:
+            try:
+                data = ndjson.load(f)
+                rows.extend(data)
+            except:
+                pass
+    return pd.DataFrame(rows)
+
+# ============================================================
+# EXTRACT FIELDS
+# ============================================================
+
+def extract_fields(df):
+    df = df[df["symbol"].isin(VALID_SYMBOLS)]
+    df = df[df["is_valid"] == True]
+
+    out = pd.DataFrame()
+    out["symbol"] = df["symbol"]
+    out["date"] = pd.to_datetime(df["timestamp_utc"]).dt.date
+    out["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+    out["spot"] = df["spot_last"]
+    out["gamma_pin"] = df.get("primary_gamma_pin_strike", None)
+    out["gross_gex"] = df["gross_gex"]
+    out["net_gex"] = df["net_gex"]
+    out["call_gex"] = df.get("call_gex", 0)
+    out["put_gex"] = df.get("put_gex", 0)
+    out["max_pain"] = df.get("max_pain", None)
+    out["is_valid"] = df["is_valid"]
+
+    return out.sort_values(["symbol", "timestamp_utc"])
+
+# ============================================================
+# MAIN EXPORT FUNCTION
+# ============================================================
+
+def export_all_indices():
+    print("Loading snapshot files...")
+    df = load_ndjson_files(SNAPSHOT_FOLDER)
+
+    print("Extracting fields...")
+    clean = extract_fields(df)
+
+    print(f"Saving to {OUTPUT_CSV}...")
+    clean.to_csv(OUTPUT_CSV, index=False)
+    print("Export complete.")
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    export_all_indices()

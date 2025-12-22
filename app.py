@@ -2202,21 +2202,27 @@ else:
                     with dl_col4:
                         with st.popover("📖 How to Use"):
                             st.markdown("""
-**Training (run for each index):**
+**Step 1: Export unified dataset**
 ```bash
-python train_gamma_model.py prices.csv gamma.csv SPX
-python train_gamma_model.py prices.csv gamma.csv NDX
-python train_gamma_model.py prices.csv gamma.csv RUT
+python export_all_indices.py
+```
+Creates `all_indices_YYYY-MM-DD.csv`
+
+**Step 2: Train models (one per index)**
+```bash
+python train_gamma_model.py all_indices.csv SPX
+python train_gamma_model.py all_indices.csv NDX
+python train_gamma_model.py all_indices.csv RUT
 ```
 
-**Prediction:**
+**Step 3: Run predictions**
 ```bash
-python predict_gamma_model.py prices.csv gamma.csv SPX
+python predict_gamma_model.py all_indices.csv SPX
 ```
 
 **Output files:**
 - `gamma_model_SPX.pt` - Trained model
-- `gamma_model_SPX_meta.json` - Feature metadata
+- `gamma_model_SPX_meta.json` - Features used
                             """)
                     
                     # CSV Export row
