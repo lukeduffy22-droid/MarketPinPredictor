@@ -2114,9 +2114,21 @@ else:
                     last_snap = snapshots[-1]
                     
                     with sum_col1:
-                        st.metric("First Snapshot", first_snap.get('timestamp_et', 'N/A')[:8] if first_snap.get('timestamp_et') else 'N/A')
+                        # Use generated_at_utc field and extract time portion (HH:MM:SS)
+                        first_time = first_snap.get('generated_at_utc', '')
+                        if first_time:
+                            # Format: extract time from ISO format (e.g., "2025-12-22T15:30:00Z" -> "15:30:00")
+                            first_time_display = first_time[11:19] if len(first_time) > 19 else first_time[:8]
+                        else:
+                            first_time_display = 'N/A'
+                        st.metric("First Snapshot", first_time_display)
                     with sum_col2:
-                        st.metric("Last Snapshot", last_snap.get('timestamp_et', 'N/A')[:8] if last_snap.get('timestamp_et') else 'N/A')
+                        last_time = last_snap.get('generated_at_utc', '')
+                        if last_time:
+                            last_time_display = last_time[11:19] if len(last_time) > 19 else last_time[:8]
+                        else:
+                            last_time_display = 'N/A'
+                        st.metric("Last Snapshot", last_time_display)
                     with sum_col3:
                         valid_count = sum(1 for s in snapshots if s.get('validation_is_valid', False))
                         st.metric("Valid Snapshots", f"{valid_count}/{len(snapshots)}")
@@ -2130,8 +2142,14 @@ else:
                     with st.expander("View Snapshot Details", expanded=False):
                         display_data = []
                         for snap in snapshots:
+                            # Extract time from generated_at_utc (ISO format)
+                            snap_time = snap.get('generated_at_utc', '')
+                            if snap_time:
+                                time_display = snap_time[11:19] if len(snap_time) > 19 else snap_time[:8]
+                            else:
+                                time_display = 'N/A'
                             display_data.append({
-                                'Time': snap.get('timestamp_et', 'N/A')[:8] if snap.get('timestamp_et') else 'N/A',
+                                'Time': time_display,
                                 'Spot': f"${snap.get('spot_last', 0):,.2f}",
                                 'Gamma Pin': f"${snap.get('gamma_pin_strike', 0):,.0f}" if snap.get('gamma_pin_strike') else 'N/A',
                                 'Gross GEX': f"${snap.get('gross_gex', 0):.3f}B",
