@@ -41,6 +41,11 @@ def run_inference(full_csv, index_name, output_csv=None):
 
     feature_cols = meta["feature_columns"]
 
+    # NOTE: If scaling was used during training, apply it here
+    # scaling = meta.get("scaling")
+    # if scaling:
+    #     X = (X - scaling["mean"]) / scaling["std"]
+
     # Load model
     model = MLP(input_dim=len(feature_cols))
     model.load_state_dict(torch.load(model_file, map_location="cpu"))
@@ -59,6 +64,16 @@ def run_inference(full_csv, index_name, output_csv=None):
         raise ValueError(f"No rows found for index: {index_name}")
 
     print(f"Found {len(df)} rows for {index_name}")
+
+    # Sort by timestamp for proper temporal ordering
+    if "timestamp_utc" in df.columns:
+        df = df.sort_values("timestamp_utc").reset_index(drop=True)
+        print(f"Sorted by timestamp_utc")
+
+    # Check for NaN gamma_pin before computing target
+    if df["gamma_pin"].isna().any():
+        nan_count = df["gamma_pin"].isna().sum()
+        raise ValueError(f"gamma_pin contains {nan_count} NaN values — cannot compute distance_to_pin")
 
     # Compute distance_to_pin (same as training)
     df["distance_to_pin"] = df["spot"] - df["gamma_pin"]

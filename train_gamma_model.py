@@ -88,10 +88,24 @@ def train_model(full_csv, index_name, model_out, meta_out):
     if df.empty:
         raise ValueError(f"No rows found for index: {index_name}")
 
+    # Sort by timestamp for proper temporal ordering
+    if "timestamp_utc" in df.columns:
+        df = df.sort_values("timestamp_utc").reset_index(drop=True)
+        print(f"Sorted {len(df)} rows by timestamp_utc")
+
+    # Check for NaN gamma_pin before computing target
+    if df["gamma_pin"].isna().any():
+        nan_count = df["gamma_pin"].isna().sum()
+        print(f"Warning: {nan_count} rows have NaN gamma_pin — dropping them")
+        df = df.dropna(subset=["gamma_pin"])
+
+    if df.empty:
+        raise ValueError(f"No valid rows remaining after dropping NaN gamma_pin")
+
     # Compute target
     df["distance_to_pin"] = df["spot"] - df["gamma_pin"]
 
-    # Drop rows missing target
+    # Drop rows missing target (safety net)
     df = df.dropna(subset=["distance_to_pin"])
 
     # Select features
@@ -144,10 +158,13 @@ def train_model(full_csv, index_name, model_out, meta_out):
 
     # Save model + metadata
     torch.save(model.state_dict(), model_out)
+    # NOTE: If you add feature scaling (StandardScaler, MinMaxScaler),
+    # save the scaler parameters here and load them during inference.
     meta = {
         "feature_columns": feature_cols,
         "target": TARGET_COLUMN,
-        "index_name": index_name
+        "index_name": index_name,
+        "scaling": None  # Future: {"mean": [...], "std": [...]} for StandardScaler
     }
     with open(meta_out, "w") as f:
         json.dump(meta, f, indent=2)
