@@ -1857,6 +1857,99 @@ else:
         
         st.divider()
         
+        # Market Maker Target Section - Where MMs are incentivized to drive price
+        st.header("🎯 Market Maker Targets")
+        st.caption("Where market makers are most incentivized to drive price by end of day")
+        
+        mm_cols = st.columns(len(st.session_state.predictions))
+        
+        for mm_col, (index_name, pred) in zip(mm_cols, st.session_state.predictions.items()):
+            with mm_col:
+                current_price = pred['current_price']
+                gex = pred.get('gex_data', {})
+                
+                gamma_pin = gex.get('pin_strike')
+                max_pain = gex.get('max_pain_strike')
+                
+                st.subheader(index_name)
+                
+                if gamma_pin or max_pain:
+                    # Calculate distances
+                    gamma_dist = ((gamma_pin - current_price) / current_price * 100) if gamma_pin else None
+                    pain_dist = ((max_pain - current_price) / current_price * 100) if max_pain else None
+                    
+                    # Determine primary target (gamma pin usually stronger intraday)
+                    if gamma_pin and max_pain:
+                        # If they're close (within 0.5%), show as aligned
+                        if abs(gamma_pin - max_pain) / current_price < 0.005:
+                            primary_target = gamma_pin
+                            target_label = "Aligned Target"
+                            target_icon = "🎯"
+                            target_explanation = "Gamma Pin and Max Pain are aligned - strong magnet effect"
+                        else:
+                            # Gamma pin is primary for intraday
+                            primary_target = gamma_pin
+                            target_label = "Gamma Pin (Primary)"
+                            target_icon = "📍"
+                            target_explanation = "Strongest intraday pull from MM hedging activity"
+                    elif gamma_pin:
+                        primary_target = gamma_pin
+                        target_label = "Gamma Pin"
+                        target_icon = "📍"
+                        target_explanation = "MM delta-hedging creates magnetic price action"
+                    else:
+                        primary_target = max_pain
+                        target_label = "Max Pain"
+                        target_icon = "💰"
+                        target_explanation = "Where option writers pay out the least"
+                    
+                    primary_dist = ((primary_target - current_price) / current_price * 100) if primary_target else 0
+                    direction = "⬆️" if primary_dist > 0 else "⬇️" if primary_dist < 0 else "↔️"
+                    
+                    # Primary MM Target
+                    st.metric(
+                        label=f"{target_icon} {target_label}",
+                        value=f"${primary_target:,.0f}",
+                        delta=f"{primary_dist:+.2f}% {direction}"
+                    )
+                    st.caption(target_explanation)
+                    
+                    # Show both levels if they exist and differ
+                    if gamma_pin and max_pain and abs(gamma_pin - max_pain) / current_price >= 0.005:
+                        st.divider()
+                        level_col1, level_col2 = st.columns(2)
+                        
+                        with level_col1:
+                            gamma_dir = "⬆️" if gamma_dist > 0 else "⬇️" if gamma_dist < 0 else "↔️"
+                            st.markdown(f"**📍 Gamma Pin**")
+                            st.markdown(f"${gamma_pin:,.0f} ({gamma_dist:+.2f}%)")
+                            st.caption("Intraday hedging pull")
+                        
+                        with level_col2:
+                            pain_dir = "⬆️" if pain_dist > 0 else "⬇️" if pain_dist < 0 else "↔️"
+                            st.markdown(f"**💰 Max Pain**")
+                            st.markdown(f"${max_pain:,.0f} ({pain_dist:+.2f}%)")
+                            st.caption("Expiration settlement target")
+                    
+                    # Pull strength indicator
+                    pull_strength = gex.get('pull_strength', 0)
+                    if pull_strength:
+                        if pull_strength < 1:
+                            strength_label = "Strong Pull"
+                            strength_color = "green"
+                        elif pull_strength < 2:
+                            strength_label = "Moderate Pull"
+                            strength_color = "orange"
+                        else:
+                            strength_label = "Weak Pull"
+                            strength_color = "gray"
+                        st.markdown(f"<span style='color: {strength_color}; font-weight: bold;'>Pull Strength: {strength_label}</span>", unsafe_allow_html=True)
+                else:
+                    st.info("Gamma data unavailable")
+                    st.caption("Waiting for options data...")
+        
+        st.divider()
+        
         # AI Portfolio Risk Assessment
         if enable_ai and st.session_state.predictions:
             st.header("🎯 AI Portfolio Risk Assessment")
