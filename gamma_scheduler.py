@@ -75,6 +75,20 @@ def export_snapshot_ndjson(snapshot) -> bool:
             f.write(json_line + '\n')
         
         print(f"  📤 Snapshot exported: {export_file}")
+        
+        # Also save to database for historical queries
+        try:
+            from database import save_audit_snapshot_to_db
+            import json
+            snapshot_dict = json.loads(json_line)
+            db_result = save_audit_snapshot_to_db(snapshot_dict)
+            if db_result:
+                print(f"  💾 Snapshot saved to database: {symbol}")
+            else:
+                print(f"  ⚠️ Database save returned None for {symbol}")
+        except Exception as db_err:
+            print(f"  ⚠️ Database save failed (NDJSON ok): {db_err}")
+        
         return True
         
     except Exception as e:
