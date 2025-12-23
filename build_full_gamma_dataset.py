@@ -1,0 +1,64 @@
+# build_full_gamma_dataset.py
+import sys
+import os
+import json
+import pandas as pd
+
+def load_snapshot(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def extract_row(snap):
+    symbol = snap.get("symbol", "")
+    ts = snap.get("timestamp_utc", snap.get("generated_at_utc", None))
+    spot = snap.get("spot_last", snap.get("spot", None))
+    gamma_pin = snap.get("primary_gamma_pin_strike") or snap.get("gamma_pin", None)
+    gross_gex = snap.get("gross_gex", None)
+    net_gex = snap.get("net_gex", None)
+    call_gex = snap.get("call_gex", None)
+    put_gex = snap.get("put_gex", None)
+    is_valid = snap.get("validation_is_valid", False)
+
+    return {
+        "symbol": symbol,
+        "timestamp_utc": ts,
+        "spot": spot,
+        "gamma_pin": gamma_pin,
+        "distance_to_pin": spot - gamma_pin if (spot is not None and gamma_pin is not None) else None,
+        "gross_gex": gross_gex,
+        "net_gex": net_gex,
+        "call_gex": call_gex,
+        "put_gex": put_gex,
+        "is_valid": is_valid
+    }
+
+def build_dataset(ndjson_dir):
+    rows = []
+    for fname in os.listdir(ndjson_dir):
+        if not fname.endswith(".ndjson"):
+            continue
+        full_path = os.path.join(ndjson_dir, fname)
+        with open(full_path, "r") as f:
+            for line in f:
+                try:
+                    snap = json.loads(line.strip())
+                    rows.append(extract_row(snap))
+                except Exception as e:
+                    print(f"Error parsing {fname}: {e}")
+
+    df = pd.DataFrame(rows)
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+    return df
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python build_full_gamma_dataset.py <ndjson_dir> <output_csv>")
+        sys.exit(1)
+
+    ndjson_dir = sys.argv[1]
+    output_csv = sys.argv[2]
+
+    df = build_dataset(ndjson_dir)
+    df.to_csv(output_csv, index=False)
+    print(f"Saved dataset to {output_csv}")
