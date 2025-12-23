@@ -174,6 +174,37 @@ def validate_gamma_snapshot(snapshot: AuditSnapshot) -> ValidationResult:
             f"[${spot_min:.2f}, ${spot_max:.2f}] for {symbol}"
         )
     
+    # === GATE 6: Pre-gate checks (from build_audit_snapshot) ===
+    # These cover chain thinness, active strikes count, and extreme concentration
+    MIN_NONZERO_STRIKES = 10
+    if snapshot.pregate_reason:
+        result.add_failure(f"GATE6_PREGATE: {snapshot.pregate_reason}")
+    elif snapshot.nonzero_strike_count is not None and snapshot.nonzero_strike_count < MIN_NONZERO_STRIKES:
+        result.add_failure(
+            f"GATE6_PREGATE: Only {snapshot.nonzero_strike_count} strikes with non-zero GEX "
+            f"(minimum required: {MIN_NONZERO_STRIKES})"
+        )
+    
+    # === GATE 7: GEX Invariants (from build_audit_snapshot) ===
+    # These are locked invariants: gross_gex >= abs(net_gex) and gross_gex == call + put
+    if total_gex_abs > 0:
+        call_total = snapshot.call_gex_total or 0
+        put_total = snapshot.put_gex_total or 0
+        expected_gross = call_total + put_total
+        
+        # Invariant 1: gross >= abs(net)
+        if snapshot.gross_gex is not None and snapshot.net_gex is not None:
+            if snapshot.gross_gex < abs(snapshot.net_gex) - 1e-9:
+                result.add_failure(
+                    f"GATE7_INVARIANT: gross_gex ({snapshot.gross_gex:.4f}) < abs(net_gex) ({abs(snapshot.net_gex):.4f})"
+                )
+        
+        # Invariant 2: gross == call + put
+        if snapshot.gross_gex is not None and abs(snapshot.gross_gex - expected_gross) > 1e-9:
+            result.add_failure(
+                f"GATE7_INVARIANT: gross_gex ({snapshot.gross_gex:.4f}) != call_gex + put_gex ({expected_gross:.4f})"
+            )
+    
     # Log validation result
     if result.is_valid:
         log.debug(f"Gamma validation PASSED for {symbol}")
