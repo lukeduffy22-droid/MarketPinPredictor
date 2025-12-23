@@ -139,7 +139,7 @@ def get_adaptive_sample_interval():
     elif minutes_left <= 60:
         return (5, "final_hour")   # Increased precision in last hour
     else:
-        return (15, "regular")     # Standard interval
+        return (5, "regular")      # 5-minute interval for more data points
 
 def is_market_hours():
     """Check if current time is during regular trading hours, respecting early close days"""
