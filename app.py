@@ -1212,7 +1212,7 @@ with st.sidebar:
                         with st.expander(f"📊 Intraday Pin History ({len(pin_history)} samples)", expanded=False):
                             # Display table (hide internal columns)
                             display_cols = ['Time', 'Pin Strike', 'Spot Price', 'Distance', 'Pull Strength', 'Total GEX', 'Net GEX', 'Valid']
-                            st.dataframe(pin_history[display_cols], hide_index=True, use_container_width=True)
+                            st.dataframe(pin_history[display_cols], hide_index=True, width='stretch')
                             
                             # Export button for this symbol
                             export_df = pd.DataFrame({
@@ -2348,7 +2348,7 @@ else:
                             'Net GEX': f"${snap.get('net_gex', 0):.3f}B",
                             'Valid': '✅' if snap.get('validation_is_valid') else '❌'
                         })
-                    st.dataframe(pd.DataFrame(display_data), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(display_data), hide_index=True, width='stretch')
                 
                 # Download ZIP with everything
                 st.subheader("📥 Download All Data")
@@ -2436,7 +2436,7 @@ else:
                                 'Net GEX': f"${snap.get('net_gex', 0):.3f}B",
                                 'Valid': '✅' if snap.get('validation_is_valid') else '❌'
                             })
-                        st.dataframe(pd.DataFrame(display_data), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(display_data), hide_index=True, width='stretch')
                     
                     # Download buttons row
                     with open(ndjson_path, 'r') as f:
