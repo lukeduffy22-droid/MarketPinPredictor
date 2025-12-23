@@ -21,6 +21,13 @@ torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
 # ============================================================
+# DEVICE SETUP
+# ============================================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ============================================================
 # DATASET
 # ============================================================
 
@@ -130,7 +137,7 @@ def train_model(full_csv, index_name, model_out, meta_out):
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # Model
-    model = MLP(input_dim=X.shape[1])
+    model = MLP(input_dim=X.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.MSELoss()
 
@@ -139,6 +146,7 @@ def train_model(full_csv, index_name, model_out, meta_out):
         model.train()
         train_losses = []
         for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             pred = model(xb)
             loss = loss_fn(pred, yb)
@@ -150,6 +158,7 @@ def train_model(full_csv, index_name, model_out, meta_out):
         val_losses = []
         with torch.no_grad():
             for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
                 pred = model(xb)
                 loss = loss_fn(pred, yb)
                 val_losses.append(loss.item())
