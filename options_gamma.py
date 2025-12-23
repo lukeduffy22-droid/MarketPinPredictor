@@ -182,13 +182,13 @@ def fetch_options_chain(api_key, underlying, spot_price, days_ahead=90, max_retr
             
             print(f"[Attempt {attempt}/{max_retries}] Fetching options chain snapshot for {options_root}...")
             start_time = time.time()
-            timeout_seconds = 15  # Increased timeout for premium API
+            timeout_seconds = 60  # Generous timeout for full options chain
             
             snapshot = client.list_snapshot_options_chain(options_root)
             
             options_data = []
             contract_count = 0
-            max_contracts = 500  # Increased for premium subscription
+            max_contracts = 10000  # Process full options chain for maximum data capture
             skipped_no_details = 0
             skipped_invalid = 0
             skipped_expiry = 0
