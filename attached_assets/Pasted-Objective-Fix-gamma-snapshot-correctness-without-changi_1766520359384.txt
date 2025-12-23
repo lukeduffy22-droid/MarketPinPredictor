@@ -1,0 +1,120 @@
+Objective
+
+Fix gamma snapshot correctness without changing gamma math, model logic, or trading behavior. This applies to all symbols.
+
+Step 1 — Fix strike data lineage (MANDATORY)
+
+Do not recompute anything.
+
+Action
+
+Ensure strikes_data passed into build_audit_snapshot() contains:
+
+strike
+
+call_gex
+
+put_gex
+
+net_gex
+
+call_open_interest
+
+put_open_interest
+
+call_gamma
+
+put_gamma
+
+These fields must come from the same dataframe rows used to compute GEX.
+
+If gamma or OI is unavailable at that stage, set the field to null, never zero.
+
+Explicit rule
+
+Zero values may only appear if the source value is truly zero.
+Missing data must be null, not 0.
+
+Acceptance
+
+It must be impossible for call_gex != 0 while call_gamma == 0 AND call_open_interest == 0.
+
+Step 2 — Enforce validation gates consistently (NO EXCEPTIONS)
+
+Right now gates are observed but ignored.
+
+Action
+
+If pregate_reason is non-empty OR nonzero_strike_count < MIN_NONZERO_STRIKES:
+
+validation_is_valid = false
+
+gamma_excluded_from_model = true
+
+confidence < 1
+
+confidence_factors must list the gate reason
+
+Hard rule
+
+A snapshot with a gate failure may be persisted and exported, but may NEVER be marked valid or high-confidence.
+
+Step 3 — Fix gamma_by_distance input scope (AFTER Step 1 & 2)
+
+Do not widen buckets blindly.
+
+Action
+
+Ensure compute_gamma_by_distance() receives the full strike surface used for aggregation, not:
+
+only top-N strikes
+
+only nonzero strikes
+
+Buckets must be computed on absolute GEX mass distribution, not count of strikes.
+
+Acceptance
+
+On normal SPX days, ATM should rarely exceed ~40–60%.
+
+100% ATM is only acceptable if explicitly gated as low-confidence.
+
+Step 4 — Lock invariants (regression protection)
+
+Add runtime assertions:
+
+assert gross_gex >= abs(net_gex)
+assert gross_gex == call_gex_total + put_gex_total
+
+
+If violated:
+
+mark snapshot invalid
+
+exclude from model
+
+export anyway (observability only)
+
+What NOT to allow the agent to do
+
+🚫 Do NOT:
+
+“fill in” gamma/OI fields post hoc
+
+widen ATM bands to hide the problem
+
+suppress pregate failures
+
+special-case SPX
+
+Interpretation of your current SPX snapshot (important)
+
+The pin at 6905 is directionally plausible, but the snapshot is structurally unreliable because:
+
+only 8 nonzero strikes
+
+gates were tripped but ignored
+
+confidence falsely reported as 1
+
+You were right to pause trading decisions.

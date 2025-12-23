@@ -461,6 +461,7 @@ def calculate_gamma_exposure(options_df, spot_price):
     
     # Aggregate by strike for the selected expiry using canonical GEX formula
     # Per-strike: net_gex = call_sum - put_sum, total_gex = |call_sum| + |put_sum|
+    # STEP 1 FIX: Include OI and gamma values from same source data
     def aggregate_gex_by_strike(group):
         call_rows = group[group['type'] == 'call']
         put_rows = group[group['type'] == 'put']
@@ -472,11 +473,22 @@ def calculate_gamma_exposure(options_df, spot_price):
         net_gex = call_sum - put_sum
         total_gex = abs(call_sum) + abs(put_sum)
         
+        # STEP 1: Include OI and gamma from source rows
+        # These come from the SAME rows used to compute GEX
+        call_oi = int(call_rows['open_interest'].sum()) if len(call_rows) > 0 else None
+        put_oi = int(put_rows['open_interest'].sum()) if len(put_rows) > 0 else None
+        call_gamma_sum = float(call_rows['gamma'].sum()) if len(call_rows) > 0 else None
+        put_gamma_sum = float(put_rows['gamma'].sum()) if len(put_rows) > 0 else None
+        
         return pd.Series({
             'call_gex': call_sum,
             'put_gex': put_sum,
             'net_gex': net_gex,
             'total_gex': total_gex,
+            'call_open_interest': call_oi,
+            'put_open_interest': put_oi,
+            'call_gamma': call_gamma_sum,
+            'put_gamma': put_gamma_sum,
             'expiry': group['expiry'].iloc[0],
             'days_to_expiry': group['days_to_expiry'].min()
         })

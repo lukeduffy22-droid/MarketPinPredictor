@@ -504,14 +504,34 @@ def build_audit_snapshot(
             reverse=True
         )[:15]
         
+        # STEP 1 FIX: Preserve None for missing data, never default to 0
+        # Zero values only appear if source value is truly zero
+        def safe_int(val):
+            """Convert to int, preserving None for missing data."""
+            if val is None:
+                return None
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return None
+        
+        def safe_float(val):
+            """Convert to float, preserving None for missing data."""
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+        
         snapshot.top_strikes_by_abs_gex = [
             {
                 'strike': float(s.get('strike', 0)),
                 'expiration_days': int(s.get('expiration_days', 0)),
-                'call_open_interest': int(s.get('call_open_interest', 0)),
-                'put_open_interest': int(s.get('put_open_interest', 0)),
-                'call_gamma': float(s.get('call_gamma', 0)),
-                'put_gamma': float(s.get('put_gamma', 0)),
+                'call_open_interest': safe_int(s.get('call_open_interest')),
+                'put_open_interest': safe_int(s.get('put_open_interest')),
+                'call_gamma': safe_float(s.get('call_gamma')),
+                'put_gamma': safe_float(s.get('put_gamma')),
                 'call_gex': float(s.get('call_gex', 0)),
                 'put_gex': float(s.get('put_gex', 0)),
                 'net_gex': float(s.get('net_gex', 0)),
@@ -593,14 +613,82 @@ def build_audit_snapshot(
         snapshot.top_strike_share = 0.0
     
     # Determine pregate_reason if chain appears problematic
+    MIN_NONZERO_STRIKES = 10  # Minimum strikes with non-zero GEX
+    
     if snapshot.strike_count < 30:
         snapshot.pregate_reason = f"CHAIN_TOO_THIN: Only {snapshot.strike_count} strikes (min: 30)"
-    elif snapshot.nonzero_strike_count < 10:
-        snapshot.pregate_reason = f"TOO_FEW_ACTIVE_STRIKES: Only {snapshot.nonzero_strike_count} strikes with non-zero GEX"
+    elif snapshot.nonzero_strike_count < MIN_NONZERO_STRIKES:
+        snapshot.pregate_reason = f"TOO_FEW_ACTIVE_STRIKES: Only {snapshot.nonzero_strike_count} strikes with non-zero GEX (min: {MIN_NONZERO_STRIKES})"
     elif snapshot.top_strike_share > 0.9:
         snapshot.pregate_reason = f"EXTREME_CONCENTRATION: Top strike has {snapshot.top_strike_share*100:.1f}% of total GEX"
     else:
         snapshot.pregate_reason = None
+    
+    # =========================================================================
+    # STEP 2: ENFORCE VALIDATION GATES CONSISTENTLY (NO EXCEPTIONS)
+    # If pregate_reason is non-empty OR nonzero_strike_count < MIN_NONZERO_STRIKES:
+    #   - validation_is_valid = False
+    #   - gamma_excluded_from_model = True
+    #   - confidence < 1
+    #   - confidence_factors must list the gate reason
+    # =========================================================================
+    if snapshot.pregate_reason or snapshot.nonzero_strike_count < MIN_NONZERO_STRIKES:
+        snapshot.validation_is_valid = False
+        snapshot.gamma_excluded_from_model = True
+        
+        # Degrade confidence and add gate reason to factors
+        gate_reason = snapshot.pregate_reason or f"TOO_FEW_ACTIVE_STRIKES: {snapshot.nonzero_strike_count} < {MIN_NONZERO_STRIKES}"
+        
+        # Recalculate confidence with validation_failed=True
+        truncation_pct = snapshot.truncation.get('truncation_pct', 0.0) if snapshot.truncation else 0.0
+        vol_regime = snapshot.vol_regime or "MEDIUM"
+        confidence, factors = compute_confidence_score(
+            contracts_used=contracts_count,
+            validation_failed=True,  # Gate failed
+            vol_regime=vol_regime,
+            truncation_pct=truncation_pct
+        )
+        # Add the specific gate reason
+        if gate_reason not in factors:
+            factors.insert(0, f"GATE_FAILED: {gate_reason}")
+        
+        snapshot.confidence = confidence
+        snapshot.confidence_factors = factors
+    
+    # =========================================================================
+    # STEP 4: LOCK INVARIANTS (regression protection)
+    # assert gross_gex >= abs(net_gex)
+    # assert gross_gex == call_gex_total + put_gex_total
+    # If violated: mark snapshot invalid, exclude from model, export anyway
+    # =========================================================================
+    invariant_violated = False
+    invariant_reasons = []
+    
+    # Invariant 1: gross_gex >= abs(net_gex)
+    if gross_gex < abs(net_gex) - 1e-9:  # Small epsilon for floating point
+        invariant_violated = True
+        invariant_reasons.append(f"INVARIANT_VIOLATED: gross_gex ({gross_gex:.4f}) < abs(net_gex) ({abs(net_gex):.4f})")
+    
+    # Invariant 2: gross_gex == call_gex_total + put_gex_total
+    expected_gross = call_gex_total + put_gex_total
+    if abs(gross_gex - expected_gross) > 1e-9:  # Small epsilon for floating point
+        invariant_violated = True
+        invariant_reasons.append(f"INVARIANT_VIOLATED: gross_gex ({gross_gex:.4f}) != call_gex + put_gex ({expected_gross:.4f})")
+    
+    if invariant_violated:
+        snapshot.validation_is_valid = False
+        snapshot.gamma_excluded_from_model = True
+        snapshot.validation_failure_reasons.extend(invariant_reasons)
+        
+        # Degrade confidence
+        if snapshot.confidence is not None:
+            snapshot.confidence = max(0.0, snapshot.confidence - 0.5)
+        else:
+            snapshot.confidence = 0.0
+        
+        if snapshot.confidence_factors is None:
+            snapshot.confidence_factors = []
+        snapshot.confidence_factors.extend(invariant_reasons)
     
     return snapshot
 

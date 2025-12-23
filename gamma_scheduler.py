@@ -12,6 +12,7 @@ import time
 import os
 from datetime import datetime, time as dt_time
 import pytz
+import pandas as pd
 from database import save_gamma_snapshot
 from websocket_streaming import get_snapshot_data
 from options_gamma import fetch_options_chain, calculate_gamma_exposure, get_options_root
@@ -298,6 +299,7 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         contracts_count = gex_analysis.get('contracts_count', len(options_df))
         
         # Convert gex_by_strike DataFrame to list for audit
+        # STEP 1 FIX: Preserve None for missing data, never convert to 0
         gex_by_strike = gex_analysis.get('gex_by_strike')
         strikes_data = []
         exp_days = []
@@ -305,16 +307,24 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             for _, row in gex_by_strike.iterrows():
                 exp_day = int(row.get('days_to_expiry', 0))
                 exp_days.append(exp_day)
+                
+                # Get OI and gamma - preserve None if missing (STEP 1 requirement)
+                call_oi = row.get('call_open_interest')
+                put_oi = row.get('put_open_interest')
+                call_gamma = row.get('call_gamma')
+                put_gamma = row.get('put_gamma')
+                
                 strikes_data.append({
                     'strike': float(row.get('strike', 0)),
                     'expiration_days': exp_day,
                     'call_gex': float(row.get('call_gex', 0)),
                     'put_gex': float(row.get('put_gex', 0)),
                     'net_gex': float(row.get('net_gex', 0)),
-                    'call_open_interest': int(row.get('call_oi', 0)),
-                    'put_open_interest': int(row.get('put_oi', 0)),
-                    'call_gamma': float(row.get('call_gamma', 0)),
-                    'put_gamma': float(row.get('put_gamma', 0)),
+                    # STEP 1: Use None for missing data, not 0
+                    'call_open_interest': int(call_oi) if call_oi is not None and not pd.isna(call_oi) else None,
+                    'put_open_interest': int(put_oi) if put_oi is not None and not pd.isna(put_oi) else None,
+                    'call_gamma': float(call_gamma) if call_gamma is not None and not pd.isna(call_gamma) else None,
+                    'put_gamma': float(put_gamma) if put_gamma is not None and not pd.isna(put_gamma) else None,
                 })
         
         # Prepare data structures for canonical build_audit_snapshot()
