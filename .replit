@@ -2,7 +2,7 @@ modules = ["python-3.11", "web", "r-4.5", "python-3.9", "nodejs-24", "nix", "dot
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales", "libxcrypt", "perl540Packages.DateTimeFormatDateParse", "pkg-config", "xsimd", "driversi686Linux.mesa-demos"]
+packages = ["glibcLocales"]
 
 [deployment]
 deploymentTarget = "autoscale"
