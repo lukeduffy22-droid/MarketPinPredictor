@@ -1944,6 +1944,40 @@ else:
                             strength_label = "Weak Pull"
                             strength_color = "gray"
                         st.markdown(f"<span style='color: {strength_color}; font-weight: bold;'>Pull Strength: {strength_label}</span>", unsafe_allow_html=True)
+                    
+                    # Close Predictor Signals
+                    st.divider()
+                    st.markdown("**📋 Close Predictor Signals**")
+                    try:
+                        close_resp = requests.get(f"http://localhost:8000/predict/close-overlay", params={"symbol": index_name}, timeout=8)
+                        if close_resp.ok:
+                            close_data = close_resp.json()
+                            signals = close_data.get('signals', [])
+                            
+                            if signals:
+                                for sig in signals[:4]:  # Show top 4 signals
+                                    st.markdown(f"<span style='font-size: 0.85em;'>{sig['emoji']} {sig['message']}</span>", unsafe_allow_html=True)
+                                
+                                # Net bias summary
+                                net_bias = close_data.get('net_bias', 'neutral')
+                                bias_emoji = "📈" if net_bias == 'bullish' else "📉" if net_bias == 'bearish' else "↔️"
+                                drift = close_data.get('drift_adjustment', 0)
+                                expected = close_data.get('expected_close', 0)
+                                
+                                if expected:
+                                    st.markdown(f"**{bias_emoji} Expected Close:** ${expected:,.0f} ({drift:+.1f} pts drift)")
+                            else:
+                                st.caption("Awaiting signals...")
+                        elif close_resp.status_code == 429:
+                            st.caption("⏳ Rate limited - signals pending...")
+                        elif close_resp.status_code == 503:
+                            st.caption("⏳ Computing signals...")
+                        else:
+                            st.caption("Close predictor unavailable")
+                    except requests.exceptions.Timeout:
+                        st.caption("⏳ Loading signals...")
+                    except Exception as e:
+                        st.caption(f"Close signals: {str(e)[:30]}...")
                 else:
                     st.info("Gamma data unavailable")
                     st.caption("Waiting for options data...")

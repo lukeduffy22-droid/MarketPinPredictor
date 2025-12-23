@@ -495,7 +495,10 @@ async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResp
         now = datetime.now(et_tz)
         trading_date = now.date()
         
-        minutes_to_close = minutes_to_close_et()
+        # Get UTC datetime for minutes_to_close calculation
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
+        minutes_to_close = minutes_to_close_et(now_utc)
         
         pin_snapshots = fetch_pin_snapshots_from_db(symbol, trading_date)
         
@@ -504,14 +507,21 @@ async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResp
         latest_pin = current_price
         
         for snap in pin_snapshots:
-            pin_strike = snap.pin_strike if hasattr(snap, 'pin_strike') else snap.get('pin_strike', 0)
-            spot = snap.spot_price if hasattr(snap, 'spot_price') else snap.get('spot_price', current_price)
+            # Handle both ORM objects and dicts
+            if hasattr(snap, 'pin_strike'):
+                pin_strike = snap.pin_strike
+                spot = getattr(snap, 'spot_price', current_price)
+                snap_ts = getattr(snap, 'timestamp', '')
+            else:
+                pin_strike = snap.get('pin_strike', 0)
+                spot = snap.get('spot_price', current_price)
+                snap_ts = snap.get('timestamp', '')
             
             if pin_strike:
                 pin_history.append({
                     'pin_strike': pin_strike,
                     'spot': spot,
-                    'timestamp': snap.timestamp if hasattr(snap, 'timestamp') else snap.get('timestamp', '')
+                    'timestamp': str(snap_ts) if snap_ts else ''
                 })
                 if pin_strike > 0:
                     deviation_history.append((spot - pin_strike) / pin_strike * 100)
@@ -521,21 +531,28 @@ async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResp
         put_gex = 0.0
         pull_strength = 0.0
         
-        try:
-            gex_analysis = options_gamma.get_gamma_analysis(
-                api_key=settings.polygon_api_key,
-                underlying=symbol,
-                spot_price=current_price
-            )
-            
-            if gex_analysis and not gex_analysis.get('data_unavailable'):
-                call_gex = gex_analysis.get('call_gex_total', 0) or 0
-                put_gex = gex_analysis.get('put_gex_total', 0) or 0
-                pull_strength = gex_analysis.get('pull_strength', 0) or 0
-                if gex_analysis.get('pin_strike'):
-                    latest_pin = gex_analysis['pin_strike']
-        except Exception as e:
-            log.warning(f"Could not fetch gamma analysis for close predictor: {e}")
+        # Skip slow GEX fetch if market is closed - use cached pin data
+        if is_regular_hours(now_utc):
+            try:
+                gex_analysis = options_gamma.get_gamma_analysis(
+                    api_key=settings.polygon_api_key,
+                    underlying=symbol,
+                    spot_price=current_price
+                )
+                
+                if gex_analysis and not gex_analysis.get('data_unavailable'):
+                    call_gex = gex_analysis.get('call_gex_total', 0) or 0
+                    put_gex = gex_analysis.get('put_gex_total', 0) or 0
+                    pull_strength = gex_analysis.get('pull_strength', 0) or 0
+                    if gex_analysis.get('pin_strike'):
+                        latest_pin = gex_analysis['pin_strike']
+            except Exception as e:
+                log.warning(f"Could not fetch gamma analysis for close predictor: {e}")
+        else:
+            # After hours - pull strength from pin history deviation
+            if deviation_history:
+                avg_dev = abs(sum(deviation_history) / len(deviation_history))
+                pull_strength = avg_dev  # Use deviation as proxy for pull strength
         
         prediction = run_close_predictor(
             index=symbol,

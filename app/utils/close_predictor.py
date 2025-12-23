@@ -108,20 +108,24 @@ def analyze_spot_deviation(
     below_threshold = sum(1 for d in deviation_history[-min_duration_samples:] if d < -threshold_pct)
     
     if above_threshold >= min_duration_samples:
+        # Clamp strength to 0-1 range; scale by 0.5% threshold for max strength
+        strength = min(1.0, max(0.0, abs(current_dev) / 0.5))
         return CloseSignal(
             emoji="⬆️",
             category="spot_deviation",
             message=f"Spot consistently above pin (+{current_dev:.2f}%) for {above_threshold}+ samples → upward bias",
             bias="bullish",
-            strength=min(1.0, current_dev / 0.1)
+            strength=strength
         )
     elif below_threshold >= min_duration_samples:
+        # Clamp strength to 0-1 range; scale by 0.5% threshold for max strength
+        strength = min(1.0, max(0.0, abs(current_dev) / 0.5))
         return CloseSignal(
             emoji="⬇️",
             category="spot_deviation",
             message=f"Spot consistently below pin ({current_dev:.2f}%) for {below_threshold}+ samples → downward bias",
             bias="bearish",
-            strength=min(1.0, abs(current_dev) / 0.1)
+            strength=strength
         )
     
     return None
@@ -286,15 +290,22 @@ def analyze_holiday_liquidity() -> Optional[CloseSignal]:
 def calculate_drift_adjustment(signals: List[CloseSignal]) -> float:
     """
     Calculate net drift adjustment from signals.
-    Returns a points adjustment (+/- from pin).
+    Returns a points adjustment (+/- from pin), clamped to ±10 pts max.
     """
     bullish_weight = sum(s.strength for s in signals if s.bias == 'bullish')
     bearish_weight = sum(s.strength for s in signals if s.bias == 'bearish')
     
+    # Clamp weights to reasonable bounds (max 3 signals worth of full strength)
+    bullish_weight = min(bullish_weight, 3.0)
+    bearish_weight = min(bearish_weight, 3.0)
+    
     net_weight = bullish_weight - bearish_weight
     
     max_drift_pts = 10
-    drift = net_weight * max_drift_pts / 3
+    drift = net_weight * max_drift_pts / 3  # Scaled so max weight gives max drift
+    
+    # Final clamp to ensure drift never exceeds bounds
+    drift = max(-max_drift_pts, min(max_drift_pts, drift))
     
     return drift
 
