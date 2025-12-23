@@ -74,6 +74,55 @@ class GammaPinSnapshot(Base):
     is_mock_data = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+
+class GammaAuditSnapshot(Base):
+    """
+    Comprehensive gamma audit snapshot storage.
+    Stores all fields from the audit snapshot for historical analysis and model training.
+    """
+    __tablename__ = 'gamma_audit_snapshots'
+    __table_args__ = (
+        UniqueConstraint('symbol', 'generated_at_utc', name='uix_audit_snapshot'),
+    )
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    symbol = Column(String(10), nullable=False, index=True)
+    trading_date = Column(Date, nullable=False, index=True)
+    generated_at_utc = Column(DateTime, nullable=False, index=True)
+    
+    spot_last = Column(Float, nullable=False)
+    spot_source = Column(String(50))
+    
+    primary_gamma_pin_strike = Column(Float)
+    primary_gamma_pin_abs_gex = Column(Float)
+    zero_gamma_level = Column(Float)
+    
+    call_gex_total = Column(Float)
+    put_gex_total = Column(Float)
+    gross_gex = Column(Float)
+    net_gex = Column(Float)
+    
+    contracts_count = Column(Integer)
+    expirations_min_days = Column(Integer)
+    expirations_max_days = Column(Integer)
+    
+    validation_is_valid = Column(Boolean, default=True)
+    validation_failure_reasons = Column(Text)
+    
+    pin_drift_points_per_hour = Column(Float)
+    pin_change_points = Column(Float)
+    prev_pin_strike = Column(Float)
+    
+    confidence = Column(Float)
+    dispersion_ratio = Column(Float)
+    vol_regime = Column(String(20))
+    vol_regime_iv = Column(Float)
+    
+    top_strikes_json = Column(Text)
+    
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
 def init_db():
     """Initialize database tables with retry logic"""
     max_retries = 3
@@ -572,6 +621,261 @@ def get_latest_gamma_snapshot(ticker):
     except Exception as e:
         print(f"Database error fetching latest gamma snapshot: {str(e)}")
         return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def save_audit_snapshot_to_db(snapshot_dict):
+    """
+    Save an audit snapshot to the database.
+    
+    Args:
+        snapshot_dict: Dictionary containing snapshot fields
+        
+    Returns:
+        GammaAuditSnapshot object or None on error
+    """
+    try:
+        db = SessionLocal()
+        
+        generated_at_str = snapshot_dict.get('generated_at_utc', '')
+        if isinstance(generated_at_str, str) and generated_at_str:
+            generated_at_utc = datetime.fromisoformat(generated_at_str.replace('Z', '+00:00'))
+        elif isinstance(generated_at_str, datetime):
+            generated_at_utc = generated_at_str
+        else:
+            generated_at_utc = datetime.utcnow()
+        
+        et_tz = pytz.timezone('US/Eastern')
+        trading_date = generated_at_utc.astimezone(et_tz).date() if generated_at_utc.tzinfo else generated_at_utc.date()
+        
+        symbol = snapshot_dict.get('symbol', '')
+        
+        existing = db.query(GammaAuditSnapshot).filter(
+            GammaAuditSnapshot.symbol == symbol,
+            GammaAuditSnapshot.generated_at_utc == generated_at_utc
+        ).first()
+        
+        validation_reasons = snapshot_dict.get('validation_failure_reasons', [])
+        if isinstance(validation_reasons, list):
+            validation_reasons = ','.join(validation_reasons)
+        
+        top_strikes = snapshot_dict.get('top_strikes_by_abs_gex', [])
+        if isinstance(top_strikes, list):
+            import json
+            top_strikes = json.dumps(top_strikes)
+        
+        if existing:
+            existing.spot_last = float(snapshot_dict.get('spot_last', 0))
+            existing.spot_source = snapshot_dict.get('spot_source', '')
+            existing.primary_gamma_pin_strike = snapshot_dict.get('primary_gamma_pin_strike')
+            existing.primary_gamma_pin_abs_gex = snapshot_dict.get('primary_gamma_pin_abs_gex')
+            existing.zero_gamma_level = snapshot_dict.get('zero_gamma_level')
+            existing.call_gex_total = snapshot_dict.get('call_gex_total')
+            existing.put_gex_total = snapshot_dict.get('put_gex_total')
+            existing.gross_gex = snapshot_dict.get('gross_gex')
+            existing.net_gex = snapshot_dict.get('net_gex')
+            existing.contracts_count = snapshot_dict.get('contracts_count')
+            existing.expirations_min_days = snapshot_dict.get('expirations_min_days')
+            existing.expirations_max_days = snapshot_dict.get('expirations_max_days')
+            existing.validation_is_valid = snapshot_dict.get('validation_is_valid', True)
+            existing.validation_failure_reasons = validation_reasons
+            existing.pin_drift_points_per_hour = snapshot_dict.get('pin_drift_points_per_hour')
+            existing.pin_change_points = snapshot_dict.get('pin_change_points')
+            existing.prev_pin_strike = snapshot_dict.get('prev_pin_strike')
+            existing.confidence = snapshot_dict.get('confidence')
+            existing.dispersion_ratio = snapshot_dict.get('dispersion_ratio')
+            existing.vol_regime = snapshot_dict.get('vol_regime')
+            existing.vol_regime_iv = snapshot_dict.get('vol_regime_iv')
+            existing.top_strikes_json = top_strikes
+            db.commit()
+            db.refresh(existing)
+            return existing
+        else:
+            audit_snapshot = GammaAuditSnapshot(
+                symbol=symbol,
+                trading_date=trading_date,
+                generated_at_utc=generated_at_utc,
+                spot_last=float(snapshot_dict.get('spot_last', 0)),
+                spot_source=snapshot_dict.get('spot_source', ''),
+                primary_gamma_pin_strike=snapshot_dict.get('primary_gamma_pin_strike'),
+                primary_gamma_pin_abs_gex=snapshot_dict.get('primary_gamma_pin_abs_gex'),
+                zero_gamma_level=snapshot_dict.get('zero_gamma_level'),
+                call_gex_total=snapshot_dict.get('call_gex_total'),
+                put_gex_total=snapshot_dict.get('put_gex_total'),
+                gross_gex=snapshot_dict.get('gross_gex'),
+                net_gex=snapshot_dict.get('net_gex'),
+                contracts_count=snapshot_dict.get('contracts_count'),
+                expirations_min_days=snapshot_dict.get('expirations_min_days'),
+                expirations_max_days=snapshot_dict.get('expirations_max_days'),
+                validation_is_valid=snapshot_dict.get('validation_is_valid', True),
+                validation_failure_reasons=validation_reasons,
+                pin_drift_points_per_hour=snapshot_dict.get('pin_drift_points_per_hour'),
+                pin_change_points=snapshot_dict.get('pin_change_points'),
+                prev_pin_strike=snapshot_dict.get('prev_pin_strike'),
+                confidence=snapshot_dict.get('confidence'),
+                dispersion_ratio=snapshot_dict.get('dispersion_ratio'),
+                vol_regime=snapshot_dict.get('vol_regime'),
+                vol_regime_iv=snapshot_dict.get('vol_regime_iv'),
+                top_strikes_json=top_strikes
+            )
+            db.add(audit_snapshot)
+            db.commit()
+            db.refresh(audit_snapshot)
+            return audit_snapshot
+    except Exception as e:
+        print(f"Database error saving audit snapshot: {str(e)}")
+        return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def get_audit_snapshots_for_day(symbol, trading_date_obj):
+    """
+    Get all audit snapshots for a symbol on a specific trading day.
+    
+    Args:
+        symbol: Stock ticker (e.g., 'SPX')
+        trading_date_obj: datetime.date object or datetime object
+    
+    Returns:
+        List of GammaAuditSnapshot objects ordered by time
+    """
+    try:
+        db = SessionLocal()
+        
+        if isinstance(trading_date_obj, datetime):
+            trading_date_obj = trading_date_obj.date()
+        
+        snapshots = db.query(GammaAuditSnapshot).filter(
+            GammaAuditSnapshot.symbol == symbol,
+            GammaAuditSnapshot.trading_date == trading_date_obj
+        ).order_by(GammaAuditSnapshot.generated_at_utc.asc()).all()
+        return snapshots
+    except Exception as e:
+        print(f"Database error fetching audit snapshots: {str(e)}")
+        return []
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def get_audit_snapshots_for_date_range(symbol, start_date, end_date):
+    """
+    Get audit snapshots for a symbol within a date range.
+    
+    Args:
+        symbol: Stock ticker (e.g., 'SPX')
+        start_date: Start date (inclusive)
+        end_date: End date (inclusive)
+    
+    Returns:
+        List of GammaAuditSnapshot objects
+    """
+    try:
+        db = SessionLocal()
+        
+        if isinstance(start_date, datetime):
+            start_date = start_date.date()
+        if isinstance(end_date, datetime):
+            end_date = end_date.date()
+        
+        snapshots = db.query(GammaAuditSnapshot).filter(
+            GammaAuditSnapshot.symbol == symbol,
+            GammaAuditSnapshot.trading_date >= start_date,
+            GammaAuditSnapshot.trading_date <= end_date
+        ).order_by(GammaAuditSnapshot.generated_at_utc.asc()).all()
+        return snapshots
+    except Exception as e:
+        print(f"Database error fetching audit snapshots: {str(e)}")
+        return []
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def get_latest_audit_snapshot(symbol):
+    """Get the most recent audit snapshot for a symbol"""
+    try:
+        db = SessionLocal()
+        snapshot = db.query(GammaAuditSnapshot).filter(
+            GammaAuditSnapshot.symbol == symbol
+        ).order_by(GammaAuditSnapshot.generated_at_utc.desc()).first()
+        return snapshot
+    except Exception as e:
+        print(f"Database error fetching latest audit snapshot: {str(e)}")
+        return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def export_audit_snapshots_to_csv(symbol=None, start_date=None, end_date=None):
+    """
+    Export audit snapshots to a pandas DataFrame for analysis/training.
+    
+    Args:
+        symbol: Optional symbol filter
+        start_date: Optional start date
+        end_date: Optional end date
+    
+    Returns:
+        pandas DataFrame with snapshot data
+    """
+    import pandas as pd
+    
+    try:
+        db = SessionLocal()
+        
+        query = db.query(GammaAuditSnapshot)
+        
+        if symbol:
+            query = query.filter(GammaAuditSnapshot.symbol == symbol)
+        if start_date:
+            if isinstance(start_date, datetime):
+                start_date = start_date.date()
+            query = query.filter(GammaAuditSnapshot.trading_date >= start_date)
+        if end_date:
+            if isinstance(end_date, datetime):
+                end_date = end_date.date()
+            query = query.filter(GammaAuditSnapshot.trading_date <= end_date)
+        
+        snapshots = query.order_by(GammaAuditSnapshot.generated_at_utc.asc()).all()
+        
+        data = []
+        for s in snapshots:
+            data.append({
+                'symbol': s.symbol,
+                'timestamp_utc': s.generated_at_utc,
+                'trading_date': s.trading_date,
+                'spot': s.spot_last,
+                'gamma_pin': s.primary_gamma_pin_strike,
+                'distance_to_pin': (s.spot_last - s.primary_gamma_pin_strike) if s.primary_gamma_pin_strike else None,
+                'gross_gex': s.gross_gex,
+                'net_gex': s.net_gex,
+                'call_gex': s.call_gex_total,
+                'put_gex': s.put_gex_total,
+                'is_valid': s.validation_is_valid,
+                'confidence': s.confidence,
+                'vol_regime': s.vol_regime
+            })
+        
+        return pd.DataFrame(data)
+    except Exception as e:
+        print(f"Database error exporting audit snapshots: {str(e)}")
+        return pd.DataFrame()
     finally:
         try:
             db.close()

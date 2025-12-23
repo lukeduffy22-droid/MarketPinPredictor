@@ -25,7 +25,7 @@ import subprocess
 import zipfile
 from datetime import datetime
 
-INDEXES = ["SPX", "NDX", "RUT"]
+INDEXES = ["SPX", "NDX", "RUT", "VIX"]
 EXPORTS_DIR = "./exports"
 ARTIFACTS_DIR = "./artifacts"
 
