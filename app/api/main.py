@@ -5,7 +5,7 @@ Enforces cadence limits, freshness checks, and performance SLAs.
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from datetime import datetime
 import time
 import logging
@@ -73,6 +73,33 @@ class EODPredictionResponse(BaseModel):
     hv10_points: Optional[float]
     num_walls: int
     num_pins: int
+    timestamp: str
+
+class CloseSignalResponse(BaseModel):
+    """Individual close predictor signal"""
+    emoji: str
+    category: str
+    message: str
+    bias: str
+    strength: float
+
+class ClosePredictorResponse(BaseModel):
+    """Close predictor overlay response with checklist signals"""
+    symbol: str
+    pin_strike: float
+    spot_price: float
+    expected_close: float
+    close_range_low: float
+    close_range_high: float
+    signals: List[CloseSignalResponse]
+    net_bias: str
+    confidence: float
+    drift_adjustment: float
+    summary: str
+    call_gex: Optional[float]
+    put_gex: Optional[float]
+    gex_ratio: Optional[float]
+    minutes_to_close: int
     timestamp: str
 
 @app.on_event("startup")
@@ -435,6 +462,132 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     except Exception as e:
         log.error(f"EOD prediction failed for {symbol}: {e}")
         raise HTTPException(503, f"EOD prediction error: {str(e)}")
+
+@app.get("/predict/close-overlay")
+async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResponse:
+    """
+    Close Predictor Overlay - Checklist-based close prediction signals.
+    
+    Analyzes:
+    - Pin migration throughout the trading day
+    - Spot vs pin deviation thresholds
+    - Call vs Put GEX imbalance
+    - Pull strength decay
+    - Final-hour drift factors
+    - Holiday/thin liquidity adjustments
+    
+    Returns signals and an adjusted close estimate based on behavioral factors.
+    """
+    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+    
+    current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
+    if not current_price:
+        raise HTTPException(503, f"No price data for {symbol}")
+    
+    try:
+        from app.utils.close_predictor import run_close_predictor, format_signals_for_ui
+        from app.utils.eod_data_integration import fetch_pin_snapshots_from_db
+        import options_gamma
+        import pytz
+        
+        et_tz = pytz.timezone('US/Eastern')
+        now = datetime.now(et_tz)
+        trading_date = now.date()
+        
+        minutes_to_close = minutes_to_close_et()
+        
+        pin_snapshots = fetch_pin_snapshots_from_db(symbol, trading_date)
+        
+        pin_history = []
+        deviation_history = []
+        latest_pin = current_price
+        
+        for snap in pin_snapshots:
+            pin_strike = snap.pin_strike if hasattr(snap, 'pin_strike') else snap.get('pin_strike', 0)
+            spot = snap.spot_price if hasattr(snap, 'spot_price') else snap.get('spot_price', current_price)
+            
+            if pin_strike:
+                pin_history.append({
+                    'pin_strike': pin_strike,
+                    'spot': spot,
+                    'timestamp': snap.timestamp if hasattr(snap, 'timestamp') else snap.get('timestamp', '')
+                })
+                if pin_strike > 0:
+                    deviation_history.append((spot - pin_strike) / pin_strike * 100)
+                    latest_pin = pin_strike
+        
+        call_gex = 0.0
+        put_gex = 0.0
+        pull_strength = 0.0
+        
+        try:
+            gex_analysis = options_gamma.get_gamma_analysis(
+                api_key=settings.polygon_api_key,
+                underlying=symbol,
+                spot_price=current_price
+            )
+            
+            if gex_analysis and not gex_analysis.get('data_unavailable'):
+                call_gex = gex_analysis.get('call_gex_total', 0) or 0
+                put_gex = gex_analysis.get('put_gex_total', 0) or 0
+                pull_strength = gex_analysis.get('pull_strength', 0) or 0
+                if gex_analysis.get('pin_strike'):
+                    latest_pin = gex_analysis['pin_strike']
+        except Exception as e:
+            log.warning(f"Could not fetch gamma analysis for close predictor: {e}")
+        
+        prediction = run_close_predictor(
+            index=symbol,
+            spot=current_price,
+            pin=latest_pin,
+            call_gex=call_gex,
+            put_gex=put_gex,
+            pull_strength=pull_strength,
+            pin_history=pin_history if pin_history else None,
+            deviation_history=deviation_history if deviation_history else None,
+            minutes_to_close=minutes_to_close
+        )
+        
+        gex_ratio = None
+        if put_gex and put_gex != 0:
+            gex_ratio = call_gex / put_gex
+        elif call_gex and call_gex != 0:
+            gex_ratio = float('inf')
+        
+        signals_formatted = [
+            CloseSignalResponse(
+                emoji=s.emoji,
+                category=s.category,
+                message=s.message,
+                bias=s.bias,
+                strength=s.strength
+            )
+            for s in prediction.signals
+        ]
+        
+        return ClosePredictorResponse(
+            symbol=symbol,
+            pin_strike=prediction.pin_strike,
+            spot_price=prediction.spot_price,
+            expected_close=prediction.expected_close,
+            close_range_low=prediction.close_range_low,
+            close_range_high=prediction.close_range_high,
+            signals=signals_formatted,
+            net_bias=prediction.net_bias,
+            confidence=prediction.confidence,
+            drift_adjustment=prediction.drift_adjustment,
+            summary=prediction.summary,
+            call_gex=call_gex if call_gex else None,
+            put_gex=put_gex if put_gex else None,
+            gex_ratio=gex_ratio,
+            minutes_to_close=minutes_to_close,
+            timestamp=now_et().isoformat()
+        )
+        
+    except Exception as e:
+        log.error(f"Close predictor failed for {symbol}: {e}")
+        raise HTTPException(503, f"Close predictor error: {str(e)}")
 
 @app.get("/gamma/multi-expiry")
 async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
