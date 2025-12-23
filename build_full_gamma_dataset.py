@@ -32,33 +32,94 @@ def extract_row(snap):
         "is_valid": is_valid
     }
 
-def build_dataset(ndjson_dir):
+def build_dataset(exports_dir, date_filter=None):
+    """
+    Build dataset from NDJSON files in exports/{SYMBOL}/{DATE}.ndjson structure.
+    
+    Args:
+        exports_dir: Root exports directory (e.g., ./exports)
+        date_filter: Optional date string (YYYY-MM-DD) to filter specific date only
+    """
     rows = []
-    for fname in os.listdir(ndjson_dir):
-        if not fname.endswith(".ndjson"):
+    files_processed = 0
+    
+    if not os.path.exists(exports_dir):
+        print(f"Error: Directory not found: {exports_dir}")
+        return pd.DataFrame()
+    
+    for symbol_dir in os.listdir(exports_dir):
+        symbol_path = os.path.join(exports_dir, symbol_dir)
+        
+        if not os.path.isdir(symbol_path):
             continue
-        full_path = os.path.join(ndjson_dir, fname)
-        with open(full_path, "r") as f:
-            for line in f:
-                try:
-                    snap = json.loads(line.strip())
-                    rows.append(extract_row(snap))
-                except Exception as e:
-                    print(f"Error parsing {fname}: {e}")
-
+        
+        for fname in os.listdir(symbol_path):
+            if not fname.endswith(".ndjson"):
+                continue
+            
+            if date_filter:
+                file_date = fname.replace('.ndjson', '')
+                if file_date != date_filter:
+                    continue
+            
+            full_path = os.path.join(symbol_path, fname)
+            file_rows = 0
+            
+            with open(full_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        snap = json.loads(line)
+                        if not snap.get("symbol"):
+                            snap["symbol"] = symbol_dir
+                        rows.append(extract_row(snap))
+                        file_rows += 1
+                    except Exception as e:
+                        print(f"Error parsing {fname}: {e}")
+            
+            files_processed += 1
+            print(f"  Processed {fname}: {file_rows} rows")
+    
+    if not rows:
+        print("Warning: No data found")
+        return pd.DataFrame()
+    
     df = pd.DataFrame(rows)
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
     df = df.sort_values("timestamp_utc").reset_index(drop=True)
+    
+    print(f"Total: {len(rows)} rows from {files_processed} files")
     return df
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python build_full_gamma_dataset.py <ndjson_dir> <output_csv>")
+        print("Usage: python build_full_gamma_dataset.py <exports_dir> <output_csv> [date_filter]")
+        print("")
+        print("Arguments:")
+        print("  exports_dir   Root exports directory (e.g., ./exports)")
+        print("  output_csv    Output CSV file path")
+        print("  date_filter   Optional: Filter to specific date (YYYY-MM-DD)")
+        print("")
+        print("Examples:")
+        print("  python build_full_gamma_dataset.py ./exports all_data.csv")
+        print("  python build_full_gamma_dataset.py ./exports data_2025-12-22.csv 2025-12-22")
         sys.exit(1)
 
-    ndjson_dir = sys.argv[1]
+    exports_dir = sys.argv[1]
     output_csv = sys.argv[2]
+    date_filter = sys.argv[3] if len(sys.argv) > 3 else None
 
-    df = build_dataset(ndjson_dir)
-    df.to_csv(output_csv, index=False)
-    print(f"Saved dataset to {output_csv}")
+    print(f"Building dataset from: {exports_dir}")
+    if date_filter:
+        print(f"Filtering to date: {date_filter}")
+    
+    df = build_dataset(exports_dir, date_filter)
+    
+    if not df.empty:
+        df.to_csv(output_csv, index=False)
+        print(f"Saved dataset to {output_csv}")
+    else:
+        print("No data to save")
+        sys.exit(1)
