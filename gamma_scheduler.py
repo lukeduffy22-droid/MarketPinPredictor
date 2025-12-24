@@ -385,18 +385,18 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
         # Step 2b: Export to NDJSON for full-day observability (always, even if invalid)
         export_snapshot_ndjson(audit_snapshot)
         
-        # Step 3: Check if gamma should be used in the model
-        # If validation fails, gamma is EXCLUDED from model but audit is persisted
-        if not should_use_gamma_in_model(audit_snapshot):
+        # Step 3: Determine validity for database storage
+        # ALL snapshots are now saved to DB, but with is_valid flag
+        is_valid_for_model = should_use_gamma_in_model(audit_snapshot)
+        validation_reasons = audit_snapshot.validation_failure_reasons if not is_valid_for_model else None
+        
+        if not is_valid_for_model:
             print(f"  ⚠️ Gamma INVALID for {symbol}: {audit_snapshot.validation_failure_reasons}")
-            print("  ⚠️ Gamma excluded from model, audit snapshot persisted (no DB save)")
-            # Return True - audit was successful, just gamma excluded from model
-            # Do NOT save to DB - this prevents invalid gamma from entering predictions
-            return True
+            print("  ⚠️ Saving to DB with is_valid=False (excluded from model predictions)")
         
         # === AUDIT PIPELINE END ===
         
-        # Save to database ONLY if validation passed
+        # Save ALL snapshots to database with validity flag
         # Use values from the canonical audit_snapshot (single source of truth)
         snapshot_result = save_gamma_snapshot(
             ticker=symbol,
@@ -406,11 +406,14 @@ def fetch_and_save_gamma_snapshot(api_key, symbol):
             spot_price=audit_snapshot.spot_last,
             total_gex=audit_snapshot.gross_gex,  # Use canonical gross_gex
             net_gex=audit_snapshot.net_gex,       # Use canonical net_gex
-            is_mock_data=is_mock
+            is_mock_data=is_mock,
+            is_valid=is_valid_for_model,
+            validation_reasons=validation_reasons
         )
         
         if snapshot_result:
-            print(f"✓ Gamma snapshot saved for {symbol}: pin=${gex_analysis['pin_strike']:.2f}, spot=${current_price:.2f}, scope={expiration_scope}, mock={is_mock}")
+            validity_status = "✓ VALID" if is_valid_for_model else "⚠️ INVALID"
+            print(f"✓ Gamma snapshot saved for {symbol}: pin=${gex_analysis['pin_strike']:.2f}, spot=${current_price:.2f}, scope={expiration_scope}, {validity_status}")
             return True
         else:
             print(f"✗ Failed to save gamma snapshot for {symbol}")

@@ -72,6 +72,8 @@ class GammaPinSnapshot(Base):
     total_gex = Column(Float, nullable=False)
     net_gex = Column(Float, nullable=False)
     is_mock_data = Column(Boolean, default=False, nullable=False)
+    is_valid = Column(Boolean, default=False, nullable=True)  # Validity flag for model training
+    validation_reasons = Column(String, nullable=True)  # Reasons if invalid
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -490,9 +492,11 @@ def round_to_15min(dt):
     # Convert to UTC for database storage (best practice for multi-timezone apps)
     return rounded_et.astimezone(pytz.UTC)
 
-def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, spot_price, total_gex, net_gex, is_mock_data=False):
+def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, spot_price, total_gex, net_gex, is_mock_data=False, is_valid=True, validation_reasons=None):
     """
     Save a gamma pin snapshot to the database with automatic deduplication.
+    
+    NOW SAVES ALL SNAPSHOTS with validity flag - no snapshots are discarded.
     
     Args:
         ticker: Stock ticker (e.g., 'SPX')
@@ -503,6 +507,8 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
         total_gex: Total gamma exposure
         net_gex: Net gamma exposure
         is_mock_data: Whether this is simulated data (default False)
+        is_valid: Whether this snapshot passed validation (default True)
+        validation_reasons: List or string of validation failure reasons (default None)
     
     Returns:
         GammaPinSnapshot object or None on error
@@ -519,13 +525,21 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
         total_gex = float(total_gex)
         net_gex = float(net_gex)
         
-        # Validate GEX invariant before saving (fail closed on invalid data)
+        # Convert validation_reasons to string if it's a list
+        if isinstance(validation_reasons, list):
+            validation_reasons = ', '.join(validation_reasons) if validation_reasons else None
+        
+        # Log GEX invariant issues but DON'T discard - we save all snapshots now
         if not validate_gex_invariant(net_gex, total_gex):
-            error_msg = f"GEX invariant violated for {ticker}: total_gex ({total_gex}) < |net_gex| ({abs(net_gex)}). Snapshot discarded."
-            print(f"ERROR: {error_msg}")
+            warning_msg = f"GEX invariant violated for {ticker}: total_gex ({total_gex}) < |net_gex| ({abs(net_gex)}). Saving with is_valid=False."
+            print(f"WARNING: {warning_msg}")
             import logging
-            logging.getLogger("database").error(error_msg)
-            raise ValueError(error_msg)
+            logging.getLogger("database").warning(warning_msg)
+            is_valid = False
+            if validation_reasons:
+                validation_reasons += f", GEX_INVARIANT_VIOLATED"
+            else:
+                validation_reasons = "GEX_INVARIANT_VIOLATED"
         
         # CRITICAL: Normalize timestamp to 15-minute boundary to prevent duplicates
         normalized_timestamp = round_to_15min(interval_timestamp)
@@ -542,15 +556,38 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
         ).first()
         
         if existing:
-            # Update existing snapshot (upsert behavior)
-            existing.pin_strike = pin_strike
-            existing.pull_strength = pull_strength
-            existing.spot_price = spot_price
-            existing.total_gex = total_gex
-            existing.net_gex = net_gex
-            existing.is_mock_data = is_mock_data
-            db.commit()
-            db.refresh(existing)
+            # PROTECT VALID SNAPSHOTS: 
+            # - If new snapshot is VALID: always update (better data wins)
+            # - If new snapshot is INVALID and existing is VALID (or NULL/legacy): DO NOT overwrite
+            # - If new snapshot is INVALID and existing is explicitly INVALID: update (same quality)
+            existing_is_valid = existing.is_valid is True  # NULL/False treated as "protected legacy"
+            
+            if is_valid:
+                # Valid snapshots always allowed to update
+                should_update = True
+            elif existing_is_valid:
+                # Invalid snapshot cannot overwrite valid/legacy data
+                should_update = False
+            else:
+                # Both invalid - allow update (same quality, newer data)
+                should_update = True
+            
+            if should_update:
+                existing.pin_strike = pin_strike
+                existing.pull_strength = pull_strength
+                existing.spot_price = spot_price
+                existing.total_gex = total_gex
+                existing.net_gex = net_gex
+                existing.is_mock_data = is_mock_data
+                existing.is_valid = is_valid
+                existing.validation_reasons = validation_reasons
+                db.commit()
+                db.refresh(existing)
+            else:
+                import logging
+                logging.getLogger("database").info(
+                    f"Preserving valid snapshot for {ticker} at {normalized_timestamp} - not overwriting with invalid"
+                )
             return existing
         else:
             # Create new snapshot
@@ -563,7 +600,9 @@ def save_gamma_snapshot(ticker, interval_timestamp, pin_strike, pull_strength, s
                 spot_price=spot_price,
                 total_gex=total_gex,
                 net_gex=net_gex,
-                is_mock_data=is_mock_data
+                is_mock_data=is_mock_data,
+                is_valid=is_valid,
+                validation_reasons=validation_reasons
             )
             db.add(snapshot)
             db.commit()

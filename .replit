@@ -2,7 +2,7 @@ modules = ["python-3.11", "postgresql-16"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales", "libxcrypt", "pkg-config", "xsimd"]
+packages = ["glibcLocales", "libxcrypt", "opensshWithKerberos", "pkg-config", "xsimd"]
 
 [deployment]
 deploymentTarget = "autoscale"
@@ -63,3 +63,6 @@ externalPort = 8000
 
 [agent]
 integrations = ["python_openai_ai_integrations:1.0.0"]
+
+[objectStorage]
+defaultBucketID = "replit-objstore-91ff6c6d-bbe4-4122-b04d-36bde58337f6"
