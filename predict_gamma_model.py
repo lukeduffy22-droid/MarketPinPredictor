@@ -46,9 +46,14 @@ def run_inference(full_csv, index_name, output_csv=None):
     # if scaling:
     #     X = (X - scaling["mean"]) / scaling["std"]
 
+    # Device selection: use CUDA if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     # Load model
     model = MLP(input_dim=len(feature_cols))
-    model.load_state_dict(torch.load(model_file, map_location="cpu"))
+    model.load_state_dict(torch.load(model_file, map_location=device))
+    model.to(device)
     model.eval()
 
     # Load unified dataset
@@ -85,11 +90,12 @@ def run_inference(full_csv, index_name, output_csv=None):
 
     # Extract features
     X = df[feature_cols].values.astype(np.float32)
-    X_tensor = torch.tensor(X, dtype=torch.float32)
+    X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
 
     # Predict distance to pin
     with torch.no_grad():
-        pred_distance = model(X_tensor).numpy().flatten()
+        preds = model(X_tensor)
+        pred_distance = preds.cpu().numpy().flatten()
 
     # Reconstruct predicted close
     predicted_close = pred_distance + df["gamma_pin"].values
