@@ -63,3 +63,64 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
 ### Database
 
 -   **PostgreSQL**: For persistent storage of model parameters, performance metrics, and historical predictions.
+
+## Project Cleanup Plan (Pending)
+
+The core `app/` package is well-organized, but the root directory has accumulated clutter. Below is the planned reorganization:
+
+### Current Issues
+- Multiple app variants (`app.py`, `app_backup.py`, `app_new.py`, `gamma_viz.py`) with unclear purposes
+- CLI tools scattered in root instead of organized in folders
+- ML training scripts mixed with entry points
+- Legacy/experimental files cluttering the workspace
+
+### Proposed Structure
+
+```
+├── app.py                 # Streamlit entry (keep)
+├── server.py              # FastAPI entry (keep)
+├── database.py            # DB models (keep)
+├── gamma_scheduler.py     # Scheduler (keep)
+├── options_gamma.py       # Core gamma (keep)
+├── websocket_streaming.py # WebSocket (keep)
+│
+├── app/                   # Core package (keep as-is)
+├── exports/               # NDJSON data (keep)
+├── logs/                  # Logs (keep)
+├── tests/                 # Tests (keep)
+│
+├── tools/                 # CLI utilities (consolidate)
+│   ├── backfill_snapshots.py
+│   ├── backtest_calibrate.py
+│   ├── backtesting.py
+│   ├── export_all_indices.py
+│   ├── run_eod_gamma_pipeline.py
+│   └── validation_report.py
+│
+├── ml/                    # ML training (new folder)
+│   ├── train_gamma_model.py
+│   ├── predict_gamma_model.py
+│   ├── validate_gamma_predictions.py
+│   └── build_full_gamma_dataset.py
+│
+├── local/                 # Local setup files (new folder)
+│   ├── setup_local.bat
+│   ├── setup_local.sh
+│   └── requirements_local.txt
+│
+└── archive/               # Old/unused files (new folder)
+    ├── app_backup.py
+    ├── app_new.py
+    ├── gamma_viz.py
+    ├── main.py
+    └── attached_assets/
+```
+
+### Cleanup Steps
+1. Create new folders: `ml/`, `local/`, `archive/`
+2. Move ML training scripts to `ml/` folder
+3. Move CLI tools to `tools/` folder
+4. Move local setup files to `local/` folder
+5. Move backup/unused files to `archive/` folder
+6. Update any import paths affected by moves
+7. Test that workflows still run correctly
