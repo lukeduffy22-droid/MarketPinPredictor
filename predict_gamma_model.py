@@ -28,10 +28,27 @@ class MLP(nn.Module):
 # ============================================================
 
 def run_inference(full_csv, index_name, output_csv=None):
+    # Minimal wrapper: read CSV then dispatch to DataFrame-based predictor
+    print(f"Loading data: {full_csv}")
+    df = pd.read_csv(full_csv)
+    return predict_from_dataframe(df, index_name, output_csv=output_csv)
 
-    # Load metadata
-    meta_file = f"gamma_model_{index_name}_meta.json"
-    model_file = f"gamma_model_{index_name}.pt"
+
+def predict_from_dataframe(df, index_name, meta_file=None, model_file=None, output_csv=None):
+    """Predict from an in-memory DataFrame for a specific index.
+
+    Args:
+        df (pd.DataFrame): unified snapshot DataFrame
+        index_name (str): index symbol to filter (e.g., 'SPX')
+        meta_file (str|None): path to metadata json (defaults to gamma_model_{index_name}_meta.json)
+        model_file (str|None): path to model state dict (defaults to gamma_model_{index_name}.pt)
+        output_csv (str|None): optional path to save predictions
+
+    Returns:
+        pd.DataFrame: predictions
+    """
+    meta_file = meta_file or f"gamma_model_{index_name}_meta.json"
+    model_file = model_file or f"gamma_model_{index_name}.pt"
 
     print(f"Loading model: {model_file}")
     print(f"Loading metadata: {meta_file}")
@@ -40,11 +57,6 @@ def run_inference(full_csv, index_name, output_csv=None):
         meta = json.load(f)
 
     feature_cols = meta["feature_columns"]
-
-    # NOTE: If scaling was used during training, apply it here
-    # scaling = meta.get("scaling")
-    # if scaling:
-    #     X = (X - scaling["mean"]) / scaling["std"]
 
     # Device selection: use CUDA if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,10 +67,6 @@ def run_inference(full_csv, index_name, output_csv=None):
     model.load_state_dict(torch.load(model_file, map_location=device))
     model.to(device)
     model.eval()
-
-    # Load unified dataset
-    print(f"Loading data: {full_csv}")
-    df = pd.read_csv(full_csv)
 
     # Strict index filtering
     if "symbol" not in df.columns:
@@ -105,7 +113,7 @@ def run_inference(full_csv, index_name, output_csv=None):
 
     # Build output DataFrame
     out = pd.DataFrame({
-        "timestamp_utc": df["timestamp_utc"],
+        "timestamp_utc": df.get("timestamp_utc", pd.Series([None]*len(df))),
         "symbol": df["symbol"],
         "spot": df["spot"],
         "gamma_pin": df["gamma_pin"],
