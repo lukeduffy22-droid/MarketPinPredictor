@@ -165,6 +165,7 @@ async def startup():
     
     log.info("API ready - WebSocket streams (stocks + options) + REST fallback starting")
 
+@app.get("/health")
 @app.get("/healthz")
 async def health_check():
     """
