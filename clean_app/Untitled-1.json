@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run clean_app main",
+      "type": "shell",
+      "command": "PORT=8000 python3 -m clean_app.main",
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "clear": true, "echo": true }
+    }
+  ]
+}
