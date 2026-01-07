@@ -1,4 +1,4 @@
-modules = ["postgresql-16", "python-3.11"]
+modules = ["python-3.11", "postgresql-16"]
 
 [nix]
 channel = "stable-25_05"
