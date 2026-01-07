@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    image: my-ml-app-web
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+    volumes:
+      - .:/app:cached
+    restart: unless-stopped
+
+  collector:
+    build: .
+    image: my-ml-app-collector
+    command: ["/bin/bash", "-c", "/app/tools/collector_entrypoint.sh"]
+    environment:
+      - COLLECTOR_INTERVAL=60
+      - QC_INTERVAL=60
+      - EXPORTS_DIR=/app/exports
+    volumes:
+      - .:/app:cached
+    restart: unless-stopped

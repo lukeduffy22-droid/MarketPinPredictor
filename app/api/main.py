@@ -3,9 +3,27 @@ FastAPI application with time-adaptive prediction endpoints.
 Enforces cadence limits, freshness checks, and performance SLAs.
 """
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
+import os
+import json
+@app.get("/collector/qc-status")
+async def get_qc_status():
+    """
+    Returns the latest QC status as JSON (written by tools/qc_status.py).
+    """
+    # Path should match where qc_status.py writes the status file
+    status_path = os.environ.get("QC_STATUS_PATH", "/app/exports/collected/parquet/qc_status.json")
+    if not os.path.exists(status_path):
+        raise HTTPException(404, f"QC status file not found: {status_path}")
+    try:
+        with open(status_path, "r") as f:
+            status = json.load(f)
+        return JSONResponse(content=status)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to read QC status: {str(e)}")
 from datetime import datetime
 import time
 import logging
