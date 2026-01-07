@@ -1,8 +1,8 @@
-modules = ["python-3.11", "postgresql-16"]
+modules = ["postgresql-16", "python-3.11"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales", "libxcrypt", "opensshWithKerberos", "pkg-config", "xsimd", "docker"]
+packages = ["docker", "glibcLocales", "libxcrypt", "opensshWithKerberos", "pkg-config", "xsimd"]
 
 [deployment]
 deploymentTarget = "autoscale"
