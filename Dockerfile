@@ -15,4 +15,7 @@ COPY . /app
 RUN chmod +x /app/tools/collector_entrypoint.sh || true
 
 EXPOSE 8000
-CMD ["bash", "-lc", "PYTHONPATH=. uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload"]
+
+# Multi-process entrypoint: runs both API server and live data collector
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["exec bash /app/tools/collector_entrypoint.sh & PYTHONPATH=. uvicorn app.api.main:app --host 0.0.0.0 --port 8000"]

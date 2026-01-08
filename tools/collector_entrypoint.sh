@@ -2,29 +2,51 @@
 set -euo pipefail
 
 # Collector+QC entrypoint
-# - Starts the collector in background (writes into /app/exports)
+# - Starts local API collector in background (writes into /app/exports)
+# - Starts Massive live data collector in background for index funds
 # - Periodically runs exports_to_parquet.py to create combined snapshots
 # - Runs add_quality_flags.py to produce QC'd parquet
 
 BASE_DIR=${BASE_DIR:-/app}
 EXPORTS_DIR=${EXPORTS_DIR:-$BASE_DIR/exports}
 COLLECTOR_INTERVAL=${COLLECTOR_INTERVAL:-60}
+MASSIVE_INTERVAL=${MASSIVE_INTERVAL:-60}
 QC_INTERVAL=${QC_INTERVAL:-60}
 ENDPOINTS=${ENDPOINTS:-"/health /gamma/multi-expiry /orb /predict/eod"}
 
 echo "Starting collector entrypoint"
-echo "EXPORTS_DIR=$EXPORTS_DIR, COLLECTOR_INTERVAL=$COLLECTOR_INTERVAL, QC_INTERVAL=$QC_INTERVAL"
+echo "EXPORTS_DIR=$EXPORTS_DIR"
+echo "COLLECTOR_INTERVAL=$COLLECTOR_INTERVAL (local API)"
+echo "MASSIVE_INTERVAL=$MASSIVE_INTERVAL (live data from Massive API)"
+echo "QC_INTERVAL=$QC_INTERVAL"
 
 # ensure exports dir exists
 mkdir -p "$EXPORTS_DIR"
 
+# Check if Massive API key is available
+if [ -z "${Massive_API:-}" ]; then
+  echo "WARNING: Massive_API env var not set - will collect local API data only"
+  echo "To enable live data collection from Massive, set: export Massive_API=your_api_key"
+else
+  echo "Massive API key detected - will collect live index data"
+fi
 
-# Start the collector in background (split endpoints into array)
+# Start the local API collector in background (split endpoints into array)
 IFS=' ' read -r -a ENDPOINT_ARR <<< "$ENDPOINTS"
 python tools/save_market_data.py --endpoints "${ENDPOINT_ARR[@]}" --out-dir "$EXPORTS_DIR" --interval $COLLECTOR_INTERVAL &
 COL_PID=$!
 
 echo "Collector started (pid=$COL_PID)"
+
+# Start Massive live data collector if API key is available
+if [ -n "${Massive_API:-}" ]; then
+  python tools/save_massive_live_data.py --api-key "$Massive_API" --out-dir "$EXPORTS_DIR" --interval $MASSIVE_INTERVAL &
+  MASSIVE_PID=$!
+  echo "Massive live data collector started (pid=$MASSIVE_PID)"
+else
+  MASSIVE_PID=""
+  echo "Skipping Massive live data collector (no API key)"
+fi
 
 # Run an initial exports+QC pass immediately
 python tools/exports_to_parquet.py --exports-dir "$EXPORTS_DIR" --out "$EXPORTS_DIR/collected/parquet" || echo "exports_to_parquet failed"
