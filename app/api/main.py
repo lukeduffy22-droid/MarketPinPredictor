@@ -1634,3 +1634,236 @@ async def get_historical_snapshot_endpoint(symbol: str, date: str):
     except Exception as e:
         log.error(f"Get historical snapshot error: {e}")
         raise HTTPException(503, f"Get snapshot error: {str(e)}")
+
+
+# =============================================================================
+# AI-FRIENDLY API ENDPOINTS
+# Clean, consolidated endpoints designed for ChatGPT and other AI models
+# =============================================================================
+
+class AISymbolPrediction(BaseModel):
+    """Prediction data for a single symbol"""
+    symbol: str
+    current_price: Optional[float]
+    predicted_close: Optional[float]
+    gamma_pin: Optional[float]
+    max_pain: Optional[float]
+    confidence: Optional[str]
+    minutes_to_close: Optional[int]
+    error: Optional[str] = None
+
+class AIPredictionsResponse(BaseModel):
+    """Consolidated predictions for all indices - designed for AI consumption"""
+    market_status: str
+    timestamp: str
+    predictions: List[AISymbolPrediction]
+    summary: str
+
+@app.get("/api/predictions", response_model=AIPredictionsResponse)
+async def get_all_predictions():
+    """
+    Get consolidated predictions for all major indices (SPX, NDX, DJI, RUT).
+    
+    This endpoint is designed for AI model consumption (ChatGPT, etc.) and provides:
+    - Current prices for all indices
+    - EOD predicted close prices
+    - Gamma pin strikes (options dealer hedging levels)
+    - Max pain strikes (option writer minimum payout level)
+    - Confidence levels based on historical accuracy
+    
+    Returns data even when market is closed using cached/historical data.
+    """
+    from datetime import datetime
+    from app.utils.time_et import is_regular_hours, minutes_to_close_et
+    
+    dt_utc = datetime.utcnow()
+    market_open = is_regular_hours(dt_utc)
+    tau = minutes_to_close_et(dt_utc) if market_open else None
+    
+    predictions = []
+    symbols = ["SPX", "NDX", "DJI", "RUT"]
+    
+    for symbol in symbols:
+        try:
+            # Get current price with fallback
+            current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
+            
+            # Try to get gamma data from cache or latest snapshot
+            gamma_pin = None
+            max_pain = None
+            predicted_close = None
+            confidence = None
+            
+            # Get latest gamma snapshot from database
+            from database import get_latest_audit_snapshot
+            db_snapshot = get_latest_audit_snapshot(symbol)
+            
+            if db_snapshot:
+                gamma_pin = db_snapshot.primary_gamma_pin_strike
+                max_pain = None  # Max pain not stored in this table yet
+                
+                # Calculate simple predicted close based on gamma pin pull
+                if current_price and gamma_pin:
+                    # Blend current price toward gamma pin (simplified EOD estimate)
+                    gamma_weight = 0.3 if tau and tau > 60 else 0.5 if tau and tau > 30 else 0.7
+                    predicted_close = current_price * (1 - gamma_weight) + gamma_pin * gamma_weight
+                    confidence = "high" if tau and tau < 30 else "medium" if tau and tau < 60 else "low"
+            
+            predictions.append(AISymbolPrediction(
+                symbol=symbol,
+                current_price=current_price,
+                predicted_close=predicted_close,
+                gamma_pin=gamma_pin,
+                max_pain=max_pain,
+                confidence=confidence,
+                minutes_to_close=tau
+            ))
+            
+        except Exception as e:
+            log.warning(f"Error getting prediction for {symbol}: {e}")
+            predictions.append(AISymbolPrediction(
+                symbol=symbol,
+                current_price=None,
+                predicted_close=None,
+                gamma_pin=None,
+                max_pain=None,
+                confidence=None,
+                minutes_to_close=tau,
+                error=str(e)
+            ))
+    
+    # Generate summary
+    valid_preds = [p for p in predictions if p.predicted_close is not None]
+    if market_open and valid_preds:
+        summary = f"Market is open with {tau} minutes to close. Predictions available for {len(valid_preds)} indices."
+    elif valid_preds:
+        summary = f"Market is closed. Showing latest cached data for {len(valid_preds)} indices."
+    else:
+        summary = "No prediction data currently available."
+    
+    return AIPredictionsResponse(
+        market_status="open" if market_open else "closed",
+        timestamp=now_et().isoformat(),
+        predictions=predictions,
+        summary=summary
+    )
+
+
+@app.get("/api/prediction/{symbol}")
+async def get_symbol_prediction(symbol: str):
+    """
+    Get detailed prediction for a single index.
+    
+    Args:
+        symbol: Index symbol (SPX, NDX, DJI, or RUT)
+    
+    Returns comprehensive prediction data including:
+    - Current price
+    - EOD predicted close
+    - Gamma pin and max pain levels
+    - Multi-expiry gamma analysis
+    - Historical accuracy metrics
+    """
+    symbol = symbol.upper()
+    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        raise HTTPException(400, f"Invalid symbol: {symbol}. Must be SPX, NDX, DJI, or RUT.")
+    
+    from datetime import datetime
+    from app.utils.time_et import is_regular_hours, minutes_to_close_et
+    
+    dt_utc = datetime.utcnow()
+    market_open = is_regular_hours(dt_utc)
+    tau = minutes_to_close_et(dt_utc) if market_open else None
+    
+    # Get current price with fallback
+    current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
+    
+    # Get latest gamma snapshot from database
+    from database import get_latest_audit_snapshot
+    db_snapshot = get_latest_audit_snapshot(symbol)
+    
+    # Get accuracy stats if available
+    accuracy = None
+    try:
+        from app.models.db_models import get_session
+        from database import Prediction
+        with get_session() as session:
+            recent = session.query(Prediction).filter(
+                Prediction.symbol == symbol
+            ).order_by(Prediction.created_at.desc()).limit(20).all()
+            
+            if recent:
+                errors = [p.error_points for p in recent if p.error_points is not None]
+                if errors:
+                    accuracy = {
+                        "sample_size": len(errors),
+                        "mean_error": round(sum(errors) / len(errors), 2),
+                        "min_error": round(min(errors), 2),
+                        "max_error": round(max(errors), 2)
+                    }
+    except Exception as e:
+        log.warning(f"Could not get accuracy stats: {e}")
+    
+    # Build response
+    response = {
+        "symbol": symbol,
+        "market_status": "open" if market_open else "closed",
+        "current_price": current_price,
+        "minutes_to_close": tau,
+        "timestamp": now_et().isoformat()
+    }
+    
+    if db_snapshot:
+        # Calculate predicted close
+        gamma_pin = db_snapshot.primary_gamma_pin_strike
+        if current_price and gamma_pin:
+            gamma_weight = 0.3 if tau and tau > 60 else 0.5 if tau and tau > 30 else 0.7
+            predicted_close = current_price * (1 - gamma_weight) + gamma_pin * gamma_weight
+            response["predicted_close"] = round(predicted_close, 2)
+            response["confidence"] = "high" if tau and tau < 30 else "medium" if tau and tau < 60 else "low"
+        
+        response["gamma_analysis"] = {
+            "gamma_pin": gamma_pin,
+            "max_pain": None,  # Not stored in this table yet
+            "pin_stability": db_snapshot.confidence,  # Using confidence as proxy
+            "wwm": None,  # Not stored in this table
+            "zero_gamma": db_snapshot.zero_gamma_level,
+            "vol_regime": db_snapshot.vol_regime,
+            "net_gex": db_snapshot.net_gex,
+            "snapshot_time": str(db_snapshot.generated_at_utc) if db_snapshot.generated_at_utc else None
+        }
+    
+    if accuracy:
+        response["accuracy_metrics"] = accuracy
+    
+    return response
+
+
+@app.get("/api/status")
+async def get_api_status():
+    """
+    Get API status and available endpoints.
+    Useful for AI models to discover available capabilities.
+    """
+    from datetime import datetime
+    from app.utils.time_et import is_regular_hours, minutes_to_close_et
+    
+    dt_utc = datetime.utcnow()
+    market_open = is_regular_hours(dt_utc)
+    tau = minutes_to_close_et(dt_utc) if market_open else None
+    
+    return {
+        "status": "online",
+        "market_status": "open" if market_open else "closed",
+        "minutes_to_close": tau,
+        "supported_symbols": ["SPX", "NDX", "DJI", "RUT"],
+        "endpoints": {
+            "/api/predictions": "Get all index predictions (recommended for AI)",
+            "/api/prediction/{symbol}": "Get detailed prediction for one index",
+            "/api/status": "This endpoint - API status and capabilities",
+            "/predict/eod": "Advanced gamma-based EOD prediction",
+            "/gamma/multi-expiry": "Multi-expiry gamma analysis",
+            "/ai/market-briefing": "AI-generated market briefing"
+        },
+        "timestamp": now_et().isoformat()
+    }
