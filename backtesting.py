@@ -6,7 +6,7 @@ Uses historical Polygon data to test prediction accuracy
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from polygon import RESTClient
+from polygon.rest import RESTClient
 import streamlit as st
 from database import save_prediction
 from options_gamma import get_gamma_analysis, fetch_options_chain, calculate_gamma_exposure

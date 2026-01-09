@@ -22,7 +22,8 @@ STILL USABLE:
 """
 
 import streamlit as st
-from polygon import WebSocketClient, RESTClient
+from polygon.websocket import WebSocketClient
+from polygon.rest import RESTClient
 from typing import List, Dict, Callable, Optional
 import threading
 import queue

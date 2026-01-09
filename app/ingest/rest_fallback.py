@@ -57,7 +57,7 @@ async def poll_polygon_rest():
     except ImportError:
         pass
     
-    from polygon import RESTClient
+    from polygon.rest import RESTClient
     
     api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")
     if not api_key:

@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Dict, Optional, Callable
 
 import websockets
-from polygon import RESTClient
+from polygon.rest import RESTClient
 
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours

@@ -2930,6 +2930,20 @@ wheels = [
 ]
 
 [[package]]
+name = "polygon"
+version = "1.2.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "requests" },
+    { name = "websocket-client" },
+    { name = "websockets" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/ba/07ca7cb1568c5d1fa4c66c01ce639a107633095a851a8719f1e356ab1ba1/polygon-1.2.8-py2.py3-none-any.whl", hash = "sha256:aa4d339f0d4c201970ef46c9d4c9199640c28abf6d0c37547e77f9870896d942", size = 112484, upload-time = "2025-08-28T18:32:58.72Z" },
+]
+
+[[package]]
 name = "polygon-api-client"
 version = "1.16.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3676,6 +3690,7 @@ dependencies = [
     { name = "openai" },
     { name = "pandas" },
     { name = "plotly" },
+    { name = "polygon" },
     { name = "polygon-api-client" },
     { name = "psycopg2-binary" },
     { name = "pydantic" },
@@ -3718,6 +3733,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "plotly", specifier = ">=5.0.0" },
+    { name = "polygon", specifier = ">=1.2.8" },
     { name = "polygon-api-client", specifier = ">=1.16.3" },
     { name = "psycopg2-binary", specifier = ">=2.9.0" },
     { name = "pydantic", specifier = ">=2.12.4" },

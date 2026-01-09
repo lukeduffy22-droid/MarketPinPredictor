@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from scipy.stats import norm
-from polygon import RESTClient
+from polygon.rest import RESTClient
 import time
 import pytz
 from database import get_latest_gamma_snapshot

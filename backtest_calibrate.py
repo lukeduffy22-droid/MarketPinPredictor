@@ -5,7 +5,7 @@ Populates RMSE buckets and validates 15% MAE improvement target.
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from polygon import RESTClient
+from polygon.rest import RESTClient
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler

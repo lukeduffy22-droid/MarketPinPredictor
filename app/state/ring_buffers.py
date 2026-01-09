@@ -138,7 +138,7 @@ def get_latest_price_with_fallback(symbol: str, api_key: str = None) -> Optional
     # Fallback 2: Polygon REST API - get previous close
     if api_key:
         try:
-            from polygon import RESTClient
+            from polygon.rest import RESTClient
             client = RESTClient(api_key)
             
             # Try to get the previous day's close for indices

@@ -4,7 +4,7 @@ import numpy as np
 import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from polygon import RESTClient
+from polygon.rest import RESTClient
 from datetime import datetime, timedelta
 import time
 from sklearn.linear_model import LinearRegression
@@ -1360,7 +1360,7 @@ with st.sidebar:
         if st.button("📊 Analyze Gamma Pull", type="primary", help="Calculate real-time gamma pin and dealer hedging direction"):
             if st.session_state.api_key and selected_indexes:
                 with st.spinner("Calculating gamma structure..."):
-                    from polygon import RESTClient
+                    from polygon.rest import RESTClient
                     import numpy as np
                     from scipy.stats import norm
                     

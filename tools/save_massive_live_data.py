@@ -25,7 +25,7 @@ from typing import Dict, List, Any
 import logging
 
 try:
-    from polygon import RESTClient
+    from polygon.rest import RESTClient
     import pandas as pd
 except ImportError:
     print("ERROR: Please install polygon-api-client and pandas")

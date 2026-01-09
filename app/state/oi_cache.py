@@ -159,7 +159,7 @@ async def schedule_oi_refresh():
     """
     from app.utils.time_et import now_et
     from app.utils.settings import settings
-    from polygon import RESTClient
+    from polygon.rest import RESTClient
     
     client = RESTClient(settings.polygon_api_key)
     

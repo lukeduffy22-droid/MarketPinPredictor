@@ -66,7 +66,8 @@ def fetch_and_store(base_url, endpoint, out_dir):
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        data = {"error": str(e), "url": url}
+        print(f"  ⚠️ Error fetching {url}: {e}")
+        return
 
     raw_path = os.path.join(raw_dir, f"{ts}.json")
     pq_path = os.path.join(pq_dir, f"{ts}.parquet")
@@ -75,8 +76,7 @@ def fetch_and_store(base_url, endpoint, out_dir):
     try:
         write_parquet(pq_path, data)
     except Exception as e:
-        # fallback: save raw as single-row parquet
-        pd.DataFrame([{"error": str(e), "raw": json.dumps(data)}]).to_parquet(pq_path, index=False)
+        print(f"  ⚠️ Error writing parquet for {endpoint}: {e}")
 
     print(f"Saved {endpoint} -> {raw_path} , {pq_path}")
 

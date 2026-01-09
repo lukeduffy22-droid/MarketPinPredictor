@@ -1,63 +1,57 @@
-import yfinance as yf
-from datetime import datetime
+# Backend application package
+"""
+Legacy entry points for market data functionality.
 
-def get_live_market_data(symbol):
-    """
-    Fetch live market data for a given stock symbol.
-    
-    Args:
-        symbol (str): Stock ticker symbol (e.g., 'AAPL', 'GOOGL')
-    
-    Returns:
-        dict: Dictionary containing current market data
-    """
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        
-        data = {
-            'symbol': symbol,
-            'current_price': info.get('currentPrice'),
-            'previous_close': info.get('previousClose'),
-            'open': info.get('open'),
-            'day_high': info.get('dayHigh'),
-            'day_low': info.get('dayLow'),
-            'volume': info.get('volume'),
-            'market_cap': info.get('marketCap'),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        return data
-    except Exception as e:
-        return {'error': str(e)}
+The original implementations of the following functions have been removed
+from this module:
+  - get_live_market_data
+  - get_multiple_quotes
+  - get_market_data_with_key
 
-def get_multiple_quotes(symbols):
-    """
-    Fetch live market data for multiple symbols.
-    
-    Args:
-        symbols (list): List of stock ticker symbols
-    
-    Returns:
-        dict: Dictionary with symbols as keys and market data as values
-    """
-    results = {}
-    for symbol in symbols:
-        results[symbol] = get_live_market_data(symbol)
-    return results
+If these functions are still needed, their implementations should live in a
+more appropriate module (for example, a dedicated `market_data` module),
+and this package can re-export them. As of now, they are intentionally
+unimplemented and will raise NotImplementedError when called.
+"""
 
 
-    def get_market_data_with_key(symbol, api_key):
-        """
-        Fetch market data using a specific API key.
-        
-        Args:
-            symbol (str): Stock ticker symbol
-            api_key (str): Your API key for authentication
-        
-        Returns:
-            dict: Dictionary containing market data
-        """
-        # Note: yfinance doesn't require API keys for basic functionality
-        # If you need authenticated access, consider using the official API
-        return get_live_market_data(symbol)
+def get_live_market_data(*args, **kwargs):
+    """
+Legacy stub for get_live_market_data.
+
+This function has been removed from app.__init__.py. If your code still
+depends on it, you should update the call site to import and use the
+new implementation (if one exists) or remove the dependency entirely.
+"""
+    raise NotImplementedError(
+        "get_live_market_data has been removed from app.__init__.py. "
+        "Update your code to use the new market data API or remove this call."
+    )
+
+
+def get_multiple_quotes(*args, **kwargs):
+    """
+Legacy stub for get_multiple_quotes.
+
+This function has been removed from app.__init__.py. If your code still
+depends on it, you should update the call site to import and use the
+new implementation (if one exists) or remove the dependency entirely.
+"""
+    raise NotImplementedError(
+        "get_multiple_quotes has been removed from app.__init__.py. "
+        "Update your code to use the new market data API or remove this call."
+    )
+
+
+def get_market_data_with_key(*args, **kwargs):
+    """
+Legacy stub for get_market_data_with_key.
+
+This function has been removed from app.__init__.py. If your code still
+depends on it, you should update the call site to import and use the
+new implementation (if one exists) or remove the dependency entirely.
+"""
+    raise NotImplementedError(
+        "get_market_data_with_key has been removed from app.__init__.py. "
+        "Update your code to use the new market data API or remove this call."
+    )

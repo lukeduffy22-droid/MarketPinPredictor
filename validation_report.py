@@ -14,7 +14,7 @@ if not api_key:
     sys.exit(1)
 
 try:
-    from polygon import RESTClient
+    from polygon.rest import RESTClient
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     
