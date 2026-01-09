@@ -206,7 +206,7 @@ def aggregate_gamma(spot: float, gamma_rows: List[Dict[str, Any]]) -> Optional[f
 
 def get_polygon_client():
     """Get Polygon REST client (Polygon rebranded to Massive Oct 2025)."""
-    from polygon import RESTClient
+    from polygon.rest import RESTClient
     api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")
     if not api_key:
         raise ValueError("Massive_API not set")

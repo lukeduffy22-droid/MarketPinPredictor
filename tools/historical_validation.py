@@ -130,7 +130,7 @@ def get_actual_close(symbol: str, target_date: date) -> Optional[float]:
         Closing price or None
     """
     try:
-        from polygon import RESTClient
+        from polygon.rest import RESTClient
         api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")
         if not api_key:
             raise ValueError("Massive_API not set")
