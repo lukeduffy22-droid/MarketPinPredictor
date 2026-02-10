@@ -4,6 +4,8 @@
 
 This application automatically collects and saves gamma snapshot data for market indices during trading hours. The gamma scheduler runs in the background and adapts its sampling frequency based on time to market close.
 
+**Important**: Live data collection requires a Polygon.io API key (set via `Massive_API` or `POLYGON_API_KEY` environment variable). Without an API key, the app will run but data collection will be disabled.
+
 ## ✅ Setup Complete
 
 The following components are properly configured:
