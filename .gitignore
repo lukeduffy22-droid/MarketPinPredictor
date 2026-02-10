@@ -1,6 +1,12 @@
 # Audit snapshot exports (generated files, not tracked in version control)
 exports/
 
+# SQLite database (for local development)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
 # Python
 __pycache__/
 *.py[cod]
