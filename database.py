@@ -6,22 +6,28 @@ from datetime import datetime, date
 import time
 import pytz
 
-# Get database URL from environment
+# Get database URL from environment or use SQLite as fallback
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Create engine with connection pooling and retry settings
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,  # Verify connections before using them
-    pool_recycle=3600,   # Recycle connections after 1 hour
-    connect_args={
-        "connect_timeout": 10,
-        "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
-        "keepalives_count": 5,
-    }
-)
+if not DATABASE_URL:
+    # Fallback to SQLite for local development/testing
+    DATABASE_URL = 'sqlite:///./market_predictor.db'
+    print(f"⚠️ DATABASE_URL not set, using SQLite: {DATABASE_URL}")
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    # PostgreSQL with connection pooling and retry settings
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,  # Verify connections before using them
+        pool_recycle=3600,   # Recycle connections after 1 hour
+        connect_args={
+            "connect_timeout": 10,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        }
+    )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
