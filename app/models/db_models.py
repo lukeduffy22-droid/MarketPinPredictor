@@ -102,10 +102,13 @@ class PredictionLog(Base):
 
 # Database connection
 def get_engine():
-    """Get database engine from environment"""
+    """Get database engine from environment, with SQLite fallback"""
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        raise ValueError("DATABASE_URL not set")
+        # Fallback to SQLite for local development/testing
+        db_url = 'sqlite:///./market_predictor.db'
+        print(f"⚠️ DATABASE_URL not set, using SQLite: {db_url}")
+        return create_engine(db_url, connect_args={"check_same_thread": False})
     return create_engine(db_url)
 
 def init_db():

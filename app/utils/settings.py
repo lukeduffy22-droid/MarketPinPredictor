@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     """Application configuration"""
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
-    polygon_api_key: str = Field(validation_alias="Massive_API")
+    polygon_api_key: Optional[str] = Field(default=None, validation_alias="Massive_API")
     database_url: Optional[str] = None
     
     # Environment
@@ -59,4 +59,6 @@ settings = Settings()
 
 # Validate critical settings on import
 if not settings.polygon_api_key:
-    raise ValueError("Massive_API environment variable is required")
+    print("⚠️ WARNING: Massive_API environment variable is not set")
+    print("⚠️ Live data collection will be disabled")
+    print("⚠️ Set environment variable: export Massive_API='your_api_key'")
