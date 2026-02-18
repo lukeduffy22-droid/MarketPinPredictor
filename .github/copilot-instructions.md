@@ -174,7 +174,7 @@ export POLYGON_API_KEY="your_key_here"
 
 ## Resources
 
-- [GAMMA_SETUP.md](../GAMMA_SETUP.md) - Gamma snapshot automation setup
-- [IMPLEMENTATION_SUMMARY.md](../IMPLEMENTATION_SUMMARY.md) - Recent implementation details
-- [CODE_EXPORT.md](../CODE_EXPORT.md) - Full codebase documentation
+- GAMMA_SETUP.md - Gamma snapshot automation setup
+- IMPLEMENTATION_SUMMARY.md - Recent implementation details
+- CODE_EXPORT.md - Full codebase documentation
 - [Polygon API Docs](https://polygon.io/docs) - Market data API reference
