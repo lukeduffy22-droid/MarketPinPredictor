@@ -104,7 +104,7 @@ database.py             # Database initialization
 # Install dependencies
 pip install -r requirements_local.txt
 # OR using uv (faster)
-uv pip sync pyproject.toml
+uv pip install .
 ```
 
 **Run Tests:**
