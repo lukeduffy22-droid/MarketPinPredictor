@@ -1,16 +1,21 @@
 # Copilot instructions for MarketPinPredictor
 
 ## Project context
-- This repository contains a Python market-index prediction system with:
-  - a FastAPI backend (`app/api/main.py`, launched via `server.py`), and
-  - Streamlit dashboards (`app.py`, `main.py`).
-- Core gamma-exposure logic and invariants live in `app/core/gex.py` and are validated by tests in `tests/test_gex.py` and `tests/test_gex_invariants.py`.
+- Python market-index prediction system with:
+  - FastAPI backend (`app/api/main.py`, launched via `server.py`); `/health` is the smoke check.
+  - Streamlit dashboards (`app.py`, `main.py`) for visualization.
+- Core gamma-exposure logic and invariants live in `app/core/gex.py` and are validated by tests in `tests/test_gex.py` and `tests/test_gex_invariants.py`. This module is the single source of truth for GEX formulas/sign conventions.
 
 ## Code changes
-- Keep changes minimal and localized to the issue.
-- Do not refactor unrelated modules while fixing a targeted issue.
-- Preserve existing API contract and GEX sign/invariant behavior.
-- Reuse existing utilities under `app/` before adding new modules.
+- Keep changes minimal and localized to the issue; avoid drive-by refactors.
+- Do not alter GEX sign conventions or invariants; reuse `app/core/gex.py` helpers instead of duplicating logic.
+- Preserve existing API contracts and data shapes for both FastAPI and Streamlit flows.
+- Prefer existing utilities under `app/` before adding new modules or dependencies.
+
+## Development setup
+- Python 3.9+; install deps with `pip install -r requirements_local.txt` (fast path) or `uv pip install .` (full env).
+- Avoid adding new dependencies unless required for the task.
+- Keep secrets, API keys, and large artifacts out of the repo.
 
 ## Validation commands
 - Run targeted tests first:
@@ -19,6 +24,7 @@
 - If backend code is touched, verify app startup:
   - `python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000`
   - check `GET /health` returns JSON
+- If working on dashboards, smoke test with `streamlit run app.py` (or `main.py` for alt UI) locally.
 
 ## Copilot task execution guidance (to avoid VS Code chat task failures)
 - Break work into small, file-scoped tasks (for example: "update `app/core/gex.py` and `tests/test_gex.py` only").
