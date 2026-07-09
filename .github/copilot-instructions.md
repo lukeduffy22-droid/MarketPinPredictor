@@ -1,10 +1,10 @@
 # Copilot instructions for MarketPinPredictor
 
-## Project overview
-This repository contains a Python-based market index prediction system focused on gamma exposure (GEX) analysis. The system provides:
-- **FastAPI backend** (`app/api/main.py`, launched via `server.py`) for API services
-- **Streamlit dashboards** (`app.py`, `main.py`) for interactive visualization
-- **Core gamma-exposure logic** in `app/core/gex.py` with comprehensive test coverage
+## Project context
+- Python market-index prediction system with:
+  - FastAPI backend (`app/api/main.py`, launched via `server.py`); `/health` is the smoke check.
+  - Streamlit dashboard (`app.py`) for visualization.
+- Core gamma-exposure logic and invariants live in `app/core/gex.py` and are validated by tests in `tests/test_gex.py` and `tests/test_gex_invariants.py`. This module is the single source of truth for GEX formulas/sign conventions.
 
 ## Technology stack
 - **Python**: >=3.9
@@ -25,23 +25,22 @@ MarketPinPredictor/
 │   ├── api/          # FastAPI backend
 │   │   └── main.py   # Main API application
 │   └── core/
-│       └── gex.py    # Core gamma-exposure calculations
+│       └── gex.py    # Core gamma-exposure calculations (single source of truth)
 ├── tests/
 │   ├── test_gex.py              # GEX functionality tests
 │   └── test_gex_invariants.py   # GEX invariant validation
 ├── server.py         # FastAPI server launcher
-├── app.py            # Main Streamlit dashboard
-├── main.py           # Alternative Streamlit entry point
+├── app.py            # Streamlit dashboard
 └── pyproject.toml    # Project dependencies
 ```
 
 ## Code changes
-- **Keep changes minimal and localized** to the specific issue
-- **Do not refactor unrelated modules** while fixing a targeted issue
-- **Preserve existing API contracts** and GEX sign/invariant behavior
-- **Reuse existing utilities** under `app/` before adding new modules
-- **Follow existing code style** in the files you're modifying
-- **Add tests** for new functionality or bug fixes when appropriate
+- **Keep changes minimal and localized** to the specific issue; avoid drive-by refactors.
+- **Do not alter GEX sign conventions or invariants**; reuse `app/core/gex.py` helpers instead of duplicating logic.
+- **Preserve existing API contracts** and data shapes for both FastAPI and Streamlit flows.
+- **Reuse existing utilities** under `app/` before adding new modules or dependencies.
+- **Follow existing code style** in the files you're modifying.
+- **Add tests** for new functionality or bug fixes when appropriate.
 
 ## Coding standards
 - **Type hints**: Use type annotations for function parameters and return values
@@ -51,27 +50,20 @@ MarketPinPredictor/
 - **Imports**: Group imports (stdlib, third-party, local) with blank lines between groups
 - **Naming**: Use descriptive variable names; follow PEP 8 conventions
 
+## Development setup
+- Python 3.9+; install deps with `pip install -r requirements_local.txt` (fast path) or `uv pip install .` (full env).
+- Avoid adding new dependencies unless required for the task.
+- Keep secrets, API keys, and large artifacts out of the repo.
+
 ## Build and test commands
-
-### Environment setup
-```bash
-# Using uv (recommended)
-uv pip install .
-
-# Or using pip
-pip install -r requirements_local.txt
-```
 
 ### Running tests
 ```bash
-# Run all tests
-pytest
-
-# Run specific test files
+# Run targeted GEX tests first
 python -m pytest tests/test_gex.py -q
 python -m pytest tests/test_gex_invariants.py -q
 
-# Run with verbose output
+# Run all tests
 pytest -v
 ```
 
@@ -94,24 +86,17 @@ streamlit run app.py
 
 ## Common workflows
 
-### Adding a new feature
-1. Review related code in `app/` to understand existing patterns
-2. Write tests first (TDD approach) in `tests/`
-3. Implement the feature, reusing existing utilities
-4. Run targeted tests to validate
-5. Run full test suite to ensure no regressions
+### Modifying GEX calculations
+1. Review `app/core/gex.py` and understand current logic
+2. Check `tests/test_gex_invariants.py` for invariants that must be preserved
+3. Make changes while preserving mathematical invariants
+4. Run both GEX test files to validate
 
 ### Fixing a bug
 1. Write a test that reproduces the bug
 2. Make the minimal fix in the relevant module
 3. Verify the test now passes
 4. Run related tests to ensure no side effects
-
-### Modifying GEX calculations
-1. Review `app/core/gex.py` and understand current logic
-2. Check `tests/test_gex_invariants.py` for invariants that must be preserved
-3. Make changes while preserving mathematical invariants
-4. Run both GEX test files to validate
 
 ## Copilot task execution guidance (to avoid VS Code chat task failures)
 - **Break work into small, file-scoped tasks**: Example: "update `app/core/gex.py` and `tests/test_gex.py` only"
