@@ -30,6 +30,9 @@ np.random.seed(RANDOM_SEED)
 # ============================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
 # ============================================================
 # DATASET
@@ -169,20 +172,6 @@ def _prepare_dataset(df: pd.DataFrame, index_name: str, include_invalid: bool = 
     return df, feature_cols
 
 
-def estimate_trainable_rows(df: pd.DataFrame, index_name: str, include_invalid: bool = False) -> Tuple[int, str]:
-    """
-    Estimate usable rows for a symbol after applying training preprocessing.
-
-    Returns:
-        (row_count, reason)
-    """
-    try:
-        prepared_df, _ = _prepare_dataset(df.copy(), index_name=index_name, include_invalid=include_invalid)
-        return int(len(prepared_df)), "ok"
-    except Exception as exc:
-        return 0, str(exc)
-
-
 def _chronological_split(df: pd.DataFrame, validation_split: float) -> Tuple[np.ndarray, np.ndarray]:
     """Create chronological train/validation indices."""
     n = len(df)
@@ -209,10 +198,6 @@ def train_model(
     max_rows: int,
     include_invalid: bool = False,
 ):
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-
     print(f"Loading dataset from: {data_path}")
     raw_df = _load_dataset(data_path, max_rows=max_rows)
     df, feature_cols = _prepare_dataset(raw_df, index_name=index_name, include_invalid=include_invalid)

@@ -2,7 +2,6 @@ import os
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, Date, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.engine.url import make_url
 from datetime import datetime, date
 import time
 import pytz
@@ -14,44 +13,21 @@ if not DATABASE_URL:
     # Fallback to SQLite for local development/testing
     DATABASE_URL = 'sqlite:///./market_predictor.db'
     print(f"⚠️ DATABASE_URL not set, using SQLite: {DATABASE_URL}")
-
-
-def _create_database_engine(database_url: str):
-    """Create SQLAlchemy engine with dialect-safe connect args."""
-    parsed = make_url(database_url)
-    backend = parsed.get_backend_name()
-    drivername = parsed.drivername
-
-    engine_kwargs = {}
-    connect_args = {}
-
-    if backend == "sqlite":
-        connect_args = {"check_same_thread": False}
-    elif backend == "postgresql":
-        engine_kwargs = {
-            "pool_pre_ping": True,
-            "pool_recycle": 3600,
-            "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
-            "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "20")),
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    # PostgreSQL with connection pooling and retry settings
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,  # Verify connections before using them
+        pool_recycle=3600,   # Recycle connections after 1 hour
+        connect_args={
+            "connect_timeout": 10,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
         }
-
-        # connect_timeout is supported by psycopg/psycopg2, but not all postgres drivers.
-        if (
-            drivername == "postgresql"
-            or "+psycopg2" in drivername
-            or "+psycopg" in drivername
-        ):
-            connect_args = {
-                "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
-                "application_name": "MarketPinPredictor",
-            }
-
-    if connect_args:
-        return create_engine(database_url, connect_args=connect_args, **engine_kwargs)
-    return create_engine(database_url, **engine_kwargs)
-
-
-engine = _create_database_engine(DATABASE_URL)
+    )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

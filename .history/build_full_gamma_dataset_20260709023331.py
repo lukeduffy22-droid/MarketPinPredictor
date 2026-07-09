@@ -2,7 +2,6 @@
 import sys
 import os
 import json
-from pathlib import Path
 import pandas as pd
 
 def load_snapshot(path):
@@ -48,44 +47,26 @@ def build_dataset(exports_dir, date_filter=None, include_invalid=False):
         print(f"Error: Directory not found: {exports_dir}")
         return pd.DataFrame()
     
-    snapshot_files = sorted(
-        p for p in Path(exports_dir).rglob("*")
-        if p.is_file() and p.suffix.lower() in {".ndjson", ".json"}
-    )
+    for root, _, files in os.walk(exports_dir):
+        for fname in files:
+            if not fname.endswith(".ndjson"):
+                continue
 
-    if not snapshot_files:
-        print(f"Warning: No snapshot files found under {exports_dir}")
-        return pd.DataFrame()
-
-    print(f"Discovered {len(snapshot_files)} snapshot file(s)")
-
-    date_filter_prefix = None
-    if date_filter:
-        # Used by audit snapshots named like YYYYMMDD-HHMMSS.json
-        date_filter_prefix = date_filter.replace("-", "")
-
-    for full_path in snapshot_files:
-        fname = full_path.name
-
-        if date_filter:
-            if full_path.suffix.lower() == ".ndjson":
+            if date_filter:
                 file_date = fname.replace('.ndjson', '')
                 if file_date != date_filter:
                     continue
-            else:
-                if not fname.startswith(date_filter_prefix):
-                    continue
 
-        symbol_guess = full_path.parent.name
-        file_rows = 0
+            full_path = os.path.join(root, fname)
+            symbol_guess = os.path.basename(os.path.dirname(full_path))
+            file_rows = 0
 
-        try:
-            if full_path.suffix.lower() == ".ndjson":
-                with open(full_path, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
+            with open(full_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
                         snap = json.loads(line)
                         if not snap.get("symbol"):
                             snap["symbol"] = symbol_guess
@@ -94,21 +75,10 @@ def build_dataset(exports_dir, date_filter=None, include_invalid=False):
                         if include_invalid or row.get("is_valid"):
                             rows.append(row)
                             file_rows += 1
-            else:
-                # Audit snapshots are one JSON object per file.
-                snap = load_snapshot(full_path)
-                if not snap.get("symbol"):
-                    snap["symbol"] = symbol_guess
+                    except Exception as e:
+                        print(f"Error parsing {fname}: {e}")
 
-                row = extract_row(snap)
-                if include_invalid or row.get("is_valid"):
-                    rows.append(row)
-                    file_rows += 1
-        except Exception as e:
-            print(f"Error parsing {full_path}: {e}")
-
-        files_processed += 1
-        if file_rows:
+            files_processed += 1
             print(f"  Processed {fname}: {file_rows} rows")
     
     if not rows:

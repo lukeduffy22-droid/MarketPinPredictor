@@ -30,6 +30,9 @@ np.random.seed(RANDOM_SEED)
 # ============================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
 # ============================================================
 # DATASET
@@ -126,7 +129,7 @@ def _load_dataset(path: str, max_rows: int = 0) -> pd.DataFrame:
     return out
 
 
-def _prepare_dataset(df: pd.DataFrame, index_name: str, include_invalid: bool = False) -> Tuple[pd.DataFrame, List[str]]:
+def _prepare_dataset(df: pd.DataFrame, index_name: str) -> Tuple[pd.DataFrame, List[str]]:
     """Validate and transform raw data to train-ready rows and selected feature columns."""
     required_cols = {"symbol", "spot", "gamma_pin"}
     missing = [c for c in required_cols if c not in df.columns]
@@ -138,14 +141,11 @@ def _prepare_dataset(df: pd.DataFrame, index_name: str, include_invalid: bool = 
     if df.empty:
         raise ValueError(f"No rows found for index: {index_name}")
 
-    # Keep validated rows by default; optionally include invalid rows for sparse datasets.
+    # Keep validated rows when available
     if "is_valid" in df.columns:
         before = len(df)
-        if include_invalid:
-            print(f"Including invalid rows for training: {before}/{before}")
-        else:
-            df = df[df["is_valid"] == True].copy()  # noqa: E712
-            print(f"Kept validated rows: {len(df)}/{before}")
+        df = df[df["is_valid"] == True].copy()  # noqa: E712
+        print(f"Kept validated rows: {len(df)}/{before}")
 
     if "timestamp_utc" in df.columns:
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], errors="coerce", utc=True)
@@ -167,20 +167,6 @@ def _prepare_dataset(df: pd.DataFrame, index_name: str, include_invalid: bool = 
         raise ValueError("No rows remaining after dropping missing feature values")
 
     return df, feature_cols
-
-
-def estimate_trainable_rows(df: pd.DataFrame, index_name: str, include_invalid: bool = False) -> Tuple[int, str]:
-    """
-    Estimate usable rows for a symbol after applying training preprocessing.
-
-    Returns:
-        (row_count, reason)
-    """
-    try:
-        prepared_df, _ = _prepare_dataset(df.copy(), index_name=index_name, include_invalid=include_invalid)
-        return int(len(prepared_df)), "ok"
-    except Exception as exc:
-        return 0, str(exc)
 
 
 def _chronological_split(df: pd.DataFrame, validation_split: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -207,15 +193,10 @@ def train_model(
     validation_split: float,
     early_stopping_patience: int,
     max_rows: int,
-    include_invalid: bool = False,
 ):
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-
     print(f"Loading dataset from: {data_path}")
     raw_df = _load_dataset(data_path, max_rows=max_rows)
-    df, feature_cols = _prepare_dataset(raw_df, index_name=index_name, include_invalid=include_invalid)
+    df, feature_cols = _prepare_dataset(raw_df, index_name=index_name)
 
     train_idx, val_idx = _chronological_split(df, validation_split=validation_split)
 
@@ -355,7 +336,6 @@ if __name__ == "__main__":
     parser.add_argument("--validation-split", type=float, default=DEFAULT_VALIDATION_SPLIT)
     parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
     parser.add_argument("--max-rows", type=int, default=0, help="Optional cap for very large corpora")
-    parser.add_argument("--include-invalid", action="store_true", help="Include invalid snapshots in training data")
     args = parser.parse_args()
 
     index_name = args.index_name.strip().upper()
@@ -373,5 +353,4 @@ if __name__ == "__main__":
         validation_split=args.validation_split,
         early_stopping_patience=args.patience,
         max_rows=args.max_rows,
-        include_invalid=args.include_invalid,
     )

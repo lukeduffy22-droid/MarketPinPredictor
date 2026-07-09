@@ -22,7 +22,6 @@ log = logging.getLogger("rest_fallback")
 
 # Global flag to indicate WebSocket is connected
 WEBSOCKET_CONNECTED = False
-CURRENT_MARKET_DATA_PROVIDER = "unknown"
 
 # Polling interval - 1 second for near-real-time with premium subscription (unlimited API calls)
 REST_POLL_INTERVAL = 1.0
@@ -39,11 +38,6 @@ def set_websocket_connected(connected: bool):
 def is_rest_only_mode() -> bool:
     """Check if we're running in REST-only mode (WebSocket unavailable)"""
     return not WEBSOCKET_CONNECTED
-
-
-def get_market_data_provider() -> str:
-    """Return the currently selected fallback provider."""
-    return CURRENT_MARKET_DATA_PROVIDER
 
 async def poll_polygon_rest():
     """
@@ -170,18 +164,15 @@ async def start_market_data_fallback():
     2. auto mode: Databento when key exists, else Polygon
     """
     provider = (settings.market_data_provider or "auto").strip().lower()
-    global CURRENT_MARKET_DATA_PROVIDER
 
     if provider == "databento":
         from app.ingest.databento_fallback import poll_databento_rest
 
-        CURRENT_MARKET_DATA_PROVIDER = "databento"
         log.info("Fallback market data provider: Databento (forced)")
         await poll_databento_rest()
         return
 
     if provider == "polygon":
-        CURRENT_MARKET_DATA_PROVIDER = "polygon"
         log.info("Fallback market data provider: Polygon (forced)")
         await poll_polygon_rest()
         return
@@ -190,11 +181,9 @@ async def start_market_data_fallback():
     if settings.databento_api_key:
         from app.ingest.databento_fallback import poll_databento_rest
 
-        CURRENT_MARKET_DATA_PROVIDER = "databento"
         log.info("Fallback market data provider: Databento (auto-selected)")
         await poll_databento_rest()
     else:
-        CURRENT_MARKET_DATA_PROVIDER = "polygon"
         log.info("Fallback market data provider: Polygon (auto-selected)")
         await poll_polygon_rest()
 

@@ -76,8 +76,8 @@ def check_exports_directory():
     exports_dir = './exports'
     
     if not os.path.exists(exports_dir):
-        os.makedirs(exports_dir, exist_ok=True)
-        print(f"✓ Created exports directory: {os.path.abspath(exports_dir)}")
+        print(f"❌ Exports directory '{exports_dir}' does not exist")
+        return False
     
     print(f"✓ Exports directory exists: {os.path.abspath(exports_dir)}")
     
@@ -86,8 +86,7 @@ def check_exports_directory():
         if os.path.exists(symbol_dir):
             print(f"✓ Symbol directory '{symbol}/' exists")
         else:
-            os.makedirs(symbol_dir, exist_ok=True)
-            print(f"✓ Created symbol directory '{symbol}/'")
+            print(f"⚠️ Symbol directory '{symbol}/' missing (will be created on first snapshot)")
     
     return True
 

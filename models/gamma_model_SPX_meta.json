@@ -1,0 +1,32 @@
+{
+  "feature_columns": [
+    "spot",
+    "gross_gex",
+    "net_gex",
+    "call_gex",
+    "put_gex"
+  ],
+  "target": "distance_to_pin",
+  "index_name": "SPX",
+  "rows_total": 200,
+  "rows_train": 160,
+  "rows_validation": 40,
+  "best_validation_mse": 2.0622737407684326,
+  "device": "cuda",
+  "scaling": {
+    "mean": [
+      6935.9013671875,
+      3636.385986328125,
+      1864.9404296875,
+      2750.661865234375,
+      885.7225341796875
+    ],
+    "std": [
+      17.761463165283203,
+      1114.16455078125,
+      997.2264404296875,
+      864.793212890625,
+      608.3128051757812
+    ]
+  }
+}

@@ -191,7 +191,7 @@ async def health_check():
     Returns per-symbol freshness and ring buffer status.
     """
     import time
-    from app.ingest.rest_fallback import is_rest_only_mode, get_market_data_provider
+    from app.ingest.rest_fallback import is_rest_only_mode
     max_age = 5  # 5 second freshness threshold (1s REST polling)
     
     status = {}
@@ -221,7 +221,6 @@ async def health_check():
     
     return {
         "status": "ok" if overall_ok else "degraded",
-        "market_data_provider": get_market_data_provider(),
         "symbols": status,
         "timestamp": now_et().isoformat()
     }
