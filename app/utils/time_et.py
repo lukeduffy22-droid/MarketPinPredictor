@@ -27,6 +27,9 @@ EARLY_CLOSE_ET_DATES = {
     "2025-07-03",  # Day before Independence Day
     "2025-11-28",  # Day after Thanksgiving
     "2025-12-24",  # Christmas Eve
+    # 2026
+    "2026-11-27",  # Day after Thanksgiving
+    "2026-12-24",  # Christmas Eve (Thursday)
 }
 
 # Full market closures - Update annually
@@ -53,6 +56,17 @@ US_MARKET_HOLIDAYS = {
     "2025-09-01",  # Labor Day
     "2025-11-27",  # Thanksgiving
     "2025-12-25",  # Christmas
+    # 2026
+    "2026-01-01",  # New Year's Day
+    "2026-01-19",  # MLK Day
+    "2026-02-16",  # Presidents' Day
+    "2026-04-03",  # Good Friday
+    "2026-05-25",  # Memorial Day
+    "2026-06-19",  # Juneteenth
+    "2026-07-03",  # Independence Day observed (July 4 falls on Saturday)
+    "2026-09-07",  # Labor Day
+    "2026-11-26",  # Thanksgiving
+    "2026-12-25",  # Christmas
 }
 
 def now_et(dt_utc: Optional[datetime] = None) -> datetime:
