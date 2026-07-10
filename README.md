@@ -6,6 +6,58 @@ MarketPinPredictor is a Python market-index prediction system with:
 - a Streamlit dashboard in `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app.py`
 - canonical gamma-exposure logic in `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/core/gex.py`
 
+## Runtime Quickstart
+
+### 1) Configure live market data provider
+
+Set at least one provider key:
+
+- `DATABENTO_API_KEY` (preferred for market-open fallback polling)
+- `Massive_API` (Polygon/Massive key)
+
+Optional provider mode:
+
+- `MARKET_DATA_PROVIDER=auto` (default, prefers Databento when key is set)
+- `MARKET_DATA_PROVIDER=databento`
+- `MARKET_DATA_PROVIDER=polygon`
+
+### 2) Run setup verification
+
+```bash
+python verify_gamma_setup.py
+```
+
+### 3) Start backend
+
+```bash
+python server.py
+```
+
+Check health and active provider:
+
+- `GET /health` returns `market_data_provider` and per-symbol freshness.
+
+## CUDA + Institutional Training
+
+### Check GPU
+
+```bash
+python tools/check_gpu.py
+```
+
+### Build full historical dataset and train all symbols
+
+```bash
+python tools/train_institutional_models.py --exports-dir ./exports --dataset-csv ./data/full_gamma_history.csv --rebuild
+```
+
+This command:
+
+1. Builds one unified dataset from all NDJSON snapshots under `./exports`.
+2. Trains SPX/NDX/DJI/RUT models with chronological splits.
+3. Uses CUDA automatically when available.
+4. Saves artifacts to `./models`.
+
 ## Active entry points
 
 - API server: `/home/runner/work/MarketPinPredictor/MarketPinPredictor/server.py`

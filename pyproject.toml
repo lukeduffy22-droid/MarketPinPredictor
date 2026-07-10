@@ -7,6 +7,7 @@ dependencies = [
     "api-session==1.4.2",
     "apig-wsgi==2.19.0",
     "apimatic-core==0.2.16",
+    "databento>=0.56.0",
     "fastapi>=0.121.1",
     "livekit-plugins-openai>=0.10.0",
     "numpy>=1.24.0,<2.0.0",

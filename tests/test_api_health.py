@@ -37,12 +37,16 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "app.ingest.rest_fallback",
-        types.SimpleNamespace(is_rest_only_mode=lambda: True),
+        types.SimpleNamespace(
+            is_rest_only_mode=lambda: True,
+            get_market_data_provider=lambda: "databento",
+        ),
     )
 
     result = asyncio.run(api_main.health_check())
 
     assert result["status"] == "degraded"
+    assert result["market_data_provider"] == "databento"
     assert all(symbol_status["mode"] == "REST" for symbol_status in result["symbols"].values())
 
 
@@ -62,10 +66,14 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "app.ingest.rest_fallback",
-        types.SimpleNamespace(is_rest_only_mode=lambda: False),
+        types.SimpleNamespace(
+            is_rest_only_mode=lambda: False,
+            get_market_data_provider=lambda: "polygon",
+        ),
     )
 
     result = asyncio.run(api_main.health_check())
 
     assert result["status"] == "ok"
+    assert result["market_data_provider"] == "polygon"
     assert all(symbol_status["mode"] == "WebSocket" for symbol_status in result["symbols"].values())
