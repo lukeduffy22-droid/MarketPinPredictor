@@ -23,7 +23,8 @@ class FakeRing:
 
 def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
     """Stale data during market hours should degrade health."""
-    fixed_now = datetime(2026, 7, 10, 19, 30, tzinfo=timezone.utc)
+    # Use a fixed weekday timestamp that maps to regular US market hours.
+    fixed_now = datetime(2025, 7, 10, 19, 30, tzinfo=timezone.utc)
     rings = {
         symbol: FakeRing(fresh=False, latest_ts=100, length_seconds=0)
         for symbol in ("SPX", "NDX", "DJI", "RUT")
@@ -47,7 +48,8 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
 
 def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
     """Stale data after hours should not degrade health."""
-    fixed_now = datetime(2026, 7, 10, 22, 0, tzinfo=timezone.utc)
+    # Use the same weekday after market close to verify after-hours behavior.
+    fixed_now = datetime(2025, 7, 10, 22, 0, tzinfo=timezone.utc)
     rings = {
         symbol: FakeRing(fresh=False, latest_ts=100, length_seconds=0)
         for symbol in ("SPX", "NDX", "DJI", "RUT")

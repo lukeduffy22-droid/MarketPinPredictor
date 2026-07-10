@@ -21,7 +21,7 @@ __all__ = [
 def _raise_removed_entrypoint(name: str) -> None:
     """Raise a consistent error for removed legacy entry points."""
     warnings.warn(
-        f"{name} is a removed legacy entry point.",
+        f"{name} is deprecated as of 0.1.0 and will be removed in a future release.",
         DeprecationWarning,
         stacklevel=2,
     )
