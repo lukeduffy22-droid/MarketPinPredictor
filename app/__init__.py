@@ -1,18 +1,35 @@
-# Backend application package
-"""
-Legacy entry points for market data functionality.
+"""Legacy application exports retained only for compatibility checks.
 
-The original implementations of the following functions have been removed
-from this module:
-  - get_live_market_data
-  - get_multiple_quotes
-  - get_market_data_with_key
+Active runtime entry points live in:
+- ``app.api.main`` for the FastAPI application
+- ``server.py`` for local API startup
+- ``app.py`` for the Streamlit dashboard
 
-If these functions are still needed, their implementations should live in a
-more appropriate module (for example, a dedicated `market_data` module),
-and this package can re-export them. As of now, they are intentionally
-unimplemented and will raise NotImplementedError when called.
+The legacy functions below remain importable so stale callers fail with a
+consistent message instead of an import error.
 """
+
+import warnings
+
+__all__ = [
+    "get_live_market_data",
+    "get_multiple_quotes",
+    "get_market_data_with_key",
+]
+
+
+def _raise_removed_entrypoint(name: str) -> None:
+    """Raise a consistent error for removed legacy entry points."""
+    warnings.warn(
+        f"{name} is a removed legacy entry point.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    raise NotImplementedError(
+        f"{name} has been removed from app.__init__.py. "
+        "Update your code to use the active API surface in app.api.main "
+        "or remove this dependency."
+    )
 
 
 def get_live_market_data(*args, **kwargs):
@@ -23,10 +40,7 @@ This function has been removed from app.__init__.py. If your code still
 depends on it, you should update the call site to import and use the
 new implementation (if one exists) or remove the dependency entirely.
 """
-    raise NotImplementedError(
-        "get_live_market_data has been removed from app.__init__.py. "
-        "Update your code to use the new market data API or remove this call."
-    )
+    _raise_removed_entrypoint("get_live_market_data")
 
 
 def get_multiple_quotes(*args, **kwargs):
@@ -37,10 +51,7 @@ This function has been removed from app.__init__.py. If your code still
 depends on it, you should update the call site to import and use the
 new implementation (if one exists) or remove the dependency entirely.
 """
-    raise NotImplementedError(
-        "get_multiple_quotes has been removed from app.__init__.py. "
-        "Update your code to use the new market data API or remove this call."
-    )
+    _raise_removed_entrypoint("get_multiple_quotes")
 
 
 def get_market_data_with_key(*args, **kwargs):
@@ -51,7 +62,4 @@ This function has been removed from app.__init__.py. If your code still
 depends on it, you should update the call site to import and use the
 new implementation (if one exists) or remove the dependency entirely.
 """
-    raise NotImplementedError(
-        "get_market_data_with_key has been removed from app.__init__.py. "
-        "Update your code to use the new market data API or remove this call."
-    )
+    _raise_removed_entrypoint("get_market_data_with_key")
