@@ -55,8 +55,8 @@ async def get_prediction_accuracy_by_regime(symbol: Optional[str] = None, days: 
             "timestamp": now_et().isoformat()
         }
         
-    except Exception as e:
-        log.error(f"Prediction accuracy by regime error: {e}")
+    except Exception:
+        log.exception("Prediction accuracy by regime error")
         raise HTTPException(503, "Prediction accuracy error")
 
 
