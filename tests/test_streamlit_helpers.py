@@ -41,7 +41,7 @@ def test_predict_eod_price_handles_insufficient_data():
     assert confidence is None
     assert df_clean is None
     assert current_price is None
-    assert "need 25+ rows" in error
+    assert error == "Initial data check failed (need 25+ rows)"
 
 
 def test_create_price_chart_returns_three_panel_figure():

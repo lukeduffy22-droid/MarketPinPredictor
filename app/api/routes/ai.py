@@ -134,7 +134,7 @@ async def get_ai_enhanced_prediction_endpoint(symbol: str = "SPX"):
             "original_prediction": float(base_result.eod_estimate),
             "adjusted_prediction": float(base_result.eod_estimate),
             "confidence": 0.0,
-            "adjustment_reason": f"AI analysis unavailable: {str(e)}",
+            "adjustment_reason": "AI analysis unavailable",
             "market_conditions": "Unable to analyze",
             "risk_factors": ["AI service error"],
             "recommendation": "Use base model prediction",
@@ -260,10 +260,11 @@ async def get_ai_status():
             "timestamp": now_et().isoformat()
         }
     except Exception as e:
+        log.error(f"AI status error: {e}")
         return {
             "available": False,
             "provider": "error",
-            "error": str(e),
+            "error": "AI service status unavailable",
             "timestamp": now_et().isoformat()
         }
 

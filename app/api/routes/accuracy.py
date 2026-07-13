@@ -57,7 +57,7 @@ async def get_prediction_accuracy_by_regime(symbol: Optional[str] = None, days: 
         
     except Exception as e:
         log.error(f"Prediction accuracy by regime error: {e}")
-        raise HTTPException(503, f"Prediction accuracy error: {str(e)}")
+        raise HTTPException(503, "Prediction accuracy error")
 
 
 @router.get("/accuracy/freeze-status")
@@ -77,7 +77,7 @@ async def get_freeze_status():
         log.error(f"Freeze status error: {e}")
         return {
             "is_frozen": True,
-            "reason": f"Error: {str(e)}",
+            "reason": "Error checking freeze status",
             "timestamp": now_et().isoformat(),
         }
 
