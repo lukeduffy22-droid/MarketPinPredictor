@@ -1,85 +1,75 @@
 # MarketPinPredictor - Copilot Instructions
 
-## Project Overview
-
-MarketPinPredictor is a real-time stock index price prediction system that leverages options gamma exposure (GEX) and market microstructure to forecast intraday price movements for major US indices (SPX, NDX, DJI, RUT).
+## Project context
+- Python market-index prediction system with:
+  - FastAPI backend (`app/api/main.py`, launched via `server.py`); `/health` is the smoke check.
+  - Streamlit dashboard (`app.py`) for visualization.
+- Core gamma-exposure logic and invariants live in `app/core/gex.py` and are validated by tests in `tests/test_gex.py` and `tests/test_gex_invariants.py`. This module is the single source of truth for GEX formulas/sign conventions.
 
 **Core Functionality:**
 - Real-time gamma exposure calculation from options data (Polygon.io API)
 - Machine learning price prediction using VWAP, gamma pins, flow urgency, and microtrends
-- FastAPI backend for data ingestion and model serving
-- Streamlit frontend for visualization and interactive analysis
 - Automated snapshot collection and backtesting infrastructure
 
-## Tech Stack
+## Technology stack
+- **Python**: >=3.9
+- **Backend**: FastAPI, Uvicorn
+- **Frontend**: Streamlit
+- **Data processing**: NumPy, Pandas, SciPy
+- **Machine Learning**: scikit-learn, XGBoost, TensorFlow, PyTorch
+- **Visualization**: Plotly
+- **Market data**: Polygon.io API client
+- **Database**: PostgreSQL (production) / SQLite (development) with SQLAlchemy
+- **Testing**: pytest
+- **Package manager**: uv or pip
 
-**Backend:**
-- Python 3.9+
-- FastAPI (async REST API)
-- SQLAlchemy 2.0+ (database ORM)
-- PostgreSQL (production) / SQLite (development)
-- WebSocket streaming for real-time data
-
-**Data & ML:**
-- Polygon.io API (market data provider)
-- PyTorch, TensorFlow, scikit-learn, XGBoost (ML models)
-- pandas, numpy, scipy (data processing)
-- plotly (visualization)
-
-**Frontend:**
-- Streamlit (interactive web UI)
-
-**Testing:**
-- pytest (unit and integration tests)
-
-## Project Structure
-
+## Project structure
 ```
-/app/                   # Modular backend application
-  /api/                 # FastAPI routers and endpoints (main.py)
-  /core/                # Core business logic (GEX calculation, predictions)
-  /features/            # Feature engineering (VWAP, microtrend, gamma pins)
-  /ingest/              # Data ingestion (Polygon WebSocket, REST backfills)
-  /models/              # SQLAlchemy models and DB schema
-  /services/            # Business services (calibration, persistence)
-  /state/               # In-memory state management (ring buffers)
-  /utils/               # Utilities (market time, settings, sanitization)
-
-/tests/                 # Unit and integration tests
-/exports/               # NDJSON snapshot exports (by symbol and date)
-/logs/                  # Log files and audit snapshots
-
-app.py                  # Main Streamlit UI
-server.py               # FastAPI server launcher
-gamma_scheduler.py      # Background scheduler for snapshot collection
-database.py             # Database initialization
+MarketPinPredictor/
+├── app/
+│   ├── api/          # FastAPI backend
+│   │   └── main.py   # Main API application
+│   ├── core/
+│   │   ├── gex.py    # Core gamma-exposure calculations (single source of truth)
+│   │   └── predictions.py  # Prediction engine (calibrated coefficients from DB)
+│   ├── features/     # Feature engineering (VWAP, microtrend, gamma pins)
+│   ├── ingest/       # Data ingestion (Polygon WebSocket, REST backfills — backend-only)
+│   ├── models/       # SQLAlchemy models and DB schema
+│   ├── services/     # Business services (calibration, persistence)
+│   ├── state/        # In-memory state management (ring buffers)
+│   └── utils/        # Utilities (market time, settings, sanitization)
+├── tests/
+│   ├── test_gex.py              # GEX functionality tests
+│   └── test_gex_invariants.py   # GEX invariant validation
+├── exports/          # NDJSON snapshot exports (by symbol and date)
+├── logs/             # Log files and audit snapshots
+├── server.py         # FastAPI server launcher
+├── app.py            # Streamlit dashboard
+├── gamma_scheduler.py  # Background scheduler for snapshot collection
+├── database.py       # Database initialization
+└── pyproject.toml    # Project dependencies
 ```
 
-## Coding Standards
+## Code changes
+- **Keep changes minimal and localized** to the specific issue; avoid drive-by refactors.
+- **Do not alter GEX sign conventions or invariants**; reuse `app/core/gex.py` helpers instead of duplicating logic.
+- **Preserve existing API contracts** and data shapes for both FastAPI and Streamlit flows.
+- **Reuse existing utilities** under `app/` before adding new modules or dependencies.
+- **Follow existing code style** in the files you're modifying.
+- **Add tests** for new functionality or bug fixes when appropriate.
+- **Never mix Streamlit session state with FastAPI global state.**
+- **Snapshot files are append-only NDJSON** — never overwrite.
 
-**General:**
-- Use type hints for all function signatures
-- Follow PEP 8 style guide (use `black` for formatting if available)
-- Docstrings for public functions (prefer Google-style)
-- Keep functions focused and under 50 lines when possible
+## Coding standards
+- **Type hints**: Use type annotations for function parameters and return values
+- **Docstrings**: Add docstrings for public functions and classes (prefer Google-style)
+- **Error handling**: Use appropriate exceptions and error messages; avoid bare `except:`
+- **Testing**: Write tests that validate both happy path and edge cases
+- **Imports**: Group imports (stdlib, third-party, local) with blank lines between groups
+- **Naming**: Use descriptive variable names; follow PEP 8 conventions (`snake_case` for functions/variables, `PascalCase` for classes, `UPPER_SNAKE_CASE` for constants)
+- **Security**: Never commit API keys or secrets; use `html_escape` for user input displayed in Streamlit UI
 
-**Naming Conventions:**
-- `snake_case` for variables, functions, and module names
-- `PascalCase` for class names
-- `UPPER_SNAKE_CASE` for constants
-- Use descriptive names: `gamma_exposure` not `gex_val`
-
-**Error Handling:**
-- Use specific exception types (avoid bare `except:`)
-- Log errors with context using the `logging` module
-- Fail fast for invalid data in critical paths (GEX computation, predictions)
-
-**Security:**
-- Never commit API keys or secrets (use environment variables)
-- Use `html_escape` for any user input displayed in Streamlit UI
-- Validate all external API responses before processing
-
-## Data Conventions
+## Data conventions
 
 **GEX Calculations:**
 - Net GEX = (call_gamma × call_oi) - (put_gamma × put_oi) × multiplier
@@ -93,88 +83,74 @@ database.py             # Database initialization
 - ETF fallbacks: SPY (SPX), QQQ (NDX), DIA (DJI), IWM (RUT)
 
 **Timestamps:**
-- All times in Eastern Time (ET) for market hours
-- Market hours: Mon-Fri, 9:30 AM - 4:00 PM ET
+- All times in Eastern Time (ET) for market hours (Mon-Fri, 9:30 AM – 4:00 PM ET)
 - Use `pytz` for timezone conversions
 
-## Build & Test Commands
+## Development setup
+- Python 3.9+; install deps with `pip install -r requirements_local.txt` (fast path) or `uv pip install .` (full env).
+- Avoid adding new dependencies unless required for the task.
+- Keep secrets, API keys, and large artifacts out of the repo.
 
-**Setup:**
+## Build and test commands
+
+### Running tests
 ```bash
-# Install dependencies
-pip install -r requirements_local.txt
-# OR using uv (faster)
-uv pip install .
-```
+# Run targeted GEX tests first
+python -m pytest tests/test_gex.py -q
+python -m pytest tests/test_gex_invariants.py -q
 
-**Run Tests:**
-```bash
-# All tests
-pytest
-
-# Specific test file
-pytest tests/test_gex.py
-
-# With verbose output
+# Run all tests
 pytest -v
 ```
 
-**Run Application:**
+### Running the application
 ```bash
-# FastAPI backend (default port 8000)
+# Start FastAPI backend
 python server.py
+# Or directly with uvicorn
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 
-# Streamlit UI (default port 8501)
+# Start Streamlit dashboard (in a separate terminal)
 streamlit run app.py
 
-# Verify gamma setup
-python verify_gamma_setup.py
-```
-
-**Database:**
-```bash
 # Initialize database
 python -c "from database import init_db; init_db()"
-
-# Set DATABASE_URL for PostgreSQL (optional, defaults to SQLite)
-export DATABASE_URL="postgresql://user:pass@host:port/db"
 ```
 
-**Environment Variables:**
-```bash
-# Required for live data (can run in demo mode without)
-export POLYGON_API_KEY="your_key_here"
-```
+### Validation commands
+- **Run targeted tests first** before making changes to understand baseline behavior
+- **For GEX changes**: Run `python -m pytest tests/test_gex.py tests/test_gex_invariants.py -q`
+- **For backend changes**: Verify app startup and check `GET /health` endpoint returns JSON
+- **For all changes**: Ensure existing tests still pass after your modifications
 
-## Key Implementation Notes
-
-**Performance Targets:**
+## Performance targets
 - p99 end-to-end prediction latency: ≤200ms after 3:45 PM ET
-- GC pauses: <20ms during critical period (3:45-4:00 PM ET)
+- GC pauses: <20ms during critical period (3:45–4:00 PM ET)
 - Memory: No heap drift during a session (ΔRSS < 100 MB)
 
-**Critical Code Paths:**
-- GEX computation: `app/core/gex.py` - Highly performance-sensitive, maintain invariants
-- Gamma scheduler: `gamma_scheduler.py` - Runs in background, collects snapshots
-- Prediction engine: `app/core/predictions.py` - Uses calibrated coefficients from DB
-- WebSocket streaming: `app/ingest/` - Backend-only, NOT used in Streamlit UI
+## Common workflows
 
-**Testing Strategy:**
-- Unit tests for GEX calculation invariants (critical)
-- Integration tests for API endpoints
-- Validation scripts for gamma setup and data pipelines
-- No test fixtures committed (use recorded-minute data if needed)
+### Modifying GEX calculations
+1. Review `app/core/gex.py` and understand current logic
+2. Check `tests/test_gex_invariants.py` for invariants that must be preserved
+3. Make changes while preserving mathematical invariants
+4. Run both GEX test files to validate
 
-**Common Pitfalls:**
-- Never mix Streamlit session state with FastAPI global state
-- Always validate GEX invariant: `assert total_gex >= abs(net_gex)`
-- Use correct Polygon ticker format: `I:SPX` for index data
-- Handle market hours correctly (check `is_market_open()` before live data calls)
-- Snapshot files are append-only NDJSON - never overwrite
+### Fixing a bug
+1. Write a test that reproduces the bug
+2. Make the minimal fix in the relevant module
+3. Verify the test now passes
+4. Run related tests to ensure no side effects
 
-## Resources
+## Copilot task execution guidance (to avoid VS Code chat task failures)
+- **Break work into small, file-scoped tasks**: Example: "update `app/core/gex.py` and `tests/test_gex.py` only"
+- **Include explicit acceptance criteria**: Specify expected behavior, tests to run, and files allowed to change
+- **Ask for a plan first**: Request a short plan before implementation
+- **Retry with narrower scope**: If chat returns an error code, rerun with a narrower prompt and fewer files in scope
+- **Validate incrementally**: Test each change before moving to the next step
 
-- GAMMA_SETUP.md - Gamma snapshot automation setup
-- IMPLEMENTATION_SUMMARY.md - Recent implementation details
-- CODE_EXPORT.md - Full codebase documentation
-- [Polygon API Docs](https://polygon.io/docs) - Market data API reference
+## Security and best practices
+- **Never commit secrets**: Use environment variables for API keys and credentials
+- **Validate inputs**: Always validate user inputs, especially in API endpoints and external API responses
+- **Handle errors gracefully**: Provide meaningful error messages without exposing sensitive information
+- **Test edge cases**: Consider boundary conditions and error scenarios in tests

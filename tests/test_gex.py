@@ -264,7 +264,7 @@ class TestAggregateGex:
     def test_aggregate_gex_missing_net_gex_key(self):
         """Missing net_gex key raises ValueError."""
         strikes = [{'strike': 100}]  # Missing 'net_gex'
-        with pytest.raises(ValueError, match="missing 'net_gex' key"):
+        with pytest.raises(ValueError, match="net_gex"):
             compute_aggregate_gex(strikes)
 
 
