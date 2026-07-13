@@ -79,7 +79,13 @@ def _current_session_date() -> date:
 
 
 def _ensure_current_session_vwap() -> None:
-    """Reset VWAP state automatically when the ET session rolls over."""
+    """Keep VWAP state aligned to the current ET session during updates.
+
+    On the first update after process start, `_vwap_session_date` is unset, so
+    the trackers are initialized for the current session. When the ET session
+    date changes, the running VWAP accumulators are reset before adding new
+    ticks.
+    """
     global _vwap_session_date
 
     session_date = _current_session_date()
