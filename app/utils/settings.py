@@ -10,18 +10,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application configuration"""
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="forbid")
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
     polygon_api_key: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("Massive_API", "POLYGON_API_KEY", "polygon_api_key"),
+        validation_alias=AliasChoices("Massive_API", "POLYGON_API_KEY"),
     )
     databento_api_key: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("DATABENTO_API_KEY", "DATABENTO_KEY", "databento_api_key"),
+        validation_alias=AliasChoices("DATABENTO_API_KEY", "DATABENTO_KEY"),
     )
-    database_url: Optional[str] = Field(default=None, validation_alias=AliasChoices("DATABASE_URL", "database_url"))
+    database_url: Optional[str] = Field(default=None, validation_alias="DATABASE_URL")
 
     # Market data provider selection for live fallback polling
     # auto: prefer Databento when key exists, otherwise Polygon
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # polygon: force Polygon
     market_data_provider: str = Field(
         default="auto",
-        validation_alias=AliasChoices("MARKET_DATA_PROVIDER", "market_data_provider"),
+        validation_alias="MARKET_DATA_PROVIDER",
     )
     
     # Environment
