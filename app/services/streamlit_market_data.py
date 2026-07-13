@@ -377,7 +377,13 @@ def fetch_market_data(api_key, ticker, days=60, use_index=True, databento_api_ke
         return None
 
 def get_current_price(api_key, ticker, databento_api_key=None):
-    """Get current/latest price"""
+    """Get the latest price using the configured market-data providers.
+
+    Args:
+        api_key: Polygon API key
+        ticker: Base ticker symbol (e.g., 'SPX', 'NDX', 'SPY')
+        databento_api_key: Optional Databento key for futures-proxy fallback
+    """
     try:
         df = fetch_market_data(
             api_key,
