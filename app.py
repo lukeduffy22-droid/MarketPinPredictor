@@ -20,6 +20,7 @@ from app.features.technical_indicators import DEFAULT_INDICATOR_PARAMS
 from app.services.streamlit_market_data import calculate_gex, fetch_market_data, fetch_vix_data
 from app.services.streamlit_predictions import predict_eod_price
 from app.visualization.price_chart import create_price_chart
+from options_gamma import get_options_root
 
 # Initialize database
 init_db()
@@ -59,11 +60,15 @@ INDEX_ETFS = {
     "VIX": "UVXY"  # VIX ETF proxy (though VIX options trade directly)
 }
 
+TRACKED_INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
+
 import os
 
 # Initialize session state - load API key from environment if available
 if 'api_key' not in st.session_state:
     st.session_state.api_key = os.environ.get('Massive_API', '') or os.environ.get('POLYGON_API_KEY', '')
+if 'databento_api_key' not in st.session_state:
+    st.session_state.databento_api_key = os.environ.get('DATABENTO_API_KEY', '')
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
@@ -229,7 +234,7 @@ def create_eod_zip_export(date_str: str = None) -> bytes:
     buffer = io.BytesIO()
     
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        symbols = ['SPX', 'NDX', 'RUT']
+        symbols = TRACKED_INDEX_SYMBOLS
         all_data = []
         
         for symbol in symbols:
@@ -295,11 +300,21 @@ with st.sidebar:
         "Polygon API Key",
         type="password",
         value=st.session_state.api_key,
-        help="Enter your Polygon.io API key with live market access"
+        help="Enter your Polygon/Massive API key for direct index data and options analytics"
     )
     
     if api_key_input:
         st.session_state.api_key = api_key_input
+
+    databento_key_input = st.text_input(
+        "Databento API Key",
+        type="password",
+        value=st.session_state.databento_api_key,
+        help="Optional: use Databento futures proxies when Polygon index history is unavailable",
+    )
+
+    if databento_key_input:
+        st.session_state.databento_api_key = databento_key_input
     
     st.divider()
     
@@ -600,7 +615,7 @@ with st.sidebar:
             # Check if any data exists
             has_data = any(
                 os.path.exists(os.path.join('exports', sym, f'{today_str}.ndjson'))
-                for sym in ['SPX', 'NDX', 'RUT']
+                for sym in TRACKED_INDEX_SYMBOLS
             )
             
             if has_data:
@@ -754,7 +769,8 @@ with st.sidebar:
                             contracts = []
                             count = 0
                             try:
-                                for c in client.list_snapshot_options_chain(symbol):
+                                options_root, is_etf_proxy = get_options_root(symbol)
+                                for c in client.list_snapshot_options_chain(options_root):
                                     count += 1
                                     if count > 1500: break
                                     if hasattr(c, 'details') and c.details:
@@ -770,6 +786,9 @@ with st.sidebar:
                                 st.error(f"Error: {str(e)[:30]}")
                                 continue
                             
+                            if is_etf_proxy:
+                                st.caption(f"Using {options_root} options as the live proxy for {symbol}")
+
                             if not contracts:
                                 st.info("No 0DTE contracts")
                                 continue
@@ -984,19 +1003,19 @@ with st.sidebar:
     st.caption("💡 This tool uses technical indicators and machine learning to predict closing prices. Predictions are estimates and should not be used as financial advice.")
 
 # Main content
-if not st.session_state.api_key:
-    st.info("👈 Please enter your Polygon API key in the sidebar to get started")
+if not (st.session_state.api_key or st.session_state.databento_api_key):
+    st.info("👈 Please enter a Polygon and/or Databento API key in the sidebar to get started")
     st.markdown("""
     ### How it works:
-    1. Enter your Polygon API key (with live market access)
+    1. Enter a Polygon key for direct index data and options analytics, and/or a Databento key for futures-proxy price data
     2. Select the stock indexes you want to analyze
     3. Click 'Analyze & Predict' to generate predictions
     
     ### Features:
-    - **Live market data** from Polygon.io with WebSocket streaming support
+    - **Live market data** from Polygon with Databento fallback support
     - **Advanced technical analysis** including VWAP, AMA (Adaptive Moving Average), RSI, MACD, Bollinger Bands
-    - **Options analytics** with Gamma Exposure (GEX) levels for key support/resistance
-    - **VIX integration** for volatility analysis
+    - **Options analytics** with Gamma Exposure (GEX) levels for key support/resistance when Polygon options access is configured
+    - **VIX integration** for volatility analysis when Polygon data is available
     - **Critical time window** monitoring (15 minutes before market close at 3:45 PM ET)
     - **Machine learning predictions** using Linear Regression and Random Forest models
     - **Interactive charts** with all technical indicators
@@ -1028,7 +1047,13 @@ else:
             status_text.text(f"Analyzing {index_name}...")
             
             # Fetch price data using direct index ticker (I:SPX format), falls back to ETF if needed
-            df = fetch_market_data(st.session_state.api_key, index_ticker, days_history, use_index=True)
+            df = fetch_market_data(
+                st.session_state.api_key,
+                index_ticker,
+                days_history,
+                use_index=True,
+                databento_api_key=st.session_state.databento_api_key,
+            )
             
             # Debug: Show data fetch result
             if df is None:

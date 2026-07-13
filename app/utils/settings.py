@@ -2,16 +2,20 @@
 Application settings using pydantic-settings for type-safe configuration.
 Loads from environment variables with fail-fast validation.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import Optional
 import os
+from typing import Optional
+
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     """Application configuration"""
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
-    polygon_api_key: Optional[str] = Field(default=None, validation_alias="Massive_API")
+    polygon_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("Massive_API", "POLYGON_API_KEY"),
+    )
     databento_api_key: Optional[str] = Field(default=None, validation_alias="DATABENTO_API_KEY")
     database_url: Optional[str] = None
 

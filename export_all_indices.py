@@ -8,9 +8,9 @@ from datetime import datetime
 # CONFIG
 # ============================================================
 
-SNAPSHOT_FOLDER = "exports/"  # Folder containing SPX/, NDX/, RUT/ subdirectories with .ndjson files
+SNAPSHOT_FOLDER = "exports/"  # Folder containing SPX/, NDX/, DJI/, and RUT/ subdirectories with .ndjson files
 OUTPUT_CSV = f"all_indices_{datetime.now().strftime('%Y-%m-%d')}.csv"
-VALID_SYMBOLS = {"SPX", "NDX", "RUT"}
+VALID_SYMBOLS = {"SPX", "NDX", "DJI", "RUT"}
 
 # ============================================================
 # LOAD SNAPSHOTS

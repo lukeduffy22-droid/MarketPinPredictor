@@ -16,6 +16,7 @@ from typing import Dict, Optional, Callable
 import websockets
 from polygon.rest import RESTClient
 
+from options_gamma import get_options_root
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
 
@@ -100,6 +101,8 @@ class OptionsWebSocketStream:
             "T.O:SPX*",   # SPX options trades
             "T.O:NDX*",   # NDX options trades
             "T.O:SPXW*",  # SPX weekly options
+            "T.O:RUT*",   # RUT options trades
+            "T.O:DIA*",   # DJI proxy options trades
         ]
     
     def is_active(self) -> bool:
@@ -189,15 +192,21 @@ class OptionsWebSocketStream:
             parts = sym[2:]
             
             root = None
-            for r in ("SPXW", "SPX", "NDX", "DJI", "RUT"):
+            for r in ("SPXW", "SPX", "NDX", "DIA", "DJI", "RUT"):
                 if parts.startswith(r):
-                    root = "SPX" if r == "SPXW" else r
+                    if r == "SPXW":
+                        root = "SPX"
+                    elif r == "DIA":
+                        root = "DJI"
+                    else:
+                        root = r
                     break
             
             if not root:
                 return
             
-            parts_after_root = parts[len(root if root != "SPX" else ("SPXW" if parts.startswith("SPXW") else "SPX")):]
+            original_root = "SPXW" if parts.startswith("SPXW") else ("DIA" if parts.startswith("DIA") else root)
+            parts_after_root = parts[len(original_root):]
             
             if len(parts_after_root) < 8:
                 return
@@ -376,11 +385,12 @@ async def fetch_eod_options_snapshot(symbol: str, spot_price: float) -> dict:
     Returns gamma exposure data for display after hours.
     """
     try:
+        options_root, is_etf_proxy = get_options_root(symbol)
         client = RESTClient(settings.polygon_api_key)
         
-        log.info(f"Fetching EOD options snapshot for {symbol}...")
+        log.info(f"Fetching EOD options snapshot for {symbol} using {options_root}...")
         
-        snapshot = client.list_snapshot_options_chain(symbol)
+        snapshot = client.list_snapshot_options_chain(options_root)
         
         options_data = []
         for contract in snapshot:
@@ -415,7 +425,9 @@ async def fetch_eod_options_snapshot(symbol: str, spot_price: float) -> dict:
             'spot_price': spot_price,
             'contracts': options_data,
             'is_realtime': False,
-            'source': 'EOD_SNAPSHOT'
+            'source': 'EOD_SNAPSHOT',
+            'options_root': options_root,
+            'is_etf_proxy': is_etf_proxy,
         }
         
     except Exception as e:
@@ -426,5 +438,7 @@ async def fetch_eod_options_snapshot(symbol: str, spot_price: float) -> dict:
             'contracts': [],
             'is_realtime': False,
             'source': 'ERROR',
+            'options_root': symbol,
+            'is_etf_proxy': False,
             'error': str(e)
         }
