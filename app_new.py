@@ -1,3 +1,9 @@
+"""LEGACY alternate Streamlit client. Primary dashboard entry point is app.py.
+
+This file is retained only as a historical/alternate copy and should not be
+used as the active runtime surface unless explicitly requested.
+"""
+
 """
 Streamlit UI for 0-day predictions - FastAPI client.
 Polls /predict/close endpoint with adaptive refresh based on time-to-close.
