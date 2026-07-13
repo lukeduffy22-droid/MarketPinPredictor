@@ -2,7 +2,7 @@
 Application settings using pydantic-settings for type-safe configuration.
 Loads from environment variables with fail-fast validation.
 """
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import Optional
 import os
@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Environment
     env: str = "dev"
     log_level: str = "INFO"
+    cors_allow_origins: str = "http://localhost:8501,http://127.0.0.1:8501"
     
     # Ring buffer configuration
     ring_secs: int = 5400  # 90 minutes
@@ -46,9 +47,15 @@ class Settings(BaseSettings):
     ws_backoff_base: float = 2.0  # Exponential backoff base
     ws_backoff_jitter: float = 0.3  # Jitter fraction
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
         
     def __init__(self, **kwargs):
         # Load from environment variables
