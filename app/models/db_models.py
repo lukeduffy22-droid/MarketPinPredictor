@@ -276,9 +276,9 @@ def get_mae_by_regime(symbol: str = None, days: int = 30) -> dict:
             'eow': compute_stats(base_filter + [PredictionLog.regime_eow == True]),
             'holiday_adjacent': compute_stats(base_filter + [PredictionLog.regime_holiday_adjacent == True]),
         }
-    except Exception as e:
+    except Exception:
         return {
-            'overall': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0, 'error': str(e)},
+            'overall': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
             'half_day': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
             'regular_day': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
             'eom': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
