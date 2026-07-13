@@ -41,6 +41,17 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.history/
+
+# Local backups and alternate app copies
+backups/
+clean_app/
+app_backup.py
+app_new.py
+
+# Local market data exports/artifacts
+Polygon APP/
+*.zip
 
 # Logs
 *.log

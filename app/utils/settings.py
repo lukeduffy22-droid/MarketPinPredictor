@@ -2,24 +2,35 @@
 Application settings using pydantic-settings for type-safe configuration.
 Loads from environment variables with fail-fast validation.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
 from typing import Optional
-import os
+
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """Application configuration"""
+
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
-    polygon_api_key: Optional[str] = Field(default=None, validation_alias="Massive_API")
-    databento_api_key: Optional[str] = Field(default=None, validation_alias="DATABENTO_API_KEY")
-    database_url: Optional[str] = None
+    polygon_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("Massive_API", "POLYGON_API_KEY", "polygon_api_key"),
+    )
+    databento_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("DATABENTO_API_KEY", "DATABENTO_KEY", "databento_api_key"),
+    )
+    database_url: Optional[str] = Field(default=None, validation_alias=AliasChoices("DATABASE_URL", "database_url"))
 
     # Market data provider selection for live fallback polling
     # auto: prefer Databento when key exists, otherwise Polygon
     # databento: force Databento
     # polygon: force Polygon
-    market_data_provider: str = "auto"
+    market_data_provider: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("MARKET_DATA_PROVIDER", "market_data_provider"),
+    )
     
     # Environment
     env: str = "dev"
@@ -46,24 +57,6 @@ class Settings(BaseSettings):
     ws_backoff_base: float = 2.0  # Exponential backoff base
     ws_backoff_jitter: float = 0.3  # Jitter fraction
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-        
-    def __init__(self, **kwargs):
-        # Load from environment variables
-        super().__init__(**kwargs)
-        
-        # Use Replit secrets if available
-        if not self.polygon_api_key:
-            self.polygon_api_key = os.getenv("Massive_API", "")
-
-        if not self.databento_api_key:
-            self.databento_api_key = os.getenv("DATABENTO_API_KEY", "")
-        
-        if not self.database_url:
-            self.database_url = os.getenv("DATABASE_URL")
-
 # Global settings instance
 settings = Settings()
 
