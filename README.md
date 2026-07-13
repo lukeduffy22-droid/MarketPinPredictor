@@ -18,6 +18,12 @@ Set at least one provider key:
 If you run the Streamlit dashboard, use the sidebar **"Save keys to .env"** action to persist
 `Massive_API` and `DATABENTO_API_KEY` locally for future restarts.
 
+<<<<<<< Updated upstream
+=======
+When `Massive_API` is not available but `DATABENTO_API_KEY` is set, the Streamlit
+**Analyze & Predict** flow automatically switches to backend Databento-driven endpoints.
+
+>>>>>>> Stashed changes
 Optional provider mode:
 
 - `MARKET_DATA_PROVIDER=auto` (default, prefers Databento when key is set)
