@@ -716,7 +716,9 @@ with st.sidebar:
         if st.button("📊 Analyze Gamma Pull", type="primary", help="Calculate real-time gamma pin and dealer hedging direction"):
             if st.session_state.api_key and selected_indexes:
                 with st.spinner("Calculating gamma structure..."):
-                                                            from scipy.stats import norm
+                    import numpy as np
+                    from polygon.rest import RESTClient
+                    from scipy.stats import norm
                     
                     def bs_gamma(S, K, T, sigma=0.25):
                         if T <= 0 or S <= 0: return 0
