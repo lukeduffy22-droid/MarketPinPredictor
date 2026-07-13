@@ -10,7 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application configuration"""
 
-    # Ignore unrelated deployment environment variables while loading only declared settings.
+    # Deployment environments may include unrelated variables; ignore them while
+    # matching declared settings case-insensitively against documented names.
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
