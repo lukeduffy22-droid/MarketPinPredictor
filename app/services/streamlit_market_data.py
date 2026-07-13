@@ -9,8 +9,8 @@ import pandas as pd
 import streamlit as st
 from polygon.rest import RESTClient
 
-from options_gamma import get_gamma_analysis
 from app.utils.settings import settings
+from options_gamma import get_gamma_analysis
 
 INDEX_POLYGON_TICKERS = {
     "SPX": "I:SPX",
@@ -171,7 +171,7 @@ def _fetch_databento_market_data(api_key: str, ticker: str, days: int = 60) -> p
 
     try:
         import databento as db
-    except Exception as exc:  # pragma: no cover - optional dependency
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("databento package is not installed. Install it with: pip install databento") from exc
 
     end_date = datetime.now()
