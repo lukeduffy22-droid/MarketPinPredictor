@@ -1697,16 +1697,16 @@ with st.sidebar:
     st.caption("💡 This tool uses technical indicators and machine learning to predict closing prices. Predictions are estimates and should not be used as financial advice.")
 
 # Main content
-if not st.session_state.api_key:
-    st.info("👈 Please enter your Polygon API key in the sidebar to get started")
+if not st.session_state.api_key and not st.session_state.databento_api_key:
+    st.info("👈 Please enter a market data key in the sidebar to get started")
     st.markdown("""
     ### How it works:
-    1. Enter your Polygon API key (with live market access)
+    1. Enter a market data key in the sidebar
     2. Select the stock indexes you want to analyze
     3. Click 'Analyze & Predict' to generate predictions
     
     ### Features:
-    - **Live market data** from Polygon.io with WebSocket streaming support
+    - **Live market data** from Databento (backend fallback) or Polygon/Massive
     - **Advanced technical analysis** including VWAP, AMA (Adaptive Moving Average), RSI, MACD, Bollinger Bands
     - **Options analytics** with Gamma Exposure (GEX) levels for key support/resistance
     - **VIX integration** for volatility analysis
@@ -1722,126 +1722,234 @@ else:
         
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
-        # Fetch VIX data once (shared across all indexes)
-        status_text.text("Fetching VIX data...")
-        vix_df = fetch_vix_data(st.session_state.api_key, days_history)
-        
-        # Check if we're in critical window for intraday data
-        if is_near_market_close():
-            st.warning("🔴 Critical window detected! Using intraday data for enhanced predictions.")
-            data_timespan = 'minute'
-            data_multiplier = 5  # 5-minute bars
-        else:
-            data_timespan = 'day'
-            data_multiplier = 1
-        
-        for idx, index_name in enumerate(selected_indexes):
-            index_ticker = INDEXES[index_name]  # Actual index ticker (SPX, NDX, etc.)
-            status_text.text(f"Analyzing {index_name}...")
-            
-            # Fetch price data using direct index ticker (I:SPX format), falls back to ETF if needed
-            df = fetch_market_data(st.session_state.api_key, index_ticker, days_history, use_index=True)
-            
-            # Debug: Show data fetch result
-            if df is None:
-                st.warning(f"⚠️ {index_name}: No data returned from fetch")
-            elif len(df) == 0:
-                st.warning(f"⚠️ {index_name}: Empty dataframe returned")
-            else:
-                st.caption(f"✓ {index_name}: Fetched {len(df)} rows")
-            
-            if df is not None and len(df) > 0:
-                # Preserve data source metadata before any operations
-                data_source = df.attrs.get('data_source', 'unknown') if hasattr(df, 'attrs') else 'unknown'
-                ticker_used = df.attrs.get('ticker_used', index_ticker) if hasattr(df, 'attrs') else index_ticker
-                
-                # Merge VIX data if available
-                if vix_df is not None and len(vix_df) > 0:
-                    df = pd.merge(df, vix_df, on='timestamp', how='left')
-                    df['vix_close'] = df['vix_close'].ffill()  # Fixed deprecated fillna(method='ffill')
-                    # Restore attrs after merge (merge loses them)
-                    df.attrs['data_source'] = data_source
-                    df.attrs['ticker_used'] = ticker_used
-                
-                # Get current price for GEX calculation
-                current_price = df['close'].iloc[-1]
-                
-                # Calculate GEX levels using actual index ticker for options
-                gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
-                
-                # Predict EOD price using selected model, timeframe, and GAMMA PIN DATA
-                # Pass gex_data so predictions align with gamma pin levels
-                predicted_price, confidence, df_with_indicators, current_price, error_msg = predict_eod_price(
-                    df, 
-                    model_type=st.session_state.selected_model,
-                    timeframe=st.session_state.timeframe,
-                    gex_data=gex_data  # Critical: gamma pin influences EOD prediction
-                )
-                
-                # Debug: Show prediction result
-                if predicted_price is None:
-                    st.warning(f"⚠️ {index_name}: Prediction failed - {error_msg or 'unknown error'}")
-                else:
-                    st.caption(f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}%")
-                
-                if predicted_price and current_price:
-                    change_pct = ((predicted_price - current_price) / current_price) * 100
-                    
-                    # data_source and ticker_used already captured before merge
-                    
-                    st.session_state.predictions[index_name] = {
-                        'ticker': index_ticker,
-                        'current_price': current_price,
-                        'predicted_price': predicted_price,
-                        'confidence': confidence,
-                        'df': df_with_indicators,
-                        'change_pct': change_pct,
-                        'model_type': st.session_state.selected_model,
-                        'timeframe': st.session_state.timeframe,
-                        'gex_data': gex_data,  # Add GEX data
-                        'has_vix': vix_df is not None,  # Track VIX availability
-                        'data_source': data_source,  # Track if using index or ETF data
-                        'ticker_used': ticker_used  # Actual ticker used for data
+        use_backend_databento_mode = (
+            not st.session_state.api_key.strip()
+            and bool(st.session_state.databento_api_key.strip())
+        )
+
+        if use_backend_databento_mode:
+            import requests
+
+            st.info("ℹ️ Running Databento-only mode via backend prediction endpoints.")
+            for idx, index_name in enumerate(selected_indexes):
+                index_ticker = INDEXES[index_name]  # Actual ticker symbol (SPX, NDX, etc.)
+                status_text.text(f"Analyzing {index_name} (backend Databento mode)...")
+                try:
+                    eod_resp = requests.get(
+                        "http://localhost:8000/predict/eod",
+                        params={"symbol": index_ticker},
+                        timeout=8,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    st.error(f"Cannot reach backend prediction API for {index_name}: {exc}")
+                    progress_bar.progress((idx + 1) / len(selected_indexes))
+                    continue
+
+                if not eod_resp.ok:
+                    st.warning(
+                        f"⚠️ {index_name}: Backend prediction unavailable "
+                        f"({eod_resp.status_code}) {eod_resp.text[:80]}"
+                    )
+                    progress_bar.progress((idx + 1) / len(selected_indexes))
+                    continue
+
+                eod_data = eod_resp.json()
+                current_price = eod_data.get("current_price")
+                predicted_price = eod_data.get("eod_estimate")
+                if not current_price or not predicted_price:
+                    st.warning(f"⚠️ {index_name}: Backend returned incomplete prediction data")
+                    progress_bar.progress((idx + 1) / len(selected_indexes))
+                    continue
+
+                try:
+                    close_resp = requests.get(
+                        "http://localhost:8000/predict/close-overlay",
+                        params={"symbol": index_ticker},
+                        timeout=8,
+                    )
+                    gex_data = close_resp.json() if close_resp.ok else {}
+                except requests.exceptions.RequestException:
+                    gex_data = {}
+
+                confidence = 70.0 if eod_data.get("num_walls", 0) else 55.0
+                change_pct = ((predicted_price - current_price) / current_price) * 100
+
+                # Build a minimal one-row frame for existing chart/analysis surfaces.
+                backend_df = pd.DataFrame([
+                    {
+                        "timestamp": datetime.now(),
+                        "open": current_price,
+                        "high": max(current_price, predicted_price),
+                        "low": min(current_price, predicted_price),
+                        "close": current_price,
+                        "volume": 0.0,
+                        "RSI": 50.0,
+                        "MACD": 0.0,
+                        "Signal_Line": 0.0,
+                        "SMA_20": current_price,
+                        "Momentum": 0.0,
+                        "VWAP": current_price,
+                        "AMA": current_price,
                     }
+                ])
+
+                st.session_state.predictions[index_name] = {
+                    "ticker": index_ticker,
+                    "current_price": current_price,
+                    "predicted_price": predicted_price,
+                    "confidence": confidence,
+                    "df": backend_df,
+                    "change_pct": change_pct,
+                    "model_type": "Backend EOD (Databento mode)",
+                    "timeframe": st.session_state.timeframe,
+                    "gex_data": gex_data,
+                    "has_vix": False,
+                    "data_source": "backend_databento",
+                    "ticker_used": index_ticker,
+                }
+
+                try:
+                    if st.session_state.timeframe == "1-day":
+                        target_date = datetime.now() + timedelta(days=1)
+                    elif st.session_state.timeframe == "5-day":
+                        target_date = datetime.now() + timedelta(days=5)
+                    else:
+                        target_date = datetime.now() + timedelta(days=7)
+
+                    save_prediction(
+                        ticker=index_ticker,
+                        index_name=index_name,
+                        current_price=current_price,
+                        predicted_price=predicted_price,
+                        confidence=confidence,
+                        model_type="Backend EOD (Databento mode)",
+                        change_pct=change_pct,
+                        target_date=target_date,
+                    )
+                except Exception as exc:
+                    st.warning(f"Could not save backend prediction: {exc}")
+
+                progress_bar.progress((idx + 1) / len(selected_indexes))
+        else:
+            # Fetch VIX data once (shared across all indexes)
+            status_text.text("Fetching VIX data...")
+            vix_df = fetch_vix_data(st.session_state.api_key, days_history)
+            
+            # Check if we're in critical window for intraday data
+            if is_near_market_close():
+                st.warning("🔴 Critical window detected! Using intraday data for enhanced predictions.")
+                data_timespan = 'minute'
+                data_multiplier = 5  # 5-minute bars
+            else:
+                data_timespan = 'day'
+                data_multiplier = 1
+            
+            for idx, index_name in enumerate(selected_indexes):
+                index_ticker = INDEXES[index_name]  # Actual index ticker (SPX, NDX, etc.)
+                status_text.text(f"Analyzing {index_name}...")
+                
+                # Fetch price data using direct index ticker (I:SPX format), falls back to ETF if needed
+                df = fetch_market_data(st.session_state.api_key, index_ticker, days_history, use_index=True)
+                
+                # Debug: Show data fetch result
+                if df is None:
+                    st.warning(f"⚠️ {index_name}: No data returned from fetch")
+                elif len(df) == 0:
+                    st.warning(f"⚠️ {index_name}: Empty dataframe returned")
+                else:
+                    st.caption(f"✓ {index_name}: Fetched {len(df)} rows")
+                
+                if df is not None and len(df) > 0:
+                    # Preserve data source metadata before any operations
+                    data_source = df.attrs.get('data_source', 'unknown') if hasattr(df, 'attrs') else 'unknown'
+                    ticker_used = df.attrs.get('ticker_used', index_ticker) if hasattr(df, 'attrs') else index_ticker
                     
-                    # Save prediction to database
-                    try:
-                        if st.session_state.timeframe == '1-day':
-                            target_date = datetime.now() + timedelta(days=1)
-                        elif st.session_state.timeframe == '5-day':
-                            target_date = datetime.now() + timedelta(days=5)
-                        else:
-                            target_date = datetime.now() + timedelta(days=7)
+                    # Merge VIX data if available
+                    if vix_df is not None and len(vix_df) > 0:
+                        df = pd.merge(df, vix_df, on='timestamp', how='left')
+                        df['vix_close'] = df['vix_close'].ffill()  # Fixed deprecated fillna(method='ffill')
+                        # Restore attrs after merge (merge loses them)
+                        df.attrs['data_source'] = data_source
+                        df.attrs['ticker_used'] = ticker_used
+                    
+                    # Get current price for GEX calculation
+                    current_price = df['close'].iloc[-1]
+                    
+                    # Calculate GEX levels using actual index ticker for options
+                    gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
+                    
+                    # Predict EOD price using selected model, timeframe, and GAMMA PIN DATA
+                    # Pass gex_data so predictions align with gamma pin levels
+                    predicted_price, confidence, df_with_indicators, current_price, error_msg = predict_eod_price(
+                        df, 
+                        model_type=st.session_state.selected_model,
+                        timeframe=st.session_state.timeframe,
+                        gex_data=gex_data  # Critical: gamma pin influences EOD prediction
+                    )
+                    
+                    # Debug: Show prediction result
+                    if predicted_price is None:
+                        st.warning(f"⚠️ {index_name}: Prediction failed - {error_msg or 'unknown error'}")
+                    else:
+                        st.caption(f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}%")
+                    
+                    if predicted_price and current_price:
+                        change_pct = ((predicted_price - current_price) / current_price) * 100
                         
-                        save_prediction(
-                            ticker=index_ticker,
-                            index_name=index_name,
-                            current_price=current_price,
-                            predicted_price=predicted_price,
-                            confidence=confidence,
-                            model_type=st.session_state.selected_model,
-                            change_pct=change_pct,
-                            target_date=target_date
-                        )
+                        # data_source and ticker_used already captured before merge
                         
-                        # Check alerts if enabled
-                        if enable_alerts and abs(change_pct) >= alert_threshold and confidence >= confidence_threshold:
-                            direction = "increase" if change_pct > 0 else "decrease"
-                            message = f"{index_name} predicted to {direction} by {abs(change_pct):.2f}% (Confidence: {confidence:.1f}%)"
-                            save_alert(
+                        st.session_state.predictions[index_name] = {
+                            'ticker': index_ticker,
+                            'current_price': current_price,
+                            'predicted_price': predicted_price,
+                            'confidence': confidence,
+                            'df': df_with_indicators,
+                            'change_pct': change_pct,
+                            'model_type': st.session_state.selected_model,
+                            'timeframe': st.session_state.timeframe,
+                            'gex_data': gex_data,  # Add GEX data
+                            'has_vix': vix_df is not None,  # Track VIX availability
+                            'data_source': data_source,  # Track if using index or ETF data
+                            'ticker_used': ticker_used  # Actual ticker used for data
+                        }
+                        
+                        # Save prediction to database
+                        try:
+                            if st.session_state.timeframe == '1-day':
+                                target_date = datetime.now() + timedelta(days=1)
+                            elif st.session_state.timeframe == '5-day':
+                                target_date = datetime.now() + timedelta(days=5)
+                            else:
+                                target_date = datetime.now() + timedelta(days=7)
+                            
+                            save_prediction(
                                 ticker=index_ticker,
                                 index_name=index_name,
-                                alert_type="price_movement",
-                                threshold=alert_threshold,
-                                current_value=abs(change_pct),
-                                message=message
+                                current_price=current_price,
+                                predicted_price=predicted_price,
+                                confidence=confidence,
+                                model_type=st.session_state.selected_model,
+                                change_pct=change_pct,
+                                target_date=target_date
                             )
-                            st.session_state.alerts.append(message)
-                    except Exception as e:
-                        st.warning(f"Could not save prediction: {str(e)}")
-            
-            progress_bar.progress((idx + 1) / len(selected_indexes))
+                            
+                            # Check alerts if enabled
+                            if enable_alerts and abs(change_pct) >= alert_threshold and confidence >= confidence_threshold:
+                                direction = "increase" if change_pct > 0 else "decrease"
+                                message = f"{index_name} predicted to {direction} by {abs(change_pct):.2f}% (Confidence: {confidence:.1f}%)"
+                                save_alert(
+                                    ticker=index_ticker,
+                                    index_name=index_name,
+                                    alert_type="price_movement",
+                                    threshold=alert_threshold,
+                                    current_value=abs(change_pct),
+                                    message=message
+                                )
+                                st.session_state.alerts.append(message)
+                        except Exception as e:
+                            st.warning(f"Could not save prediction: {str(e)}")
+                
+                progress_bar.progress((idx + 1) / len(selected_indexes))
         
         status_text.text("Analysis complete!")
         time.sleep(0.5)
@@ -2018,7 +2126,11 @@ else:
                     st.divider()
                     st.markdown("**📋 Close Predictor Signals**")
                     try:
-                        close_resp = requests.get(f"http://localhost:8000/predict/close-overlay", params={"symbol": index_name}, timeout=8)
+                        close_resp = requests.get(
+                            "http://localhost:8000/predict/close-overlay",
+                            params={"symbol": pred["ticker"]},
+                            timeout=8,
+                        )
                         if close_resp.ok:
                             close_data = close_resp.json()
                             signals = close_data.get('signals', [])
