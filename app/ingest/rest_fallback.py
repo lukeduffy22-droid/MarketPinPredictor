@@ -193,6 +193,15 @@ async def start_market_data_fallback():
         CURRENT_MARKET_DATA_PROVIDER = "databento"
         log.info("Fallback market data provider: Databento (auto-selected)")
         await poll_databento_rest()
+        if settings.polygon_api_key:
+            CURRENT_MARKET_DATA_PROVIDER = "polygon"
+            log.warning("Databento fallback exited during startup, switching to Polygon")
+            await poll_polygon_rest()
+            return
+
+        CURRENT_MARKET_DATA_PROVIDER = "databento_unavailable"
+        log.error("Databento fallback exited during startup and no Polygon key is configured")
+        return
     else:
         CURRENT_MARKET_DATA_PROVIDER = "polygon"
         log.info("Fallback market data provider: Polygon (auto-selected)")
