@@ -15,6 +15,9 @@ Set at least one provider key:
 - `DATABENTO_API_KEY` (preferred for market-open fallback polling)
 - `Massive_API` (Polygon/Massive key)
 
+If you run the Streamlit dashboard, use the sidebar **"Save keys to .env"** action to persist
+`Massive_API` and `DATABENTO_API_KEY` locally for future restarts.
+
 Optional provider mode:
 
 - `MARKET_DATA_PROVIDER=auto` (default, prefers Databento when key is set)

@@ -64,10 +64,38 @@ INDEX_ETFS = {
 }
 
 import os
+from pathlib import Path
+
+
+def upsert_env_var(env_path: Path, key: str, value: str) -> None:
+    """Create/update a single key in .env while preserving other entries."""
+    lines: list[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    new_line = f"{key}={value}"
+    replaced = False
+    updated_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(f"{key}="):
+            updated_lines.append(new_line)
+            replaced = True
+        else:
+            updated_lines.append(line)
+
+    if not replaced:
+        if updated_lines and updated_lines[-1].strip():
+            updated_lines.append("")
+        updated_lines.append(new_line)
+
+    env_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
 # Initialize session state - load API key from environment if available
 if 'api_key' not in st.session_state:
     st.session_state.api_key = os.environ.get('Massive_API', '') or os.environ.get('POLYGON_API_KEY', '')
+if 'databento_api_key' not in st.session_state:
+    st.session_state.databento_api_key = os.environ.get('DATABENTO_API_KEY', '')
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
@@ -923,14 +951,55 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     api_key_input = st.text_input(
-        "Polygon API Key",
+        "Polygon/Massive API Key",
         type="password",
         value=st.session_state.api_key,
-        help="Enter your Polygon.io API key with live market access"
+        help="Enter your Polygon/Massive API key with live market access"
+    )
+
+    databento_api_key_input = st.text_input(
+        "Databento API Key",
+        type="password",
+        value=st.session_state.databento_api_key,
+        help="Enter your Databento API key for market-open fallback polling"
     )
     
-    if api_key_input:
-        st.session_state.api_key = api_key_input
+    st.session_state.api_key = api_key_input
+    st.session_state.databento_api_key = databento_api_key_input
+
+    if st.button("💾 Save keys to .env", help="Persists API keys for future app/backend restarts"):
+        env_file = Path(__file__).resolve().parent / ".env"
+        try:
+            saved_keys: list[str] = []
+            skipped_keys: list[str] = []
+
+            polygon_key = st.session_state.api_key.strip()
+            databento_key = st.session_state.databento_api_key.strip()
+
+            if polygon_key:
+                upsert_env_var(env_file, "Massive_API", polygon_key)
+                saved_keys.append("Massive_API")
+            else:
+                skipped_keys.append("Massive_API")
+
+            if databento_key:
+                upsert_env_var(env_file, "DATABENTO_API_KEY", databento_key)
+                saved_keys.append("DATABENTO_API_KEY")
+            else:
+                skipped_keys.append("DATABENTO_API_KEY")
+
+            if saved_keys:
+                st.success(f"Saved {', '.join(saved_keys)} to .env")
+                st.info("Restart FastAPI backend and Streamlit to load updated environment variables.")
+            else:
+                st.error("No keys were saved because both fields are blank.")
+
+            if skipped_keys:
+                st.warning(
+                    f"Skipped blank field(s): {', '.join(skipped_keys)}. Existing .env values were left unchanged."
+                )
+        except OSError as exc:
+            st.error(f"Could not write .env file: {exc}")
     
     st.divider()
     
