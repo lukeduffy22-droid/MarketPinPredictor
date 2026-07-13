@@ -149,6 +149,15 @@ python -c "from database import init_db; init_db()"
 - **Retry with narrower scope**: If chat returns an error code, rerun with a narrower prompt and fewer files in scope
 - **Validate incrementally**: Test each change before moving to the next step
 
+### Task kickoff contract (required before implementation)
+- Define scope up front with: `files allowed`, `acceptance criteria`, and `tests to run`.
+- Keep checklist-style progress updates to 2-5 items so execution stays focused and fast.
+
+### Execution loop (required during implementation)
+- Run baseline checks before editing (`lint/tests` already present in this repository), then rerun targeted tests immediately after each change.
+- Start with parallel exploration (`rg` and multi-file reads) before deep edits to shorten diagnosis time.
+- Prefer minimal, localized patches; expand scope only when a coupled bug is confirmed by failing tests.
+
 ## Security and best practices
 - **Never commit secrets**: Use environment variables for API keys and credentials
 - **Validate inputs**: Always validate user inputs, especially in API endpoints and external API responses
