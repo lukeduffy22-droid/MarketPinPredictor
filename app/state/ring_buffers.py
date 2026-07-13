@@ -5,7 +5,7 @@ Optimized for <200ms latency and minimal memory footprint.
 from collections import deque
 from typing import Deque, Tuple, Any, Dict, Optional, NamedTuple
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 
 class IndexTick(NamedTuple):
     """Normalized index price tick"""
@@ -68,9 +68,27 @@ FLOW_RINGS: Dict[str, Ring1s] = {
 _vwap_state: Dict[str, Dict[str, float]] = {
     s: {"sum_pv": 0.0, "sum_v": 0.0} for s in ("SPX", "NDX", "DJI", "RUT")
 }
+_vwap_session_date: Optional[date] = None
+
+
+def _current_session_date() -> date:
+    """Get the current trading session date in Eastern Time."""
+    from app.utils.time_et import now_et
+
+    return now_et(datetime.now(timezone.utc)).date()
+
+
+def _ensure_current_session_vwap() -> None:
+    """Reset VWAP state automatically when the ET session rolls over."""
+    global _vwap_session_date
+
+    session_date = _current_session_date()
+    if _vwap_session_date != session_date:
+        reset_session_vwap(session_date=session_date)
 
 def update_session_vwap(symbol: str, price: float, size: float = 1.0):
     """Update running VWAP calculation for symbol"""
+    _ensure_current_session_vwap()
     if symbol in _vwap_state:
         _vwap_state[symbol]["sum_pv"] += price * size
         _vwap_state[symbol]["sum_v"] += size
@@ -92,10 +110,12 @@ def get_session_vwap(symbol: str) -> float:
     
     return total_pv / total_v if total_v > 0 else 0.0
 
-def reset_session_vwap():
+def reset_session_vwap(session_date: Optional[date] = None):
     """Reset VWAP trackers (call at market open)"""
+    global _vwap_session_date
     for symbol in _vwap_state:
         _vwap_state[symbol] = {"sum_pv": 0.0, "sum_v": 0.0}
+    _vwap_session_date = session_date or _current_session_date()
 
 def get_latest_price(symbol: str) -> Optional[float]:
     """Get latest price for symbol from ring buffer only"""

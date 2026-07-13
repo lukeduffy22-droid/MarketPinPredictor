@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import logging
 
@@ -163,7 +163,10 @@ async def health_check():
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
     
-    overall_ok = all(s["fresh"] or not is_regular_hours(datetime.utcnow()) for s in status.values())
+    overall_ok = all(
+        s["fresh"] or not is_regular_hours(datetime.now(timezone.utc))
+        for s in status.values()
+    )
     
     return {
         "status": "ok" if overall_ok else "degraded",
@@ -171,4 +174,3 @@ async def health_check():
         "symbols": status,
         "timestamp": now_et().isoformat()
     }
-

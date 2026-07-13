@@ -118,7 +118,7 @@ async def poll_databento_rest() -> None:
                 await asyncio.sleep(30)
                 continue
 
-            if not is_regular_hours(datetime.utcnow()):
+            if not is_regular_hours(datetime.now(timezone.utc)):
                 await asyncio.sleep(30)
                 continue
 
