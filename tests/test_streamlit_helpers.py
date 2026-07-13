@@ -44,6 +44,41 @@ def test_predict_eod_price_handles_insufficient_data():
     assert error == "Initial data check failed (need 25+ rows)"
 
 
+def test_predict_eod_price_returns_prediction_without_tensorflow():
+    predicted, confidence, df_clean, current_price, error = predict_eod_price(_sample_ohlcv(60))
+
+    assert error is None
+    assert predicted is not None
+    assert confidence is not None
+    assert df_clean is not None
+    assert current_price == 159
+
+
+def test_predict_eod_price_supports_ensemble_with_gamma_pin():
+    predicted, confidence, _, current_price, error = predict_eod_price(
+        _sample_ohlcv(60),
+        model_type="Ensemble",
+        gex_data={"pin_strike": 158.5, "pull_strength": 75},
+    )
+
+    assert error is None
+    assert predicted is not None
+    assert confidence >= 40
+    assert abs(predicted - current_price) / current_price < 0.02
+
+
+def test_predict_eod_price_ignores_invalid_gamma_pin():
+    predicted, confidence, _, current_price, error = predict_eod_price(
+        _sample_ohlcv(60),
+        gex_data={"pin_strike": "not-a-number", "pull_strength": "strong"},
+    )
+
+    assert error is None
+    assert predicted is not None
+    assert confidence is not None
+    assert current_price == 159
+
+
 def test_create_price_chart_returns_three_panel_figure():
     df = calculate_technical_indicators(_sample_ohlcv())
 

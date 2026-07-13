@@ -323,9 +323,9 @@ with st.sidebar:
     st.header("🤖 Model Settings")
     selected_model = st.selectbox(
         "ML Model",
-        options=["Linear Regression", "Random Forest"],
+        options=["Ensemble", "Linear Regression", "Random Forest"],
         index=0,
-        help="Choose the machine learning model for predictions"
+        help="Choose the machine learning model for predictions. Ensemble blends linear and random forest models using recent holdout accuracy."
     )
     st.session_state.selected_model = selected_model
     

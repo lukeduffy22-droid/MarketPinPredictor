@@ -5,9 +5,20 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+
+
+def _regression_accuracy(y_true, predictions):
+    """Return MAPE-based accuracy while avoiding divide-by-zero artifacts."""
+    y_true = np.asarray(y_true, dtype=float)
+    predictions = np.asarray(predictions, dtype=float)
+    non_zero = np.abs(y_true) > 1e-9
+
+    if not np.any(non_zero):
+        mae = np.mean(np.abs(y_true - predictions)) if len(y_true) else float("inf")
+        return 0.0 if not np.isfinite(mae) else max(0.0, 100.0 - mae)
+
+    mape = np.mean(np.abs((y_true[non_zero] - predictions[non_zero]) / y_true[non_zero])) * 100
+    return max(0.0, 100.0 - float(mape))
 
 def train_linear_regression(X_train, y_train, X_test, y_test):
     """Train Linear Regression model"""
@@ -19,8 +30,7 @@ def train_linear_regression(X_train, y_train, X_test, y_test):
     model.fit(X_train_scaled, y_train)
     
     test_predictions = model.predict(X_test_scaled)
-    mape = np.mean(np.abs((y_test - test_predictions) / y_test)) * 100
-    accuracy = max(0, 100 - mape)
+    accuracy = _regression_accuracy(y_test, test_predictions)
     
     return model, scaler, accuracy
 
@@ -41,13 +51,15 @@ def train_random_forest(X_train, y_train, X_test, y_test):
     model.fit(X_train_scaled, y_train)
     
     test_predictions = model.predict(X_test_scaled)
-    mape = np.mean(np.abs((y_test - test_predictions) / y_test)) * 100
-    accuracy = max(0, 100 - mape)
+    accuracy = _regression_accuracy(y_test, test_predictions)
     
     return model, scaler, accuracy
 
 def create_lstm_model(input_shape):
     """Create LSTM model for time series prediction"""
+    from tensorflow import keras
+    from tensorflow.keras import layers
+
     model = keras.Sequential([
         layers.LSTM(50, return_sequences=True, input_shape=input_shape),
         layers.Dropout(0.2),
@@ -70,6 +82,8 @@ def prepare_lstm_data(data, lookback=10):
 
 def train_lstm(X_train, y_train, X_test, y_test, epochs=50):
     """Train LSTM model"""
+    from tensorflow import keras
+
     # Reshape for LSTM
     if len(X_train.shape) == 2:
         lookback = 10
@@ -110,8 +124,7 @@ def train_lstm(X_train, y_train, X_test, y_test, epochs=50):
     
     # Calculate accuracy
     test_predictions = model.predict(X_test_scaled, verbose=0)
-    mape = np.mean(np.abs((y_test_lstm - test_predictions.flatten()) / y_test_lstm)) * 100
-    accuracy = max(0, 100 - mape)
+    accuracy = _regression_accuracy(y_test_lstm, test_predictions.flatten())
     
     return model, scaler, accuracy, n_timesteps
 
