@@ -10,7 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application configuration"""
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="forbid")
+    # Ignore unrelated deployment environment variables while loading only declared settings.
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
     polygon_api_key: Optional[str] = Field(
