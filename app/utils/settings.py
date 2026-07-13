@@ -11,10 +11,10 @@ class Settings(BaseSettings):
     """Application configuration"""
 
     # Deployment environments may include unrelated variables; ignore them while
-    # matching declared settings case-insensitively against documented names.
+    # loading declared settings from documented environment names.
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
     
-    # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
+    # API Keys
     polygon_api_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("Massive_API", "POLYGON_API_KEY"),
