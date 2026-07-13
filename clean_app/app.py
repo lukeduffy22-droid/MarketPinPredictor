@@ -1,3 +1,9 @@
+"""LEGACY alternate Streamlit dashboard. Primary dashboard entry point is ../app.py.
+
+This file is retained only as a historical/alternate copy and should not be
+used as the active runtime surface unless explicitly requested.
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
