@@ -26,6 +26,10 @@ def _sample_market_df(source: str, ticker_used: str) -> pd.DataFrame:
     return df
 
 
+def _fail_if_called(*_args, **_kwargs):
+    raise AssertionError("Polygon should not be used")
+
+
 def test_settings_accept_polygon_api_key_alias(monkeypatch):
     monkeypatch.delenv("Massive_API", raising=False)
     monkeypatch.setenv("POLYGON_API_KEY", "polygon-from-env")
@@ -40,11 +44,7 @@ def test_fetch_market_data_uses_databento_when_polygon_is_unset(monkeypatch):
 
     monkeypatch.setattr(smd, "_resolve_market_data_provider", lambda *_args, **_kwargs: "databento")
     monkeypatch.setattr(smd, "_fetch_databento_market_data", lambda *_args, **_kwargs: databento_df)
-    monkeypatch.setattr(
-        smd,
-        "_fetch_polygon_market_data",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Polygon should not be used")),
-    )
+    monkeypatch.setattr(smd, "_fetch_polygon_market_data", _fail_if_called)
 
     result = smd.fetch_market_data(
         api_key="",

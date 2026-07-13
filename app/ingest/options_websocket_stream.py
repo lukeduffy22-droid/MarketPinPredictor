@@ -26,6 +26,10 @@ log = logging.getLogger("options_ws_stream")
 _options_singleton_lock = threading.Lock()
 
 _gamma_update_callback: Optional[Callable] = None
+ROOT_MAPPING = {
+    "SPXW": "SPX",
+    "DIA": "DJI",
+}
 
 class OptionsGammaTracker:
     """
@@ -192,20 +196,16 @@ class OptionsWebSocketStream:
             parts = sym[2:]
             
             root = None
+            original_root = None
             for r in ("SPXW", "SPX", "NDX", "DIA", "DJI", "RUT"):
                 if parts.startswith(r):
-                    if r == "SPXW":
-                        root = "SPX"
-                    elif r == "DIA":
-                        root = "DJI"
-                    else:
-                        root = r
+                    root = ROOT_MAPPING.get(r, r)
+                    original_root = r
                     break
             
             if not root:
                 return
             
-            original_root = "SPXW" if parts.startswith("SPXW") else ("DIA" if parts.startswith("DIA") else root)
             parts_after_root = parts[len(original_root):]
             
             if len(parts_after_root) < 8:

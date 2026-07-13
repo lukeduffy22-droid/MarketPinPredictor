@@ -172,7 +172,7 @@ def _fetch_databento_market_data(api_key: str, ticker: str, days: int = 60) -> p
     try:
         import databento as db
     except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("databento package is not installed") from exc
+        raise RuntimeError("databento package is not installed. Install it with: pip install databento") from exc
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days + 5)
