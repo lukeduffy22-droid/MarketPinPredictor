@@ -47,3 +47,25 @@ ENV/
 
 # Local config
 .env.local
+# Local editor history snapshots
+.history/
+
+# Local bundled tooling (should not live in repo)
+Git/
+
+# Runtime outputs
+logs/
+.pytest_cache/
+
+# Local exports/data dumps
+Polygon APP/
+attached_assets/
+exports_smoke/
+exports_verify/
+exports_verify2/
+exports_final_verify/
+data/raw/
+data/parquet/
+backups/
+clean_app/
+vision
