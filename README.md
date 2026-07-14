@@ -64,7 +64,7 @@ This command:
 - FastAPI app: `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/api/main.py`
 - Streamlit app: `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app.py`
 
-The files `app_new.py`, `app_backup.py`, and `clean_app/app.py` are legacy or alternate copies and should not be treated as the primary runtime surface unless you are explicitly working on them.
+The files `app_new.py`, `app_backup.py`, and `clean_app/app.py` are deprecated guard entrypoints and intentionally exit immediately. Always run the dashboard from `app.py`.
 
 ## Requirements
 
