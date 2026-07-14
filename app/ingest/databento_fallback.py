@@ -93,6 +93,9 @@ async def poll_databento_rest() -> None:
     api_key = settings.databento_api_key
     if not api_key:
         log.warning("DATABENTO_API_KEY not set, Databento polling disabled")
+        from app.ingest.rest_fallback import mark_market_data_error
+
+        mark_market_data_error("databento", "Databento API key not configured")
         return
 
     try:
@@ -107,9 +110,15 @@ async def poll_databento_rest() -> None:
         client = _DatabentoPollClient(api_key)
     except Exception as exc:
         log.error("Databento client initialization failed: %s", exc)
+        from app.ingest.rest_fallback import mark_market_data_error
+
+        mark_market_data_error("databento", f"Client initialization failed: {exc}")
         return
 
     log.info("Starting Databento polling (every %.1fs)", DATABENTO_POLL_INTERVAL)
+    from app.ingest.rest_fallback import mark_market_data_error, mark_market_data_running, mark_market_data_success
+
+    mark_market_data_running("databento")
 
     while True:
         try:
@@ -126,6 +135,9 @@ async def poll_databento_rest() -> None:
             prices = client.fetch_latest_prices(now_utc)
             ts = int(time.time())
 
+            if prices:
+                mark_market_data_success("databento", len(prices))
+
             for symbol, price in prices.items():
                 tick = IndexTick(ts=ts, price=price, size=1.0)
                 INDEX_RINGS[symbol].add(ts, tick)
@@ -134,4 +146,5 @@ async def poll_databento_rest() -> None:
             await asyncio.sleep(DATABENTO_POLL_INTERVAL)
         except Exception as exc:
             log.error("Databento polling error: %s", exc)
+            mark_market_data_error("databento", str(exc))
             await asyncio.sleep(DATABENTO_POLL_INTERVAL)

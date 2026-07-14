@@ -10,9 +10,11 @@ for near-real-time data.
 """
 import asyncio
 import logging
+from copy import deepcopy
 from datetime import datetime
-import time
 import os
+import time
+from typing import cast
 
 from app.state.ring_buffers import INDEX_RINGS, update_session_vwap, IndexTick
 from app.utils.time_et import is_regular_hours
@@ -26,6 +28,19 @@ CURRENT_MARKET_DATA_PROVIDER = "unknown"
 
 # Polling interval - 1 second for near-real-time with premium subscription (unlimited API calls)
 REST_POLL_INTERVAL = 1.0
+
+MARKET_DATA_RUNTIME_STATUS = {
+    "selected_provider": "unknown",
+    "selection_reason": "startup",
+    "running": False,
+    "last_attempt_at": None,
+    "last_success_at": None,
+    "last_success_provider": None,
+    "last_error_at": None,
+    "last_error": None,
+    "successful_symbols": 0,
+    "polling_interval_seconds": REST_POLL_INTERVAL,
+}
 
 # Logging interval - log every N polls to reduce noise
 LOG_EVERY_N_POLLS = 10
@@ -44,6 +59,72 @@ def is_rest_only_mode() -> bool:
 def get_market_data_provider() -> str:
     """Return the currently selected fallback provider."""
     return CURRENT_MARKET_DATA_PROVIDER
+
+
+def _utc_now_iso() -> str:
+    """Return a UTC ISO8601 timestamp for runtime diagnostics."""
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def set_market_data_provider(provider: str, reason: str) -> None:
+    """Record the currently selected fallback provider."""
+    global CURRENT_MARKET_DATA_PROVIDER
+    CURRENT_MARKET_DATA_PROVIDER = provider
+    MARKET_DATA_RUNTIME_STATUS["selected_provider"] = provider
+    MARKET_DATA_RUNTIME_STATUS["selection_reason"] = reason
+    MARKET_DATA_RUNTIME_STATUS["polling_interval_seconds"] = REST_POLL_INTERVAL
+
+
+def mark_market_data_running(provider: str) -> None:
+    """Record that the selected market data poller is active."""
+    MARKET_DATA_RUNTIME_STATUS["selected_provider"] = provider
+    MARKET_DATA_RUNTIME_STATUS["running"] = True
+    MARKET_DATA_RUNTIME_STATUS["last_attempt_at"] = _utc_now_iso()
+
+
+def mark_market_data_success(provider: str, successful_symbols: int) -> None:
+    """Record a successful market data poll cycle."""
+    timestamp = _utc_now_iso()
+    MARKET_DATA_RUNTIME_STATUS["selected_provider"] = provider
+    MARKET_DATA_RUNTIME_STATUS["running"] = True
+    MARKET_DATA_RUNTIME_STATUS["last_attempt_at"] = timestamp
+    MARKET_DATA_RUNTIME_STATUS["last_success_at"] = timestamp
+    MARKET_DATA_RUNTIME_STATUS["last_success_provider"] = provider
+    MARKET_DATA_RUNTIME_STATUS["last_error"] = None
+    MARKET_DATA_RUNTIME_STATUS["successful_symbols"] = successful_symbols
+
+
+def mark_market_data_error(provider: str, error: str) -> None:
+    """Record the latest poll failure for operator diagnostics."""
+    timestamp = _utc_now_iso()
+    MARKET_DATA_RUNTIME_STATUS["selected_provider"] = provider
+    MARKET_DATA_RUNTIME_STATUS["running"] = True
+    MARKET_DATA_RUNTIME_STATUS["last_attempt_at"] = timestamp
+    MARKET_DATA_RUNTIME_STATUS["last_error_at"] = timestamp
+    MARKET_DATA_RUNTIME_STATUS["last_error"] = error
+
+
+def get_market_data_status() -> dict:
+    """Return a diagnostic snapshot for the active fallback provider."""
+    status = deepcopy(MARKET_DATA_RUNTIME_STATUS)
+    status["configured_provider"] = (settings.market_data_provider or "auto").strip().lower()
+    status["polygon_api_key_configured"] = bool(settings.polygon_api_key or os.getenv("POLYGON_API_KEY"))
+    status["databento_api_key_configured"] = bool(settings.databento_api_key)
+
+    last_success_at = status.get("last_success_at")
+    if last_success_at:
+        try:
+            parsed = datetime.fromisoformat(last_success_at.replace("Z", "+00:00"))
+            status["last_success_age_seconds"] = max(
+                0.0,
+                (datetime.utcnow() - parsed.replace(tzinfo=None)).total_seconds(),
+            )
+        except ValueError:
+            status["last_success_age_seconds"] = None
+    else:
+        status["last_success_age_seconds"] = None
+
+    return status
 
 async def poll_polygon_rest():
     """
@@ -67,12 +148,14 @@ async def poll_polygon_rest():
     api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")
     if not api_key:
         log.error("Massive_API not set, cannot poll REST API")
+        mark_market_data_error("polygon", "Polygon API key not configured")
         return
     
     client = RESTClient(api_key)
     INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
     
     log.info(f"Starting REST API polling (every {REST_POLL_INTERVAL}s - premium subscription, unlimited API calls)")
+    mark_market_data_running("polygon")
     
     # Track consecutive failures per symbol
     failure_counts = {s: 0 for s in INDEX_SYMBOLS}
@@ -110,18 +193,20 @@ async def poll_polygon_rest():
                 if results_list:
                     _poll_count += 1
                     should_log = (_poll_count % LOG_EVERY_N_POLLS == 0)
+                    mark_market_data_success("polygon", len(results_list))
                     
                     if should_log:
                         log.info(f"REST API poll #{_poll_count} - {len(results_list)} indices")
                     
                     for snapshot in results_list:
-                        if hasattr(snapshot, 'ticker') and hasattr(snapshot, 'value') and snapshot.value:
+                        ticker = getattr(snapshot, "ticker", None)
+                        value = getattr(snapshot, "value", None)
+                        if isinstance(ticker, str) and value:
                             # Extract symbol from ticker (e.g., "I:SPX" -> "SPX")
-                            ticker = snapshot.ticker
                             symbol = ticker.replace("I:", "") if ticker.startswith("I:") else ticker
                             
                             if symbol in INDEX_SYMBOLS:
-                                price = float(snapshot.value)
+                                price = float(value)
                                 
                                 # Create tick from REST data
                                 tick = IndexTick(ts=ts, price=price, size=1.0)
@@ -148,6 +233,7 @@ async def poll_polygon_rest():
                             
             except Exception as e:
                 log.warning(f"REST API batch error: {e}")
+                mark_market_data_error("polygon", str(e))
                 # Increment all failure counts
                 for symbol in INDEX_SYMBOLS:
                     if failure_counts[symbol] < MAX_FAILURES:
@@ -158,6 +244,7 @@ async def poll_polygon_rest():
             
         except Exception as e:
             log.error(f"REST polling error: {e}")
+            mark_market_data_error("polygon", str(e))
             await asyncio.sleep(REST_POLL_INTERVAL)
 
 
@@ -167,21 +254,33 @@ async def start_market_data_fallback():
 
     Provider precedence:
     1. explicit MARKET_DATA_PROVIDER (databento or polygon)
-    2. auto mode: Databento when key exists, else Polygon
+    2. Databento default: use Databento when available, fall back to Polygon
+    3. auto mode: Databento when key exists, else Polygon
     """
-    provider = (settings.market_data_provider or "auto").strip().lower()
-    global CURRENT_MARKET_DATA_PROVIDER
+    provider = (settings.market_data_provider or "databento").strip().lower()
 
     if provider == "databento":
-        from app.ingest.databento_fallback import poll_databento_rest
+        if settings.databento_api_key:
+            from app.ingest.databento_fallback import poll_databento_rest
 
-        CURRENT_MARKET_DATA_PROVIDER = "databento"
-        log.info("Fallback market data provider: Databento (forced)")
-        await poll_databento_rest()
+            set_market_data_provider("databento", "default-databento")
+            log.info("Fallback market data provider: Databento (default)")
+            await poll_databento_rest()
+            return
+
+        if settings.polygon_api_key:
+            set_market_data_provider("polygon", "databento-unavailable-fallback-polygon")
+            log.warning("Databento requested but not configured; falling back to Polygon")
+            await poll_polygon_rest()
+            return
+
+        set_market_data_provider("databento", "databento-unavailable-no-provider")
+        mark_market_data_error("databento", "No Databento or Polygon API key configured")
+        log.error("No market data provider configured")
         return
 
     if provider == "polygon":
-        CURRENT_MARKET_DATA_PROVIDER = "polygon"
+        set_market_data_provider("polygon", "forced")
         log.info("Fallback market data provider: Polygon (forced)")
         await poll_polygon_rest()
         return
@@ -190,11 +289,11 @@ async def start_market_data_fallback():
     if settings.databento_api_key:
         from app.ingest.databento_fallback import poll_databento_rest
 
-        CURRENT_MARKET_DATA_PROVIDER = "databento"
+        set_market_data_provider("databento", "auto-databento-key")
         log.info("Fallback market data provider: Databento (auto-selected)")
         await poll_databento_rest()
     else:
-        CURRENT_MARKET_DATA_PROVIDER = "polygon"
+        set_market_data_provider("polygon", "auto-no-databento-key")
         log.info("Fallback market data provider: Polygon (auto-selected)")
         await poll_polygon_rest()
 
@@ -223,7 +322,7 @@ async def load_cached_snapshots():
                     
                     if snapshot:
                         # Use stored spot price as index value
-                        price = snapshot.spot_price
+                        price = float(cast(float, snapshot.spot_price))
                         ts = int(time.time())
                         
                         # Create tick from cached data

@@ -2,24 +2,29 @@
 Application settings using pydantic-settings for type-safe configuration.
 Loads from environment variables with fail-fast validation.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import Optional
 import os
+from typing import Optional
+
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """Application configuration"""
     
     # API Keys - reads from Massive_API env var (Polygon rebranded to Massive Oct 2025)
-    polygon_api_key: Optional[str] = Field(default=None, validation_alias="Massive_API")
+    polygon_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("Massive_API", "POLYGON_API_KEY"),
+    )
     databento_api_key: Optional[str] = Field(default=None, validation_alias="DATABENTO_API_KEY")
     database_url: Optional[str] = None
 
     # Market data provider selection for live fallback polling
+    # databento: default and preferred live provider; falls back to Polygon if unavailable
     # auto: prefer Databento when key exists, otherwise Polygon
     # databento: force Databento
     # polygon: force Polygon
-    market_data_provider: str = "auto"
+    market_data_provider: str = "databento"
     
     # Environment
     env: str = "dev"
@@ -51,9 +56,7 @@ class Settings(BaseSettings):
     ws_backoff_base: float = 2.0  # Exponential backoff base
     ws_backoff_jitter: float = 0.3  # Jitter fraction
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
         
     def __init__(self, **kwargs):
         # Load from environment variables
@@ -61,7 +64,7 @@ class Settings(BaseSettings):
         
         # Use Replit secrets if available
         if not self.polygon_api_key:
-            self.polygon_api_key = os.getenv("Massive_API", "")
+            self.polygon_api_key = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY") or ""
 
         if not self.databento_api_key:
             self.databento_api_key = os.getenv("DATABENTO_API_KEY", "")

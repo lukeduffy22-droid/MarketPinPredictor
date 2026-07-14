@@ -57,6 +57,8 @@ async def get_live_model_metadata():
 @router.get("/diagnostics/system")
 async def get_system_diagnostics():
     """Expose backend diagnostics for production operations."""
+    from app.ingest.rest_fallback import get_market_data_status
+
     try:
         import torch
 
@@ -66,10 +68,13 @@ async def get_system_diagnostics():
         cuda_available = False
         cuda_device = None
 
+    market_data_status = get_market_data_status()
+
     return {
         "status": "ok",
         "environment": settings.env,
-        "market_data_provider": settings.market_data_provider,
+        "market_data_provider": market_data_status.get("selected_provider", settings.market_data_provider),
+        "market_data_status": market_data_status,
         "backend_base_url": settings.backend_base_url,
         "streamlit_backend_only": settings.streamlit_backend_only,
         "device": {

@@ -1073,7 +1073,13 @@ else:
                 if predicted_price is None:
                     st.warning(f"⚠️ {index_name}: Prediction failed - {error_msg or 'unknown error'}")
                 else:
-                    st.caption(f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}%")
+                    provider = backend_prediction.get('market_data_provider', 'unknown')
+                    symbol_status = backend_prediction.get('symbol_status', {})
+                    data_age = symbol_status.get('data_age_seconds')
+                    freshness_note = f", data age {data_age}s" if data_age is not None else ""
+                    st.caption(
+                        f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}% via {provider}{freshness_note}"
+                    )
                 
                 if predicted_price and authoritative_current_price:
                     change_pct = ((predicted_price - authoritative_current_price) / authoritative_current_price) * 100
