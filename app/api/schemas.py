@@ -14,6 +14,8 @@ class PredictionResponse(BaseModel):
     rmse: Optional[float]
     mae: Optional[float]
     features: dict
+    model_metadata: dict
+    runtime_metadata: dict
     timestamp: str
 
 class LevelsResponse(BaseModel):
@@ -83,4 +85,3 @@ class AIPredictionsResponse(BaseModel):
     timestamp: str
     predictions: List[AISymbolPrediction]
     summary: str
-

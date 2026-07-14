@@ -11,6 +11,7 @@ from app.utils.time_et import now_et, minutes_to_close_et, is_regular_hours, get
 from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
 from app.features.calculators import compute_all_features
 from app.models.db_models import get_rmse_for_tau
+from app.models.model_artifacts import load_gamma_model_artifact
 
 import logging
 import time
@@ -29,6 +30,57 @@ async def get_metrics():
         "latency": latencies,
         "memory": mem,
         "timestamp": now_et().isoformat()
+    }
+
+
+@router.get("/models/live")
+async def get_live_model_metadata():
+    """Expose live model metadata and artifact provenance."""
+    symbols = ("SPX", "NDX", "DJI", "RUT")
+    return {
+        "live_prediction_model": {
+            "model_name": "time-adaptive-ridge",
+            "model_version": settings.live_model_version,
+            "feature_schema_version": settings.live_feature_schema_version,
+        },
+        "symbols": {
+            symbol: {
+                "live_runtime": api_state.model_metadata_cache.get(symbol, {}),
+                "offline_gamma_artifact": load_gamma_model_artifact(symbol),
+            }
+            for symbol in symbols
+        },
+        "timestamp": now_et().isoformat(),
+    }
+
+
+@router.get("/diagnostics/system")
+async def get_system_diagnostics():
+    """Expose backend diagnostics for production operations."""
+    try:
+        import torch
+
+        cuda_available = torch.cuda.is_available()
+        cuda_device = torch.cuda.get_device_name(0) if cuda_available else None
+    except ImportError:
+        cuda_available = False
+        cuda_device = None
+
+    return {
+        "status": "ok",
+        "environment": settings.env,
+        "market_data_provider": settings.market_data_provider,
+        "backend_base_url": settings.backend_base_url,
+        "streamlit_backend_only": settings.streamlit_backend_only,
+        "device": {
+            "live_inference": "cpu-live",
+            "cuda_available": cuda_available,
+            "cuda_device": cuda_device,
+            "batch_training_preference": "cuda-when-available",
+        },
+        "latency": predict_latency.get_percentiles(),
+        "memory": snapshot("diagnostics"),
+        "timestamp": now_et().isoformat(),
     }
 
 

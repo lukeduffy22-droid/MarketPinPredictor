@@ -18,6 +18,20 @@ import time
 log = logging.getLogger("api")
 
 router = APIRouter()
+SUPPORTED_SYMBOLS = ("SPX", "NDX", "DJI", "RUT")
+DEFAULT_COEFFICIENTS = {
+    "beta_vwap": 1.0,
+    "beta_gamma": 0.0,
+    "beta_flow": 0.0,
+    "beta_microtrend": 0.0,
+    "intercept": 0.0,
+}
+LIVE_FEATURES = ["vwap_deviation", "microtrend", "gamma_pin_strength", "flow_urgency"]
+DEFAULT_MODEL_METADATA = {
+    "coefficients_source": "fallback-defaults",
+    "coefficients_updated_at": None,
+    "coefficients_sample_size": 0,
+}
 
 @router.get("/levels/eod")
 async def get_gamma_levels(symbol: str) -> LevelsResponse:
@@ -68,6 +82,57 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
         timestamp=now_et().isoformat()
     )
 
+
+@router.get("/gamma/state")
+async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
+    """Return backend gamma state for Streamlit consumption."""
+    clean_symbol = symbol.upper().replace("I:", "")
+    if clean_symbol not in SUPPORTED_SYMBOLS:
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+
+    resolved_spot = spot_price or get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
+    if not resolved_spot:
+        raise HTTPException(503, f"No price data for {clean_symbol}")
+
+    try:
+        import options_gamma
+
+        gex = options_gamma.get_gamma_analysis(
+            api_key=settings.polygon_api_key,
+            underlying=clean_symbol,
+            spot_price=resolved_spot,
+        )
+        if not gex:
+            raise HTTPException(503, f"No gamma analysis available for {clean_symbol}")
+
+        gamma_walls = gex.get("gamma_walls")
+        if hasattr(gamma_walls, "to_dict"):
+            gamma_walls = gamma_walls.to_dict(orient="records")
+        if gamma_walls is None:
+            gamma_walls = []
+        summary = "Gamma state available"
+
+        return {
+            "symbol": clean_symbol,
+            "spot_price": resolved_spot,
+            "pin_strike": gex.get("pin_strike"),
+            "pull_strength": gex.get("pull_strength", 0.0),
+            "total_gex": gex.get("total_gex", 0.0),
+            "net_gex": gex.get("net_gex", 0.0),
+            "zero_gamma": gex.get("zero_gamma"),
+            "direction": gex.get("direction"),
+            "summary": summary,
+            "is_etf_proxy": gex.get("is_etf_proxy", False),
+            "options_root": gex.get("options_root", clean_symbol),
+            "gamma_walls": gamma_walls,
+            "timestamp": now_et().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("Gamma state failed for %s", clean_symbol)
+        raise HTTPException(503, "Gamma state error")
+
 @router.get("/predict/close")
 async def predict_close(symbol: str) -> PredictionResponse:
     """
@@ -77,7 +142,7 @@ async def predict_close(symbol: str) -> PredictionResponse:
     t0 = time.perf_counter()
     
     # Validate symbol
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in SUPPORTED_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     dt_utc = datetime.utcnow()
@@ -125,12 +190,16 @@ async def predict_close(symbol: str) -> PredictionResponse:
             log.warning(f"Feature computation exceeded 150ms budget for {symbol}")
             raise HTTPException(503, "Feature computation too slow")
             
-    except Exception as e:
-        log.error(f"Feature computation failed for {symbol}: {e}")
-        raise HTTPException(503, f"Feature computation error: {str(e)}")
+    except Exception:
+        log.exception("Feature computation failed for %s", symbol)
+        raise HTTPException(503, "Feature computation error")
     
-    # Get coefficients
-    coeffs = api_state.coefficients_cache.get(symbol, {})
+    # Get coefficients and fallback metadata
+    coeffs = api_state.coefficients_cache.get(symbol)
+    fallback_active = False
+    if not coeffs:
+        coeffs = DEFAULT_COEFFICIENTS
+        fallback_active = True
     
     # Compute prediction using Ridge model
     vwap_dev = features["vwap_deviation"]
@@ -184,6 +253,39 @@ async def predict_close(symbol: str) -> PredictionResponse:
     # Track latency
     latency_ms = (time.perf_counter() - t0) * 1000
     predict_latency.record(latency_ms)
+    memory = snapshot(f"predict_close:{symbol}")
+    metadata = api_state.model_metadata_cache.get(symbol, DEFAULT_MODEL_METADATA)
+    fallback_reason = (
+        "coefficients cache missing; using deterministic defaults"
+        if fallback_active
+        else None
+    )
+    model_metadata = {
+        "model_name": "time-adaptive-ridge",
+        "model_version": settings.live_model_version,
+        "feature_schema_version": settings.live_feature_schema_version,
+        "feature_list": LIVE_FEATURES,
+        "coefficients_source": metadata.get("coefficients_source", "fallback-defaults"),
+        "coefficients_updated_at": metadata.get("coefficients_updated_at"),
+        "coefficients_sample_size": metadata.get("coefficients_sample_size", 0),
+        "fallback_active": fallback_active,
+        "fallback_reason": fallback_reason,
+    }
+    runtime_metadata = {
+        "inference_device": "cpu-live",
+        "latency_ms": latency_ms,
+        "memory_current_mb": memory["current_mb"],
+        "memory_peak_mb": memory["peak_mb"],
+    }
+    log.info(
+        "predict_close symbol=%s model=%s version=%s device=%s latency_ms=%.2f fallback=%s",
+        symbol,
+        model_metadata["model_name"],
+        model_metadata["model_version"],
+        runtime_metadata["inference_device"],
+        latency_ms,
+        fallback_active,
+    )
     
     return PredictionResponse(
         symbol=symbol,
@@ -194,6 +296,8 @@ async def predict_close(symbol: str) -> PredictionResponse:
         rmse=rmse,
         mae=mae,
         features=features,
+        model_metadata=model_metadata,
+        runtime_metadata=runtime_metadata,
         timestamp=now_et().isoformat()
     )
 

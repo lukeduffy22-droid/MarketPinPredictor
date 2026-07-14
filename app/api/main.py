@@ -88,6 +88,11 @@ async def startup():
                 "beta_microtrend": coeff.beta_microtrend,
                 "intercept": coeff.intercept
             }
+            api_state.model_metadata_cache[symbol] = {
+                "coefficients_source": "database",
+                "coefficients_updated_at": coeff.updated_at.isoformat() if coeff.updated_at else None,
+                "coefficients_sample_size": coeff.sample_size,
+            }
             log.info(f"Loaded coefficients for {symbol}")
         else:
             # Use default coefficients (VWAP-only model)
@@ -97,6 +102,11 @@ async def startup():
                 "beta_flow": 0.0,
                 "beta_microtrend": 0.0,
                 "intercept": 0.0
+            }
+            api_state.model_metadata_cache[symbol] = {
+                "coefficients_source": "fallback-defaults",
+                "coefficients_updated_at": None,
+                "coefficients_sample_size": 0,
             }
             log.warning(f"No coefficients found for {symbol}, using defaults")
     
@@ -171,4 +181,3 @@ async def health_check():
         "symbols": status,
         "timestamp": now_et().isoformat()
     }
-
