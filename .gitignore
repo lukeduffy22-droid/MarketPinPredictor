@@ -47,3 +47,5 @@ ENV/
 
 # Local config
 .env.local
+# Local editor history snapshots
+.history/
