@@ -40,7 +40,7 @@ def load_gamma_model_artifact(symbol: str) -> Dict[str, Any]:
 
     try:
         raw = json.loads(meta_path.read_text())
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return metadata
 
     metadata.update(

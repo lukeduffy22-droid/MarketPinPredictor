@@ -62,7 +62,7 @@ async def get_system_diagnostics():
 
         cuda_available = torch.cuda.is_available()
         cuda_device = torch.cuda.get_device_name(0) if cuda_available else None
-    except Exception:
+    except ImportError:
         cuda_available = False
         cuda_device = None
 

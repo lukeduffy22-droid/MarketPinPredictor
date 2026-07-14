@@ -1064,8 +1064,10 @@ else:
                 
                 # Predict from backend API (single production path)
                 predicted_price, confidence, backend_prediction, error_msg = fetch_live_prediction(index_ticker)
+                authoritative_current_price = current_price
                 if predicted_price is not None:
-                    current_price = backend_prediction.get("current_price", current_price)
+                    # Backend current_price is authoritative for the prediction contract.
+                    authoritative_current_price = backend_prediction.get("current_price", current_price)
                 
                 # Debug: Show prediction result
                 if predicted_price is None:
@@ -1073,14 +1075,14 @@ else:
                 else:
                     st.caption(f"✓ {index_name}: Predicted ${predicted_price:.2f}, confidence {confidence:.1f}%")
                 
-                if predicted_price and current_price:
-                    change_pct = ((predicted_price - current_price) / current_price) * 100
+                if predicted_price and authoritative_current_price:
+                    change_pct = ((predicted_price - authoritative_current_price) / authoritative_current_price) * 100
                     
                     # data_source and ticker_used already captured before merge
                     
                     st.session_state.predictions[index_name] = {
                         'ticker': index_ticker,
-                        'current_price': current_price,
+                        'current_price': authoritative_current_price,
                         'predicted_price': predicted_price,
                         'confidence': confidence,
                         'df': df_with_indicators,
@@ -1106,7 +1108,7 @@ else:
                         save_prediction(
                             ticker=index_ticker,
                             index_name=index_name,
-                            current_price=current_price,
+                            current_price=authoritative_current_price,
                             predicted_price=predicted_price,
                             confidence=confidence,
                             model_type=st.session_state.selected_model,

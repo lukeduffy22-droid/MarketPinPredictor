@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -27,6 +27,11 @@ DEFAULT_COEFFICIENTS = {
     "intercept": 0.0,
 }
 LIVE_FEATURES = ["vwap_deviation", "microtrend", "gamma_pin_strength", "flow_urgency"]
+DEFAULT_MODEL_METADATA = {
+    "coefficients_source": "fallback-defaults",
+    "coefficients_updated_at": None,
+    "coefficients_sample_size": 0,
+}
 
 @router.get("/levels/eod")
 async def get_gamma_levels(symbol: str) -> LevelsResponse:
@@ -105,6 +110,7 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
             gamma_walls = gamma_walls.to_dict(orient="records")
         if gamma_walls is None:
             gamma_walls = []
+        summary = "Gamma state available"
 
         return {
             "symbol": clean_symbol,
@@ -115,7 +121,7 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
             "net_gex": gex.get("net_gex", 0.0),
             "zero_gamma": gex.get("zero_gamma"),
             "direction": gex.get("direction"),
-            "summary": gex.get("summary"),
+            "summary": summary,
             "is_etf_proxy": gex.get("is_etf_proxy", False),
             "options_root": gex.get("options_root", clean_symbol),
             "gamma_walls": gamma_walls,
@@ -123,9 +129,9 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
         }
     except HTTPException:
         raise
-    except Exception as exc:
-        log.error(f"Gamma state failed for {clean_symbol}: {exc}")
-        raise HTTPException(503, f"Gamma state error: {str(exc)}")
+    except Exception:
+        log.exception("Gamma state failed for %s", clean_symbol)
+        raise HTTPException(503, "Gamma state error")
 
 @router.get("/predict/close")
 async def predict_close(symbol: str) -> PredictionResponse:
@@ -184,18 +190,16 @@ async def predict_close(symbol: str) -> PredictionResponse:
             log.warning(f"Feature computation exceeded 150ms budget for {symbol}")
             raise HTTPException(503, "Feature computation too slow")
             
-    except Exception as e:
-        log.error(f"Feature computation failed for {symbol}: {e}")
-        raise HTTPException(503, f"Feature computation error: {str(e)}")
+    except Exception:
+        log.exception("Feature computation failed for %s", symbol)
+        raise HTTPException(503, "Feature computation error")
     
     # Get coefficients and fallback metadata
     coeffs = api_state.coefficients_cache.get(symbol)
     fallback_active = False
-    fallback_reason = None
     if not coeffs:
         coeffs = DEFAULT_COEFFICIENTS
         fallback_active = True
-        fallback_reason = "coefficients cache missing; using deterministic defaults"
     
     # Compute prediction using Ridge model
     vwap_dev = features["vwap_deviation"]
@@ -250,15 +254,13 @@ async def predict_close(symbol: str) -> PredictionResponse:
     latency_ms = (time.perf_counter() - t0) * 1000
     predict_latency.record(latency_ms)
     memory = snapshot(f"predict_close:{symbol}")
-    metadata = api_state.model_metadata_cache.get(
-        symbol,
-        {
-            "coefficients_source": "fallback-defaults",
-            "coefficients_updated_at": None,
-            "coefficients_sample_size": 0,
-        },
+    metadata = api_state.model_metadata_cache.get(symbol, DEFAULT_MODEL_METADATA)
+    fallback_reason = (
+        "coefficients cache missing; using deterministic defaults"
+        if fallback_active
+        else None
     )
-    model_metadata: Dict[str, object] = {
+    model_metadata = {
         "model_name": "time-adaptive-ridge",
         "model_version": settings.live_model_version,
         "feature_schema_version": settings.live_feature_schema_version,
