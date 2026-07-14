@@ -6,12 +6,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, AsyncIterator
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import logging
+from contextlib import asynccontextmanager
 
 from app.utils.settings import settings
 from app.utils.metrics import timed, predict_latency, snapshot
@@ -25,12 +26,92 @@ from app.models.db_models import load_coefficients, get_rmse_for_tau
 
 log = logging.getLogger("api")
 
-app = FastAPI(title="0-Day Index Predictor")
+_startup_readiness = {
+    "database_initialized": False,
+    "coefficients_loaded": False,
+    "oi_refresh_started": False,
+    "aggregate_flush_started": False,
+    "index_ws_started": False,
+    "options_ws_started": False,
+    "market_data_fallback_started": False,
+    "cached_snapshot_loader_started": False,
+    "gamma_scheduler_started": False,
+}
+_startup_initialized = False
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Initialize long-lived services and track readiness state."""
+    global _startup_initialized
+    log.info("Starting 0-day predictor API")
+
+    from app.models.db_models import init_db
+    init_db()
+    _startup_readiness["database_initialized"] = True
+
+    for symbol in ("SPX", "NDX", "DJI", "RUT"):
+        coeff = load_coefficients(symbol)
+
+        if coeff:
+            _coefficients_cache[symbol] = {
+                "beta_vwap": coeff.beta_vwap,
+                "beta_gamma": coeff.beta_gamma,
+                "beta_flow": coeff.beta_flow,
+                "beta_microtrend": coeff.beta_microtrend,
+                "intercept": coeff.intercept
+            }
+            log.info(f"Loaded coefficients for {symbol}")
+        else:
+            _coefficients_cache[symbol] = {
+                "beta_vwap": 1.0,
+                "beta_gamma": 0.0,
+                "beta_flow": 0.0,
+                "beta_microtrend": 0.0,
+                "intercept": 0.0
+            }
+            log.warning(f"No coefficients found for {symbol}, using defaults")
+    _startup_readiness["coefficients_loaded"] = True
+
+    import asyncio
+    from app.state.oi_cache import schedule_oi_refresh
+    asyncio.create_task(schedule_oi_refresh())
+    _startup_readiness["oi_refresh_started"] = True
+
+    from app.ingest.websocket_aggregator import flush_aggregates
+    asyncio.create_task(flush_aggregates())
+    _startup_readiness["aggregate_flush_started"] = True
+
+    from app.ingest.websocket_stream import start_websocket_stream
+    asyncio.create_task(start_websocket_stream())
+    _startup_readiness["index_ws_started"] = True
+
+    from app.ingest.options_websocket_stream import start_options_websocket_stream
+    asyncio.create_task(start_options_websocket_stream())
+    _startup_readiness["options_ws_started"] = True
+
+    from app.ingest.rest_fallback import start_market_data_fallback, load_cached_snapshots
+    asyncio.create_task(start_market_data_fallback())
+    _startup_readiness["market_data_fallback_started"] = True
+    asyncio.create_task(load_cached_snapshots())
+    _startup_readiness["cached_snapshot_loader_started"] = True
+
+    from gamma_scheduler import start_gamma_scheduler
+    start_gamma_scheduler()
+    _startup_readiness["gamma_scheduler_started"] = True
+    log.info("Gamma pin scheduler started")
+
+    _startup_initialized = True
+    log.info("API ready - WebSocket streams + provider-aware fallback poller starting")
+    yield
+
+
+app = FastAPI(title="0-Day Index Predictor", lifespan=lifespan)
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -121,68 +202,6 @@ class ClosePredictorResponse(BaseModel):
     minutes_to_close: int
     timestamp: str
 
-@app.on_event("startup")
-async def startup():
-    """Initialize application - load coefficients from DB"""
-    log.info("Starting 0-day predictor API")
-    
-    # Initialize database
-    from app.models.db_models import init_db
-    init_db()
-    
-    # Load coefficients for all symbols
-    for symbol in ("SPX", "NDX", "DJI", "RUT"):
-        coeff = load_coefficients(symbol)
-        
-        if coeff:
-            _coefficients_cache[symbol] = {
-                "beta_vwap": coeff.beta_vwap,
-                "beta_gamma": coeff.beta_gamma,
-                "beta_flow": coeff.beta_flow,
-                "beta_microtrend": coeff.beta_microtrend,
-                "intercept": coeff.intercept
-            }
-            log.info(f"Loaded coefficients for {symbol}")
-        else:
-            # Use default coefficients (VWAP-only model)
-            _coefficients_cache[symbol] = {
-                "beta_vwap": 1.0,
-                "beta_gamma": 0.0,
-                "beta_flow": 0.0,
-                "beta_microtrend": 0.0,
-                "intercept": 0.0
-            }
-            log.warning(f"No coefficients found for {symbol}, using defaults")
-    
-    # Start OI cache refresh background task
-    from app.state.oi_cache import schedule_oi_refresh
-    import asyncio
-    asyncio.create_task(schedule_oi_refresh())
-    
-    # Start aggregation flush task
-    from app.ingest.websocket_aggregator import flush_aggregates
-    asyncio.create_task(flush_aggregates())
-    
-    # Start WebSocket stream for data ingestion
-    from app.ingest.websocket_stream import start_websocket_stream
-    asyncio.create_task(start_websocket_stream())
-    
-    # Start dedicated Options WebSocket stream for real-time gamma updates
-    from app.ingest.options_websocket_stream import start_options_websocket_stream
-    asyncio.create_task(start_options_websocket_stream())
-    
-    # Start market data fallback (Databento or Polygon based on settings)
-    from app.ingest.rest_fallback import start_market_data_fallback, load_cached_snapshots
-    asyncio.create_task(start_market_data_fallback())
-    asyncio.create_task(load_cached_snapshots())  # Secondary fallback from DB
-    
-    # Start gamma pin scheduler to save snapshots throughout the day
-    from gamma_scheduler import start_gamma_scheduler
-    start_gamma_scheduler()
-    log.info("Gamma pin scheduler started")
-    
-    log.info("API ready - WebSocket streams + provider-aware fallback poller starting")
-
 @app.get("/health")
 @app.get("/healthz")
 async def health_check():
@@ -217,11 +236,18 @@ async def health_check():
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
     
-    overall_ok = all(s["fresh"] or not is_regular_hours(datetime.utcnow()) for s in status.values())
-    
+    is_market_hours = is_regular_hours(datetime.now(timezone.utc))
+    overall_ok = all(s["fresh"] or not is_market_hours for s in status.values())
+    startup_ok = all(_startup_readiness.values()) if _startup_initialized else None
+    if startup_ok is False:
+        overall_ok = False
+
     return {
         "status": "ok" if overall_ok else "degraded",
         "market_data_provider": get_market_data_provider(),
+        "startup_initialized": _startup_initialized,
+        "startup_checks": dict(_startup_readiness),
+        "startup_ready": startup_ok,
         "symbols": status,
         "timestamp": now_et().isoformat()
     }
@@ -287,7 +313,7 @@ async def predict_close(symbol: str) -> PredictionResponse:
     if symbol not in ("SPX", "NDX", "DJI", "RUT"):
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
-    dt_utc = datetime.utcnow()
+    dt_utc = datetime.now(timezone.utc)
     
     # Check if market is open
     if not is_regular_hours(dt_utc):
@@ -1676,7 +1702,7 @@ async def get_all_predictions():
     from datetime import datetime
     from app.utils.time_et import is_regular_hours, minutes_to_close_et
     
-    dt_utc = datetime.utcnow()
+    dt_utc = datetime.now(timezone.utc)
     market_open = is_regular_hours(dt_utc)
     tau = minutes_to_close_et(dt_utc) if market_open else None
     
@@ -1772,7 +1798,7 @@ async def get_symbol_prediction(symbol: str):
     from datetime import datetime
     from app.utils.time_et import is_regular_hours, minutes_to_close_et
     
-    dt_utc = datetime.utcnow()
+    dt_utc = datetime.now(timezone.utc)
     market_open = is_regular_hours(dt_utc)
     tau = minutes_to_close_et(dt_utc) if market_open else None
     
@@ -1849,7 +1875,7 @@ async def get_api_status():
     from datetime import datetime
     from app.utils.time_et import is_regular_hours, minutes_to_close_et
     
-    dt_utc = datetime.utcnow()
+    dt_utc = datetime.now(timezone.utc)
     market_open = is_regular_hours(dt_utc)
     tau = minutes_to_close_et(dt_utc) if market_open else None
     
