@@ -13,3 +13,6 @@ def test_domain_routes_remain_registered():
     assert "/accuracy/ledger" in paths
     assert "/historical/snapshot/{symbol}/{date}" in paths
     assert "/api/predictions" in paths
+    assert "/gamma/state" in paths
+    assert "/models/live" in paths
+    assert "/diagnostics/system" in paths

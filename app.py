@@ -16,9 +16,10 @@ from ai_analysis import (
 from gamma_viz import show_gamma_evolution_section
 from app.core.audit_persistence import load_last_valid_snapshot
 from app.utils.market_time import market_is_closed, get_freeze_status
-from app.features.technical_indicators import DEFAULT_INDICATOR_PARAMS
+from app.utils.settings import settings
+from app.features.technical_indicators import DEFAULT_INDICATOR_PARAMS, calculate_technical_indicators
 from app.services.streamlit_market_data import calculate_gex, fetch_market_data, fetch_vix_data
-from app.services.streamlit_predictions import predict_eod_price
+from app.services.backend_predictions import fetch_live_prediction
 from app.visualization.price_chart import create_price_chart
 
 # Initialize database
@@ -58,6 +59,7 @@ INDEX_ETFS = {
     "RUT": "IWM",
     "VIX": "UVXY"  # VIX ETF proxy (though VIX options trade directly)
 }
+BACKEND_BASE_URL = settings.backend_base_url.rstrip("/")
 
 import os
 
@@ -67,7 +69,7 @@ if 'api_key' not in st.session_state:
 if 'predictions' not in st.session_state:
     st.session_state.predictions = {}
 if 'selected_model' not in st.session_state:
-    st.session_state.selected_model = 'Linear Regression'
+    st.session_state.selected_model = 'Backend Time-Adaptive Ridge'
 # REMOVED: ws_stream and streaming_active session state
 # WebSocket connections are now managed exclusively by the FastAPI backend
 # Streamlit uses REST endpoints to read cached data from the backend
@@ -322,18 +324,18 @@ with st.sidebar:
     
     st.header("🤖 Model Settings")
     selected_model = st.selectbox(
-        "ML Model",
-        options=["Linear Regression", "Random Forest"],
+        "Prediction Model",
+        options=["Backend Time-Adaptive Ridge"],
         index=0,
-        help="Choose the machine learning model for predictions"
+        help="Live predictions are served by the FastAPI backend."
     )
     st.session_state.selected_model = selected_model
     
     selected_timeframe = st.selectbox(
         "Prediction Timeframe",
-        options=["1-day", "5-day", "1-week"],
+        options=["1-day"],
         index=0,
-        help="Select how far ahead to predict"
+        help="Live close prediction from backend source of truth."
     )
     st.session_state.timeframe = selected_timeframe
     
@@ -637,7 +639,7 @@ with st.sidebar:
         # Fetch status from backend API
         try:
             import requests
-            health_resp = requests.get("http://localhost:8000/health", timeout=2)
+            health_resp = requests.get(f"{BACKEND_BASE_URL}/health", timeout=2)
             if health_resp.status_code == 200:
                 health_data = health_resp.json()
                 
@@ -667,7 +669,7 @@ with st.sidebar:
                     ticker = INDEXES[idx_name]
                     # Read from in-memory ring buffer only (no Polygon call, no socket)
                     try:
-                        buffer_resp = requests.get(f"http://localhost:8000/buffer/latest/{ticker}", timeout=2)
+                        buffer_resp = requests.get(f"{BACKEND_BASE_URL}/buffer/latest/{ticker}", timeout=2)
                         if buffer_resp.status_code == 200:
                             buffer_data = buffer_resp.json()
                             if buffer_data and buffer_data.get("price"):
@@ -998,7 +1000,7 @@ if not st.session_state.api_key:
     - **Options analytics** with Gamma Exposure (GEX) levels for key support/resistance
     - **VIX integration** for volatility analysis
     - **Critical time window** monitoring (15 minutes before market close at 3:45 PM ET)
-    - **Machine learning predictions** using Linear Regression and Random Forest models
+    - **Production backend predictions** via the FastAPI time-adaptive ridge model
     - **Interactive charts** with all technical indicators
     - **CSV export** for Excel compatibility
     - **Confidence scores** and alerts for significant movements
@@ -1054,18 +1056,16 @@ else:
                 # Get current price for GEX calculation
                 current_price = df['close'].iloc[-1]
                 
-                # Calculate GEX levels using actual index ticker for options
+                # Calculate indicators for charting (backend handles prediction inference)
+                df_with_indicators = calculate_technical_indicators(df, st.session_state.indicator_params)
+
+                # Calculate GEX levels (backend source of truth when available)
                 gex_data = calculate_gex(st.session_state.api_key, index_ticker, current_price)
                 
-                # Predict EOD price using selected model, timeframe, and GAMMA PIN DATA
-                # Pass gex_data so predictions align with gamma pin levels
-                predicted_price, confidence, df_with_indicators, current_price, error_msg = predict_eod_price(
-                    df, 
-                    model_type=st.session_state.selected_model,
-                    timeframe=st.session_state.timeframe,
-                    gex_data=gex_data,  # Critical: gamma pin influences EOD prediction
-                    indicator_params=st.session_state.indicator_params
-                )
+                # Predict from backend API (single production path)
+                predicted_price, confidence, backend_prediction, error_msg = fetch_live_prediction(index_ticker)
+                if predicted_price is not None:
+                    current_price = backend_prediction.get("current_price", current_price)
                 
                 # Debug: Show prediction result
                 if predicted_price is None:
@@ -1087,6 +1087,7 @@ else:
                         'change_pct': change_pct,
                         'model_type': st.session_state.selected_model,
                         'timeframe': st.session_state.timeframe,
+                        'backend_prediction': backend_prediction,
                         'gex_data': gex_data,  # Add GEX data
                         'has_vix': vix_df is not None,  # Track VIX availability
                         'data_source': data_source,  # Track if using index or ETF data
@@ -1306,7 +1307,7 @@ else:
                     st.divider()
                     st.markdown("**📋 Close Predictor Signals**")
                     try:
-                        close_resp = requests.get(f"http://localhost:8000/predict/close-overlay", params={"symbol": index_name}, timeout=8)
+                        close_resp = requests.get(f"{BACKEND_BASE_URL}/predict/close-overlay", params={"symbol": index_name}, timeout=8)
                         if close_resp.ok:
                             close_data = close_resp.json()
                             signals = close_data.get('signals', [])

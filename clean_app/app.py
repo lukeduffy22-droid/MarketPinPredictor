@@ -1,6 +1,6 @@
 """Deprecated Streamlit entrypoint kept only as a guard.
 
-Use /home/runner/work/MarketPinPredictor/MarketPinPredictor/app.py instead.
+Use app.py from the repository root instead.
 """
 
 from __future__ import annotations

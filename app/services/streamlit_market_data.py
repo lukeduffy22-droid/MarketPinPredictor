@@ -3,10 +3,12 @@
 from datetime import datetime, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
 from polygon.rest import RESTClient
 
 from options_gamma import get_gamma_analysis
+from app.utils.settings import settings
 
 INDEX_POLYGON_TICKERS = {
     "SPX": "I:SPX",
@@ -77,6 +79,36 @@ def fetch_vix_data(api_key, days=60):
 
 def calculate_gex(api_key, ticker, spot_price):
     """Calculate real Gamma Exposure (GEX) for options using gamma analysis"""
+    clean_symbol = ticker.replace("I:", "")
+    backend_url = settings.backend_base_url.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{backend_url}/gamma/state",
+            params={"symbol": clean_symbol, "spot_price": spot_price},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            payload = resp.json()
+            gamma_walls = pd.DataFrame(payload.get("gamma_walls", []))
+            return {
+                "total_gex": payload.get("total_gex", 0),
+                "net_gex": payload.get("net_gex", 0),
+                "pin_strike": payload.get("pin_strike"),
+                "pin_expiry": None,
+                "zero_gamma": payload.get("zero_gamma"),
+                "direction": payload.get("direction"),
+                "pull_strength": payload.get("pull_strength", 0),
+                "summary": payload.get("summary", ""),
+                "gamma_walls": gamma_walls,
+                "gex_by_strike": [],
+                "options_root": payload.get("options_root", clean_symbol),
+                "is_etf_proxy": payload.get("is_etf_proxy", False),
+                "key_levels": gamma_walls["strike"].tolist()[:3] if (not gamma_walls.empty and "strike" in gamma_walls.columns) else [spot_price * 0.98, spot_price * 1.02],
+            }
+    except Exception:
+        if settings.streamlit_backend_only:
+            return None
+
     try:
         # Use the real gamma analysis from options_gamma module
         gex_analysis = get_gamma_analysis(api_key, ticker, spot_price)
@@ -280,4 +312,3 @@ def get_current_price(api_key, ticker):
     except Exception as e:
         st.error(f"Error fetching current price: {str(e)}")
         return None
-

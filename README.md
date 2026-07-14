@@ -2,9 +2,9 @@
 
 MarketPinPredictor is a Python market-index prediction system with:
 
-- a FastAPI backend in `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/api/main.py`
-- a Streamlit dashboard in `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app.py`
-- canonical gamma-exposure logic in `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/core/gex.py`
+- a FastAPI backend in `app/api/main.py`
+- a Streamlit dashboard in `app.py`
+- canonical gamma-exposure logic in `app/core/gex.py`
 
 ## Runtime Quickstart
 
@@ -60,11 +60,20 @@ This command:
 
 ## Active entry points
 
-- API server: `/home/runner/work/MarketPinPredictor/MarketPinPredictor/server.py`
-- FastAPI app: `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/api/main.py`
-- Streamlit app: `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app.py`
+- API server: `server.py`
+- FastAPI app: `app/api/main.py`
+- Streamlit app: `app.py`
 
 The files `app_new.py`, `app_backup.py`, and `clean_app/app.py` are deprecated guard entrypoints and intentionally exit immediately. Always run the dashboard from `app.py`.
+
+## Production prediction architecture
+
+- Live predictions are served by FastAPI `/predict/close` (time-adaptive ridge, versioned metadata, deterministic fallback defaults).
+- Streamlit is a thin dashboard client and reads live prediction/gamma/health from backend endpoints.
+- Offline/batch CUDA workflows remain in `train_gamma_model.py`, `predict_gamma_model.py`, and `tools/train_institutional_models.py`.
+- Model diagnostics and provenance are exposed at:
+  - `GET /models/live`
+  - `GET /diagnostics/system`
 
 ## Requirements
 
@@ -134,7 +143,7 @@ pytest -v
 ## Notes for contributors
 
 - Keep changes minimal and localized.
-- Preserve GEX sign conventions and invariants by reusing `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/core/gex.py`.
+- Preserve GEX sign conventions and invariants by reusing `app/core/gex.py`.
 - Preserve existing FastAPI and Streamlit data shapes.
 - Prefer adding focused tests for stable behavior over broad refactors.
-- Legacy exports in `/home/runner/work/MarketPinPredictor/MarketPinPredictor/app/__init__.py` are intentionally unsupported and exist only to fail with clear guidance.
+- Legacy exports in `app/__init__.py` are intentionally unsupported and exist only to fail with clear guidance.

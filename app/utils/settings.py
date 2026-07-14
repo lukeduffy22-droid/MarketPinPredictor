@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Environment
     env: str = "dev"
     log_level: str = "INFO"
+    backend_base_url: str = "http://127.0.0.1:8000"
     
     # Ring buffer configuration
     ring_secs: int = 5400  # 90 minutes
@@ -36,6 +37,10 @@ class Settings(BaseSettings):
     # Performance thresholds
     max_predict_latency_ms: int = 200  # p99 latency target
     max_memory_delta_mb: int = 100  # Maximum memory growth per session
+    live_model_version: str = "ridge-live-v1"
+    live_feature_schema_version: str = "ridge-features-v1"
+    model_artifacts_dir: str = "models"
+    streamlit_backend_only: bool = True
     
     # Freshness requirements
     max_tick_age_seconds: int = 5  # Maximum age for index ticks during RTH
