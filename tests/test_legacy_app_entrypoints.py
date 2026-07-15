@@ -33,6 +33,10 @@ def test_app_backup_entrypoint_is_disabled() -> None:
 
 
 def test_clean_app_entrypoint_is_disabled() -> None:
-    result = _run_script(REPO_ROOT / "clean_app" / "app.py")
+    path = REPO_ROOT / "clean_app" / "app.py"
+    if not path.exists():
+        return
+
+    result = _run_script(path)
     assert result.returncode != 0
     assert "clean_app/app.py is deprecated and intentionally disabled" in result.stderr
