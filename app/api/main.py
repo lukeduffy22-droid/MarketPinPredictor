@@ -2,16 +2,18 @@
 FastAPI application with time-adaptive prediction endpoints.
 Enforces cadence limits, freshness checks, and performance SLAs.
 """
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, List
-import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import json
-from datetime import datetime
-import time
 import logging
+import os
+import time
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, List, Optional
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from app.utils.settings import settings
 from app.utils.metrics import timed, predict_latency, snapshot
@@ -67,7 +69,6 @@ from app.api import state as api_state
 _last_prediction_ts = api_state.last_prediction_ts
 _coefficients_cache = api_state.coefficients_cache
 
-@app.on_event("startup")
 async def startup():
     """Initialize application - load coefficients from DB"""
     log.info("Starting 0-day predictor API")
@@ -81,6 +82,10 @@ async def startup():
         coeff = load_coefficients(symbol)
         
         if coeff:
+            updated_at = getattr(coeff, "updated_at", None)
+            updated_at_iso = None
+            if updated_at is not None:
+                updated_at_iso = updated_at.isoformat()
             api_state.coefficients_cache[symbol] = {
                 "beta_vwap": coeff.beta_vwap,
                 "beta_gamma": coeff.beta_gamma,
@@ -90,7 +95,7 @@ async def startup():
             }
             api_state.model_metadata_cache[symbol] = {
                 "coefficients_source": "database",
-                "coefficients_updated_at": coeff.updated_at.isoformat() if coeff.updated_at else None,
+                "coefficients_updated_at": updated_at_iso,
                 "coefficients_sample_size": coeff.sample_size,
             }
             log.info(f"Loaded coefficients for {symbol}")
@@ -139,6 +144,16 @@ async def startup():
     
     log.info("API ready - WebSocket streams + provider-aware fallback poller starting")
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Application lifespan for startup tasks."""
+    await startup()
+    yield
+
+
+app.router.lifespan_context = lifespan
+
 @app.get("/health")
 @app.get("/healthz")
 async def health_check():
@@ -147,7 +162,7 @@ async def health_check():
     Returns per-symbol freshness and ring buffer status.
     """
     import time
-    from app.ingest.rest_fallback import is_rest_only_mode, get_market_data_provider
+    from app.ingest.rest_fallback import get_market_data_provider, get_market_data_status, is_rest_only_mode
     max_age = 5  # 5 second freshness threshold (1s REST polling)
     
     status = {}
@@ -173,11 +188,15 @@ async def health_check():
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
     
-    overall_ok = all(s["fresh"] or not is_regular_hours(datetime.utcnow()) for s in status.values())
+    overall_ok = all(
+        s["fresh"] or not is_regular_hours(datetime.now(timezone.utc))
+        for s in status.values()
+    )
     
     return {
         "status": "ok" if overall_ok else "degraded",
         "market_data_provider": get_market_data_provider(),
+        "provider_status": get_market_data_status(),
         "symbols": status,
         "timestamp": now_et().isoformat()
     }

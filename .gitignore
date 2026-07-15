@@ -1,5 +1,9 @@
 # Audit snapshot exports (generated files, not tracked in version control)
 exports/
+exports_final_verify/
+exports_smoke/
+exports_verify/
+exports_verify2/
 
 # SQLite database (for local development)
 *.db
@@ -44,8 +48,21 @@ ENV/
 
 # Logs
 *.log
+logs/
 
 # Local config
 .env.local
 # Local editor history snapshots
 .history/
+
+# Generated local artifacts
+attached_assets/
+**/__pycache__/
+backups/
+clean_app/
+data/raw/
+data/parquet/
+data/full_gamma_history.csv
+models/*.pt
+models/*_meta.json
+models/training_report.json

@@ -40,6 +40,15 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
         types.SimpleNamespace(
             is_rest_only_mode=lambda: True,
             get_market_data_provider=lambda: "databento",
+            get_market_data_status=lambda: {
+                "selected_provider": "databento",
+                "selection_reason": "forced",
+                "running": True,
+                "databento_api_key_configured": True,
+                "polygon_api_key_configured": False,
+                "last_success_at": "2025-07-10T19:29:55Z",
+                "last_success_age_seconds": 5.0,
+            },
         ),
     )
 
@@ -47,6 +56,7 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
 
     assert result["status"] == "degraded"
     assert result["market_data_provider"] == "databento"
+    assert result["provider_status"]["selected_provider"] == "databento"
     assert all(symbol_status["mode"] == "REST" for symbol_status in result["symbols"].values())
 
 
@@ -69,6 +79,15 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
         types.SimpleNamespace(
             is_rest_only_mode=lambda: False,
             get_market_data_provider=lambda: "polygon",
+            get_market_data_status=lambda: {
+                "selected_provider": "polygon",
+                "selection_reason": "auto-no-databento-key",
+                "running": True,
+                "databento_api_key_configured": False,
+                "polygon_api_key_configured": True,
+                "last_success_at": "2025-07-10T21:59:55Z",
+                "last_success_age_seconds": 5.0,
+            },
         ),
     )
 
@@ -76,4 +95,5 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
 
     assert result["status"] == "ok"
     assert result["market_data_provider"] == "polygon"
+    assert result["provider_status"]["selected_provider"] == "polygon"
     assert all(symbol_status["mode"] == "WebSocket" for symbol_status in result["symbols"].values())

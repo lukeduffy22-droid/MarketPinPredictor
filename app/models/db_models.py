@@ -2,13 +2,13 @@
 Database models for calibration coefficients and RMSE tracking.
 Per-symbol and per-time-bucket storage for adaptive predictions.
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Date
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.engine.url import make_url
 from datetime import datetime
-from typing import Optional
 import os
+from typing import Optional
+
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Date
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
 
