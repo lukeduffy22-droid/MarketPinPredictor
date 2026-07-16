@@ -21,6 +21,7 @@ from app.utils.time_et import (
 )
 from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
 from app.features.calculators import compute_all_features
+from app.ingest.provider_selection import should_start_polygon_index_stream
 from app.models.db_models import load_coefficients, get_rmse_for_tau
 
 log = logging.getLogger("api")
@@ -120,11 +121,11 @@ async def startup():
     asyncio.create_task(flush_aggregates())
     
     # Start Polygon websocket stream only when key is configured
-    if settings.polygon_api_key:
+    if should_start_polygon_index_stream():
         from app.ingest.websocket_stream import start_websocket_stream
         asyncio.create_task(start_websocket_stream())
     else:
-        log.info("Polygon websocket stream disabled (no Massive_API configured)")
+        log.info("Polygon websocket stream disabled by provider selection")
     
     # Start dedicated Options WebSocket stream for real-time gamma updates
     from app.ingest.options_websocket_stream import start_options_websocket_stream

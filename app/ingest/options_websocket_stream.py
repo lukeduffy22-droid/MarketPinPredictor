@@ -16,6 +16,7 @@ from typing import Dict, Optional, Callable
 import websockets
 from polygon.rest import RESTClient
 
+from app.ingest.provider_selection import resolve_options_data_provider
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
 
@@ -344,20 +345,16 @@ async def start_options_websocket_stream():
     global _options_stream
     global CURRENT_OPTIONS_DATA_PROVIDER
 
-    provider = (settings.options_data_provider or "none").strip().lower()
+    provider = resolve_options_data_provider()
     if provider == "none":
         CURRENT_OPTIONS_DATA_PROVIDER = "none"
-        log.info("Options provider disabled (options_data_provider=none)")
-        return
-
-    if provider != "polygon":
-        CURRENT_OPTIONS_DATA_PROVIDER = "none"
-        log.warning("Unsupported options provider '%s'; options provider disabled", provider)
-        return
-
-    if not settings.polygon_api_key:
-        CURRENT_OPTIONS_DATA_PROVIDER = "none"
-        log.info("Polygon API key not configured; options provider disabled")
+        configured = (settings.options_data_provider or "none").strip().lower()
+        if configured == "polygon" and not settings.polygon_api_key:
+            log.info("Polygon API key not configured; options provider disabled")
+        elif configured not in ("none", "polygon"):
+            log.warning("Unsupported options provider '%s'; options provider disabled", configured)
+        else:
+            log.info("Options provider disabled (options_data_provider=none)")
         return
 
     CURRENT_OPTIONS_DATA_PROVIDER = "polygon"
