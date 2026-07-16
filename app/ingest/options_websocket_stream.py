@@ -385,6 +385,37 @@ def is_options_websocket_active() -> bool:
     global _options_stream
     return _options_stream is not None and _options_stream.is_active()
 
+
+def get_options_subscription_state() -> dict:
+    """Return current options websocket subscription state for diagnostics."""
+    global _options_stream
+    if _options_stream is None:
+        return {
+            "stream": "options",
+            "provider": CURRENT_OPTIONS_DATA_PROVIDER,
+            "running": False,
+            "connected": False,
+            "authenticated": False,
+            "requested_count": 0,
+            "requested_subscriptions": [],
+            "confirmed_count": 0,
+            "confirmed_subscriptions": [],
+        }
+
+    requested = sorted(list(_options_stream.subscriptions))
+    confirmed = sorted(list(_options_stream._subscribed_channels))
+    return {
+        "stream": "options",
+        "provider": CURRENT_OPTIONS_DATA_PROVIDER,
+        "running": bool(_options_stream.running),
+        "connected": bool(_options_stream.connected),
+        "authenticated": bool(_options_stream.authenticated),
+        "requested_count": len(requested),
+        "requested_subscriptions": requested,
+        "confirmed_count": len(confirmed),
+        "confirmed_subscriptions": confirmed,
+    }
+
 def set_gamma_update_callback(callback: Callable):
     """Set callback for real-time gamma updates"""
     global _gamma_update_callback

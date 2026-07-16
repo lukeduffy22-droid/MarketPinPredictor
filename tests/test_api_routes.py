@@ -11,6 +11,7 @@ def test_domain_routes_remain_registered():
     assert "/predict/ai-enhanced" in paths
     assert "/ai/status" in paths
     assert "/accuracy/ledger" in paths
+    assert "/debug/subscriptions" in paths
     assert "/historical/snapshot/{symbol}/{date}" in paths
     assert "/api/predictions" in paths
     assert "/gamma/state" in paths
