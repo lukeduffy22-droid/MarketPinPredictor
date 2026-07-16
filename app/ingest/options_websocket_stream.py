@@ -25,6 +25,7 @@ log = logging.getLogger("options_ws_stream")
 _options_singleton_lock = threading.Lock()
 
 _gamma_update_callback: Optional[Callable] = None
+CURRENT_OPTIONS_DATA_PROVIDER = "none"
 
 class OptionsGammaTracker:
     """
@@ -341,6 +342,25 @@ async def start_options_websocket_stream():
     This function is safe to call multiple times without creating duplicates.
     """
     global _options_stream
+    global CURRENT_OPTIONS_DATA_PROVIDER
+
+    provider = (settings.options_data_provider or "none").strip().lower()
+    if provider == "none":
+        CURRENT_OPTIONS_DATA_PROVIDER = "none"
+        log.info("Options provider disabled (options_data_provider=none)")
+        return
+
+    if provider != "polygon":
+        CURRENT_OPTIONS_DATA_PROVIDER = "none"
+        log.warning("Unsupported options provider '%s'; options provider disabled", provider)
+        return
+
+    if not settings.polygon_api_key:
+        CURRENT_OPTIONS_DATA_PROVIDER = "none"
+        log.info("Polygon API key not configured; options provider disabled")
+        return
+
+    CURRENT_OPTIONS_DATA_PROVIDER = "polygon"
     
     with _options_singleton_lock:
         if _options_stream is None:
@@ -358,6 +378,10 @@ async def stop_options_websocket_stream():
     
     if _options_stream:
         await _options_stream.stop()
+
+def get_options_data_provider() -> str:
+    """Return the currently selected options data provider."""
+    return CURRENT_OPTIONS_DATA_PROVIDER
 
 def is_options_websocket_active() -> bool:
     """Check if the singleton Options WebSocket is currently active"""
