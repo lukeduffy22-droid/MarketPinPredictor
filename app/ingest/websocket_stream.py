@@ -276,3 +276,32 @@ def is_websocket_active() -> bool:
     """Check if the singleton WebSocket is currently active"""
     global _ws_stream
     return _ws_stream is not None and _ws_stream.is_active()
+
+
+def get_websocket_subscription_state() -> dict:
+    """Return current index websocket subscription state for diagnostics."""
+    global _ws_stream
+    if _ws_stream is None:
+        return {
+            "stream": "index",
+            "running": False,
+            "connected": False,
+            "authenticated": False,
+            "requested_count": 0,
+            "requested_subscriptions": [],
+            "confirmed_count": 0,
+            "confirmed_subscriptions": [],
+        }
+
+    requested = sorted(list(_ws_stream.subscriptions))
+    confirmed = sorted(list(_ws_stream._subscribed_channels))
+    return {
+        "stream": "index",
+        "running": bool(_ws_stream.running),
+        "connected": bool(_ws_stream.connected),
+        "authenticated": bool(_ws_stream.authenticated),
+        "requested_count": len(requested),
+        "requested_subscriptions": requested,
+        "confirmed_count": len(confirmed),
+        "confirmed_subscriptions": confirmed,
+    }

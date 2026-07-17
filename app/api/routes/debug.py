@@ -19,6 +19,40 @@ log = logging.getLogger("api")
 
 router = APIRouter()
 
+
+@router.get("/debug/subscriptions")
+async def debug_subscriptions():
+    """
+    Return full websocket subscription visibility for diagnostics.
+
+    Includes requested and confirmed channel lists so large subscription
+    sets (for example 421 symbols/channels) can be inspected directly.
+    """
+    try:
+        from app.ingest.websocket_stream import get_websocket_subscription_state
+        from app.ingest.options_websocket_stream import get_options_subscription_state
+
+        index_state = get_websocket_subscription_state()
+        options_state = get_options_subscription_state()
+
+        return {
+            "index_stream": index_state,
+            "options_stream": options_state,
+            "total_requested_subscriptions": (
+                index_state.get("requested_count", 0)
+                + options_state.get("requested_count", 0)
+            ),
+            "total_confirmed_subscriptions": (
+                index_state.get("confirmed_count", 0)
+                + options_state.get("confirmed_count", 0)
+            ),
+            "timestamp": now_et().isoformat(),
+        }
+    except Exception as e:
+        log.error(f"Debug subscriptions error: {e}")
+        raise HTTPException(503, f"Subscription debug error: {str(e)}")
+
+
 @router.get("/debug/reconcile/{symbol}")
 async def debug_reconcile(symbol: str):
     """

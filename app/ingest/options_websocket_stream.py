@@ -16,6 +16,7 @@ from typing import Dict, Optional, Callable
 import websockets
 from polygon.rest import RESTClient
 
+from app.ingest.provider_selection import resolve_options_data_provider
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
 
@@ -25,6 +26,7 @@ log = logging.getLogger("options_ws_stream")
 _options_singleton_lock = threading.Lock()
 
 _gamma_update_callback: Optional[Callable] = None
+CURRENT_OPTIONS_DATA_PROVIDER = "none"
 
 class OptionsGammaTracker:
     """
@@ -341,6 +343,21 @@ async def start_options_websocket_stream():
     This function is safe to call multiple times without creating duplicates.
     """
     global _options_stream
+    global CURRENT_OPTIONS_DATA_PROVIDER
+
+    provider = resolve_options_data_provider()
+    if provider == "none":
+        CURRENT_OPTIONS_DATA_PROVIDER = "none"
+        configured = (settings.options_data_provider or "none").strip().lower()
+        if configured == "polygon" and not settings.polygon_api_key:
+            log.info("Polygon API key not configured; options provider disabled")
+        elif configured not in ("none", "polygon"):
+            log.warning("Unsupported options provider '%s'; options provider disabled", configured)
+        else:
+            log.info("Options provider disabled (options_data_provider=none)")
+        return
+
+    CURRENT_OPTIONS_DATA_PROVIDER = "polygon"
     
     with _options_singleton_lock:
         if _options_stream is None:
@@ -359,10 +376,45 @@ async def stop_options_websocket_stream():
     if _options_stream:
         await _options_stream.stop()
 
+def get_options_data_provider() -> str:
+    """Return the currently selected options data provider."""
+    return CURRENT_OPTIONS_DATA_PROVIDER
+
 def is_options_websocket_active() -> bool:
     """Check if the singleton Options WebSocket is currently active"""
     global _options_stream
     return _options_stream is not None and _options_stream.is_active()
+
+
+def get_options_subscription_state() -> dict:
+    """Return current options websocket subscription state for diagnostics."""
+    global _options_stream
+    if _options_stream is None:
+        return {
+            "stream": "options",
+            "provider": CURRENT_OPTIONS_DATA_PROVIDER,
+            "running": False,
+            "connected": False,
+            "authenticated": False,
+            "requested_count": 0,
+            "requested_subscriptions": [],
+            "confirmed_count": 0,
+            "confirmed_subscriptions": [],
+        }
+
+    requested = sorted(list(_options_stream.subscriptions))
+    confirmed = sorted(list(_options_stream._subscribed_channels))
+    return {
+        "stream": "options",
+        "provider": CURRENT_OPTIONS_DATA_PROVIDER,
+        "running": bool(_options_stream.running),
+        "connected": bool(_options_stream.connected),
+        "authenticated": bool(_options_stream.authenticated),
+        "requested_count": len(requested),
+        "requested_subscriptions": requested,
+        "confirmed_count": len(confirmed),
+        "confirmed_subscriptions": confirmed,
+    }
 
 def set_gamma_update_callback(callback: Callable):
     """Set callback for real-time gamma updates"""

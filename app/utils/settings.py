@@ -19,7 +19,12 @@ class Settings(BaseSettings):
     # auto: prefer Databento when key exists, otherwise Polygon
     # databento: force Databento
     # polygon: force Polygon
-    market_data_provider: str = "auto"
+    market_data_provider: str = "databento"
+    
+    # Options data provider selection
+    # none: disable live options provider (default)
+    # polygon: enable Polygon options websocket/snapshot path
+    options_data_provider: str = "none"
     
     # Environment
     env: str = "dev"

@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.api import state as api_state
 from app.api.schemas import *
+from app.ingest.provider_selection import resolve_options_data_provider
 from app.utils.settings import settings
 from app.utils.metrics import predict_latency, snapshot
 from app.utils.time_et import now_et, minutes_to_close_et, is_regular_hours, get_cadence_ms
@@ -32,6 +33,31 @@ DEFAULT_MODEL_METADATA = {
     "coefficients_updated_at": None,
     "coefficients_sample_size": 0,
 }
+
+
+def _gamma_unavailable_payload(
+    symbol: str,
+    spot_price: float,
+    summary: str,
+    options_root: Optional[str] = None,
+    is_etf_proxy: bool = False,
+):
+    return {
+        "symbol": symbol,
+        "spot_price": spot_price,
+        "pin_strike": None,
+        "pull_strength": 0.0,
+        "total_gex": 0.0,
+        "net_gex": 0.0,
+        "zero_gamma": None,
+        "direction": "unknown",
+        "summary": summary,
+        "data_unavailable": True,
+        "is_etf_proxy": is_etf_proxy,
+        "options_root": options_root or symbol,
+        "gamma_walls": [],
+        "timestamp": now_et().isoformat(),
+    }
 
 @router.get("/levels/eod")
 async def get_gamma_levels(symbol: str) -> LevelsResponse:
@@ -94,6 +120,18 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
     if not resolved_spot:
         raise HTTPException(503, f"No price data for {clean_symbol}")
 
+    options_provider = resolve_options_data_provider()
+    configured_options_provider = (settings.options_data_provider or "none").strip().lower()
+    if options_provider == "none":
+        summary = "Gamma unavailable: options provider disabled (Databento-only mode)."
+        if configured_options_provider == "polygon" and not settings.polygon_api_key:
+            summary = "Gamma unavailable: Polygon options provider selected but API key is missing."
+        return _gamma_unavailable_payload(
+            symbol=clean_symbol,
+            spot_price=resolved_spot,
+            summary=summary,
+        )
+
     try:
         import options_gamma
 
@@ -110,6 +148,15 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
             gamma_walls = gamma_walls.to_dict(orient="records")
         if gamma_walls is None:
             gamma_walls = []
+        if gex.get("data_unavailable"):
+            return _gamma_unavailable_payload(
+                symbol=clean_symbol,
+                spot_price=resolved_spot,
+                summary=gex.get("summary", f"Gamma unavailable for {clean_symbol}."),
+                options_root=gex.get("options_root", clean_symbol),
+                is_etf_proxy=gex.get("is_etf_proxy", False),
+            )
+
         summary = "Gamma state available"
 
         return {

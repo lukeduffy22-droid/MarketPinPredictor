@@ -17,9 +17,13 @@ Set at least one provider key:
 
 Optional provider mode:
 
-- `MARKET_DATA_PROVIDER=auto` (default, prefers Databento when key is set)
-- `MARKET_DATA_PROVIDER=databento`
+- `MARKET_DATA_PROVIDER=databento` (default)
 - `MARKET_DATA_PROVIDER=polygon`
+
+Optional options provider mode:
+
+- `OPTIONS_DATA_PROVIDER=none` (default, disables live options feed)
+- `OPTIONS_DATA_PROVIDER=polygon`
 
 ### 2) Run setup verification
 
