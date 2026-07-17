@@ -24,11 +24,12 @@ log = logging.getLogger("databento_fallback")
 DATABENTO_POLL_INTERVAL = 1.0
 
 # Databento futures proxies for major US indices
-SYMBOL_MAP: Dict[str, str] = {
-    "SPX": "ES.c.0",
-    "NDX": "NQ.c.0",
-    "DJI": "YM.c.0",
-    "RUT": "RTY.c.0",
+SYMBOL_MAP: Dict[str, tuple[str, ...]] = {
+    "SPX": ("ES.c.0",),
+    "NDX": ("NQ.c.0",),
+    "DJI": ("YM.c.0",),
+    "RUT": ("RTY.c.0",),
+    "VIX": ("VX.c.0", "VXM.c.0"),
 }
 
 
@@ -55,31 +56,33 @@ class _DatabentoPollClient:
 
         prices: Dict[str, float] = {}
 
-        for index_symbol, proxy_symbol in SYMBOL_MAP.items():
-            try:
-                store = self._client.timeseries.get_range(
-                    dataset="GLBX.MDP3",
-                    schema="ohlcv-1s",
-                    stype_in="continuous",
-                    symbols=[proxy_symbol],
-                    start=start,
-                    end=end,
-                )
+        for index_symbol, proxy_symbols in SYMBOL_MAP.items():
+            for proxy_symbol in proxy_symbols:
+                try:
+                    store = self._client.timeseries.get_range(
+                        dataset="GLBX.MDP3",
+                        schema="ohlcv-1s",
+                        stype_in="continuous",
+                        symbols=[proxy_symbol],
+                        start=start,
+                        end=end,
+                    )
 
-                df = store.to_df()
-                if df is None or df.empty:
-                    continue
+                    df = store.to_df()
+                    if df is None or df.empty:
+                        continue
 
-                # Databento frames generally expose "close" for OHLCV schemas.
-                close_series = df.get("close")
-                if close_series is None or close_series.empty:
-                    continue
+                    # Databento frames generally expose "close" for OHLCV schemas.
+                    close_series = df.get("close")
+                    if close_series is None or close_series.empty:
+                        continue
 
-                latest_close = float(close_series.iloc[-1])
-                if latest_close > 0:
-                    prices[index_symbol] = latest_close
-            except Exception as exc:
-                log.debug("Databento fetch failed for %s (%s): %s", index_symbol, proxy_symbol, exc)
+                    latest_close = float(close_series.iloc[-1])
+                    if latest_close > 0:
+                        prices[index_symbol] = latest_close
+                        break
+                except Exception as exc:
+                    log.debug("Databento fetch failed for %s (%s): %s", index_symbol, proxy_symbol, exc)
 
         return prices
 

@@ -47,6 +47,7 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
 
     assert result["status"] == "degraded"
     assert result["market_data_provider"] == "databento"
+    assert "VIX" in result["symbols"]
     assert all(symbol_status["mode"] == "REST" for symbol_status in result["symbols"].values())
 
 
@@ -76,4 +77,5 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
 
     assert result["status"] == "ok"
     assert result["market_data_provider"] == "polygon"
+    assert "VIX" in result["symbols"]
     assert all(symbol_status["mode"] == "WebSocket" for symbol_status in result["symbols"].values())

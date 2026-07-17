@@ -14,7 +14,7 @@ from datetime import datetime
 import time
 import os
 
-from app.state.ring_buffers import INDEX_RINGS, update_session_vwap, IndexTick
+from app.state.ring_buffers import INDEX_RINGS, TRACKED_INDEX_SYMBOLS, update_session_vwap, IndexTick
 from app.utils.time_et import is_regular_hours
 from app.utils.settings import settings
 
@@ -70,7 +70,7 @@ async def poll_polygon_rest():
         return
     
     client = RESTClient(api_key)
-    INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
+    INDEX_SYMBOLS = list(TRACKED_INDEX_SYMBOLS)
     
     log.info(f"Starting REST API polling (every {REST_POLL_INTERVAL}s - premium subscription, unlimited API calls)")
     
@@ -205,7 +205,7 @@ async def load_cached_snapshots():
     """
     from database import get_latest_gamma_snapshot
     
-    INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
+    INDEX_SYMBOLS = list(TRACKED_INDEX_SYMBOLS)
     
     log.info("Starting database fallback for cached snapshots (WebSocket unavailable)")
     

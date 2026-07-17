@@ -8,7 +8,13 @@ from app.api.schemas import *
 from app.utils.settings import settings
 from app.utils.metrics import predict_latency, snapshot
 from app.utils.time_et import now_et, minutes_to_close_et, is_regular_hours, get_cadence_ms
-from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
+from app.state.ring_buffers import (
+    INDEX_RINGS,
+    PREDICTION_SYMBOLS,
+    TRACKED_INDEX_SYMBOLS,
+    get_latest_price,
+    get_latest_price_with_fallback,
+)
 from app.features.calculators import compute_all_features
 from app.models.db_models import get_rmse_for_tau
 
@@ -18,7 +24,8 @@ import time
 log = logging.getLogger("api")
 
 router = APIRouter()
-SUPPORTED_SYMBOLS = ("SPX", "NDX", "DJI", "RUT")
+SUPPORTED_SYMBOLS = PREDICTION_SYMBOLS
+GAMMA_SYMBOLS = TRACKED_INDEX_SYMBOLS
 DEFAULT_COEFFICIENTS = {
     "beta_vwap": 1.0,
     "beta_gamma": 0.0,
@@ -40,7 +47,7 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
     Uses OI cache (no REST calls).
     Works after hours using fallback pricing.
     """
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in GAMMA_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     from app.state.oi_cache import oi_cache
@@ -87,7 +94,7 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
 async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
     """Return backend gamma state for Streamlit consumption."""
     clean_symbol = symbol.upper().replace("I:", "")
-    if clean_symbol not in SUPPORTED_SYMBOLS:
+    if clean_symbol not in GAMMA_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
 
     resolved_spot = spot_price or get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
@@ -132,6 +139,32 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
     except Exception:
         log.exception("Gamma state failed for %s", clean_symbol)
         raise HTTPException(503, "Gamma state error")
+
+
+@router.get("/buffer/latest/{symbol}")
+async def get_latest_buffered_price(symbol: str):
+    """Return the latest cached backend price for a live display symbol."""
+    clean_symbol = symbol.upper().replace("I:", "")
+    if clean_symbol not in GAMMA_SYMBOLS:
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+
+    ring = INDEX_RINGS.get(clean_symbol)
+    latest = ring.latest() if ring else None
+    fallback_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
+
+    timestamp = None
+    if latest:
+        latest_ts, _ = latest
+        timestamp = datetime.utcfromtimestamp(latest_ts).isoformat()
+
+    return {
+        "symbol": clean_symbol,
+        "price": fallback_price,
+        "timestamp": timestamp,
+        "fresh": ring.is_fresh(max_age_seconds=5) if ring else False,
+        "buffer_length": ring.length_seconds if ring else 0,
+        "has_ring_data": bool(latest),
+    }
 
 @router.get("/predict/close")
 async def predict_close(symbol: str) -> PredictionResponse:
@@ -311,7 +344,7 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     Works after hours using fallback pricing from database or Polygon REST API.
     """
     # Validate symbol
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in SUPPORTED_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     # Convert symbol to ticker format for Polygon API
@@ -395,7 +428,7 @@ async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResp
     
     Returns signals and an adjusted close estimate based on behavioral factors.
     """
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in SUPPORTED_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
@@ -535,7 +568,7 @@ async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
     # Normalize symbol - strip I: prefix if present
     clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
     
-    if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if clean_symbol not in SUPPORTED_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     current_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)

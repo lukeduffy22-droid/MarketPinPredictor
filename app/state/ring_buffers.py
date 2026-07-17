@@ -55,18 +55,22 @@ class Ring1s:
         """Number of seconds of data available"""
         return len(self.q)
 
+# Backend-tracked live display symbols.
+TRACKED_INDEX_SYMBOLS = ("SPX", "NDX", "DJI", "RUT", "VIX")
+PREDICTION_SYMBOLS = ("SPX", "NDX", "DJI", "RUT")
+
 # Global per-symbol ring buffers
 INDEX_RINGS: Dict[str, Ring1s] = {
-    s: Ring1s() for s in ("SPX", "NDX", "DJI", "RUT")
+    s: Ring1s() for s in TRACKED_INDEX_SYMBOLS
 }
 
 FLOW_RINGS: Dict[str, Ring1s] = {
-    r: Ring1s() for r in ("SPX", "NDX", "DJI", "RUT")
+    r: Ring1s() for r in PREDICTION_SYMBOLS
 }
 
 # Session VWAP trackers (reset at market open)
 _vwap_state: Dict[str, Dict[str, float]] = {
-    s: {"sum_pv": 0.0, "sum_v": 0.0} for s in ("SPX", "NDX", "DJI", "RUT")
+    s: {"sum_pv": 0.0, "sum_v": 0.0} for s in TRACKED_INDEX_SYMBOLS
 }
 
 def update_session_vwap(symbol: str, price: float, size: float = 1.0):

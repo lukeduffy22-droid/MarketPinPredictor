@@ -19,7 +19,13 @@ from app.utils.time_et import (
     now_et, minutes_to_close_et, is_regular_hours,
     is_power_hour, get_cadence_ms
 )
-from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
+from app.state.ring_buffers import (
+    INDEX_RINGS,
+    PREDICTION_SYMBOLS,
+    TRACKED_INDEX_SYMBOLS,
+    get_latest_price,
+    get_latest_price_with_fallback,
+)
 from app.features.calculators import compute_all_features
 from app.models.db_models import load_coefficients, get_rmse_for_tau
 
@@ -77,7 +83,7 @@ async def startup():
     init_db()
     
     # Load coefficients for all symbols
-    for symbol in ("SPX", "NDX", "DJI", "RUT"):
+    for symbol in PREDICTION_SYMBOLS:
         coeff = load_coefficients(symbol)
         
         if coeff:
@@ -153,7 +159,7 @@ async def health_check():
     status = {}
     current_time = int(time.time())
     
-    for symbol in ("SPX", "NDX", "DJI", "RUT"):
+    for symbol in TRACKED_INDEX_SYMBOLS:
         ring = INDEX_RINGS.get(symbol)
         
         is_fresh = ring.is_fresh(max_age_seconds=max_age) if ring else False
@@ -173,7 +179,10 @@ async def health_check():
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
     
-    overall_ok = all(s["fresh"] or not is_regular_hours(datetime.utcnow()) for s in status.values())
+    overall_ok = all(
+        status[symbol]["fresh"] or not is_regular_hours(datetime.utcnow())
+        for symbol in PREDICTION_SYMBOLS
+    )
     
     return {
         "status": "ok" if overall_ok else "degraded",
