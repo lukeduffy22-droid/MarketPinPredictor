@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -155,7 +155,7 @@ async def get_latest_buffered_price(symbol: str):
     timestamp = None
     if latest:
         latest_ts, _ = latest
-        timestamp = datetime.utcfromtimestamp(latest_ts).isoformat()
+        timestamp = datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat()
 
     return {
         "symbol": clean_symbol,

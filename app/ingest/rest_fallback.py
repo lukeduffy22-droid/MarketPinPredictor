@@ -186,7 +186,7 @@ async def start_market_data_fallback():
         await poll_polygon_rest()
         return
 
-    # auto mode
+    # auto mode: prefer Databento when key exists, fall back to Polygon otherwise
     if settings.databento_api_key:
         from app.ingest.databento_fallback import poll_databento_rest
 

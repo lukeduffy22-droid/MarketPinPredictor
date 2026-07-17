@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from app.state.ring_buffers import INDEX_RINGS, IndexTick, update_session_vwap
 from app.utils.settings import settings
@@ -24,7 +24,7 @@ log = logging.getLogger("databento_fallback")
 DATABENTO_POLL_INTERVAL = 1.0
 
 # Databento futures proxies for major US indices
-SYMBOL_MAP: Dict[str, tuple[str, ...]] = {
+SYMBOL_MAP: Dict[str, Tuple[str, ...]] = {
     "SPX": ("ES.c.0",),
     "NDX": ("NQ.c.0",),
     "DJI": ("YM.c.0",),
