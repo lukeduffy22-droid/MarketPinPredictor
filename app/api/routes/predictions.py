@@ -24,8 +24,8 @@ import time
 log = logging.getLogger("api")
 
 router = APIRouter()
-SUPPORTED_SYMBOLS = PREDICTION_SYMBOLS
-GAMMA_SYMBOLS = TRACKED_INDEX_SYMBOLS
+PREDICTION_ENDPOINT_SYMBOLS = PREDICTION_SYMBOLS
+LIVE_DISPLAY_SYMBOLS = TRACKED_INDEX_SYMBOLS
 DEFAULT_COEFFICIENTS = {
     "beta_vwap": 1.0,
     "beta_gamma": 0.0,
@@ -47,7 +47,7 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
     Uses OI cache (no REST calls).
     Works after hours using fallback pricing.
     """
-    if symbol not in GAMMA_SYMBOLS:
+    if symbol not in LIVE_DISPLAY_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     from app.state.oi_cache import oi_cache
@@ -94,7 +94,7 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
 async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
     """Return backend gamma state for Streamlit consumption."""
     clean_symbol = symbol.upper().replace("I:", "")
-    if clean_symbol not in GAMMA_SYMBOLS:
+    if clean_symbol not in LIVE_DISPLAY_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
 
     resolved_spot = spot_price or get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
@@ -145,7 +145,7 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
 async def get_latest_buffered_price(symbol: str):
     """Return the latest cached backend price for a live display symbol."""
     clean_symbol = symbol.upper().replace("I:", "")
-    if clean_symbol not in GAMMA_SYMBOLS:
+    if clean_symbol not in LIVE_DISPLAY_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
 
     ring = INDEX_RINGS.get(clean_symbol)
@@ -175,7 +175,7 @@ async def predict_close(symbol: str) -> PredictionResponse:
     t0 = time.perf_counter()
     
     # Validate symbol
-    if symbol not in SUPPORTED_SYMBOLS:
+    if symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     dt_utc = datetime.utcnow()
@@ -344,7 +344,7 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     Works after hours using fallback pricing from database or Polygon REST API.
     """
     # Validate symbol
-    if symbol not in SUPPORTED_SYMBOLS:
+    if symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     # Convert symbol to ticker format for Polygon API
@@ -428,7 +428,7 @@ async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResp
     
     Returns signals and an adjusted close estimate based on behavioral factors.
     """
-    if symbol not in SUPPORTED_SYMBOLS:
+    if symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
@@ -568,7 +568,7 @@ async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
     # Normalize symbol - strip I: prefix if present
     clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
     
-    if clean_symbol not in SUPPORTED_SYMBOLS:
+    if clean_symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     current_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)

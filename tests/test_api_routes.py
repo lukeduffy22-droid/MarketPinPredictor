@@ -4,6 +4,7 @@ import asyncio
 
 from app.api.main import app
 from app.api.routes import predictions
+from app.state.ring_buffers import TRACKED_INDEX_SYMBOLS
 
 
 class _FakeRing:
@@ -33,12 +34,13 @@ def test_domain_routes_remain_registered():
     assert "/diagnostics/system" in paths
 
 
-def test_buffer_latest_supports_vix(monkeypatch):
-    monkeypatch.setattr(predictions, "INDEX_RINGS", {"VIX": _FakeRing()})
+def test_buffer_latest_supports_tracked_symbols(monkeypatch):
+    monkeypatch.setattr(predictions, "INDEX_RINGS", {symbol: _FakeRing() for symbol in TRACKED_INDEX_SYMBOLS})
     monkeypatch.setattr(predictions, "get_latest_price_with_fallback", lambda symbol, api_key=None: 19.75)
 
-    result = asyncio.run(predictions.get_latest_buffered_price("VIX"))
+    for symbol in TRACKED_INDEX_SYMBOLS:
+        result = asyncio.run(predictions.get_latest_buffered_price(symbol))
 
-    assert result["symbol"] == "VIX"
-    assert result["price"] == 19.75
-    assert result["fresh"] is True
+        assert result["symbol"] == symbol
+        assert result["price"] == 19.75
+        assert result["fresh"] is True
