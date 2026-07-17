@@ -29,7 +29,7 @@ SYMBOL_MAP: Dict[str, Tuple[str, ...]] = {
     "NDX": ("NQ.c.0",),
     "DJI": ("YM.c.0",),
     "RUT": ("RTY.c.0",),
-    # VIX may be exposed through either the standard or mini volatility futures
+    # VIX may be available through either the standard or mini volatility futures
     # contract in different environments, so try both continuous symbols.
     "VIX": ("VX.c.0", "VXM.c.0"),
 }

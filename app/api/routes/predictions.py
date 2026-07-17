@@ -151,18 +151,20 @@ async def get_latest_buffered_price(symbol: str):
     ring = INDEX_RINGS.get(clean_symbol)
     latest = ring.latest() if ring else None
     fallback_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
+    is_fresh = ring.is_fresh(max_age_seconds=5) if ring else False
+    buffer_length = ring.length_seconds if ring else 0
 
     timestamp = None
     if latest:
-        latest_ts, _ = latest
+        latest_ts, _tick = latest
         timestamp = datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat()
 
     return {
         "symbol": clean_symbol,
         "price": fallback_price,
         "timestamp": timestamp,
-        "fresh": ring.is_fresh(max_age_seconds=5) if ring else False,
-        "buffer_length": ring.length_seconds if ring else 0,
+        "fresh": is_fresh,
+        "buffer_length": buffer_length,
         "has_ring_data": bool(latest),
     }
 
