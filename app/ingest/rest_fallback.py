@@ -14,8 +14,7 @@ from datetime import datetime
 import time
 import os
 
-from app.state.ring_buffers import INDEX_RINGS, update_session_vwap, IndexTick
-from app.ingest.provider_selection import resolve_index_data_provider
+from app.state.ring_buffers import INDEX_RINGS, TRACKED_INDEX_SYMBOLS, update_session_vwap, IndexTick
 from app.utils.time_et import is_regular_hours
 from app.utils.settings import settings
 
@@ -71,7 +70,7 @@ async def poll_polygon_rest():
         return
     
     client = RESTClient(api_key)
-    INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
+    INDEX_SYMBOLS = list(TRACKED_INDEX_SYMBOLS)
     
     log.info(f"Starting REST API polling (every {REST_POLL_INTERVAL}s - premium subscription, unlimited API calls)")
     
@@ -170,24 +169,38 @@ async def start_market_data_fallback():
     1. explicit MARKET_DATA_PROVIDER (databento or polygon)
     2. auto mode: Databento when key exists, else Polygon
     """
-    provider = resolve_index_data_provider()
+    provider = (settings.market_data_provider or "auto").strip().lower()
     global CURRENT_MARKET_DATA_PROVIDER
-
-    CURRENT_MARKET_DATA_PROVIDER = provider
 
     if provider == "databento":
         from app.ingest.databento_fallback import poll_databento_rest
 
-        log.info("Fallback market data provider: Databento")
+        CURRENT_MARKET_DATA_PROVIDER = "databento"
+        log.info("Fallback market data provider: Databento (forced)")
         await poll_databento_rest()
         return
 
     if provider == "polygon":
-        log.info("Fallback market data provider: Polygon")
+        CURRENT_MARKET_DATA_PROVIDER = "polygon"
+        log.info("Fallback market data provider: Polygon (forced)")
         await poll_polygon_rest()
         return
 
-    log.error("No usable index data provider configured: missing Databento and Polygon credentials")
+    # auto mode: prefer Databento when key exists, fall back to Polygon otherwise
+    if settings.databento_api_key:
+        from app.ingest.databento_fallback import poll_databento_rest
+
+        CURRENT_MARKET_DATA_PROVIDER = "databento"
+        log.info("Fallback market data provider: Databento (auto-selected)")
+        await poll_databento_rest()
+    else:
+        if not settings.polygon_api_key:
+            CURRENT_MARKET_DATA_PROVIDER = "unconfigured"
+            log.error("No Databento or Polygon API key configured for fallback market data")
+            return
+        CURRENT_MARKET_DATA_PROVIDER = "polygon"
+        log.info("Fallback market data provider: Polygon (auto-selected)")
+        await poll_polygon_rest()
 
 async def load_cached_snapshots():
     """
@@ -196,7 +209,7 @@ async def load_cached_snapshots():
     """
     from database import get_latest_gamma_snapshot
     
-    INDEX_SYMBOLS = ["SPX", "NDX", "DJI", "RUT"]
+    INDEX_SYMBOLS = list(TRACKED_INDEX_SYMBOLS)
     
     log.info("Starting database fallback for cached snapshots (WebSocket unavailable)")
     

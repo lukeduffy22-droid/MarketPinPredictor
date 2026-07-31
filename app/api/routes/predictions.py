@@ -1,15 +1,20 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
 from app.api import state as api_state
 from app.api.schemas import *
-from app.ingest.provider_selection import resolve_options_data_provider
 from app.utils.settings import settings
 from app.utils.metrics import predict_latency, snapshot
 from app.utils.time_et import now_et, minutes_to_close_et, is_regular_hours, get_cadence_ms
-from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
+from app.state.ring_buffers import (
+    INDEX_RINGS,
+    PREDICTION_SYMBOLS,
+    TRACKED_INDEX_SYMBOLS,
+    get_latest_price,
+    get_latest_price_with_fallback,
+)
 from app.features.calculators import compute_all_features
 from app.models.db_models import get_rmse_for_tau
 
@@ -19,7 +24,8 @@ import time
 log = logging.getLogger("api")
 
 router = APIRouter()
-SUPPORTED_SYMBOLS = ("SPX", "NDX", "DJI", "RUT")
+PREDICTION_ENDPOINT_SYMBOLS = PREDICTION_SYMBOLS
+LIVE_DISPLAY_SYMBOLS = TRACKED_INDEX_SYMBOLS
 DEFAULT_COEFFICIENTS = {
     "beta_vwap": 1.0,
     "beta_gamma": 0.0,
@@ -35,30 +41,6 @@ DEFAULT_MODEL_METADATA = {
 }
 
 
-def _gamma_unavailable_payload(
-    symbol: str,
-    spot_price: float,
-    summary: str,
-    options_root: Optional[str] = None,
-    is_etf_proxy: bool = False,
-):
-    return {
-        "symbol": symbol,
-        "spot_price": spot_price,
-        "pin_strike": None,
-        "pull_strength": 0.0,
-        "total_gex": 0.0,
-        "net_gex": 0.0,
-        "zero_gamma": None,
-        "direction": "unknown",
-        "summary": summary,
-        "data_unavailable": True,
-        "is_etf_proxy": is_etf_proxy,
-        "options_root": options_root or symbol,
-        "gamma_walls": [],
-        "timestamp": now_et().isoformat(),
-    }
-
 @router.get("/levels/eod")
 async def get_gamma_levels(symbol: str) -> LevelsResponse:
     """
@@ -66,7 +48,7 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
     Uses OI cache (no REST calls).
     Works after hours using fallback pricing.
     """
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in LIVE_DISPLAY_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     from app.state.oi_cache import oi_cache
@@ -113,24 +95,12 @@ async def get_gamma_levels(symbol: str) -> LevelsResponse:
 async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
     """Return backend gamma state for Streamlit consumption."""
     clean_symbol = symbol.upper().replace("I:", "")
-    if clean_symbol not in SUPPORTED_SYMBOLS:
+    if clean_symbol not in LIVE_DISPLAY_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
 
     resolved_spot = spot_price or get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
     if not resolved_spot:
         raise HTTPException(503, f"No price data for {clean_symbol}")
-
-    options_provider = resolve_options_data_provider()
-    configured_options_provider = (settings.options_data_provider or "none").strip().lower()
-    if options_provider == "none":
-        summary = "Gamma unavailable: options provider disabled (Databento-only mode)."
-        if configured_options_provider == "polygon" and not settings.polygon_api_key:
-            summary = "Gamma unavailable: Polygon options provider selected but API key is missing."
-        return _gamma_unavailable_payload(
-            symbol=clean_symbol,
-            spot_price=resolved_spot,
-            summary=summary,
-        )
 
     try:
         import options_gamma
@@ -148,15 +118,6 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
             gamma_walls = gamma_walls.to_dict(orient="records")
         if gamma_walls is None:
             gamma_walls = []
-        if gex.get("data_unavailable"):
-            return _gamma_unavailable_payload(
-                symbol=clean_symbol,
-                spot_price=resolved_spot,
-                summary=gex.get("summary", f"Gamma unavailable for {clean_symbol}."),
-                options_root=gex.get("options_root", clean_symbol),
-                is_etf_proxy=gex.get("is_etf_proxy", False),
-            )
-
         summary = "Gamma state available"
 
         return {
@@ -180,6 +141,34 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
         log.exception("Gamma state failed for %s", clean_symbol)
         raise HTTPException(503, "Gamma state error")
 
+
+@router.get("/buffer/latest/{symbol}")
+async def get_latest_buffered_price(symbol: str):
+    """Return the latest cached backend price for a live display symbol."""
+    clean_symbol = symbol.upper().replace("I:", "")
+    if clean_symbol not in LIVE_DISPLAY_SYMBOLS:
+        raise HTTPException(400, f"Invalid symbol: {symbol}")
+
+    ring = INDEX_RINGS.get(clean_symbol)
+    latest = ring.latest() if ring else None
+    fallback_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
+    is_fresh = ring.is_fresh(max_age_seconds=5) if ring else False
+    buffer_length = ring.length_seconds if ring else 0
+
+    timestamp = None
+    if latest:
+        latest_ts, _tick = latest
+        timestamp = datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat()
+
+    return {
+        "symbol": clean_symbol,
+        "price": fallback_price,
+        "timestamp": timestamp,
+        "fresh": is_fresh,
+        "buffer_length": buffer_length,
+        "has_ring_data": bool(latest),
+    }
+
 @router.get("/predict/close")
 async def predict_close(symbol: str) -> PredictionResponse:
     """
@@ -189,7 +178,7 @@ async def predict_close(symbol: str) -> PredictionResponse:
     t0 = time.perf_counter()
     
     # Validate symbol
-    if symbol not in SUPPORTED_SYMBOLS:
+    if symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     dt_utc = datetime.utcnow()
@@ -358,7 +347,7 @@ async def predict_eod(symbol: str) -> EODPredictionResponse:
     Works after hours using fallback pricing from database or Polygon REST API.
     """
     # Validate symbol
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     # Convert symbol to ticker format for Polygon API
@@ -442,7 +431,7 @@ async def get_close_predictor_overlay(symbol: str = "SPX") -> ClosePredictorResp
     
     Returns signals and an adjusted close estimate based on behavioral factors.
     """
-    if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     current_price = get_latest_price_with_fallback(symbol, settings.polygon_api_key)
@@ -582,7 +571,7 @@ async def get_multi_expiry_gamma(symbol: str = "SPX", max_dte: int = 7):
     # Normalize symbol - strip I: prefix if present
     clean_symbol = symbol.replace('I:', '') if symbol.startswith('I:') else symbol
     
-    if clean_symbol not in ("SPX", "NDX", "DJI", "RUT"):
+    if clean_symbol not in PREDICTION_ENDPOINT_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
     
     current_price = get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)

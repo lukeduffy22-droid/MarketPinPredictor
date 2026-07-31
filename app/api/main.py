@@ -19,9 +19,14 @@ from app.utils.time_et import (
     now_et, minutes_to_close_et, is_regular_hours,
     is_power_hour, get_cadence_ms
 )
-from app.state.ring_buffers import INDEX_RINGS, get_latest_price, get_latest_price_with_fallback
+from app.state.ring_buffers import (
+    INDEX_RINGS,
+    PREDICTION_SYMBOLS,
+    TRACKED_INDEX_SYMBOLS,
+    get_latest_price,
+    get_latest_price_with_fallback,
+)
 from app.features.calculators import compute_all_features
-from app.ingest.provider_selection import should_start_polygon_index_stream
 from app.models.db_models import load_coefficients, get_rmse_for_tau
 
 log = logging.getLogger("api")
@@ -78,7 +83,7 @@ async def startup():
     init_db()
     
     # Load coefficients for all symbols
-    for symbol in ("SPX", "NDX", "DJI", "RUT"):
+    for symbol in PREDICTION_SYMBOLS:
         coeff = load_coefficients(symbol)
         
         if coeff:
@@ -120,12 +125,9 @@ async def startup():
     from app.ingest.websocket_aggregator import flush_aggregates
     asyncio.create_task(flush_aggregates())
     
-    # Start Polygon websocket stream only when key is configured
-    if should_start_polygon_index_stream():
-        from app.ingest.websocket_stream import start_websocket_stream
-        asyncio.create_task(start_websocket_stream())
-    else:
-        log.info("Polygon websocket stream disabled by provider selection")
+    # Start WebSocket stream for data ingestion
+    from app.ingest.websocket_stream import start_websocket_stream
+    asyncio.create_task(start_websocket_stream())
     
     # Start dedicated Options WebSocket stream for real-time gamma updates
     from app.ingest.options_websocket_stream import start_options_websocket_stream
@@ -152,13 +154,12 @@ async def health_check():
     """
     import time
     from app.ingest.rest_fallback import is_rest_only_mode, get_market_data_provider
-    from app.ingest.options_websocket_stream import get_options_data_provider
     max_age = 5  # 5 second freshness threshold (1s REST polling)
     
     status = {}
     current_time = int(time.time())
     
-    for symbol in ("SPX", "NDX", "DJI", "RUT"):
+    for symbol in TRACKED_INDEX_SYMBOLS:
         ring = INDEX_RINGS.get(symbol)
         
         is_fresh = ring.is_fresh(max_age_seconds=max_age) if ring else False
@@ -178,12 +179,14 @@ async def health_check():
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
     
-    overall_ok = all(s["fresh"] or not is_regular_hours(datetime.utcnow()) for s in status.values())
+    overall_ok = all(
+        status[symbol]["fresh"] or not is_regular_hours(datetime.utcnow())
+        for symbol in PREDICTION_SYMBOLS
+    )
     
     return {
         "status": "ok" if overall_ok else "degraded",
         "market_data_provider": get_market_data_provider(),
-        "options_data_provider": get_options_data_provider(),
         "symbols": status,
         "timestamp": now_et().isoformat()
     }
