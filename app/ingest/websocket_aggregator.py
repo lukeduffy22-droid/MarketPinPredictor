@@ -11,6 +11,8 @@ from datetime import datetime, date
 
 log = logging.getLogger("ws_ingest")
 
+from app.state.ring_buffers import PREDICTION_SYMBOLS, TRACKED_INDEX_SYMBOLS
+
 # Sub-second accumulator per symbol
 _accum: Dict[str, Dict[int, List]] = defaultdict(lambda: defaultdict(list))
 
@@ -34,7 +36,7 @@ def parse_index_value(msg: dict) -> tuple:
         else:
             return None
         
-        if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        if symbol not in TRACKED_INDEX_SYMBOLS:
             return None
         
         # Get value and timestamp
@@ -75,7 +77,7 @@ def parse_index_aggregate(msg: dict) -> tuple:
         else:
             return None
         
-        if symbol not in ("SPX", "NDX", "DJI", "RUT"):
+        if symbol not in TRACKED_INDEX_SYMBOLS:
             return None
         
         # Get price and timestamp
@@ -119,7 +121,7 @@ def parse_options_trade(msg: dict) -> tuple:
         
         # Extract root (SPX, SPXW, etc)
         root = None
-        for r in ("SPX", "NDX", "DJI", "RUT"):
+        for r in PREDICTION_SYMBOLS:
             if parts.startswith(r):
                 root = r
                 break

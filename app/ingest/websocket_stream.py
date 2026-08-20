@@ -51,6 +51,7 @@ class PolygonWebSocketStream:
             "V.I:NDX",    # NASDAQ 100 value updates
             "V.I:DJI",    # Dow Jones value updates
             "V.I:RUT",    # Russell 2000 value updates
+            "V.I:VIX",    # Volatility index value updates
         ]
     
     def is_active(self) -> bool:

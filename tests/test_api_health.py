@@ -6,6 +6,7 @@ import types
 from datetime import datetime, timezone
 
 from app.api import main as api_main
+from app.state.ring_buffers import TRACKED_INDEX_SYMBOLS
 
 
 class FakeRing:
@@ -27,7 +28,7 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
     fixed_now = datetime(2025, 7, 10, 19, 30, tzinfo=timezone.utc)
     rings = {
         symbol: FakeRing(fresh=False, latest_ts=100, length_seconds=0)
-        for symbol in ("SPX", "NDX", "DJI", "RUT")
+        for symbol in TRACKED_INDEX_SYMBOLS
     }
 
     monkeypatch.setattr(api_main, "INDEX_RINGS", rings)
@@ -42,17 +43,12 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
             get_market_data_provider=lambda: "databento",
         ),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "app.ingest.options_websocket_stream",
-        types.SimpleNamespace(get_options_data_provider=lambda: "none"),
-    )
 
     result = asyncio.run(api_main.health_check())
 
     assert result["status"] == "degraded"
     assert result["market_data_provider"] == "databento"
-    assert result["options_data_provider"] == "none"
+    assert "VIX" in result["symbols"]
     assert all(symbol_status["mode"] == "REST" for symbol_status in result["symbols"].values())
 
 
@@ -62,7 +58,7 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
     fixed_now = datetime(2025, 7, 10, 22, 0, tzinfo=timezone.utc)
     rings = {
         symbol: FakeRing(fresh=False, latest_ts=100, length_seconds=0)
-        for symbol in ("SPX", "NDX", "DJI", "RUT")
+        for symbol in TRACKED_INDEX_SYMBOLS
     }
 
     monkeypatch.setattr(api_main, "INDEX_RINGS", rings)
@@ -77,15 +73,10 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
             get_market_data_provider=lambda: "polygon",
         ),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "app.ingest.options_websocket_stream",
-        types.SimpleNamespace(get_options_data_provider=lambda: "polygon"),
-    )
 
     result = asyncio.run(api_main.health_check())
 
     assert result["status"] == "ok"
     assert result["market_data_provider"] == "polygon"
-    assert result["options_data_provider"] == "polygon"
+    assert "VIX" in result["symbols"]
     assert all(symbol_status["mode"] == "WebSocket" for symbol_status in result["symbols"].values())

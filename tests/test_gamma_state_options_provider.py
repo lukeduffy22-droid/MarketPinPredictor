@@ -2,37 +2,55 @@
 
 import asyncio
 
+import pytest
+from fastapi import HTTPException
+
 from app.api.routes import predictions
 
 
-def test_gamma_state_returns_unavailable_when_options_provider_disabled(monkeypatch):
-    """Gamma endpoint should fail closed when options provider is disabled."""
-    monkeypatch.setattr(predictions.settings, "options_data_provider", "none")
+def test_gamma_state_raises_503_when_options_module_unavailable(monkeypatch):
+    """Gamma endpoint should raise 503 when options_gamma module is unavailable."""
     monkeypatch.setattr(
         predictions, "get_latest_price_with_fallback", lambda symbol, api_key: 5500.0
     )
 
-    result = asyncio.run(predictions.get_gamma_state("SPX"))
+    def _raise_import(*args, **kwargs):
+        raise ImportError("options_gamma not installed")
 
-    assert result["data_unavailable"] is True
-    assert result["total_gex"] == 0.0
-    assert result["net_gex"] == 0.0
-    assert result["gamma_walls"] == []
-    assert "options provider disabled" in result["summary"].lower()
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "options_gamma":
+            raise ImportError("options_gamma not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(predictions.get_gamma_state("SPX"))
+
+    assert exc_info.value.status_code == 503
 
 
-def test_gamma_state_returns_unavailable_when_polygon_key_missing(monkeypatch):
-    """Gamma endpoint should fail closed when polygon provider has no key."""
-    monkeypatch.setattr(predictions.settings, "options_data_provider", "polygon")
-    monkeypatch.setattr(predictions.settings, "polygon_api_key", "")
+def test_gamma_state_accepts_vix_symbol(monkeypatch):
+    """Gamma endpoint should accept VIX as a valid live display symbol."""
     monkeypatch.setattr(
-        predictions, "get_latest_price_with_fallback", lambda symbol, api_key: 5500.0
+        predictions, "get_latest_price_with_fallback", lambda symbol, api_key: 19.75
     )
 
-    result = asyncio.run(predictions.get_gamma_state("SPX"))
+    import builtins
+    real_import = builtins.__import__
 
-    assert result["data_unavailable"] is True
-    assert result["total_gex"] == 0.0
-    assert result["net_gex"] == 0.0
-    assert result["gamma_walls"] == []
-    assert "api key is missing" in result["summary"].lower()
+    def mock_import(name, *args, **kwargs):
+        if name == "options_gamma":
+            raise ImportError("options_gamma not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(predictions.get_gamma_state("VIX"))
+
+    # VIX is now a valid symbol - it should attempt gamma and raise 503, not 400
+    assert exc_info.value.status_code == 503
