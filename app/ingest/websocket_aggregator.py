@@ -9,6 +9,8 @@ from collections import defaultdict
 from typing import Dict, List
 from datetime import datetime, date
 
+from app.state.ring_buffers import PREDICTION_SYMBOLS, TRACKED_INDEX_SYMBOLS
+
 log = logging.getLogger("ws_ingest")
 
 from app.state.ring_buffers import PREDICTION_SYMBOLS, TRACKED_INDEX_SYMBOLS
