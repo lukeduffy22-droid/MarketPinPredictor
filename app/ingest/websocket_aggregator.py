@@ -235,8 +235,7 @@ async def flush_aggregates():
     Runs every 1 second to create 1-second bars.
     Also updates ORB tracker with each price tick.
     """
-    from app.state.ring_buffers import INDEX_RINGS, update_session_vwap
-    from app.state.orb_tracker import update_orb
+    from app.state.ring_buffers import record_live_index_tick
     
     while True:
         try:
@@ -257,14 +256,7 @@ async def flush_aggregates():
                             if result:
                                 ts, agg_tick = result
                                 
-                                # Add to ring buffer
-                                INDEX_RINGS[symbol].add(ts, agg_tick)
-                                
-                                # Update VWAP tracker
-                                update_session_vwap(symbol, agg_tick.price, agg_tick.size)
-                                
-                                # Update ORB tracker (tracks high/low during 9:30-10:30 AM ET)
-                                update_orb(symbol, agg_tick.price)
+                                record_live_index_tick(symbol, agg_tick)
         
         except Exception as e:
             log.error(f"Error in flush_aggregates: {e}")
