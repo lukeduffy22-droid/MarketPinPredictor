@@ -428,7 +428,7 @@ def get_options_subscription_state() -> dict:
     """Return current options websocket subscription state for diagnostics."""
     global _options_stream
     if _options_stream is None:
-        state = {
+        return {
             "stream": "options",
             "provider": CURRENT_OPTIONS_DATA_PROVIDER,
             "running": False,

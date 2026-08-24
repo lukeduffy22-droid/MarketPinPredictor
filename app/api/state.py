@@ -105,33 +105,33 @@ def get_live_model_readiness(symbol: str, now_ts: float = None) -> dict:
 def record_runtime_anomaly(symbol: str, readiness: dict) -> None:
     """Append a deduplicated model-readiness anomaly or recovery event."""
     issues = tuple(readiness.get("issues", ()))
-    previous_issues, last_recorded = _last_anomaly_state.get(
-        symbol,
-        (None, 0.0),
-    )
     now_ts = time.time()
-    heartbeat_due = bool(issues) and now_ts - last_recorded >= 300
-    if issues == previous_issues and not heartbeat_due:
-        return
-
-    event_type = "live_model_anomaly" if issues else "live_model_recovered"
-    payload = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "event_type": event_type,
-        "symbol": symbol,
-        "issues": list(issues),
-        "readiness": readiness,
-    }
-    log_dir = settings.live_anomaly_log_dir
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(
-        log_dir,
-        f"{datetime.now(timezone.utc).date().isoformat()}.ndjson",
-    )
     with _anomaly_lock:
+        previous_issues, last_recorded = _last_anomaly_state.get(
+            symbol,
+            (None, 0.0),
+        )
+        heartbeat_due = bool(issues) and now_ts - last_recorded >= 300
+        if issues == previous_issues and not heartbeat_due:
+            return
+
+        event_type = "live_model_anomaly" if issues else "live_model_recovered"
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "event_type": event_type,
+            "symbol": symbol,
+            "issues": list(issues),
+            "readiness": readiness,
+        }
+        log_dir = settings.live_anomaly_log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir,
+            f"{datetime.now(timezone.utc).date().isoformat()}.ndjson",
+        )
         with open(log_path, "a", encoding="utf-8") as anomaly_file:
             anomaly_file.write(json.dumps(payload, sort_keys=True) + "\n")
-    _last_anomaly_state[symbol] = (issues, now_ts)
+        _last_anomaly_state[symbol] = (issues, now_ts)
     log_method = log.error if issues else log.info
     log_method("%s for %s: %s", event_type, symbol, list(issues))
 

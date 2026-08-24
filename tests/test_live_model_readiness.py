@@ -169,3 +169,13 @@ def test_options_trade_populates_flow_ring():
     assert trade.K == 5500
     assert trade.notional == 2000.0
     assert trade.aggressor == 0
+
+
+def test_options_subscription_state_handles_unstarted_stream(monkeypatch):
+    """Diagnostics should remain available before the options stream starts."""
+    monkeypatch.setattr(options_websocket_stream, "_options_stream", None)
+
+    state = options_websocket_stream.get_options_subscription_state()
+
+    assert state["running"] is False
+    assert state["confirmed_count"] == 0
