@@ -25,6 +25,7 @@ import pandas as pd
 from scipy.optimize import brentq
 from scipy.stats import norm
 
+from app.core.gex import compute_aggregate_gex
 from backend.config import DATA_DIR, MAX_BUFFER_SIZE
 
 logger = logging.getLogger(__name__)
@@ -433,12 +434,15 @@ class DatabentoGammaStreamer:
             if iv is None:
                 continue
             gamma = black_scholes_gamma(spot, float(row["strike"]), years, iv)
-            sign = -1.0 if row["option_type"] == "C" else 1.0
+            exposure = gamma * float(row["open_interest"]) * CONTRACT_MULTIPLIER
+            is_call = row["option_type"] == "C"
             expiration_date = row["expiration_date"]
             days_to_expiry = max((expiration_date - date.today()).days, 0) if isinstance(expiration_date, date) else 0
             calc_rows.append({
                 "strike": float(row["strike"]),
-                "gex": sign * gamma * float(row["open_interest"]) * CONTRACT_MULTIPLIER,
+                "call_gex": exposure if is_call else 0.0,
+                "put_gex": exposure if not is_call else 0.0,
+                "gex": exposure if is_call else -exposure,
                 "option_type": str(row["option_type"]),
                 "days_to_expiry": float(days_to_expiry),
                 "expiration_date": expiration_date,
@@ -459,10 +463,13 @@ class DatabentoGammaStreamer:
         pos_wall = max((strike for strike, value in gex_by_strike.items() if value > 0), key=lambda strike: gex_by_strike[strike], default=None)
         neg_wall = min((strike for strike, value in gex_by_strike.items() if value < 0), key=lambda strike: gex_by_strike[strike], default=None)
         top = sorted(gex_by_strike.items(), key=lambda item: abs(item[1]), reverse=True)[:5]
-        call_gex_total = float(calc.loc[calc["option_type"] == "C", "gex"].abs().sum())
-        put_gex_total = float(calc.loc[calc["option_type"] == "P", "gex"].abs().sum())
-        gross_gex = float(calc["gex"].abs().sum())
-        net_gex = float(calc["gex"].sum())
+        aggregate_gex = compute_aggregate_gex(
+            calc[["strike", "call_gex", "put_gex"]].to_dict(orient="records")
+        )
+        call_gex_total = aggregate_gex.call_gex_total
+        put_gex_total = aggregate_gex.put_gex_total
+        gross_gex = aggregate_gex.gross_gex
+        net_gex = aggregate_gex.net_gex
         min_days = float(calc["days_to_expiry"].min())
         max_days = float(calc["days_to_expiry"].max())
         top_strikes = []

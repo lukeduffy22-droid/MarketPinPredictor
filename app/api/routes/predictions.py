@@ -98,6 +98,25 @@ async def get_gamma_state(symbol: str, spot_price: Optional[float] = None):
     if clean_symbol not in LIVE_DISPLAY_SYMBOLS:
         raise HTTPException(400, f"Invalid symbol: {symbol}")
 
+    from app.ingest.provider_selection import (
+        resolve_index_data_provider,
+        resolve_options_data_provider,
+    )
+
+    if (
+        resolve_options_data_provider() == "none"
+        and resolve_index_data_provider() == "databento"
+    ):
+        from app.ingest.databento_gamma import get_databento_gamma_state
+
+        gamma_state = get_databento_gamma_state(clean_symbol)
+        if gamma_state is None:
+            raise HTTPException(
+                503,
+                f"Live Databento gamma state unavailable for {clean_symbol}",
+            )
+        return gamma_state
+
     resolved_spot = spot_price or get_latest_price_with_fallback(clean_symbol, settings.polygon_api_key)
     if not resolved_spot:
         raise HTTPException(503, f"No price data for {clean_symbol}")

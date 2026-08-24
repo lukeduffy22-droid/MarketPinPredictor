@@ -10,7 +10,7 @@ Provides ORB features for ML prediction enhancement:
 """
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -18,7 +18,7 @@ from pathlib import Path
 import threading
 from typing import Dict, Optional
 
-from app.utils.time_et import now_et, open_time_et, ET
+from app.utils.time_et import now_et, open_time_et
 
 log = logging.getLogger("orb_tracker")
 
@@ -225,9 +225,7 @@ class ORBTracker:
         """Check if current time is within ORB period (9:30-10:30 AM ET)"""
         t = dt or now_et()
         market_open = open_time_et(t)
-        orb_end = market_open.replace(
-            hour=10, minute=30, second=0, microsecond=0
-        )
+        orb_end = market_open + timedelta(minutes=ORB_DURATION_MINUTES)
         return market_open <= t <= orb_end
     
     def update_price(self, symbol: str, price: float, timestamp: Optional[datetime] = None):
