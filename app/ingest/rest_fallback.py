@@ -14,7 +14,13 @@ from datetime import datetime
 import time
 import os
 
-from app.state.ring_buffers import INDEX_RINGS, TRACKED_INDEX_SYMBOLS, update_session_vwap, IndexTick
+from app.state.ring_buffers import (
+    INDEX_RINGS,
+    TRACKED_INDEX_SYMBOLS,
+    IndexTick,
+    record_live_index_tick,
+    update_session_vwap,
+)
 from app.utils.time_et import is_regular_hours
 from app.utils.settings import settings
 
@@ -126,9 +132,7 @@ async def poll_polygon_rest():
                                 # Create tick from REST data
                                 tick = IndexTick(ts=ts, price=price, size=1.0)
                                 
-                                # Add to ring buffer
-                                INDEX_RINGS[symbol].add(ts, tick)
-                                update_session_vwap(symbol, price, 1.0)
+                                record_live_index_tick(symbol, tick)
                                 
                                 # Reset failure count on success
                                 failure_counts[symbol] = 0

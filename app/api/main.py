@@ -116,10 +116,18 @@ async def startup():
             }
             log.warning(f"No coefficients found for {symbol}, using defaults")
     
-    # Start OI cache refresh background task
-    from app.state.oi_cache import schedule_oi_refresh
     import asyncio
-    asyncio.create_task(schedule_oi_refresh())
+    from app.ingest.provider_selection import (
+        resolve_index_data_provider,
+        resolve_options_data_provider,
+    )
+
+    index_provider = resolve_index_data_provider()
+    options_provider = resolve_options_data_provider()
+    if options_provider == "polygon":
+        from app.state.oi_cache import schedule_oi_refresh
+
+        asyncio.create_task(schedule_oi_refresh())
     
     # Start aggregation flush task
     from app.ingest.websocket_aggregator import flush_aggregates
@@ -130,18 +138,27 @@ async def startup():
     asyncio.create_task(start_websocket_stream())
     
     # Start dedicated Options WebSocket stream for real-time gamma updates
-    from app.ingest.options_websocket_stream import start_options_websocket_stream
-    asyncio.create_task(start_options_websocket_stream())
+    if options_provider == "polygon":
+        from app.ingest.options_websocket_stream import start_options_websocket_stream
+
+        asyncio.create_task(start_options_websocket_stream())
+    elif index_provider == "databento":
+        from app.ingest.databento_gamma import start_databento_gamma_stream
+
+        asyncio.create_task(start_databento_gamma_stream())
     
     # Start market data fallback (Databento or Polygon based on settings)
     from app.ingest.rest_fallback import start_market_data_fallback, load_cached_snapshots
     asyncio.create_task(start_market_data_fallback())
     asyncio.create_task(load_cached_snapshots())  # Secondary fallback from DB
+
+    asyncio.create_task(api_state.monitor_live_model_readiness())
     
-    # Start gamma pin scheduler to save snapshots throughout the day
-    from gamma_scheduler import start_gamma_scheduler
-    start_gamma_scheduler()
-    log.info("Gamma pin scheduler started")
+    if options_provider == "polygon":
+        from gamma_scheduler import start_gamma_scheduler
+
+        start_gamma_scheduler()
+        log.info("Gamma pin scheduler started")
     
     log.info("API ready - WebSocket streams + provider-aware fallback poller starting")
 
@@ -154,8 +171,22 @@ async def health_check():
     """
     import time
     from app.ingest.rest_fallback import is_rest_only_mode, get_market_data_provider
+    from app.ingest.provider_selection import (
+        resolve_index_data_provider,
+        resolve_options_data_provider,
+    )
+    from app.state.orb_tracker import get_orb_tracker
+
     max_age = 5  # 5 second freshness threshold (1s REST polling)
-    
+    market_data_provider = get_market_data_provider()
+    if market_data_provider in ("unknown", "unconfigured"):
+        market_data_provider = resolve_index_data_provider()
+    current_et = now_et()
+    orb_required = (
+        is_regular_hours(current_et)
+        and (current_et.hour, current_et.minute) > (10, 30)
+    )
+    orb_tracker = get_orb_tracker()
     status = {}
     current_time = int(time.time())
     
@@ -178,15 +209,54 @@ async def health_check():
             "latest_price": get_latest_price(symbol),
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
+
+        if symbol in PREDICTION_SYMBOLS:
+            model_readiness = api_state.get_live_model_readiness(symbol)
+            orb_data = orb_tracker.get_orb_data(symbol)
+            orb_recorded = bool(
+                orb_data
+                and orb_data.opening_price is not None
+                and orb_data.orb_high is not None
+                and orb_data.orb_low is not None
+            )
+            status[symbol]["prediction_model"] = model_readiness
+            if (
+                market_data_provider == "databento"
+                and resolve_options_data_provider() == "none"
+            ):
+                from app.ingest.databento_gamma import get_databento_gamma_status
+
+                status[symbol]["gamma"] = get_databento_gamma_status(symbol)
+            else:
+                status[symbol]["gamma"] = {
+                    "provider": model_readiness["options"]["provider"],
+                    "supported": True,
+                    "ready": model_readiness["oi"]["fresh"],
+                }
+            status[symbol]["orb"] = {
+                "recorded": orb_recorded,
+                "complete": bool(orb_data and orb_data.orb_complete),
+                "required": orb_required,
+                "tick_count": orb_data.tick_count if orb_data else 0,
+            }
     
     overall_ok = all(
-        status[symbol]["fresh"] or not is_regular_hours(datetime.utcnow())
+        (
+            status[symbol]["fresh"]
+            and status[symbol]["prediction_model"]["ready"]
+            and (
+                not status[symbol]["orb"]["required"]
+                or status[symbol]["orb"]["complete"]
+            )
+        )
+        or not is_regular_hours(current_et)
         for symbol in PREDICTION_SYMBOLS
     )
     
     return {
         "status": "ok" if overall_ok else "degraded",
-        "market_data_provider": get_market_data_provider(),
+        "market_data_provider": market_data_provider,
+        "market_open_ready": overall_ok,
         "symbols": status,
-        "timestamp": now_et().isoformat()
+        "timestamp": current_et.isoformat()
     }

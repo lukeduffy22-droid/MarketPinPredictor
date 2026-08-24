@@ -5,7 +5,7 @@ Optimized for <200ms latency and minimal memory footprint.
 from collections import deque
 from typing import Deque, Tuple, Any, Dict, Optional, NamedTuple
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 
 class IndexTick(NamedTuple):
     """Normalized index price tick"""
@@ -78,6 +78,27 @@ def update_session_vwap(symbol: str, price: float, size: float = 1.0):
     if symbol in _vwap_state:
         _vwap_state[symbol]["sum_pv"] += price * size
         _vwap_state[symbol]["sum_v"] += size
+
+
+def record_live_index_tick(
+    symbol: str,
+    tick: IndexTick,
+    *,
+    update_vwap: bool = True,
+) -> None:
+    """Record a normalized live tick and update all session-derived state."""
+    if symbol not in INDEX_RINGS or tick.price <= 0:
+        return
+
+    INDEX_RINGS[symbol].add(tick.ts, tick)
+    if update_vwap:
+        update_session_vwap(symbol, tick.price, tick.size)
+
+    if symbol in PREDICTION_SYMBOLS:
+        from app.state.orb_tracker import update_orb
+
+        tick_time = datetime.fromtimestamp(tick.ts, tz=timezone.utc)
+        update_orb(symbol, tick.price, tick_time)
 
 def get_session_vwap(symbol: str) -> float:
     """Get current session VWAP for symbol"""
