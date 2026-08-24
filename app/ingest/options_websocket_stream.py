@@ -17,6 +17,7 @@ import websockets
 from polygon.rest import RESTClient
 
 from app.ingest.provider_selection import resolve_options_data_provider
+from app.state.ring_buffers import FLOW_RINGS, OptTrade
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
 
@@ -243,8 +244,6 @@ class OptionsWebSocketStream:
 
             _gamma_tracker.process_trade(root, strike, is_call, notional, ts)
             self._last_trade_time = ts
-
-            from app.state.ring_buffers import FLOW_RINGS, OptTrade
 
             FLOW_RINGS[root].add(
                 ts,

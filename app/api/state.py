@@ -142,7 +142,7 @@ async def monitor_live_model_readiness() -> None:
 
     while True:
         try:
-            if is_regular_hours(datetime.utcnow()):
+            if is_regular_hours(datetime.now(timezone.utc)):
                 for symbol in last_prediction_ts:
                     readiness = get_live_model_readiness(symbol)
                     record_runtime_anomaly(symbol, readiness)
