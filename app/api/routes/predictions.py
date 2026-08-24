@@ -208,6 +208,20 @@ async def predict_close(symbol: str) -> PredictionResponse:
     
     if ring.length_seconds < min_data_seconds:
         raise HTTPException(503, f"Insufficient data for {symbol}")
+
+    readiness = api_state.get_live_model_readiness(symbol)
+    if not readiness["ready"]:
+        api_state.record_runtime_anomaly(symbol, readiness)
+        log.error(
+            "Blocking degraded prediction for %s: %s",
+            symbol,
+            readiness["issues"],
+        )
+        raise HTTPException(
+            503,
+            f"Full gamma/flow model unavailable for {symbol}: "
+            + ", ".join(readiness["issues"]),
+        )
     
     # Get current price
     current_price = get_latest_price(symbol)
@@ -232,10 +246,16 @@ async def predict_close(symbol: str) -> PredictionResponse:
     
     # Get coefficients and fallback metadata
     coeffs = api_state.coefficients_cache.get(symbol)
-    fallback_active = False
-    if not coeffs:
-        coeffs = DEFAULT_COEFFICIENTS
-        fallback_active = True
+    metadata = api_state.model_metadata_cache.get(symbol, DEFAULT_MODEL_METADATA)
+    fallback_active = (
+        not coeffs
+        or metadata.get("coefficients_source") != "database"
+    )
+    if fallback_active:
+        raise HTTPException(
+            503,
+            f"Calibrated coefficients unavailable for {symbol}",
+        )
     
     # Compute prediction using Ridge model
     vwap_dev = features["vwap_deviation"]
@@ -290,12 +310,6 @@ async def predict_close(symbol: str) -> PredictionResponse:
     latency_ms = (time.perf_counter() - t0) * 1000
     predict_latency.record(latency_ms)
     memory = snapshot(f"predict_close:{symbol}")
-    metadata = api_state.model_metadata_cache.get(symbol, DEFAULT_MODEL_METADATA)
-    fallback_reason = (
-        "coefficients cache missing; using deterministic defaults"
-        if fallback_active
-        else None
-    )
     model_metadata = {
         "model_name": "time-adaptive-ridge",
         "model_version": settings.live_model_version,
@@ -304,8 +318,8 @@ async def predict_close(symbol: str) -> PredictionResponse:
         "coefficients_source": metadata.get("coefficients_source", "fallback-defaults"),
         "coefficients_updated_at": metadata.get("coefficients_updated_at"),
         "coefficients_sample_size": metadata.get("coefficients_sample_size", 0),
-        "fallback_active": fallback_active,
-        "fallback_reason": fallback_reason,
+        "fallback_active": False,
+        "fallback_reason": None,
     }
     runtime_metadata = {
         "inference_device": "cpu-live",

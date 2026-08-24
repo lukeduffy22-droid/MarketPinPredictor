@@ -80,6 +80,10 @@ async def get_system_diagnostics():
         },
         "latency": predict_latency.get_percentiles(),
         "memory": snapshot("diagnostics"),
+        "live_model_readiness": {
+            symbol: api_state.get_live_model_readiness(symbol)
+            for symbol in ("SPX", "NDX", "DJI", "RUT")
+        },
         "timestamp": now_et().isoformat(),
     }
 

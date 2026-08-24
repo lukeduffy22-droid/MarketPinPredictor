@@ -28,6 +28,18 @@ _options_singleton_lock = threading.Lock()
 _gamma_update_callback: Optional[Callable] = None
 CURRENT_OPTIONS_DATA_PROVIDER = "none"
 
+
+def _timestamp_seconds(raw_timestamp: int) -> int:
+    """Normalize Polygon millisecond, microsecond, or nanosecond timestamps."""
+    timestamp = int(raw_timestamp or 0)
+    if timestamp > 10**16:
+        return timestamp // 1_000_000_000
+    if timestamp > 10**13:
+        return timestamp // 1_000_000
+    if timestamp > 10**10:
+        return timestamp // 1_000
+    return timestamp
+
 class OptionsGammaTracker:
     """
     Tracks real-time options trades and updates gamma exposure calculations.
@@ -102,6 +114,8 @@ class OptionsWebSocketStream:
             "T.O:SPX*",   # SPX options trades
             "T.O:NDX*",   # NDX options trades
             "T.O:SPXW*",  # SPX weekly options
+            "T.O:DIA*",   # DJI ETF proxy options
+            "T.O:RUT*",   # Russell 2000 options
         ]
     
     def is_active(self) -> bool:
@@ -190,40 +204,64 @@ class OptionsWebSocketStream:
             
             parts = sym[2:]
             
-            root = None
-            for r in ("SPXW", "SPX", "NDX", "DJI", "RUT"):
-                if parts.startswith(r):
-                    root = "SPX" if r == "SPXW" else r
+            options_root = None
+            for candidate in ("SPXW", "SPX", "NDX", "DIA", "RUT"):
+                if parts.startswith(candidate):
+                    options_root = candidate
                     break
-            
-            if not root:
+
+            if not options_root:
                 return
-            
-            parts_after_root = parts[len(root if root != "SPX" else ("SPXW" if parts.startswith("SPXW") else "SPX")):]
-            
-            if len(parts_after_root) < 8:
+
+            root = {"SPXW": "SPX", "DIA": "DJI"}.get(
+                options_root,
+                options_root,
+            )
+            parts_after_root = parts[len(options_root):]
+
+            if len(parts_after_root) < 14:
                 return
-            
+
+            expiration_text = parts_after_root[:6]
             cp_flag = parts_after_root[6] if len(parts_after_root) > 6 else None
             if cp_flag not in ("C", "P"):
                 return
-            
+
             is_call = (cp_flag == "C")
-            
             strike_str = parts_after_root[7:]
             if not strike_str.isdigit():
                 return
             strike = int(strike_str) // 1000
-            
+
             price = msg.get("p", 0)
             size = msg.get("s", 1)
-            ts = msg.get("t", 0) // 1000 if msg.get("t") else 0
-            
+            ts = _timestamp_seconds(msg.get("t", 0))
+            if not ts or not price or not size:
+                return
+
             notional = price * size * 100
-            
+
             _gamma_tracker.process_trade(root, strike, is_call, notional, ts)
             self._last_trade_time = ts
-            
+
+            from app.state.ring_buffers import FLOW_RINGS, OptTrade
+
+            FLOW_RINGS[root].add(
+                ts,
+                OptTrade(
+                    ts=ts,
+                    root=root,
+                    K=strike,
+                    is_call=is_call,
+                    exp=datetime.strptime(
+                        f"20{expiration_text}",
+                        "%Y%m%d",
+                    ).date(),
+                    notional=notional,
+                    aggressor=0,
+                ),
+            )
+
             if _gamma_update_callback:
                 _gamma_update_callback(root, strike, is_call, notional)
                 
@@ -390,7 +428,7 @@ def get_options_subscription_state() -> dict:
     """Return current options websocket subscription state for diagnostics."""
     global _options_stream
     if _options_stream is None:
-        return {
+        state = {
             "stream": "options",
             "provider": CURRENT_OPTIONS_DATA_PROVIDER,
             "running": False,
@@ -415,6 +453,9 @@ def get_options_subscription_state() -> dict:
         "confirmed_count": len(confirmed),
         "confirmed_subscriptions": confirmed,
     }
+    state["trade_counts"] = dict(_gamma_tracker.trade_counts)
+    state["last_update_ts"] = dict(_gamma_tracker.last_update_ts)
+    return state
 
 def set_gamma_update_callback(callback: Callable):
     """Set callback for real-time gamma updates"""

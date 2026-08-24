@@ -137,6 +137,8 @@ async def startup():
     from app.ingest.rest_fallback import start_market_data_fallback, load_cached_snapshots
     asyncio.create_task(start_market_data_fallback())
     asyncio.create_task(load_cached_snapshots())  # Secondary fallback from DB
+
+    asyncio.create_task(api_state.monitor_live_model_readiness())
     
     # Start gamma pin scheduler to save snapshots throughout the day
     from gamma_scheduler import start_gamma_scheduler
@@ -178,9 +180,18 @@ async def health_check():
             "latest_price": get_latest_price(symbol),
             "mode": "REST" if is_rest_only_mode() else "WebSocket"
         }
+
+        if symbol in PREDICTION_SYMBOLS:
+            status[symbol]["prediction_model"] = (
+                api_state.get_live_model_readiness(symbol)
+            )
     
     overall_ok = all(
-        status[symbol]["fresh"] or not is_regular_hours(datetime.utcnow())
+        (
+            status[symbol]["fresh"]
+            and status[symbol]["prediction_model"]["ready"]
+        )
+        or not is_regular_hours(datetime.utcnow())
         for symbol in PREDICTION_SYMBOLS
     )
     

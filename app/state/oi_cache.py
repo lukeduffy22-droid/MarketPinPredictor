@@ -3,18 +3,12 @@ Options open interest cache service.
 Loads OI at 09:35 ET and 13:00 ET to avoid REST calls in prediction path.
 """
 import logging
-import os
 from typing import Dict, Optional
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 from dataclasses import dataclass
 import asyncio
 
 log = logging.getLogger("oi_cache")
-
-# CRITICAL: Simulated OI must NOT leak into production
-# Default to True until real OI data source is wired
-# Set ALLOW_SIMULATED_OI=false in production when real OI is available
-ALLOW_SIMULATED_OI = os.environ.get("ALLOW_SIMULATED_OI", "true").lower() == "true"
 
 @dataclass
 class OISnapshot:
@@ -59,65 +53,92 @@ class OICache:
         
         try:
             log.info(f"Refreshing OI cache for {symbol}")
-            
-            # Get 0DTE options (expiring today)
-            today = datetime.now().date()
-            
-            # Use simulated data for now (real data requires higher API tier)
-            # In production, use: polygon_client.list_options_contracts()
-            # IMPORTANT: Mark this data as simulated
-            self._data[symbol] = self._generate_simulated_oi(symbol)
-            self._is_simulated[symbol] = True  # Mark as simulated data
-            
+
+            snapshots = await asyncio.to_thread(
+                self._load_live_chain,
+                symbol,
+                polygon_client,
+            )
+            if not snapshots:
+                raise RuntimeError("live options chain contained no usable OI")
+
+            self._data[symbol] = snapshots
+            self._is_simulated[symbol] = False
             self._last_refresh[symbol] = now_et()
-            
-            log.info(f"OI cache refreshed for {symbol}: {len(self._data[symbol])} strikes (SIMULATED)")
-            
+
+            log.info(
+                "OI cache refreshed for %s: %d strikes (LIVE)",
+                symbol,
+                len(snapshots),
+            )
+
         except Exception as e:
             log.error(f"Failed to refresh OI cache for {symbol}: {e}")
         finally:
             self._refresh_in_progress = False
-    
-    def _generate_simulated_oi(self, symbol: str) -> Dict[int, OISnapshot]:
-        """
-        Generate simulated OI data for testing.
-        Replace with real API calls when higher-tier access is available.
-        """
-        from app.state.ring_buffers import get_latest_price
-        
-        current_price = get_latest_price(symbol)
-        if not current_price:
-            # Use reasonable defaults
-            defaults = {"SPX": 6000, "NDX": 21000, "DJI": 44000, "RUT": 2300}
-            current_price = defaults.get(symbol, 6000)
-        
-        # Generate strikes around current price
-        strikes = {}
-        strike_step = 25 if symbol == "SPX" else 50
-        
-        for i in range(-10, 11):  # 20 strikes around ATM
-            K = int(current_price + i * strike_step)
-            
-            # Distance from ATM affects OI (higher near ATM)
-            dist = abs(i)
-            oi_base = max(100, 1000 - dist * 50)
-            
-            strikes[K] = OISnapshot(
-                K=K,
-                oi_call=oi_base,
-                oi_put=oi_base,
-                iv_call=0.15 + dist * 0.01,  # IV smile
-                iv_put=0.15 + dist * 0.01,
-                exp=datetime.now().date()
+
+    @staticmethod
+    def _load_live_chain(symbol: str, polygon_client) -> Dict[int, OISnapshot]:
+        """Load the nearest live options expiry into strike-level OI snapshots."""
+        options_root = {"DJI": "DIA"}.get(symbol, symbol)
+        today = date.today()
+        by_expiry: Dict[date, Dict[int, OISnapshot]] = {}
+
+        for contract in polygon_client.list_snapshot_options_chain(options_root):
+            details = getattr(contract, "details", None)
+            if details is None:
+                continue
+
+            try:
+                expiry = date.fromisoformat(str(details.expiration_date))
+                strike = int(round(float(details.strike_price)))
+                contract_type = str(details.contract_type).lower()
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+            if expiry < today or contract_type not in ("call", "put"):
+                continue
+
+            open_interest = int(getattr(contract, "open_interest", 0) or 0)
+            implied_volatility = float(
+                getattr(contract, "implied_volatility", 0.0) or 0.0
             )
-        
-        return strikes
+            if open_interest <= 0 or implied_volatility <= 0:
+                continue
+
+            expiry_data = by_expiry.setdefault(expiry, {})
+            snapshot = expiry_data.setdefault(
+                strike,
+                OISnapshot(
+                    K=strike,
+                    oi_call=0,
+                    oi_put=0,
+                    iv_call=0.0,
+                    iv_put=0.0,
+                    exp=expiry,
+                ),
+            )
+            if contract_type == "call":
+                snapshot.oi_call += open_interest
+                snapshot.iv_call = implied_volatility
+            else:
+                snapshot.oi_put += open_interest
+                snapshot.iv_put = implied_volatility
+
+        if not by_expiry:
+            return {}
+
+        nearest_expiry = min(by_expiry)
+        return {
+            strike: snapshot
+            for strike, snapshot in by_expiry[nearest_expiry].items()
+            if snapshot.iv_call > 0 and snapshot.iv_put > 0
+        }
     
     def get_oi(self, symbol: str, strike: int) -> Optional[OISnapshot]:
         """Get OI snapshot for specific strike"""
-        # Fail closed: don't return simulated OI in live mode
-        if not ALLOW_SIMULATED_OI and self._is_simulated.get(symbol, False):
-            log.warning(f"Simulated OI requested for {symbol} strike {strike} but ALLOW_SIMULATED_OI=false")
+        if self._is_simulated.get(symbol, False):
+            log.warning(f"Simulated OI requested for {symbol} strike {strike}")
             return None
         return self._data.get(symbol, {}).get(strike)
     
@@ -125,17 +146,14 @@ class OICache:
         """
         Get all strikes for symbol.
         
-        IMPORTANT: Fails closed if simulated OI would be returned in live mode.
-        Set ALLOW_SIMULATED_OI=true in environment for local testing only.
+        IMPORTANT: Always fails closed if simulated OI would be returned.
         """
-        # Fail closed: don't return simulated OI in live mode
-        if not ALLOW_SIMULATED_OI and self._is_simulated.get(symbol, False):
+        if self._is_simulated.get(symbol, False):
             log.warning(
                 f"OI cache is returning simulated OI for {symbol}. "
-                "Disable simulation or wire real OI for live runs. "
-                "Set ALLOW_SIMULATED_OI=true for testing."
+                "Gamma is unavailable until a live refresh succeeds."
             )
-            return {}  # Return empty dict to fail closed
+            return {}
         return self._data.get(symbol, {})
     
     def is_fresh(self, symbol: str, max_age_minutes: int = 120) -> bool:
@@ -149,6 +167,17 @@ class OICache:
         
         return age <= max_age_minutes
 
+    def get_status(self, symbol: str, max_age_minutes: int = 120) -> dict:
+        """Return provenance and freshness for a symbol's OI cache."""
+        snapshots = self.get_all_strikes(symbol)
+        last_refresh = self._last_refresh.get(symbol)
+        return {
+            "fresh": self.is_fresh(symbol, max_age_minutes=max_age_minutes),
+            "simulated": self._is_simulated.get(symbol, False),
+            "strike_count": len(snapshots),
+            "last_refresh": last_refresh.isoformat() if last_refresh else None,
+        }
+
 # Global OI cache instance
 oi_cache = OICache()
 
@@ -161,26 +190,39 @@ async def schedule_oi_refresh():
     from app.utils.settings import settings
     from polygon.rest import RESTClient
     
+    if not settings.polygon_api_key:
+        log.error("Polygon API key unavailable; live OI refresh disabled")
+        return
+
     client = RESTClient(settings.polygon_api_key)
     
     while True:
         try:
             current = now_et()
             
-            # Check if we should refresh (09:35 or 13:00 ET)
-            should_refresh = False
-            
-            if current.hour == 9 and current.minute == 35:
-                should_refresh = True
-            elif current.hour == 13 and current.minute == 0:
-                should_refresh = True
+            scheduled_refresh = (
+                (current.hour == 9 and current.minute == 35)
+                or (current.hour == 13 and current.minute == 0)
+            )
+            market_open_refresh = (
+                9 <= current.hour < 16
+                and current.weekday() < 5
+                and any(
+                    not oi_cache.is_fresh(
+                        symbol,
+                        max_age_minutes=settings.max_oi_age_minutes,
+                    )
+                    for symbol in ("SPX", "NDX", "DJI", "RUT")
+                )
+            )
+            should_refresh = scheduled_refresh or market_open_refresh
             
             if should_refresh:
                 for symbol in ("SPX", "NDX", "DJI", "RUT"):
                     await oi_cache.refresh(symbol, client)
                 
-                # Wait 2 minutes to avoid double-refresh
-                await asyncio.sleep(120)
+                # Avoid hammering the chain API after either success or failure.
+                await asyncio.sleep(300)
             else:
                 # Check every 30 seconds
                 await asyncio.sleep(30)
