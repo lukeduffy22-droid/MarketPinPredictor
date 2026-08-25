@@ -79,10 +79,25 @@ class OICache:
 
     @staticmethod
     def _load_live_chain(symbol: str, polygon_client) -> Dict[int, OISnapshot]:
-        """Load the nearest live options expiry into strike-level OI snapshots."""
-        options_root = {"DJI": "DIA"}.get(symbol, symbol)
+        """Load today's live options expiry into strike-level OI snapshots.
+
+        DJI is excluded from live chain loading because the ETF proxy (DIA,
+        ~$400 strikes) is incompatible with the DJI index price (~$44,000);
+        the downstream Black-Scholes gamma calculator would underflow to zero.
+        Only today's expiry is accepted so that T=1/365 0DTE assumptions in
+        the gamma calculator remain valid.
+        """
+        if symbol == "DJI":
+            log.warning(
+                "Live OI load for DJI is unsupported: DIA proxy strikes are on a "
+                "different price scale than the DJI index. Gamma pins for DJI are "
+                "unavailable."
+            )
+            return {}
+
+        options_root = symbol
         today = date.today()
-        by_expiry: Dict[date, Dict[int, OISnapshot]] = {}
+        today_data: Dict[int, OISnapshot] = {}
 
         for contract in polygon_client.list_snapshot_options_chain(options_root):
             details = getattr(contract, "details", None)
@@ -96,7 +111,7 @@ class OICache:
             except (AttributeError, TypeError, ValueError):
                 continue
 
-            if expiry < today or contract_type not in ("call", "put"):
+            if expiry != today or contract_type not in ("call", "put"):
                 continue
 
             open_interest = int(getattr(contract, "open_interest", 0) or 0)
@@ -106,8 +121,7 @@ class OICache:
             if open_interest <= 0 or implied_volatility <= 0:
                 continue
 
-            expiry_data = by_expiry.setdefault(expiry, {})
-            snapshot = expiry_data.setdefault(
+            snapshot = today_data.setdefault(
                 strike,
                 OISnapshot(
                     K=strike,
@@ -125,13 +139,19 @@ class OICache:
                 snapshot.oi_put += open_interest
                 snapshot.iv_put = implied_volatility
 
-        if not by_expiry:
+        if not today_data:
+            log.warning(
+                "No 0DTE options contracts found for %s on %s. "
+                "Failing closed to prevent incorrect T=1/365 gamma calculations "
+                "from non-0DTE strikes.",
+                symbol,
+                today,
+            )
             return {}
 
-        nearest_expiry = min(by_expiry)
         return {
             strike: snapshot
-            for strike, snapshot in by_expiry[nearest_expiry].items()
+            for strike, snapshot in today_data.items()
             if snapshot.iv_call > 0 and snapshot.iv_put > 0
         }
     

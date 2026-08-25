@@ -178,8 +178,20 @@ class ORBTracker:
             log.error("Unable to restore ORB audit data from %s: %s", path, exc)
 
     def _ensure_trading_day(self, trading_date: date) -> None:
-        """Reset and initialize all prediction symbols for a trading day."""
+        """Reset and initialize all prediction symbols for a trading day.
+
+        Only advances to a newer date; out-of-order or replayed prior-day
+        ticks are silently ignored to prevent stale data from erasing live ORBs.
+        """
         if self._last_reset_date == trading_date:
+            return
+
+        if self._last_reset_date is not None and trading_date < self._last_reset_date:
+            log.debug(
+                "Ignoring out-of-order trading date %s (current day %s)",
+                trading_date,
+                self._last_reset_date,
+            )
             return
 
         log.info("New trading day %s, resetting ORB data", trading_date)

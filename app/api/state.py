@@ -71,16 +71,28 @@ def get_live_model_readiness(symbol: str, now_ts: float = None) -> dict:
         issues.append("gamma_coefficient_inactive")
     if not flow_coefficient_active:
         issues.append("flow_coefficient_inactive")
-    if options_provider != "polygon":
+
+    if options_provider == "polygon":
+        if not options_stream_active:
+            issues.append("options_stream_inactive")
+        if oi_status["simulated"]:
+            issues.append("simulated_oi_rejected")
+        elif not oi_status["fresh"] or oi_status["strike_count"] == 0:
+            issues.append("live_oi_unavailable")
+        if not flow_ready:
+            issues.append("live_options_flow_stale")
+    elif options_provider == "none":
+        # Databento-only deployment: OI and options flow come from the Databento
+        # gamma stream, not from Polygon.  Only block when Databento gamma itself
+        # is unavailable.
+        from app.ingest.databento_gamma import get_databento_gamma_status
+        db_status = get_databento_gamma_status(symbol)
+        if not db_status["supported"]:
+            issues.append("databento_gamma_symbol_unsupported")
+        elif not db_status["ready"]:
+            issues.append("databento_gamma_unavailable")
+    else:
         issues.append("live_options_provider_unavailable")
-    elif not options_stream_active:
-        issues.append("options_stream_inactive")
-    if oi_status["simulated"]:
-        issues.append("simulated_oi_rejected")
-    elif not oi_status["fresh"] or oi_status["strike_count"] == 0:
-        issues.append("live_oi_unavailable")
-    if not flow_ready:
-        issues.append("live_options_flow_stale")
 
     return {
         "ready": not issues,
@@ -123,14 +135,17 @@ def record_runtime_anomaly(symbol: str, readiness: dict) -> None:
             "issues": list(issues),
             "readiness": readiness,
         }
-        log_dir = settings.live_anomaly_log_dir
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(
-            log_dir,
-            f"{datetime.now(timezone.utc).date().isoformat()}.ndjson",
-        )
-        with open(log_path, "a", encoding="utf-8") as anomaly_file:
-            anomaly_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        try:
+            log_dir = settings.live_anomaly_log_dir
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(
+                log_dir,
+                f"{datetime.now(timezone.utc).date().isoformat()}.ndjson",
+            )
+            with open(log_path, "a", encoding="utf-8") as anomaly_file:
+                anomaly_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        except OSError as exc:
+            log.warning("Unable to persist readiness anomaly for %s: %s", symbol, exc)
         _last_anomaly_state[symbol] = (issues, now_ts)
     log_method = log.error if issues else log.info
     log_method("%s for %s: %s", event_type, symbol, list(issues))

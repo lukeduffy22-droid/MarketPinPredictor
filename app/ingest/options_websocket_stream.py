@@ -206,7 +206,7 @@ class OptionsWebSocketStream:
             parts = sym[2:]
             
             options_root = None
-            for candidate in ("SPXW", "SPX", "NDX", "DIA", "RUT"):
+            for candidate in ("SPXW", "NDXP", "RUTW", "SPX", "NDX", "DIA", "RUT"):
                 if parts.startswith(candidate):
                     options_root = candidate
                     break
@@ -214,7 +214,7 @@ class OptionsWebSocketStream:
             if not options_root:
                 return
 
-            root = {"SPXW": "SPX", "DIA": "DJI"}.get(
+            root = {"SPXW": "SPX", "NDXP": "NDX", "RUTW": "RUT", "DIA": "DJI"}.get(
                 options_root,
                 options_root,
             )
@@ -245,21 +245,22 @@ class OptionsWebSocketStream:
             _gamma_tracker.process_trade(root, strike, is_call, notional, ts)
             self._last_trade_time = ts
 
-            FLOW_RINGS[root].add(
-                ts,
-                OptTrade(
-                    ts=ts,
-                    root=root,
-                    K=strike,
-                    is_call=is_call,
-                    exp=datetime.strptime(
-                        f"20{expiration_text}",
-                        "%Y%m%d",
-                    ).date(),
-                    notional=notional,
-                    aggressor=0,
-                ),
-            )
+            if root in FLOW_RINGS:
+                FLOW_RINGS[root].add(
+                    ts,
+                    OptTrade(
+                        ts=ts,
+                        root=root,
+                        K=strike,
+                        is_call=is_call,
+                        exp=datetime.strptime(
+                            f"20{expiration_text}",
+                            "%Y%m%d",
+                        ).date(),
+                        notional=notional,
+                        aggressor=0,
+                    ),
+                )
 
             if _gamma_update_callback:
                 _gamma_update_callback(root, strike, is_call, notional)
@@ -441,7 +442,7 @@ def get_options_subscription_state() -> dict:
 
     requested = sorted(list(_options_stream.subscriptions))
     confirmed = sorted(list(_options_stream._subscribed_channels))
-    return {
+    state = {
         "stream": "options",
         "provider": CURRENT_OPTIONS_DATA_PROVIDER,
         "running": bool(_options_stream.running),

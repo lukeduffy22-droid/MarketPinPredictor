@@ -20,7 +20,13 @@ def test_all_prediction_symbols_are_reported_before_first_tick(tmp_path, monkeyp
     assert set(tracker.get_all_orb_data()) == set(ORB_SYMBOLS)
 
 
-def test_orb_uses_tick_timestamp_and_persists_once(tmp_path):
+def test_orb_uses_tick_timestamp_and_persists_once(tmp_path, monkeypatch):
+    from app.utils.time_et import now_et as _real_now_et
+
+    monkeypatch.setattr(
+        "app.state.orb_tracker.now_et",
+        lambda dt=None: _real_now_et(_utc_timestamp(9, 0)) if dt is None else _real_now_et(dt),
+    )
     tracker = ORBTracker(export_dir=tmp_path)
 
     tracker.update_price("SPX", 6500.0, _utc_timestamp(13, 30))
@@ -42,7 +48,13 @@ def test_orb_uses_tick_timestamp_and_persists_once(tmp_path):
     assert records[0]["symbol"] == "SPX"
 
 
-def test_completed_orb_is_restored_after_restart(tmp_path):
+def test_completed_orb_is_restored_after_restart(tmp_path, monkeypatch):
+    from app.utils.time_et import now_et as _real_now_et
+
+    monkeypatch.setattr(
+        "app.state.orb_tracker.now_et",
+        lambda dt=None: _real_now_et(_utc_timestamp(9, 0)) if dt is None else _real_now_et(dt),
+    )
     tracker = ORBTracker(export_dir=tmp_path)
     tracker.update_price("NDX", 24000.0, _utc_timestamp(13, 30))
     tracker.update_price("NDX", 24100.0, _utc_timestamp(14, 0))

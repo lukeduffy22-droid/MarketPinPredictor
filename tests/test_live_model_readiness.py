@@ -114,8 +114,8 @@ def test_anomaly_log_is_append_only_and_deduplicated(monkeypatch, tmp_path):
     assert records[0]["event_type"] == "live_model_anomaly"
 
 
-def test_live_oi_loader_uses_nearest_expiry():
-    """The OI cache should aggregate live call and put data by strike."""
+def test_live_oi_loader_uses_today_only_expiry():
+    """Only today's 0DTE contracts should be loaded; future expiries must be excluded."""
     def contract(expiry: str, kind: str, oi: int, iv: float):
         return SimpleNamespace(
             details=SimpleNamespace(
@@ -145,11 +145,14 @@ def test_live_oi_loader_uses_nearest_expiry():
     assert snapshots[5500].exp == today
 
 
-def test_options_trade_populates_flow_ring():
+def test_options_trade_populates_flow_ring(monkeypatch):
     """Dedicated options ingestion must feed the model's flow ring."""
+    from app.state.ring_buffers import Ring1s
+
+    test_ring = Ring1s()
+    monkeypatch.setitem(FLOW_RINGS, "SPX", test_ring)
+
     stream = options_websocket_stream.OptionsWebSocketStream()
-    ring = FLOW_RINGS["SPX"]
-    ring.q.clear()
     timestamp_ns = 1_800_000_000_000_000_000
 
     asyncio.run(
@@ -163,7 +166,7 @@ def test_options_trade_populates_flow_ring():
         )
     )
 
-    timestamp, trade = ring.latest()
+    timestamp, trade = test_ring.latest()
     assert timestamp == 1_800_000_000
     assert trade.root == "SPX"
     assert trade.K == 5500
