@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
-from app.state.ring_buffers import INDEX_RINGS, IndexTick, update_session_vwap
+from app.state.ring_buffers import IndexTick, record_live_index_tick
 from app.utils.settings import settings
 from app.utils.time_et import is_regular_hours
 
@@ -133,8 +133,7 @@ async def poll_databento_rest() -> None:
 
             for symbol, price in prices.items():
                 tick = IndexTick(ts=ts, price=price, size=1.0)
-                INDEX_RINGS[symbol].add(ts, tick)
-                update_session_vwap(symbol, price, 1.0)
+                record_live_index_tick(symbol, tick)
 
             await asyncio.sleep(DATABENTO_POLL_INTERVAL)
         except Exception as exc:
