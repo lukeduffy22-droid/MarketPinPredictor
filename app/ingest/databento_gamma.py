@@ -1,6 +1,7 @@
 """Lifecycle and API adapter for Databento OPRA gamma-pin streaming."""
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.utils.settings import settings
@@ -9,6 +10,22 @@ from app.utils.settings import settings
 log = logging.getLogger("databento_gamma")
 SUPPORTED_GAMMA_SYMBOLS = ("SPX", "NDX", "RUT")
 _streamer = None
+
+
+def _result_is_fresh(result: dict) -> bool:
+    """Return whether a Databento result is recent enough for live use."""
+    timestamp = result.get("timestamp")
+    if isinstance(timestamp, str):
+        try:
+            timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if not isinstance(timestamp, datetime):
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+    return 0 <= age_seconds <= settings.max_gamma_age_seconds
 
 
 async def start_databento_gamma_stream() -> None:
@@ -36,7 +53,7 @@ def get_databento_gamma_state(symbol: str) -> Optional[dict]:
     if _streamer is None or clean_symbol not in SUPPORTED_GAMMA_SYMBOLS:
         return None
     result = _streamer.get_latest_pin(clean_symbol)
-    if not result:
+    if not result or not _result_is_fresh(result):
         return None
 
     gross_gex = float(result.get("gross_gex") or 0.0)

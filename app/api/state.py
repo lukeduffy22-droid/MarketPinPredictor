@@ -123,14 +123,18 @@ def record_runtime_anomaly(symbol: str, readiness: dict) -> None:
             "issues": list(issues),
             "readiness": readiness,
         }
-        log_dir = settings.live_anomaly_log_dir
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(
-            log_dir,
-            f"{datetime.now(timezone.utc).date().isoformat()}.ndjson",
-        )
-        with open(log_path, "a", encoding="utf-8") as anomaly_file:
-            anomaly_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        try:
+            log_dir = settings.live_anomaly_log_dir
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(
+                log_dir,
+                f"{datetime.now(timezone.utc).date().isoformat()}.ndjson",
+            )
+            with open(log_path, "a", encoding="utf-8") as anomaly_file:
+                anomaly_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        except OSError as exc:
+            log.error("Unable to persist runtime anomaly for %s: %s", symbol, exc)
+            return
         _last_anomaly_state[symbol] = (issues, now_ts)
     log_method = log.error if issues else log.info
     log_method("%s for %s: %s", event_type, symbol, list(issues))

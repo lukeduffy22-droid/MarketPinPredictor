@@ -79,12 +79,15 @@ class OICache:
 
     @staticmethod
     def _load_live_chain(symbol: str, polygon_client) -> Dict[int, OISnapshot]:
-        """Load the nearest live options expiry into strike-level OI snapshots."""
-        options_root = {"DJI": "DIA"}.get(symbol, symbol)
-        today = date.today()
-        by_expiry: Dict[date, Dict[int, OISnapshot]] = {}
+        """Load today's live options expiry into strike-level OI snapshots."""
+        if symbol == "DJI":
+            log.warning("DJI OI unavailable: DIA proxy strikes are not index-scaled")
+            return {}
 
-        for contract in polygon_client.list_snapshot_options_chain(options_root):
+        today = date.today()
+        expiry_data: Dict[int, OISnapshot] = {}
+
+        for contract in polygon_client.list_snapshot_options_chain(symbol):
             details = getattr(contract, "details", None)
             if details is None:
                 continue
@@ -96,7 +99,7 @@ class OICache:
             except (AttributeError, TypeError, ValueError):
                 continue
 
-            if expiry < today or contract_type not in ("call", "put"):
+            if expiry != today or contract_type not in ("call", "put"):
                 continue
 
             open_interest = int(getattr(contract, "open_interest", 0) or 0)
@@ -106,7 +109,6 @@ class OICache:
             if open_interest <= 0 or implied_volatility <= 0:
                 continue
 
-            expiry_data = by_expiry.setdefault(expiry, {})
             snapshot = expiry_data.setdefault(
                 strike,
                 OISnapshot(
@@ -125,13 +127,9 @@ class OICache:
                 snapshot.oi_put += open_interest
                 snapshot.iv_put = implied_volatility
 
-        if not by_expiry:
-            return {}
-
-        nearest_expiry = min(by_expiry)
         return {
             strike: snapshot
-            for strike, snapshot in by_expiry[nearest_expiry].items()
+            for strike, snapshot in expiry_data.items()
             if snapshot.iv_call > 0 and snapshot.iv_put > 0
         }
     

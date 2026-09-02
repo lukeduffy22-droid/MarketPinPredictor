@@ -16,7 +16,7 @@ class _FakeStreamer:
     def get_latest_pin(self, symbol):
         return {
             "symbol": symbol,
-            "timestamp": datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc),
+            "timestamp": datetime.now(timezone.utc),
             "price": 6500.0,
             "gamma_pin": 6525.0,
             "zero_gamma": 6475.0,
@@ -47,6 +47,17 @@ def test_databento_gamma_fails_closed_for_unsupported_symbol(monkeypatch):
         "supported": False,
         "ready": False,
     }
+
+
+def test_databento_gamma_rejects_stale_pin(monkeypatch):
+    """Cached gamma results must expire when live updates stop."""
+    streamer = _FakeStreamer()
+    stale = streamer.get_latest_pin("SPX")
+    stale["timestamp"] = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(streamer, "get_latest_pin", lambda _symbol: stale)
+    monkeypatch.setattr(databento_gamma, "_streamer", streamer)
+
+    assert databento_gamma.get_databento_gamma_state("SPX") is None
 
 
 def test_gamma_route_uses_databento_and_fails_closed_when_warming(monkeypatch):

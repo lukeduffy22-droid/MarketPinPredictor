@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     max_tick_age_seconds: int = 5  # Maximum age for index ticks during RTH
     min_ring_length_seconds: int = 300  # Minimum data required for predictions
     max_oi_age_minutes: int = 120
+    max_gamma_age_seconds: int = 60
     max_options_flow_age_seconds: int = 60
     live_monitor_interval_seconds: int = 30
     live_anomaly_log_dir: str = "logs/runtime_anomalies"

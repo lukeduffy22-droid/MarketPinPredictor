@@ -114,7 +114,7 @@ def test_anomaly_log_is_append_only_and_deduplicated(monkeypatch, tmp_path):
     assert records[0]["event_type"] == "live_model_anomaly"
 
 
-def test_live_oi_loader_uses_nearest_expiry():
+def test_live_oi_loader_uses_same_day_expiry():
     """The OI cache should aggregate live call and put data by strike."""
     def contract(expiry: str, kind: str, oi: int, iv: float):
         return SimpleNamespace(
@@ -145,11 +145,29 @@ def test_live_oi_loader_uses_nearest_expiry():
     assert snapshots[5500].exp == today
 
 
-def test_options_trade_populates_flow_ring():
+def test_live_oi_loader_rejects_future_only_and_dia_proxy():
+    """OI must fail closed without same-day, index-scaled contracts."""
+    tomorrow = date.fromordinal(date.today().toordinal() + 1)
+    contract = SimpleNamespace(
+        details=SimpleNamespace(
+            expiration_date=tomorrow.isoformat(),
+            strike_price=5500,
+            contract_type="call",
+        ),
+        open_interest=100,
+        implied_volatility=0.2,
+    )
+    client = SimpleNamespace(list_snapshot_options_chain=lambda root: [contract])
+
+    assert OICache._load_live_chain("SPX", client) == {}
+    assert OICache._load_live_chain("DJI", client) == {}
+
+
+def test_options_trade_populates_flow_ring(monkeypatch):
     """Dedicated options ingestion must feed the model's flow ring."""
     stream = options_websocket_stream.OptionsWebSocketStream()
-    ring = FLOW_RINGS["SPX"]
-    ring.q.clear()
+    ring = type(FLOW_RINGS["SPX"])()
+    monkeypatch.setitem(FLOW_RINGS, "SPX", ring)
     timestamp_ns = 1_800_000_000_000_000_000
 
     asyncio.run(
@@ -169,6 +187,47 @@ def test_options_trade_populates_flow_ring():
     assert trade.K == 5500
     assert trade.notional == 2000.0
     assert trade.aggressor == 0
+
+
+def test_weekly_option_roots_populate_index_flow_rings(monkeypatch):
+    """NDXP and RUTW trades must map to their index flow rings."""
+    stream = options_websocket_stream.OptionsWebSocketStream()
+    ndx_ring = type(FLOW_RINGS["NDX"])()
+    rut_ring = type(FLOW_RINGS["RUT"])()
+    monkeypatch.setitem(FLOW_RINGS, "NDX", ndx_ring)
+    monkeypatch.setitem(FLOW_RINGS, "RUT", rut_ring)
+
+    asyncio.run(stream._process_options_trade({
+        "sym": "O:NDXP260902C24000000", "p": 10.0, "s": 1, "t": 1_800_000_000_000_000_000,
+    }))
+    asyncio.run(stream._process_options_trade({
+        "sym": "O:RUTW260902P02200000", "p": 5.0, "s": 1, "t": 1_800_000_000_000_000_000,
+    }))
+
+    assert ndx_ring.latest()[1].root == "NDX"
+    assert rut_ring.latest()[1].root == "RUT"
+
+
+def test_options_subscription_state_includes_trade_diagnostics(monkeypatch):
+    """Running-stream diagnostics must include processed trade counters."""
+    stream = options_websocket_stream.OptionsWebSocketStream()
+    monkeypatch.setattr(options_websocket_stream, "_options_stream", stream)
+    monkeypatch.setattr(options_websocket_stream._gamma_tracker, "trade_counts", {"SPX": 4})
+    monkeypatch.setattr(options_websocket_stream._gamma_tracker, "last_update_ts", {"SPX": 123.0})
+
+    state = options_websocket_stream.get_options_subscription_state()
+
+    assert state["trade_counts"] == {"SPX": 4}
+    assert state["last_update_ts"] == {"SPX": 123.0}
+
+
+def test_anomaly_write_failure_is_best_effort(monkeypatch, tmp_path):
+    """A log filesystem failure must not escape the readiness path."""
+    monkeypatch.setattr(api_state.settings, "live_anomaly_log_dir", str(tmp_path))
+    monkeypatch.setattr(api_state.os, "makedirs", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("full")))
+    api_state._last_anomaly_state.clear()
+
+    api_state.record_runtime_anomaly("SPX", {"ready": False, "issues": ["live_oi_unavailable"]})
 
 
 def test_options_subscription_state_handles_unstarted_stream(monkeypatch):

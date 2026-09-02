@@ -181,6 +181,8 @@ class ORBTracker:
         """Reset and initialize all prediction symbols for a trading day."""
         if self._last_reset_date == trading_date:
             return
+        if self._last_reset_date is not None and trading_date < self._last_reset_date:
+            return
 
         log.info("New trading day %s, resetting ORB data", trading_date)
         self._orb_data.clear()
@@ -240,6 +242,9 @@ class ORBTracker:
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
         t = now_et(t)
+        if self._last_reset_date is not None and t.date() < self._last_reset_date:
+            log.warning("Ignoring out-of-order %s tick dated %s", symbol, t.date())
+            return
         orb = self._get_or_create_orb(symbol, t.date())
         
         # Only update ORB high/low during ORB period (9:30-10:30 AM ET)

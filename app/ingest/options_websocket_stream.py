@@ -206,7 +206,7 @@ class OptionsWebSocketStream:
             parts = sym[2:]
             
             options_root = None
-            for candidate in ("SPXW", "SPX", "NDX", "DIA", "RUT"):
+            for candidate in ("SPXW", "NDXP", "RUTW", "SPX", "NDX", "DIA", "RUT"):
                 if parts.startswith(candidate):
                     options_root = candidate
                     break
@@ -214,7 +214,12 @@ class OptionsWebSocketStream:
             if not options_root:
                 return
 
-            root = {"SPXW": "SPX", "DIA": "DJI"}.get(
+            root = {
+                "SPXW": "SPX",
+                "NDXP": "NDX",
+                "RUTW": "RUT",
+                "DIA": "DJI",
+            }.get(
                 options_root,
                 options_root,
             )
@@ -427,7 +432,7 @@ def get_options_subscription_state() -> dict:
     """Return current options websocket subscription state for diagnostics."""
     global _options_stream
     if _options_stream is None:
-        return {
+        state = {
             "stream": "options",
             "provider": CURRENT_OPTIONS_DATA_PROVIDER,
             "running": False,
@@ -438,20 +443,20 @@ def get_options_subscription_state() -> dict:
             "confirmed_count": 0,
             "confirmed_subscriptions": [],
         }
-
-    requested = sorted(list(_options_stream.subscriptions))
-    confirmed = sorted(list(_options_stream._subscribed_channels))
-    return {
-        "stream": "options",
-        "provider": CURRENT_OPTIONS_DATA_PROVIDER,
-        "running": bool(_options_stream.running),
-        "connected": bool(_options_stream.connected),
-        "authenticated": bool(_options_stream.authenticated),
-        "requested_count": len(requested),
-        "requested_subscriptions": requested,
-        "confirmed_count": len(confirmed),
-        "confirmed_subscriptions": confirmed,
-    }
+    else:
+        requested = sorted(list(_options_stream.subscriptions))
+        confirmed = sorted(list(_options_stream._subscribed_channels))
+        state = {
+            "stream": "options",
+            "provider": CURRENT_OPTIONS_DATA_PROVIDER,
+            "running": bool(_options_stream.running),
+            "connected": bool(_options_stream.connected),
+            "authenticated": bool(_options_stream.authenticated),
+            "requested_count": len(requested),
+            "requested_subscriptions": requested,
+            "confirmed_count": len(confirmed),
+            "confirmed_subscriptions": confirmed,
+        }
     state["trade_counts"] = dict(_gamma_tracker.trade_counts)
     state["last_update_ts"] = dict(_gamma_tracker.last_update_ts)
     return state

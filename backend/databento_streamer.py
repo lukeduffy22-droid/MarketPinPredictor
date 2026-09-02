@@ -597,6 +597,7 @@ class DatabentoGammaStreamer:
 
     def _write_invalid_snapshot(self, symbol: str, reason: str) -> None:
         symbol = symbol.upper()
+        self.latest_pins.pop(symbol, None)
         now = time.monotonic()
         last_write = self._last_snapshot_write.get(symbol, 0.0)
         if now - last_write < self.snapshot_interval:
