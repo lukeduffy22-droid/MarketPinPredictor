@@ -35,6 +35,16 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
     monkeypatch.setattr(api_main, "get_latest_price", lambda symbol: None)
     monkeypatch.setattr(api_main, "is_regular_hours", lambda dt: True)
     monkeypatch.setattr(api_main, "now_et", lambda: fixed_now)
+    monkeypatch.setattr(
+        api_main.api_state,
+        "get_live_model_readiness",
+        lambda symbol: {
+            "ready": False,
+            "issues": ["live_oi_unavailable"],
+            "oi": {"fresh": False},
+            "options": {"provider": "none"},
+        },
+    )
     monkeypatch.setitem(
         sys.modules,
         "app.ingest.rest_fallback",
@@ -48,8 +58,13 @@ def test_health_check_reports_degraded_during_regular_hours(monkeypatch):
 
     assert result["status"] == "degraded"
     assert result["market_data_provider"] == "databento"
+    assert result["market_open_ready"] is False
     assert "VIX" in result["symbols"]
     assert all(symbol_status["mode"] == "REST" for symbol_status in result["symbols"].values())
+    assert all(
+        "orb" in result["symbols"][symbol]
+        for symbol in ("SPX", "NDX", "DJI", "RUT")
+    )
 
 
 def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
@@ -65,6 +80,16 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
     monkeypatch.setattr(api_main, "get_latest_price", lambda symbol: None)
     monkeypatch.setattr(api_main, "is_regular_hours", lambda dt: False)
     monkeypatch.setattr(api_main, "now_et", lambda: fixed_now)
+    monkeypatch.setattr(
+        api_main.api_state,
+        "get_live_model_readiness",
+        lambda symbol: {
+            "ready": False,
+            "issues": ["live_oi_unavailable"],
+            "oi": {"fresh": False},
+            "options": {"provider": "none"},
+        },
+    )
     monkeypatch.setitem(
         sys.modules,
         "app.ingest.rest_fallback",
@@ -77,6 +102,7 @@ def test_health_check_reports_ok_outside_regular_hours(monkeypatch):
     result = asyncio.run(api_main.health_check())
 
     assert result["status"] == "ok"
+    assert result["market_open_ready"] is True
     assert result["market_data_provider"] == "polygon"
     assert "VIX" in result["symbols"]
     assert all(symbol_status["mode"] == "WebSocket" for symbol_status in result["symbols"].values())

@@ -189,8 +189,12 @@ def calc_flow_urgency(symbol: str, lookback_seconds: int = 60) -> float:
     
     # Calculate flow metrics
     total_notional = sum(trade.notional for _, trade in recent_trades)
-    buy_notional = sum(
+    directional_notional = sum(
         trade.notional for _, trade in recent_trades 
+        if trade.aggressor != 0
+    )
+    buy_notional = sum(
+        trade.notional for _, trade in recent_trades
         if trade.aggressor > 0
     )
     
@@ -199,8 +203,10 @@ def calc_flow_urgency(symbol: str, lookback_seconds: int = 60) -> float:
     # 2. Directional bias (buy vs sell)
     volume_score = min(1.0, total_notional / 1e8)  # Normalize by $100M
     
-    if total_notional > 0:
-        directional_bias = abs(buy_notional / total_notional - 0.5) * 2  # 0-1
+    if directional_notional > 0:
+        directional_bias = abs(
+            buy_notional / directional_notional - 0.5
+        ) * 2
     else:
         directional_bias = 0.0
     

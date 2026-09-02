@@ -9,17 +9,22 @@ Provides ORB features for ML prediction enhancement:
 - Range width as percentage of opening price
 """
 
-from dataclasses import dataclass, field
-from datetime import datetime, date
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+import json
 import logging
+import os
+from pathlib import Path
+import threading
+from typing import Dict, Optional
 
-from app.utils.time_et import now_et, open_time_et, ET
+from app.utils.time_et import now_et, open_time_et
 
 log = logging.getLogger("orb_tracker")
 
 # ORB period: 9:30 AM - 10:30 AM ET (first 60 minutes)
 ORB_DURATION_MINUTES = 60
+ORB_SYMBOLS = ("SPX", "NDX", "DJI", "RUT")
 
 
 @dataclass
@@ -128,19 +133,100 @@ class ORBTracker:
     Resets daily at market open.
     """
     
-    def __init__(self):
+    def __init__(self, export_dir: Optional[Path] = None):
         self._orb_data: Dict[str, ORBData] = {}
         self._last_reset_date: Optional[date] = None
+        self._export_dir = export_dir or Path(
+            os.environ.get("ORB_EXPORT_DIR", "exports/orb")
+        )
+        self._persisted_keys = set()
+        self._persistence_lock = threading.Lock()
+        self._ensure_trading_day(now_et().date())
+
+    def _daily_path(self, trading_date: date) -> Path:
+        """Return the append-only audit path for a trading day."""
+        return self._export_dir / f"{trading_date.isoformat()}.ndjson"
+
+    def _load_completed_orbs(self, trading_date: date) -> None:
+        """Restore completed ORBs after a backend restart."""
+        path = self._daily_path(trading_date)
+        if not path.exists():
+            return
+
+        try:
+            with path.open("r", encoding="utf-8") as orb_file:
+                for line in orb_file:
+                    try:
+                        payload = json.loads(line)
+                        symbol = str(payload.get("symbol", "")).upper()
+                        if symbol not in ORB_SYMBOLS or not payload.get("orb_complete"):
+                            continue
+                        orb = ORBData(
+                            date=trading_date,
+                            symbol=symbol,
+                            opening_price=payload.get("opening_price"),
+                            orb_high=payload.get("orb_high"),
+                            orb_low=payload.get("orb_low"),
+                            orb_complete=True,
+                            tick_count=int(payload.get("tick_count") or 0),
+                        )
+                        self._orb_data[symbol] = orb
+                        self._persisted_keys.add((trading_date, symbol))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        log.warning("Skipping invalid ORB audit row in %s", path)
+        except OSError as exc:
+            log.error("Unable to restore ORB audit data from %s: %s", path, exc)
+
+    def _ensure_trading_day(self, trading_date: date) -> None:
+        """Reset and initialize all prediction symbols for a trading day.
+
+        Only advances to a newer date; out-of-order or replayed prior-day
+        ticks are silently ignored to prevent stale data from erasing live ORBs.
+        """
+        if self._last_reset_date == trading_date:
+            return
+
+        if self._last_reset_date is not None and trading_date < self._last_reset_date:
+            log.debug(
+                "Ignoring out-of-order trading date %s (current day %s)",
+                trading_date,
+                self._last_reset_date,
+            )
+            return
+
+        log.info("New trading day %s, resetting ORB data", trading_date)
+        self._orb_data.clear()
+        self._persisted_keys.clear()
+        self._last_reset_date = trading_date
+        self._load_completed_orbs(trading_date)
+        for symbol in ORB_SYMBOLS:
+            self._orb_data.setdefault(
+                symbol,
+                ORBData(date=trading_date, symbol=symbol),
+            )
+
+    def _persist_completed_orb(self, orb: ORBData) -> None:
+        """Append a completed ORB once so it survives process restarts."""
+        key = (orb.date, orb.symbol)
+        with self._persistence_lock:
+            if key in self._persisted_keys:
+                return
+            try:
+                self._export_dir.mkdir(parents=True, exist_ok=True)
+                with self._daily_path(orb.date).open("a", encoding="utf-8") as orb_file:
+                    orb_file.write(json.dumps(orb.to_dict(), sort_keys=True) + "\n")
+                self._persisted_keys.add(key)
+            except OSError as exc:
+                log.error("Unable to persist completed ORB for %s: %s", orb.symbol, exc)
     
-    def _get_or_create_orb(self, symbol: str) -> ORBData:
+    def _get_or_create_orb(
+        self,
+        symbol: str,
+        trading_date: Optional[date] = None,
+    ) -> ORBData:
         """Get or create ORB data for symbol, resetting if new trading day"""
-        current_date = now_et().date()
-        
-        # Reset all ORB data at start of new trading day
-        if self._last_reset_date != current_date:
-            log.info(f"New trading day {current_date}, resetting ORB data")
-            self._orb_data.clear()
-            self._last_reset_date = current_date
+        current_date = trading_date or now_et().date()
+        self._ensure_trading_day(current_date)
         
         if symbol not in self._orb_data:
             self._orb_data[symbol] = ORBData(date=current_date, symbol=symbol)
@@ -151,9 +237,7 @@ class ORBTracker:
         """Check if current time is within ORB period (9:30-10:30 AM ET)"""
         t = dt or now_et()
         market_open = open_time_et(t)
-        orb_end = market_open.replace(
-            hour=10, minute=30, second=0, microsecond=0
-        )
+        orb_end = market_open + timedelta(minutes=ORB_DURATION_MINUTES)
         return market_open <= t <= orb_end
     
     def update_price(self, symbol: str, price: float, timestamp: Optional[datetime] = None):
@@ -165,7 +249,10 @@ class ORBTracker:
             return
         
         t = timestamp or now_et()
-        orb = self._get_or_create_orb(symbol)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        t = now_et(t)
+        orb = self._get_or_create_orb(symbol, t.date())
         
         # Only update ORB high/low during ORB period (9:30-10:30 AM ET)
         if self._is_orb_period(t):
@@ -191,9 +278,11 @@ class ORBTracker:
                 f"{symbol} ORB complete: High=${orb.orb_high:.2f}, "
                 f"Low=${orb.orb_low:.2f}, Range={orb.range_width_pct:.2f}%"
             )
+            self._persist_completed_orb(orb)
     
     def get_orb_data(self, symbol: str) -> Optional[ORBData]:
         """Get current ORB data for symbol"""
+        self._ensure_trading_day(now_et().date())
         return self._orb_data.get(symbol)
     
     def get_orb_features(self, symbol: str, current_price: float) -> ORBFeatures:
@@ -231,6 +320,7 @@ class ORBTracker:
     
     def get_all_orb_data(self) -> Dict[str, Dict]:
         """Get ORB data for all tracked symbols"""
+        self._ensure_trading_day(now_et().date())
         return {
             symbol: orb.to_dict()
             for symbol, orb in self._orb_data.items()

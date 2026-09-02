@@ -8,7 +8,7 @@ from database import init_db, save_prediction, get_predictions_by_ticker, get_al
 from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
 # BACKEND-ONLY WEBSOCKET: Only REST-based helpers are imported here
 # WebSocket creation functions are NOT imported - all WebSocket is backend-only
-from websocket_streaming import is_market_open, get_snapshot_data
+from websocket_streaming import is_market_open
 from ai_analysis import (
     analyze_prediction, analyze_streaming_data, 
     get_risk_assessment, explain_gamma_exposure
@@ -20,6 +20,7 @@ from app.utils.settings import settings
 from app.features.technical_indicators import DEFAULT_INDICATOR_PARAMS, calculate_technical_indicators
 from app.services.streamlit_market_data import calculate_gex, fetch_market_data, fetch_vix_data
 from app.services.backend_predictions import fetch_live_prediction
+from app.services.backend_health import build_symbol_health_rows
 from app.visualization.price_chart import create_price_chart
 
 # Initialize database
@@ -40,15 +41,6 @@ INDEXES = {
     "Dow Jones (DJI via DIA options)": "DJI",
     "Russell 2000 (RUT)": "RUT",
     "VIX (Volatility)": "VIX"
-}
-
-# Polygon index ticker format (with I: prefix for indices)
-INDEX_POLYGON_TICKERS = {
-    "SPX": "I:SPX",
-    "NDX": "I:NDX",
-    "DJI": "I:DJI",
-    "RUT": "I:RUT",
-    "VIX": "I:VIX"
 }
 
 # ETF proxies as fallback (only used if direct index data unavailable)
@@ -645,16 +637,31 @@ with st.sidebar:
                 
                 status_col1, status_col2, status_col3 = st.columns(3)
                 with status_col1:
-                    ws_status = health_data.get("websocket", "unknown")
-                    if ws_status == "active":
-                        st.success("✅ WebSocket: Connected")
+                    backend_status = health_data.get("status", "unknown")
+                    if backend_status == "ok":
+                        st.success("✅ Backend: Ready")
                     else:
-                        st.info(f"WebSocket: {ws_status}")
+                        st.error(f"Backend: {backend_status}")
                 with status_col2:
-                    buffer_status = health_data.get("buffer_health", "unknown")
-                    st.metric("Buffer Status", buffer_status)
+                    st.metric(
+                        "Market Data Provider",
+                        health_data.get("market_data_provider", "unknown").title(),
+                    )
                 with status_col3:
-                    st.metric("Uptime", health_data.get("uptime", "N/A"))
+                    symbol_health = health_data.get("symbols", {})
+                    ready_count = sum(
+                        bool(item.get("prediction_model", {}).get("ready"))
+                        for item in symbol_health.values()
+                    )
+                    st.metric("Prediction Models Ready", f"{ready_count}/4")
+
+                health_rows = build_symbol_health_rows(health_data)
+                if health_rows:
+                    st.dataframe(
+                        health_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             else:
                 st.warning("Backend not responding")
         except Exception as e:
@@ -683,34 +690,6 @@ with st.sidebar:
                 st.success("UI repainted from backend cache")
             except Exception as e:
                 st.error(f"Error fetching cached data: {str(e)[:50]}")
-        
-        # Snapshot data fallback using REST API
-        st.divider()
-        st.caption("**Snapshot Data (REST API Fallback)**")
-        if st.button("📸 Get Current Prices", type="secondary", help="Fetch latest prices via Polygon REST API"):
-            if selected_indexes and st.session_state.api_key:
-                tickers_to_fetch = [INDEX_POLYGON_TICKERS[INDEXES[idx]] for idx in selected_indexes]
-                with st.spinner("Fetching snapshot data..."):
-                    snapshot_data = get_snapshot_data(st.session_state.api_key, tickers_to_fetch)
-                    if snapshot_data:
-                        st.success(f"✅ Fetched prices for {len(snapshot_data)} tickers")
-                        # Display snapshot data
-                        cols = st.columns(len(snapshot_data))
-                        for i, (ticker, data) in enumerate(snapshot_data.items()):
-                            with cols[i]:
-                                if data['price']:
-                                    change = ((data['price'] - data['prev_close']) / data['prev_close'] * 100) if data['prev_close'] else 0
-                                    st.metric(
-                                        ticker, 
-                                        f"${data['price']:.2f}",
-                                        f"{change:+.2f}%"
-                                    )
-                                else:
-                                    st.metric(ticker, "N/A")
-                    else:
-                        st.error("Failed to fetch snapshot data. Check your API key.")
-            else:
-                st.warning("Please enter API key and select indexes first!")
         
         # Live Gamma Monitor
         st.divider()
