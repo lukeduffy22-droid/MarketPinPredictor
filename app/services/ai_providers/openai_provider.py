@@ -318,7 +318,10 @@ Provide a trading briefing in JSON format:
         if "pull_strength" in gamma_data:
             lines.append(f"- Pull Strength: {gamma_data['pull_strength']:.2f}%")
         if "zero_gamma" in gamma_data:
-            lines.append(f"- Zero Gamma Level: {gamma_data['zero_gamma']:.2f}")
+            lines.append(
+                "- First strike-bucket GEX sign crossing: "
+                f"{gamma_data['zero_gamma']:.2f} (not a portfolio spot-sweep level)"
+            )
         
         return "\n".join(lines) if lines else "Gamma data format not recognized"
     

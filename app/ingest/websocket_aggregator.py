@@ -1,6 +1,7 @@
 """
 WebSocket ingestion with 1-second aggregation to prevent CPU overload.
 Normalizes all payloads to IndexTick and OptTrade at ingest boundary.
+Auto-saves all data to database for historical analysis.
 """
 import asyncio
 import logging
@@ -11,51 +12,56 @@ from datetime import datetime, date
 
 log = logging.getLogger("ws_ingest")
 
-from app.state.ring_buffers import PREDICTION_SYMBOLS, TRACKED_INDEX_SYMBOLS
-
 # Sub-second accumulator per symbol
 _accum: Dict[str, Dict[int, List]] = defaultdict(lambda: defaultdict(list))
+
+# Batch accumulators for database writes (flush every N seconds)
+_db_tick_batch = []
+_db_trade_batch = []
+_last_db_flush = time.time()
+DB_FLUSH_INTERVAL = 60  # Flush to DB every 60 seconds
+DB_BATCH_SIZE = 1000  # Or when batch reaches this size
 
 def parse_index_value(msg: dict) -> tuple:
     """
     Parse Polygon Value message for indices.
     Value messages provide real-time index value updates.
     Returns (symbol, IndexTick) or None if invalid.
-    
+
     Format: {ev: "V", val: 3988.5, T: "I:SPX", t: 1678220098130}
     """
     from app.state.ring_buffers import IndexTick
-    
+
     try:
         # Get ticker with I: prefix
         ticker = msg.get("T", "")
-        
+
         # Extract symbol without I: prefix
         if ticker.startswith("I:"):
             symbol = ticker[2:]
         else:
             return None
-        
-        if symbol not in TRACKED_INDEX_SYMBOLS:
+
+        if symbol not in ("SPX", "NDX", "DJI", "RUT"):
             return None
-        
+
         # Get value and timestamp
         value = msg.get("val")  # Index value
         ts_ms = msg.get("t")   # Timestamp in milliseconds
-        
+
         if value is None or ts_ms is None:
             return None
-        
+
         # Convert to seconds
         ts = ts_ms // 1000
-        
+
         # Volume is N/A for value updates, use 1.0
         size = 1.0
-        
+
         tick = IndexTick(ts=ts, price=float(value), size=size)
-        
+
         return (symbol, tick)
-        
+
     except Exception as e:
         log.warning(f"Failed to parse index value: {e}")
         return None
@@ -66,37 +72,37 @@ def parse_index_aggregate(msg: dict) -> tuple:
     Returns (symbol, IndexTick) or None if invalid.
     """
     from app.state.ring_buffers import IndexTick
-    
+
     try:
         # Polygon sends: ev=A, sym=I:SPX, c=close, v=volume (None for indices), s=start_ts
         sym = msg.get("sym", "")
-        
+
         # Extract symbol without I: prefix
         if sym.startswith("I:"):
             symbol = sym[2:]
         else:
             return None
-        
-        if symbol not in TRACKED_INDEX_SYMBOLS:
+
+        if symbol not in ("SPX", "NDX", "DJI", "RUT"):
             return None
-        
+
         # Get price and timestamp
         price = msg.get("c")  # Close price of this bar
         ts_ms = msg.get("s")  # Start timestamp (milliseconds)
-        
+
         if price is None or ts_ms is None:
             return None
-        
+
         # Convert to seconds
         ts = ts_ms // 1000
-        
+
         # Volume is None for indices, use 1.0
         size = 1.0
-        
+
         tick = IndexTick(ts=ts, price=float(price), size=size)
-        
+
         return (symbol, tick)
-        
+
     except Exception as e:
         log.warning(f"Failed to parse index aggregate: {e}")
         return None
@@ -107,54 +113,55 @@ def parse_options_trade(msg: dict) -> tuple:
     Returns (root_symbol, OptTrade) or None if invalid.
     """
     from app.state.ring_buffers import OptTrade
-    
+
     try:
         # Polygon sends: ev=T, sym=O:SPX241108C06000000, p=price, s=size, ...
         sym = msg.get("sym", "")
-        
+
         if not sym.startswith("O:"):
             return None
-        
+
         # Parse OCC symbol: O:SPX241108C06000000
         # Format: O:{root}{yymmdd}{C|P}{strike*1000}
         parts = sym[2:]  # Remove O:
-        
+
         # Extract root (SPX, SPXW, etc)
         root = None
-        for r in PREDICTION_SYMBOLS:
+        for r in ("SPX", "NDX", "DJI", "RUT"):
             if parts.startswith(r):
                 root = r
                 break
-        
+
         if not root:
             return None
-        
+
         # Extract expiration (next 6 chars after root)
         exp_str = parts[len(root):len(root)+6]
         exp_date = datetime.strptime(f"20{exp_str}", "%Y%m%d").date()
-        
+
         # Extract call/put flag
         cp_flag = parts[len(root)+6]
         is_call = (cp_flag == "C")
-        
+
         # Extract strike (remaining digits / 1000)
         strike_str = parts[len(root)+7:]
         strike = int(strike_str) // 1000
-        
+
         # Get trade details
         price = msg.get("p")
         size = msg.get("s", 1)
         ts_ms = msg.get("t")
-        
+
         if price is None or ts_ms is None:
             return None
-        
+
         ts = ts_ms // 1000
         notional = price * size * 100  # Options contract multiplier
-        
-        # Determine aggressor (simplified - use exchange code if available)
-        aggressor = 1  # Default to buy side
-        
+
+        # Polygon trade messages do not establish aggressor side here. Preserve
+        # the observation as unknown instead of fabricating a buyer initiation.
+        aggressor = 0
+
         trade = OptTrade(
             ts=ts,
             root=root,
@@ -164,9 +171,9 @@ def parse_options_trade(msg: dict) -> tuple:
             notional=notional,
             aggressor=aggressor
         )
-        
+
         return (root, trade)
-        
+
     except Exception as e:
         log.warning(f"Failed to parse options trade: {e}")
         return None
@@ -177,22 +184,22 @@ def aggregate_ticks(symbol: str, ticks: List) -> tuple:
     Returns (timestamp, IndexTick with aggregated data).
     """
     from app.state.ring_buffers import IndexTick
-    
+
     if not ticks:
         return None
-    
+
     # Use latest timestamp
     ts = ticks[-1].ts
-    
+
     # Use VWAP for aggregated price
     total_pv = sum(t.price * t.size for t in ticks)
     total_v = sum(t.size for t in ticks)
-    
+
     if total_v > 0:
         agg_price = total_pv / total_v
     else:
         agg_price = ticks[-1].price
-    
+
     return (ts, IndexTick(ts=ts, price=agg_price, size=total_v))
 
 async def ingest_message(msg: dict):
@@ -201,62 +208,150 @@ async def ingest_message(msg: dict):
     Routes to appropriate parser and accumulates for 1-second aggregation.
     """
     ev = msg.get("ev")
-    
+
     if ev == "V":  # Value update (primary index feed)
         result = parse_index_value(msg)
         if result:
             symbol, tick = result
-            
+
             # Accumulate by second
             ts_second = tick.ts
             _accum[symbol][ts_second].append(tick)
-    
+
     elif ev == "A":  # Aggregate (index bars) - fallback
         result = parse_index_aggregate(msg)
         if result:
             symbol, tick = result
-            
+
             # Accumulate by second
             ts_second = tick.ts
             _accum[symbol][ts_second].append(tick)
-    
+
     elif ev == "T":  # Trade (options)
         result = parse_options_trade(msg)
         if result:
             root, trade = result
-            
+
             # Add directly to flow ring (trades already atomic)
             from app.state.ring_buffers import FLOW_RINGS
             FLOW_RINGS[root].add(trade.ts, trade)
+
+            # Add to database batch
+            today = datetime.now().date()
+            _db_trade_batch.append({
+                'root_symbol': root,
+                'timestamp': datetime.fromtimestamp(trade.ts),
+                'strike': trade.K,
+                'is_call': trade.is_call,
+                'expiration_date': trade.exp,
+                'notional': trade.notional,
+                'aggressor': trade.aggressor,
+                'trading_date': today
+            })
+
+
+async def _flush_to_database():
+    """
+    Flush accumulated ticks and trades to database in batch.
+    Runs asynchronously to avoid blocking main event loop.
+    """
+    global _last_db_flush, _db_tick_batch, _db_trade_batch
+
+    # Copy and clear batches
+    ticks_to_save = _db_tick_batch[:]
+    trades_to_save = _db_trade_batch[:]
+    _db_tick_batch.clear()
+    _db_trade_batch.clear()
+    _last_db_flush = time.time()
+
+    try:
+        # Run database operations in thread pool to avoid blocking
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        loop = asyncio.get_event_loop()
+        executor = ThreadPoolExecutor(max_workers=2)
+
+        if ticks_to_save:
+            await loop.run_in_executor(executor, _save_ticks_sync, ticks_to_save)
+            log.info(f"Saved {len(ticks_to_save)} index ticks to database")
+
+        if trades_to_save:
+            await loop.run_in_executor(executor, _save_trades_sync, trades_to_save)
+            log.info(f"Saved {len(trades_to_save)} options trades to database")
+
+    except Exception as e:
+        log.error(f"Error flushing to database: {e}")
+
+
+def _save_ticks_sync(ticks_data: list):
+    """Synchronous database save for ticks (called in thread pool)"""
+    from database import batch_insert_index_ticks
+    batch_insert_index_ticks(ticks_data)
+
+
+def _save_trades_sync(trades_data: list):
+    """Synchronous database save for trades (called in thread pool)"""
+    from database import batch_insert_options_trades
+    batch_insert_options_trades(trades_data)
 
 async def flush_aggregates():
     """
     Periodically flush accumulated ticks to ring buffers.
     Runs every 1 second to create 1-second bars.
     Also updates ORB tracker with each price tick.
+    Auto-saves data to database in batches.
     """
-    from app.state.ring_buffers import record_live_index_tick
-    
+    from app.state.ring_buffers import INDEX_RINGS, update_session_vwap
+    from app.state.orb_tracker import update_orb
+
+    global _last_db_flush, _db_tick_batch, _db_trade_batch
+
     while True:
         try:
             await asyncio.sleep(1.0)
-            
+
             current_second = int(time.time())
-            
+            today = datetime.now().date()
+
             for symbol in list(_accum.keys()):
                 symbol_accum = _accum[symbol]
-                
+
                 # Flush all complete seconds (not current second)
                 for ts_second in list(symbol_accum.keys()):
                     if ts_second < current_second:
                         ticks = symbol_accum.pop(ts_second)
-                        
+
                         if ticks:
                             result = aggregate_ticks(symbol, ticks)
                             if result:
                                 ts, agg_tick = result
-                                
-                                record_live_index_tick(symbol, agg_tick)
-        
+
+                                # Add to ring buffer
+                                INDEX_RINGS[symbol].add(ts, agg_tick)
+
+                                # Update VWAP tracker
+                                update_session_vwap(symbol, agg_tick.price, agg_tick.size)
+
+                                # Update ORB tracker (tracks high/low during 9:30-10:30 AM ET)
+                                update_orb(symbol, agg_tick.price)
+
+                                # Add to database batch
+                                _db_tick_batch.append({
+                                    'symbol': symbol,
+                                    'timestamp': datetime.fromtimestamp(ts),
+                                    'price': agg_tick.price,
+                                    'size': agg_tick.size,
+                                    'trading_date': today
+                                })
+
+            # Flush to database if batch is full or interval elapsed
+            if (len(_db_tick_batch) >= DB_BATCH_SIZE or
+                len(_db_trade_batch) >= DB_BATCH_SIZE or
+                (time.time() - _last_db_flush) >= DB_FLUSH_INTERVAL):
+
+                if _db_tick_batch or _db_trade_batch:
+                    asyncio.create_task(_flush_to_database())
+
         except Exception as e:
             log.error(f"Error in flush_aggregates: {e}")

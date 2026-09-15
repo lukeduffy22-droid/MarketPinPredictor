@@ -5,12 +5,19 @@ Provides real-time insights on predictions and streaming data
 """
 
 import os
-from openai import OpenAI
 import streamlit as st
 from datetime import datetime
 
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 def get_openai_client():
     """Initialize OpenAI client using Replit AI Integrations (preferred) or fallback to OPENAI_API_KEY"""
+    if OpenAI is None:
+        return None
+
     # First try Replit's integrated OpenAI (billed to Replit credits)
     api_key = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY")
     base_url = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
@@ -25,7 +32,34 @@ def get_openai_client():
     
     return None
 
-def analyze_prediction(ticker_name, current_price, predicted_price, confidence, technical_indicators, gex_data=None, vix_value=None):
+def _confidence_context(confidence, confidence_kind=None, confidence_calibrated=False):
+    """Describe score semantics without converting heuristics into probabilities."""
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return "Model quality score: unavailable"
+    if confidence_calibrated:
+        return f"Calibrated confidence: {value:.1f}%"
+    if confidence_kind == "data_quality_heuristic":
+        return (
+            f"Data-quality heuristic: {value:.1f}/100 "
+            "(not an empirical forecast probability)"
+        )
+    return f"Reported score: {value:.1f}/100 (calibration unknown)"
+
+
+def analyze_prediction(
+    ticker_name,
+    current_price,
+    predicted_price,
+    confidence,
+    technical_indicators,
+    gex_data=None,
+    vix_value=None,
+    *,
+    confidence_kind=None,
+    confidence_calibrated=False,
+):
     """
     Get AI analysis of a prediction using GPT-4
     
@@ -33,7 +67,7 @@ def analyze_prediction(ticker_name, current_price, predicted_price, confidence, 
         ticker_name: Name of the index (e.g., "S&P 500 (SPX)")
         current_price: Current price
         predicted_price: Predicted EOD price
-        confidence: Prediction confidence percentage
+        confidence: Reported confidence or quality score
         technical_indicators: Dict with RSI, MACD, etc.
         gex_data: Gamma exposure data (optional)
         vix_value: VIX volatility value (optional)
@@ -54,7 +88,7 @@ Index: {ticker_name}
 Current Price: ${current_price:.2f}
 Predicted EOD Price: ${predicted_price:.2f}
 Expected Change: {change_pct:+.2f}%
-Confidence: {confidence:.1f}%
+{_confidence_context(confidence, confidence_kind, confidence_calibrated)}
 
 Technical Indicators:
 - RSI: {technical_indicators.get('RSI', 'N/A')}
@@ -72,7 +106,7 @@ Gamma Exposure:
 - Pin Strike: ${gex_data.get('pin_strike', 'N/A')}
 - Direction: {gex_data.get('direction', 'N/A')}
 - Pull Strength: {gex_data.get('pull_strength', 'N/A'):.1f}%
-- Zero Gamma Level: ${gex_data.get('zero_gamma', 'N/A')}
+- First strike-bucket GEX sign crossing: ${gex_data.get('zero_gamma', 'N/A')} (not a portfolio spot-sweep level or guaranteed target)
 """
     
     if vix_value:
@@ -82,7 +116,7 @@ Gamma Exposure:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are an expert financial analyst specializing in technical analysis and options markets. Provide concise, actionable insights based on the data provided. Focus on risk assessment, key support/resistance levels, and trading implications. Keep your response under 150 words."},
+                {"role": "system", "content": "Explain the analytical market context, uncertainty, and invalidation conditions concisely. Treat gamma levels and model outputs as estimates, never guarantees, and do not provide individualized trade instructions. Keep your response under 150 words."},
                 {"role": "user", "content": context}
             ],
             temperature=0.7,
@@ -152,13 +186,16 @@ def get_risk_assessment(predictions_dict):
     # Summarize all predictions
     summary = "Portfolio Summary:\n"
     for idx_name, pred in predictions_dict.items():
-        summary += f"\n{idx_name}: {pred['change_pct']:+.2f}% (confidence: {pred['confidence']:.0f}%)"
+        summary += (
+            f"\n{idx_name}: {pred['change_pct']:+.2f}% "
+            f"({_confidence_context(pred.get('confidence'), pred.get('confidence_kind'), pred.get('confidence_calibrated') is True)})"
+        )
     
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a risk management analyst. Assess overall market risk based on these index predictions. Consider correlation, volatility, and confidence levels. Maximum 120 words."},
+                {"role": "system", "content": "Assess the analytical risk context of these index estimates. Distinguish calibrated confidence from heuristic quality scores, discuss uncertainty and correlation, and do not provide individualized trade instructions. Maximum 120 words."},
                 {"role": "user", "content": summary}
             ],
             temperature=0.7,
@@ -188,7 +225,8 @@ def explain_gamma_exposure(gex_data):
 Pin Strike: ${gex_data.get('pin_strike', 'N/A')}
 Current Position: {gex_data.get('direction', 'N/A')} the pin
 Pull Strength: {gex_data.get('pull_strength', 0):.1f}%
-Zero Gamma Level: ${gex_data.get('zero_gamma', 'N/A')}
+First strike-bucket GEX sign crossing: ${gex_data.get('zero_gamma', 'N/A')}
+This crossing is not a portfolio spot-sweep level or guaranteed price target.
 Total GEX: ${gex_data.get('total_gex', 0):.1f}B
 """
     

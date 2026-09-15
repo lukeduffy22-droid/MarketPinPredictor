@@ -6,20 +6,20 @@ Easy to swap between OpenAI, Google, Anthropic, etc.
 
 import os
 import logging
+from importlib import import_module
 from typing import Dict, Any, Optional
 
 from .ai_providers.base_provider import BaseAIProvider, PredictionCritique, MarketAnalysis
-from .ai_providers.openai_provider import OpenAIProvider
 
 log = logging.getLogger(__name__)
 
 # Registry of available providers
-_PROVIDERS: Dict[str, type] = {
-    "openai": OpenAIProvider,
-    # Future providers can be added here:
-    # "google": GoogleProvider,
-    # "anthropic": AnthropicProvider,
-    # "grok": GrokProvider,
+_PROVIDERS: Dict[str, tuple[str, str]] = {
+    "openai": (".ai_providers.openai_provider", "OpenAIProvider"),
+    # Future providers can be added here as (module_path, class_name):
+    # "google": (".ai_providers.google_provider", "GoogleProvider"),
+    # "anthropic": (".ai_providers.anthropic_provider", "AnthropicProvider"),
+    # "grok": (".ai_providers.grok_provider", "GrokProvider"),
 }
 
 # Singleton instance
@@ -58,7 +58,7 @@ class AIService:
             return
         
         try:
-            provider_class = _PROVIDERS[self._provider_name]
+            provider_class = _load_provider_class(self._provider_name)
             self._provider = provider_class()
             
             if self._provider.is_available():
@@ -211,3 +211,12 @@ def get_ai_service(provider: str = "openai", force_new: bool = False) -> AIServi
         _ai_service_instance.switch_provider(provider)
     
     return _ai_service_instance
+
+
+def _load_provider_class(provider_name: str) -> type[BaseAIProvider]:
+    module_path, class_name = _PROVIDERS[provider_name]
+    module = import_module(module_path, package=__package__)
+    provider_class = getattr(module, class_name)
+    if not issubclass(provider_class, BaseAIProvider):
+        raise TypeError(f"{provider_name} provider {class_name} is not a BaseAIProvider")
+    return provider_class
