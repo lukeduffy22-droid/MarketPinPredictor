@@ -1,5 +1,11 @@
 # Live Data Collection Setup Guide
 
+> **Legacy reference only.** This document describes the retired Polygon/Massive
+> deployment path and is not the current live architecture. New work must use
+> the Databento full-stack launcher and evidence contract documented in
+> `README.md` and `.github/copilot-instructions.md`. The historical utilities it
+> names are preserved under `legacy/friday-1-9/`.
+
 ## Overview
 The system now automatically collects live market data from two sources:
 
@@ -91,7 +97,8 @@ ls -lh /app/exports/massive/
 After collection, the pipeline automatically:
 
 1. **Combines snapshots** - Merges all collected data
-2. **Quality checks** - Validates data integrity with `add_quality_flags.py`
+2. **Quality checks** - Historically used
+   `legacy/friday-1-9/tools/add_quality_flags.py`
 3. **Exports to Parquet** - Creates optimized columnar format for analysis
 
 ## Verification

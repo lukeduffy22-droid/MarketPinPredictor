@@ -29,6 +29,14 @@ The local and GitHub histories have no merge base. The local tree also contains 
 - legacy scripts containing literal provider credentials;
 - campaign and research-output artifacts, which require separate review if they are ever published.
 
+## Preserved legacy code
+
+Forty-two superseded `friday-1/9` app, test, and tool files are retained
+byte-for-byte under `legacy/friday-1-9/`. They are outside active import and
+pytest discovery so the current architecture has one clear implementation for
+GitHub and Copilot, while the old code remains available for comparison or
+recovery.
+
 ## Review contract
 
 Keep observed OPRA evidence separate from inferred side/positioning estimates. Preserve fail-closed abstentions and the existing maturity, evaluation, calibration, and promotion gates. CUDA or high record volume is not evidence that a forecast is accurate or production-authorized.

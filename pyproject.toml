@@ -39,6 +39,7 @@ dependencies = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+norecursedirs = ["legacy"]
 
 [[tool.uv.index]]
 explicit = true
