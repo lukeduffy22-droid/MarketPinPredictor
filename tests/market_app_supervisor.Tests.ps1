@@ -601,11 +601,14 @@ Describe 'Exact process network quiescence' {
             Get-MarketAppProcessTcpConnectionCountFromNetstatLines `
                 -ProcessId 4242 `
                 -Lines $lines | Should Be 3
+            @(Get-MarketAppProcessTcpConnectionStatesFromNetstatLines `
+                -ProcessId 4242 `
+                -Lines $lines) | Should Be @('LISTENING', 'ESTABLISHED', 'BOUND')
         }
 
-        It 'requires both exact PID exit and zero owned TCP rows' {
+        It 'requires exact PID exit and no active TCP rows' {
             Mock Get-MarketAppProcessRecord { $null }
-            Mock Get-MarketAppProcessTcpConnectionCount { 0 }
+            Mock Get-MarketAppProcessTcpConnectionStates { @() }
 
             $quiescent = Wait-MarketAppProcessNetworkQuiescence `
                 -ProcessId 4242 `
@@ -614,6 +617,7 @@ Describe 'Exact process network quiescence' {
             $quiescent.Quiescent | Should Be $true
             $quiescent.ProcessExists | Should Be $false
             $quiescent.TcpConnectionCount | Should Be 0
+            $quiescent.ResidualClosingOnly | Should Be $false
 
             Mock Get-MarketAppProcessRecord { [pscustomobject]@{ ProcessId = 4242 } }
             $processStillAlive = Wait-MarketAppProcessNetworkQuiescence `
@@ -623,12 +627,50 @@ Describe 'Exact process network quiescence' {
             $processStillAlive.ProcessExists | Should Be $true
 
             Mock Get-MarketAppProcessRecord { $null }
-            Mock Get-MarketAppProcessTcpConnectionCount { 9 }
+            Mock Get-MarketAppProcessTcpConnectionStates { @('ESTABLISHED') }
             $socketsStillOwned = Wait-MarketAppProcessNetworkQuiescence `
                 -ProcessId 4242 `
                 -TimeoutSeconds 0
             $socketsStillOwned.Quiescent | Should Be $false
-            $socketsStillOwned.TcpConnectionCount | Should Be 9
+            $socketsStillOwned.TcpConnectionCount | Should Be 1
+            $socketsStillOwned.ActiveTcpConnectionCount | Should Be 1
+        }
+
+        It 'accepts a confirmed-dead PID after two residual closing-state samples' {
+            Mock Get-MarketAppProcessRecord { $null }
+            Mock Get-MarketAppProcessTcpConnectionStates { @('FIN_WAIT_2', 'TIME_WAIT') }
+
+            $quiescent = Wait-MarketAppProcessNetworkQuiescence `
+                -ProcessId 4242 `
+                -TimeoutSeconds 1 `
+                -PollMilliseconds 10
+
+            $quiescent.Quiescent | Should Be $true
+            $quiescent.ProcessExists | Should Be $false
+            $quiescent.TcpConnectionCount | Should Be 2
+            $quiescent.ActiveTcpConnectionCount | Should Be 0
+            $quiescent.ResidualClosingOnly | Should Be $true
+            @($quiescent.TcpStates) | Should Be @('FIN_WAIT_2', 'TIME_WAIT')
+            Assert-MockCalled Get-MarketAppProcessTcpConnectionStates -Times 2 -Scope It
+        }
+
+        It 'fails closed if the PID reappears while residual closing rows remain' {
+            $script:processRead = 0
+            Mock Get-MarketAppProcessRecord {
+                $script:processRead++
+                if ($script:processRead -eq 1) { return $null }
+                return [pscustomobject]@{ ProcessId = 4242 }
+            }
+            Mock Get-MarketAppProcessTcpConnectionStates { @('FIN_WAIT_2') }
+
+            $result = Wait-MarketAppProcessNetworkQuiescence `
+                -ProcessId 4242 `
+                -TimeoutSeconds 1 `
+                -PollMilliseconds 10
+
+            $result.Quiescent | Should Be $false
+            $result.ProcessExists | Should Be $true
+            $result.ResidualClosingOnly | Should Be $false
         }
     }
 }
@@ -1109,6 +1151,39 @@ Describe 'Automatic listener stop-time boundary' {
             # Only prepared + late-authorized can be written before the denied
             # stop; a third verified-stop event would be a false success.
             Assert-MockCalled Write-MarketAppSupervisorLog -Times 2
+        }
+
+        It 'fails closed if another listener acquires the service port after stop' {
+            Mock Assert-MarketAppExpectedListenerPid { 4242 }
+            Mock Test-MarketAppVerifiedProcess { $true }
+            Mock Write-MarketAppSupervisorLog {}
+            Mock Get-Date { [datetime]'2026-09-08T08:24:00' }
+            Mock Stop-Process {}
+            Mock Wait-MarketAppProcessNetworkQuiescence {
+                [pscustomobject]@{
+                    Quiescent = $true
+                    ProcessId = 4242
+                    ProcessExists = $false
+                    TcpConnectionCount = 1
+                    ActiveTcpConnectionCount = 0
+                    ResidualClosingOnly = $true
+                    TcpStates = @('FIN_WAIT_2')
+                    ElapsedMilliseconds = 250
+                }
+            }
+            Mock Get-MarketAppListenerProcessIds { @(9001) }
+
+            { Invoke-MarketAppBoundedAutomaticListenerStop `
+                -Port 8000 `
+                -ExpectedPid 4242 `
+                -ProjectRoot 'C:\MarketPinPredictor' `
+                -RequiredCommandMarkers @('server.py') `
+                -Component 'backend' `
+                -DecisionTime ([datetime]'2026-09-08T08:24:00') `
+                -InvocationId 'test-post-stop-listener-race' `
+                -Caller 'Pester' `
+                -RecoveryReason 'verified_prior_day_backend_preopen_refresh' } |
+                Should Throw 'replacement ownership is ambiguous'
         }
 
         It 'abstains when a dead-handoff stop reaches the verified early cash close' {
@@ -3497,6 +3572,13 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $ensureScript | Should Match 'RecoveryReason \$readinessDecision.Reason'
         $supervisorModule | Should Match 'stopCheckTime = Get-Date[\s\S]+Stop-Process -Id \$listenerPid'
         $supervisorModule | Should Match 'stopCheckTime -ge \$recoveryDeadline[\s\S]+action=preserve_listener'
+    }
+
+    It 'records a startup profile receipt with cache source and verified process ownership' {
+        $startScript | Should Match 'marketpin-startup-profile\.v1'
+        $startScript | Should Match 'requested_symbols[\s\S]+cache_file[\s\S]+cache_source_sha256[\s\S]+selected_universe_sha256'
+        $startScript | Should Match 'source_fingerprint_sha256[\s\S]+backend[\s\S]+listener_pid[\s\S]+ownership_verified'
+        $startScript | Should Match "Event 'startup_profile_receipt_recorded'"
     }
 
     It 'logs incomplete post-close evidence instead of raising a runtime failure' {

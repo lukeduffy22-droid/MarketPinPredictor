@@ -2064,6 +2064,54 @@ function Get-MarketAppProcessTcpConnectionCountFromNetstatLines {
     return [int]@($Lines | Where-Object { [string]$_ -match $pattern }).Count
 }
 
+function Get-MarketAppProcessTcpConnectionStatesFromNetstatLines {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$ProcessId,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Lines
+    )
+
+    $pattern = '^\s*TCP\s+\S+\s+\S+\s+(?<state>\S+)\s+' +
+        [regex]::Escape([string]$ProcessId) + '\s*$'
+    return @(
+        $Lines |
+            ForEach-Object {
+                $match = [regex]::Match([string]$_, $pattern)
+                if ($match.Success) {
+                    $match.Groups['state'].Value.ToUpperInvariant()
+                }
+            }
+    )
+}
+
+function Get-MarketAppProcessTcpConnectionStates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$ProcessId
+    )
+
+    $netstatExe = Join-Path ([Environment]::SystemDirectory) 'netstat.exe'
+    $lines = & $netstatExe -ano -p tcp 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "netstat failed while checking TCP states for process PID $ProcessId."
+    }
+
+    return @(
+        Get-MarketAppProcessTcpConnectionStatesFromNetstatLines `
+            -ProcessId $ProcessId `
+            -Lines @($lines | Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_)
+            })
+    )
+}
+
 function Get-MarketAppProcessTcpConnectionCount {
     [CmdletBinding()]
     param(
@@ -2106,19 +2154,50 @@ function Wait-MarketAppProcessNetworkQuiescence {
     $deadlineUtc = $startedUtc.AddSeconds($TimeoutSeconds)
     $processExists = $true
     $tcpConnectionCount = -1
+    $tcpStates = @()
+    $activeTcpConnectionCount = -1
+    $residualClosingSamples = 0
+    $residualClosingStates = @('FIN_WAIT_1', 'FIN_WAIT_2', 'TIME_WAIT', 'CLOSING', 'LAST_ACK')
     do {
         $processExists = $null -ne (Get-MarketAppProcessRecord -ProcessId $ProcessId)
-        $tcpConnectionCount = Get-MarketAppProcessTcpConnectionCount -ProcessId $ProcessId
+        $tcpStates = @(Get-MarketAppProcessTcpConnectionStates -ProcessId $ProcessId)
+        $tcpConnectionCount = $tcpStates.Count
+        $activeTcpConnectionCount = @(
+            $tcpStates | Where-Object { $_ -cnotin $residualClosingStates }
+        ).Count
         if (-not $processExists -and $tcpConnectionCount -eq 0) {
             return [pscustomobject]@{
                 Quiescent = $true
                 ProcessId = $ProcessId
                 ProcessExists = $false
                 TcpConnectionCount = 0
+                ActiveTcpConnectionCount = 0
+                ResidualClosingOnly = $false
+                TcpStates = @()
                 ElapsedMilliseconds = [int][Math]::Round(
                     ([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
                 )
             }
+        }
+        if (-not $processExists -and $activeTcpConnectionCount -eq 0) {
+            $residualClosingSamples++
+            if ($residualClosingSamples -ge 2) {
+                return [pscustomobject]@{
+                    Quiescent = $true
+                    ProcessId = $ProcessId
+                    ProcessExists = $false
+                    TcpConnectionCount = [int]$tcpConnectionCount
+                    ActiveTcpConnectionCount = 0
+                    ResidualClosingOnly = $true
+                    TcpStates = @($tcpStates)
+                    ElapsedMilliseconds = [int][Math]::Round(
+                        ([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
+                    )
+                }
+            }
+        }
+        else {
+            $residualClosingSamples = 0
         }
         if ([DateTime]::UtcNow -ge $deadlineUtc) {
             break
@@ -2131,6 +2210,9 @@ function Wait-MarketAppProcessNetworkQuiescence {
         ProcessId = $ProcessId
         ProcessExists = [bool]$processExists
         TcpConnectionCount = [int]$tcpConnectionCount
+        ActiveTcpConnectionCount = [int]$activeTcpConnectionCount
+        ResidualClosingOnly = $false
+        TcpStates = @($tcpStates)
         ElapsedMilliseconds = [int][Math]::Round(
             ([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
         )
@@ -2337,12 +2419,38 @@ function Invoke-MarketAppBoundedAutomaticListenerStop {
     if (-not $quiescence.Quiescent) {
         throw "$Component PID $listenerPid did not reach exact-PID network quiescence after stop: process_exists=$($quiescence.ProcessExists) tcp_connection_count=$($quiescence.TcpConnectionCount)."
     }
+    $postStopListenerPids = @(Get-MarketAppListenerProcessIds -Port $Port)
+    if ($postStopListenerPids.Count -ne 0) {
+        throw "$Component port $Port acquired listener PID(s) $($postStopListenerPids -join ',') after the verified stop; replacement ownership is ambiguous."
+    }
+    $activeTcpConnectionCount = if (
+        $quiescence.PSObject.Properties.Name -contains 'ActiveTcpConnectionCount'
+    ) {
+        [int]$quiescence.ActiveTcpConnectionCount
+    }
+    else {
+        [int]$quiescence.TcpConnectionCount
+    }
+    $residualClosingOnly = if (
+        $quiescence.PSObject.Properties.Name -contains 'ResidualClosingOnly'
+    ) {
+        [bool]$quiescence.ResidualClosingOnly
+    }
+    else {
+        $false
+    }
+    $tcpStates = if ($quiescence.PSObject.Properties.Name -contains 'TcpStates') {
+        @($quiescence.TcpStates)
+    }
+    else {
+        @()
+    }
     Write-MarketAppSupervisorLog `
         -ProjectRoot $ProjectRoot `
         -InvocationId $InvocationId `
         -Caller $Caller `
         -Event 'automatic_stop_verified_listener' `
-        -Message "component=$Component port=$Port listener_pid=$listenerPid recovery_reason=$RecoveryReason stop_check_time_ct=$($stopCheckTime.ToString('o')) process_exited=true tcp_connection_count=0 quiescence_elapsed_ms=$($quiescence.ElapsedMilliseconds) action=stopped"
+        -Message "component=$Component port=$Port listener_pid=$listenerPid recovery_reason=$RecoveryReason stop_check_time_ct=$($stopCheckTime.ToString('o')) process_exited=true tcp_connection_count=$($quiescence.TcpConnectionCount) active_tcp_connection_count=$activeTcpConnectionCount residual_closing_only=$residualClosingOnly tcp_states=$($tcpStates -join ',') quiescence_elapsed_ms=$($quiescence.ElapsedMilliseconds) action=stopped"
     return [pscustomobject]@{
         Stopped = $true
         Reason = if ($AllowLateSessionSalvage) { 'stopped_late_session_salvage' } else { 'stopped_before_protected_opening_boundary' }
