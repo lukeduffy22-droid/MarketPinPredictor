@@ -1,0 +1,32 @@
+{
+  "name": "MarketPin Operations",
+  "subtitle": "Audit MarketPin evidence",
+  "description": "Diagnose MarketPinPredictor sessions, reconcile dashboard and persisted evidence, audit gamma and prediction provenance, and review market-facing features with explicit freshness, uncertainty, and risk boundaries. This skills-only plugin uses host-provided workspace and Python capabilities when available. It does not place trades, provide individualized investment instructions, hide invalid data, or automatically restart services.",
+  "category": "Developer Tools",
+  "developerName": null,
+  "websiteURL": "https://github.com/lukeduffy22-droid/MarketPinPredictor",
+  "customerSupportURL": null,
+  "privacyPolicyURL": null,
+  "termsOfServiceURL": null,
+  "version": "0.1.0",
+  "packageName": "marketpin-operations",
+  "capabilities": [
+    "Diagnose MarketPin live-session health",
+    "Reconcile dashboard, API, audit, and SQLite evidence",
+    "Audit gamma and prediction provenance",
+    "Review dashboard trust and market-risk communication",
+    "Run focused repository quality checks"
+  ],
+  "starterPrompts": [
+    "Check this MarketPinPredictor session and explain whether it is healthy.",
+    "Audit this MarketPin gamma or prediction value across UI, API, audit, and SQLite.",
+    "Review this MarketPin feature for evidence quality, UX trust, and market-risk communication."
+  ],
+  "status": "not_ready",
+  "missing": [
+    "Verified OpenAI publisher identity",
+    "Public customer support URL",
+    "Public privacy policy URL",
+    "Public terms of service URL"
+  ]
+}

@@ -1,0 +1,8 @@
+interface:
+  display_name: "MarketPin Product Review"
+  short_description: "Review trust, signals, UX, and risk"
+  brand_color: "#0B3558"
+  default_prompt: "Review this MarketPin feature for engineering evidence, dashboard trust, and market-risk communication."
+policy:
+  products: [CHAT, CODEX]
+  allow_implicit_invocation: true

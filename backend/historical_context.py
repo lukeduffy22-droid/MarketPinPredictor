@@ -58,7 +58,11 @@ def _load_market_history() -> pd.DataFrame:
         frames.append(frame)
 
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            *columns,
+            "history_file",
+            "history_priority",
+        ])
 
     df = pd.concat(frames, ignore_index=True)
     df["symbol"] = df["symbol"].astype(str).str.upper()

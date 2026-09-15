@@ -1,0 +1,8 @@
+interface:
+  display_name: "MarketPin Evidence Auditor"
+  short_description: "Audit gamma and prediction provenance"
+  brand_color: "#0B3558"
+  default_prompt: "Audit this MarketPin value for freshness, provenance, alignment, and replayability."
+policy:
+  products: [CHAT, CODEX]
+  allow_implicit_invocation: true

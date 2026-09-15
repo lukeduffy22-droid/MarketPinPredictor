@@ -1,0 +1,7 @@
+interface:
+  display_name: "MarketPin Python Verification"
+  short_description: "Run deterministic local verification"
+  brand_color: "#0B3558"
+policy:
+  products: [CHAT, CODEX]
+  allow_implicit_invocation: false

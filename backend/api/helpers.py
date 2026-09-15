@@ -448,6 +448,8 @@ def _historical_closed_market_fallback(symbol: str) -> dict | None:
         return None
 
     market_history = get_market_history()
+    if market_history.empty or not {"symbol", "close"}.issubset(market_history.columns):
+        return None
     symbol_history = market_history[market_history["symbol"].astype(str).str.upper().eq(normalized)].copy()
     if symbol_history.empty:
         return None
