@@ -1,0 +1,65 @@
+name: source-integration-quality-gate
+
+on:
+  pull_request:
+    branches:
+      - friday-1/9
+  push:
+    branches:
+      - "codex/**"
+
+permissions:
+  contents: read
+
+jobs:
+  publication-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete branch history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch protected integration base
+        run: git fetch origin friday-1/9
+
+      - name: Reject secrets, runtime artifacts, and oversized new blobs
+        run: python tools/check_publication_boundary.py --base origin/friday-1/9
+
+  offline-contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lightweight test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest fastapi pydantic sqlalchemy websockets numpy pandas requests python-dotenv databento
+
+      - name: Compile source entrypoints
+        run: |
+          python -m compileall -q app.py app backend tools
+
+      - name: Run provenance and provider contract tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: .
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_gex.py \
+            tests/test_gex_invariants.py \
+            tests/test_streamer_provider_selection.py \
+            tests/test_closing_tape_readiness.py \
+            tests/test_prediction_authority.py \
+            tests/test_validation_method_labels.py

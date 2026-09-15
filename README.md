@@ -1,153 +1,72 @@
-# MarketPinPredictor
+# Market Pin Predictor
 
-MarketPinPredictor is a Python market-index prediction system with:
+Market Pin Predictor is a local Streamlit and FastAPI application for recording Databento OPRA evidence, analyzing index-option market structure, and producing evidence-gated research forecasts.
 
-- a FastAPI backend in `app/api/main.py`
-- a Streamlit dashboard in `app.py`
-- canonical gamma-exposure logic in `app/core/gex.py`
+The repository deliberately keeps two kinds of information separate:
 
-## Runtime Quickstart
+- **Observed:** immutable option trades and their pre-trade national best bid/offer, definitions, event/receive timestamps, corrections, flags, and daily open-interest statistics.
+- **Inferred:** trade-side heuristics, positioning estimates, gamma interpretation, and model forecasts. These remain labeled estimates because OPRA does not publish aggressor side or participant holdings.
 
-### 1) Configure live market data provider
+## Current architecture
 
-Set at least one provider key:
-
-- `DATABENTO_API_KEY` (preferred for market-open fallback polling)
-- `Massive_API` (Polygon/Massive key)
-
-Optional provider mode:
-
-- `MARKET_DATA_PROVIDER=databento` (default)
-- `MARKET_DATA_PROVIDER=polygon`
-
-Optional options provider mode:
-
-- `OPTIONS_DATA_PROVIDER=none` (default, disables live options feed)
-- `OPTIONS_DATA_PROVIDER=polygon`
-
-### 2) Run setup verification
-
-```bash
-python verify_gamma_setup.py
+```text
+Databento OPRA
+    -> backend/databento_streamer.py
+    -> backend/closing_tape/        capture, replay, integrity, evaluation
+    -> backend/app.py               FastAPI contracts and lifecycle gates
+    -> app.py                       Streamlit dashboard
 ```
 
-### 3) Start backend
+Important entrypoints and contracts:
 
-```bash
-python server.py
+- `start_databento_app.ps1` — canonical Windows launcher for the complete local stack
+- `backend/app.py` — canonical FastAPI application
+- `server.py` — direct launcher for `backend.app:app`
+- `app.py` — Streamlit dashboard
+- `backend/prediction_authority.py` — fail-closed production authority
+- `backend/prediction_passport.py` — immutable forecast identity and provenance
+- `app/core/gex.py` — GEX formulas and sign conventions
+
+## Local setup
+
+Create `.venv`, install the backend requirements, and copy `.env.example` to a local `.env`. Never commit `.env` or provider credentials.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements_backend.txt --extra-index-url https://download.pytorch.org/whl/cu128
+Copy-Item .env.example .env
 ```
 
-Check health and active provider:
+The pinned CUDA packages target the workstation configuration. CI intentionally installs a lighter CPU-only dependency set for contract tests.
 
-- `GET /health` returns `market_data_provider` and per-symbol freshness.
+## Run
 
-## CUDA + Institutional Training
+For a normal live session, use the guarded launcher rather than starting components separately:
 
-### Check GPU
-
-```bash
-python tools/check_gpu.py
+```powershell
+.\start_databento_app.ps1
 ```
 
-### Build full historical dataset and train all symbols
+For backend-only development:
 
-```bash
-python tools/train_institutional_models.py --exports-dir ./exports --dataset-csv ./data/full_gamma_history.csv --rebuild
+```powershell
+.\.venv\Scripts\python.exe server.py
 ```
 
-This command:
+An open port or HTTP 200 is not sufficient live-readiness evidence. The lifecycle and provenance endpoints must also show advancing, fresh, current-generation data.
 
-1. Builds one unified dataset from all NDJSON snapshots under `./exports`.
-2. Trains SPX/NDX/DJI/RUT models with chronological splits.
-3. Uses CUDA automatically when available.
-4. Saves artifacts to `./models`.
+## Test
 
-## Active entry points
-
-- API server: `server.py`
-- FastAPI app: `app/api/main.py`
-- Streamlit app: `app.py`
-
-The files `app_new.py`, `app_backup.py`, and `clean_app/app.py` are deprecated guard entrypoints and intentionally exit immediately. Always run the dashboard from `app.py`.
-
-## Production prediction architecture
-
-- Live predictions are served by FastAPI `/predict/close` (time-adaptive ridge, versioned metadata, deterministic fallback defaults).
-- Streamlit is a thin dashboard client and reads live prediction/gamma/health from backend endpoints.
-- Offline/batch CUDA workflows remain in `train_gamma_model.py`, `predict_gamma_model.py`, and `tools/train_institutional_models.py`.
-- Model diagnostics and provenance are exposed at:
-  - `GET /models/live`
-  - `GET /diagnostics/system`
-
-## Requirements
-
-- Python 3.9+
-- Optional: `Massive_API` environment variable for live Polygon/Massive market data
-- Optional: `DATABASE_URL` for PostgreSQL-backed persistence
-
-## Install
-
-Fast local install:
-
-```bash
-pip install -r requirements_local.txt
+```powershell
+$env:PYTHONDONTWRITEBYTECODE='1'
+.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider
+.\.venv\Scripts\python.exe tools\check_publication_boundary.py --base origin/friday-1/9
 ```
 
-Full environment with `uv`:
+Use targeted tests while editing, then run the relevant broader offline suite. Tests must use temporary databases and must never mutate the configured live database.
 
-```bash
-uv pip install .
-```
+## Repository boundary
 
-## Run the backend
+GitHub holds source, tests, configuration templates, and reviewed documentation. Live databases, DBN captures, exports, logs, generated datasets, model weights, caches, environments, and bundled third-party repositories remain local and are ignored. See [.github/copilot-instructions.md](.github/copilot-instructions.md) for contributor and Copilot constraints.
 
-```bash
-python server.py
-```
-
-Or:
-
-```bash
-python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
-```
-
-Smoke check:
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-## Run the dashboard
-
-```bash
-streamlit run app.py
-```
-
-## Tests
-
-Targeted GEX tests:
-
-```bash
-python -m pytest tests/test_gex.py -q
-python -m pytest tests/test_gex_invariants.py -q
-```
-
-Targeted API and legacy-surface tests:
-
-```bash
-python -m pytest tests/test_api_health.py tests/test_legacy_exports.py -q
-```
-
-Run all tests:
-
-```bash
-pytest -v
-```
-
-## Notes for contributors
-
-- Keep changes minimal and localized.
-- Preserve GEX sign conventions and invariants by reusing `app/core/gex.py`.
-- Preserve existing FastAPI and Streamlit data shapes.
-- Prefer adding focused tests for stable behavior over broad refactors.
-- Legacy exports in `app/__init__.py` are intentionally unsupported and exist only to fail with clear guidance.
+Forecasts and side classifications are research estimates unless the recorded evidence has passed the existing maturity, evaluation, calibration, and promotion gates. This project does not place trades and is not investment advice.

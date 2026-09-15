@@ -1,51 +1,107 @@
-# Audit snapshot exports (generated files, not tracked in version control)
-exports/
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
 
-# SQLite database (for local development)
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
-
-# Python
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+*.pyo
 
 # Virtual environments
-.env
-.venv
-env/
+.venv/
 venv/
-ENV/
+env/
 
-# IDE
-.idea/
-.vscode/
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+
+# Test/tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.codex_tmp/
+.codex-tmp/
+.playwright-cli/
+.snapshots/
+
+# Streamlit runtime safety is repository-owned; .streamlit/config.toml is
+# intentionally tracked so a direct local launch cannot re-enable hot reload.
+
+# Notebook and editor noise
+.ipynb_checkpoints/
 *.swp
 *.swo
 
-# Logs
-*.log
+# OS artifacts
+.DS_Store
+Thumbs.db
 
-# Local config
-.env.local
-# Local editor history snapshots
+# Runtime-generated artifacts
+logs/
+attached_assets/
 .history/
+push_attempt.log
+output/
+outputs/
+tmp/
+historical_data/
+exports/
+exports_*/
+backups/
+research/outputs/
+plugins/dist/
+Git/
+pytorch/
+vision/
+**/node_modules/
+
+# Generated data exports
+exports/*/*.ndjson
+
+# Local runtime databases
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db-memo
+*.sqlite
+*.sqlite3
+
+# Provider captures, columnar datasets, and generated model artifacts
+*.dbn
+*.dbn.zst
+*.parquet
+*.feather
+*.arrow
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.bundle
+*.zip
+*.jsonl
+*.ndjson
+*.pyd
+*.dll
+*.exe
+*.wasm
+*.log
+~$*
+ml_data_backup_*.csv
+
+# High-volume closing-tape runtime artifacts
+data/closing_tape/
+data/databento_history/
+data/databento_cache/
+data/parquet/
+data/raw/
+data/verified_close_sources/
+data/closing_prices/
+data/backups/
