@@ -1,4 +1,5 @@
 [server]
-headless = true
-address = "0.0.0.0"
-port = 5000
+# MarketPin source changes are deployed through a verified process restart.
+# Hot-reload can evict an imported module while Python 3.11 dataclasses are
+# resolving annotations, leaving the class module absent from sys.modules.
+fileWatcherType = "none"

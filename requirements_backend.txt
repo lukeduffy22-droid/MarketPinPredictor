@@ -1,0 +1,41 @@
+# Production Backend Requirements
+# Versions pinned to the working local install (.venv).
+# Torch is installed from the cu128 index (Blackwell, RTX 50 series):
+#   pip install -r requirements_backend.txt --extra-index-url https://download.pytorch.org/whl/cu128
+
+# Core
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+pydantic==2.12.5
+
+# Database
+sqlalchemy==2.0.45
+# alembic is optional (migrations) and not part of the working venv; add when needed.
+
+# WebSocket
+websockets==16.0
+aiohttp==3.13.3
+
+# ML/CUDA - Blackwell (RTX 50 series) support
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
+numpy>=1.26.4
+pandas>=2.3.3
+scikit-learn>=1.8.0
+
+# Market data
+polygon-api-client==1.16.3
+databento>=0.84.0
+python-dotenv>=1.0.0
+pypdf>=6.16.2,<7.0.0
+
+# Monitoring (optional; not in the working venv)
+# prometheus-client>=0.19.0
+
+# Development
+pytest>=7.4.4
+# pytest-asyncio and black are optional dev tools; add when needed.
+
+# MCP server (tools/marketpin_mcp_server.py — Codex/agent bridge)
+mcp==2.2.0
