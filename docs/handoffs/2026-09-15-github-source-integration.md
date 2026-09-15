@@ -37,6 +37,10 @@ pytest discovery so the current architecture has one clear implementation for
 GitHub and Copilot, while the old code remains available for comparison or
 recovery.
 
+The invalid Conda workflow is likewise preserved byte-for-byte below the legacy
+archive instead of being discarded. It is intentionally outside the active
+`.github/workflows/` directory.
+
 ## Review contract
 
 Keep observed OPRA evidence separate from inferred side/positioning estimates. Preserve fail-closed abstentions and the existing maturity, evaluation, calibration, and promotion gates. CUDA or high record volume is not evidence that a forecast is accurate or production-authorized.

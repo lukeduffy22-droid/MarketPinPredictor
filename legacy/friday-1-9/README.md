@@ -7,6 +7,8 @@ moved here unchanged during the source-only integration; they were not deleted.
 The archive is retained for behavior comparison and recovery only. It is not an
 active import root, it is excluded from normal pytest discovery, and Copilot
 changes should not target it unless a task explicitly concerns legacy behavior.
+The malformed Conda workflow is also retained here as inert reference material;
+placing it outside `.github/workflows/` prevents GitHub from executing it.
 
 Current equivalents live under the root Streamlit `app.py`, `backend/`, the
 active `app/` services, `tests/`, and `tools/` trees. New production work must
