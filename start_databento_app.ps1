@@ -39,6 +39,61 @@ function Write-StartupSupervisorLog {
         -Message $Message
 }
 
+function Write-StartupProfileReceipt {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$UniversePreparation,
+        [Parameter(Mandatory = $true)][int]$BackendLaunchPid,
+        [Parameter(Mandatory = $true)][int]$BackendListenerPid,
+        [Parameter(Mandatory = $true)][int]$DashboardLaunchPid,
+        [Parameter(Mandatory = $true)][int]$DashboardListenerPid
+    )
+
+    $runtimeDirectory = Join-Path $AppDir 'logs\runtime'
+    [System.IO.Directory]::CreateDirectory($runtimeDirectory) | Out-Null
+    $receiptPath = Join-Path $runtimeDirectory "startup-profile-$InvocationId.json"
+    $temporaryPath = "$receiptPath.$([guid]::NewGuid().ToString('N')).tmp"
+    $provenance = $UniversePreparation.Result.provenance
+    $sourcePath = [string]$provenance.source_path
+    $receipt = [ordered]@{
+        schema_version = 'marketpin-startup-profile.v1'
+        invocation_id = $InvocationId
+        recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+        caller = $Caller
+        project_root = [System.IO.Path]::GetFullPath($AppDir)
+        requested_symbols = @($env:DATABENTO_SYMBOLS -split ',')
+        universe = [ordered]@{
+            provenance_label = [string]$UniversePreparation.ProvenanceLabel
+            trading_date = [string]$provenance.trading_date
+            cache_file = if ($sourcePath) { [System.IO.Path]::GetFileName($sourcePath) } else { $null }
+            cache_source_sha256 = [string]$provenance.source_sha256
+            selected_universe_sha256 = [string]$UniversePreparation.Result.selected_universe_sha256
+        }
+        source_fingerprint_sha256 = [string]$script:OpeningAcceptancePreflightResult.source_fingerprint_sha256
+        processes = [ordered]@{
+            backend = [ordered]@{
+                launch_pid = $BackendLaunchPid
+                listener_pid = $BackendListenerPid
+                ownership_verified = $true
+            }
+            dashboard = [ordered]@{
+                launch_pid = $DashboardLaunchPid
+                listener_pid = $DashboardListenerPid
+                ownership_verified = $true
+            }
+        }
+    }
+    $json = $receipt | ConvertTo-Json -Depth 6
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, "$json`n", $utf8NoBom)
+        Move-Item -LiteralPath $temporaryPath -Destination $receiptPath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+    return $receiptPath
+}
+
 function Invoke-OpeningAcceptancePreflight {
     param(
         [Parameter(Mandatory = $true)][string]$PythonPath,
@@ -801,6 +856,40 @@ if (-not (Wait-ForHttpEndpoint `
     Stop-StartupProcesses -BackendProcess $backendProcess -DashboardProcess $dashboardProcess
     throw 'Dashboard launch ownership/readiness verification failed.'
 }
+
+$backendListenerPid = Get-MarketAppOwnedListenerPid `
+    -Port 8000 `
+    -LaunchProcessId $backendProcess.Id `
+    -ListenerProcessIds @(Get-MarketAppListenerProcessIds -Port 8000)
+$dashboardListenerPid = Get-MarketAppOwnedListenerPid `
+    -Port 8501 `
+    -LaunchProcessId $dashboardProcess.Id `
+    -ListenerProcessIds @(Get-MarketAppListenerProcessIds -Port 8501)
+if ($null -eq $backendListenerPid -or $null -eq $dashboardListenerPid) {
+    Stop-StartupProcesses -BackendProcess $backendProcess -DashboardProcess $dashboardProcess
+    throw 'Startup endpoint ownership changed before the profile receipt could be recorded.'
+}
+$backendOwnershipVerified = Test-MarketAppVerifiedProcess `
+    -ProcessId $backendListenerPid `
+    -ProjectRoot $AppDir `
+    -RequiredCommandMarkers @('server.py', 'backend.app:app')
+$dashboardOwnershipVerified = Test-MarketAppVerifiedProcess `
+    -ProcessId $dashboardListenerPid `
+    -ProjectRoot $AppDir `
+    -RequiredCommandMarkers @('streamlit', 'app.py')
+if (-not $backendOwnershipVerified -or -not $dashboardOwnershipVerified) {
+    Stop-StartupProcesses -BackendProcess $backendProcess -DashboardProcess $dashboardProcess
+    throw 'Startup process ownership could not be reverified for the profile receipt.'
+}
+$startupProfileReceiptPath = Write-StartupProfileReceipt `
+    -UniversePreparation $universePreparation `
+    -BackendLaunchPid $backendProcess.Id `
+    -BackendListenerPid $backendListenerPid `
+    -DashboardLaunchPid $dashboardProcess.Id `
+    -DashboardListenerPid $dashboardListenerPid
+Write-StartupSupervisorLog `
+    -Event 'startup_profile_receipt_recorded' `
+    -Message "requested_symbols=$env:DATABENTO_SYMBOLS cache_file=$([System.IO.Path]::GetFileName([string]$universePreparation.Result.provenance.source_path)) selected_hash=$($universePreparation.Result.selected_universe_sha256) source_fingerprint=$($script:OpeningAcceptancePreflightResult.source_fingerprint_sha256) backend_listener_pid=$backendListenerPid dashboard_listener_pid=$dashboardListenerPid ownership_verified=True receipt_path=$startupProfileReceiptPath"
 
 if ($env:MARKETPIN_FORECAST_RESEARCH_AUTOSTART -ne '0') {
     try {

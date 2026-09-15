@@ -65,6 +65,14 @@ def test_report_generates_evidence_bound_change_review():
     assert report['medium_risk_improvements'] == report['high_impact_optional'] == []
 
 
+def test_advisor_view_binding_accepts_retained_capabilities():
+    from app.services import advisor_view
+
+    old = inspect_capabilities()
+    report = advisor_view.build_advisor_report(context(), old)
+    assert report['capabilities']['fingerprint'] == inspect_capabilities()['fingerprint']
+
+
 def test_disk_selection_roundtrip_and_failed_write_preserves_previous(tmp_path, monkeypatch):
     c = context(); c['pipeline']['stale_symbols'] = ['SPX']
     report = build_advisor_report(c)
