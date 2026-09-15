@@ -1,0 +1,45 @@
+{
+  "author": {
+    "name": "MarketPinPredictor contributors",
+    "url": "https://github.com/lukeduffy22-droid/MarketPinPredictor"
+  },
+  "description": "Diagnose MarketPinPredictor sessions, audit gamma and prediction evidence, and review market-facing product behavior with explicit freshness, provenance, and risk boundaries.",
+  "homepage": "https://github.com/lukeduffy22-droid/MarketPinPredictor",
+  "interface": {
+    "brandColor": "#0B3558",
+    "brandColorDark": "#55D6BE",
+    "capabilities": [
+      "Diagnose MarketPin live-session health",
+      "Reconcile dashboard, API, audit, and SQLite evidence",
+      "Audit gamma and prediction provenance",
+      "Review dashboard trust and market-risk communication",
+      "Run focused repository quality checks"
+    ],
+    "category": "Developer Tools",
+    "composerIcon": "./assets/composer-icon.svg",
+    "defaultPrompt": [
+      "Check this MarketPinPredictor session and explain whether it is healthy.",
+      "Audit this MarketPin gamma or prediction value across UI, API, audit, and SQLite.",
+      "Review this MarketPin feature for evidence quality, UX trust, and market-risk communication."
+    ],
+    "developerName": "MarketPinPredictor contributors",
+    "displayName": "MarketPin Operations",
+    "logo": "./assets/logo-light.svg",
+    "longDescription": "A skills-only operations and review companion for MarketPinPredictor repositories. It helps inspect live Databento, FastAPI, Streamlit, audit, and SQLite evidence; reconcile questionable gamma and prediction values; review dashboard trust, signal explanations, and financial-risk communication; and run narrowly scoped repository quality checks. It defaults to read-only evidence gathering, preserves invalid and stale states, never treats analytical targets as guaranteed outcomes, and does not place trades or automatically restart services.",
+    "shortDescription": "Audit MarketPin evidence",
+    "websiteURL": "https://github.com/lukeduffy22-droid/MarketPinPredictor"
+  },
+  "keywords": [
+    "marketpin",
+    "databento",
+    "gamma-exposure",
+    "market-data",
+    "dashboard-audit",
+    "repository-operations"
+  ],
+  "license": "Proprietary",
+  "name": "marketpin-operations",
+  "repository": "https://github.com/lukeduffy22-droid/MarketPinPredictor",
+  "skills": "./skills/",
+  "version": "0.1.0"
+}

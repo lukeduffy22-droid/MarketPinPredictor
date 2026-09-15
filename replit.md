@@ -66,6 +66,11 @@ Comprehensive Eastern Time management for `minutes_to_close_et()`, market holida
 
 ## Project Cleanup Plan (Pending)
 
+> **Historical plan.** This proposed Replit-era layout is not the current
+> MarketPinPredictor architecture. Follow `README.md` and
+> `.github/copilot-instructions.md` for active paths. Superseded files retained
+> for comparison now live under `legacy/friday-1-9/`.
+
 The core `app/` package is well-organized, but the root directory has accumulated clutter. Below is the planned reorganization:
 
 ### Current Issues
@@ -90,7 +95,7 @@ The core `app/` package is well-organized, but the root directory has accumulate
 ├── tests/                 # Tests (keep)
 │
 ├── tools/                 # CLI utilities (consolidate)
-│   ├── backfill_snapshots.py
+│   ├── backfill_snapshots.py  # now archived under legacy/friday-1-9/tools/
 │   ├── backtest_calibrate.py
 │   ├── backtesting.py
 │   ├── export_all_indices.py

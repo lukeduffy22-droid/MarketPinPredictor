@@ -1,0 +1,32 @@
+{
+  "schema_version": "marketpin-expanded-universe-staging.v1",
+  "status": "STAGED_NOT_ACTIVATED",
+  "purpose": "Bounded main index and ETF option coverage plus independent cross-market equity context",
+  "environment": {
+    "DATABENTO_SYMBOLS": "SPX,NDX,VIX,RUT,SPY,QQQ,DIA,IWM",
+    "DATABENTO_REQUIRED_SYMBOLS": "SPX,NDX",
+    "DATABENTO_SUBSCRIPTION_PROFILE": "near-term-shadow",
+    "DATABENTO_MAX_SUBSCRIPTION_CONTRACTS": "3600",
+    "DATABENTO_MAX_CONTRACTS_PER_MARKET": "1800",
+    "DATABENTO_USE_MULTI_EXPIRATION": "0",
+    "DATABENTO_EQUITY_CONTEXT_ENABLED": "0",
+    "DATABENTO_EQUITY_CONTEXT_SYMBOLS": "SPY,QQQ,DIA,IWM,RSP,VTI,MDY,XLK,XLF,XLY,XLP,XLE,XLI,XLV,XLU,SMH,TLT,IEF,HYG,LQD"
+  },
+  "activation": {
+    "automatic": false,
+    "loads_into_running_process": false,
+    "live_restart_performed": false,
+    "equity_context_enable_requires_verified_entitlement": true,
+    "option_universe_requires_current_definitions_and_pair_complete_selection": true,
+    "core_allocation_policy": "ETF options use residual capacity after existing index pairs; no increase to the OPRA global cap",
+    "observed_entitlement_blocker": "Current-session EQUS.MINI ohlcv-1m requests returned license_not_found_unauthorized on 2026-09-10; this profile does not enable retries"
+  },
+  "instrument_identity": {
+    "DIJ_alias": "DJI",
+    "index_etf_families": {"SPX": "SPY", "NDX": "QQQ", "DJI": "DIA", "RUT": "IWM"},
+    "cash_index_price_conversion_allowed": false,
+    "DJI_cash_feed_supported": false,
+    "DJX_is_a_distinct_instrument": true,
+    "EQUS_MINI_is_consolidated_SIP": false
+  }
+}

@@ -5,7 +5,6 @@ Per-symbol and per-time-bucket storage for adaptive predictions.
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.engine.url import make_url
 from datetime import datetime
 from typing import Optional
 import os
@@ -101,59 +100,25 @@ class PredictionLog(Base):
     regime_eom = Column(Boolean, default=False)  # End of month
     regime_eow = Column(Boolean, default=False)  # End of week
 
-def _build_engine():
-    """Build a shared SQLAlchemy engine with dialect-aware settings."""
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        db_url = 'sqlite:///./market_predictor.db'
-        print(f"⚠️ DATABASE_URL not set, using SQLite: {db_url}")
-
-    parsed = make_url(db_url)
-    backend = parsed.get_backend_name()
-    drivername = parsed.drivername
-
-    engine_kwargs = {}
-    connect_args = {}
-
-    if backend == "sqlite":
-        connect_args = {"check_same_thread": False}
-    elif backend == "postgresql":
-        engine_kwargs = {
-            "pool_pre_ping": True,
-            "pool_recycle": 3600,
-        }
-        if (
-            drivername == "postgresql"
-            or "+psycopg2" in drivername
-            or "+psycopg" in drivername
-        ):
-            connect_args = {
-                "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
-                "application_name": "MarketPinPredictor",
-            }
-
-    if connect_args:
-        return create_engine(db_url, connect_args=connect_args, **engine_kwargs)
-    return create_engine(db_url, **engine_kwargs)
-
-
-ENGINE = _build_engine()
-SessionLocal = sessionmaker(bind=ENGINE)
-
-
 # Database connection
 def get_engine():
-    """Return module-level shared engine."""
-    return ENGINE
+    """Get database engine from environment"""
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL not set")
+    return create_engine(db_url)
 
 def init_db():
     """Initialize database tables"""
-    Base.metadata.create_all(ENGINE)
-    return ENGINE
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    return engine
 
 def get_session():
     """Get database session"""
-    return SessionLocal()
+    engine = get_engine()
+    Session = sessionmaker(bind=engine)
+    return Session()
 
 def load_coefficients(symbol: str) -> CalibrationCoeff:
     """
@@ -276,9 +241,9 @@ def get_mae_by_regime(symbol: str = None, days: int = 30) -> dict:
             'eow': compute_stats(base_filter + [PredictionLog.regime_eow == True]),
             'holiday_adjacent': compute_stats(base_filter + [PredictionLog.regime_holiday_adjacent == True]),
         }
-    except Exception:
+    except Exception as e:
         return {
-            'overall': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
+            'overall': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0, 'error': str(e)},
             'half_day': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
             'regular_day': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},
             'eom': {'mae': 0.0, 'mae_pct': 0.0, 'n_samples': 0, 'bias': 0.0},

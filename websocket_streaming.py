@@ -22,14 +22,16 @@ STILL USABLE:
 """
 
 import streamlit as st
-from polygon.websocket import WebSocketClient
-from polygon.rest import RESTClient
+from polygon import WebSocketClient, RESTClient
 from typing import List, Dict, Callable, Optional
 import threading
 import queue
-from datetime import datetime
+import os
+from datetime import datetime, timedelta, timezone
 import time
 import warnings
+
+import pandas as pd
 
 class RealTimeDataStream:
     """
@@ -486,7 +488,11 @@ The app automatically selects the optimal data feed:
 
 def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Dict]]:
     """
-    Get snapshot data for index tickers as a backup method when streaming is unavailable
+    Get snapshot data for index tickers as a backup method when streaming is unavailable.
+
+    Databento is tried first when a Databento API key is present for directly
+    supported non-index tickers. Real index values (SPX/NDX/DJI/RUT/VIX) are
+    fetched from the index snapshot source rather than ETF proxies.
     
     Args:
         api_key: Polygon/Massive API key
@@ -496,8 +502,96 @@ def get_snapshot_data(api_key: str, tickers: List[str]) -> Optional[Dict[str, Di
         Dictionary mapping ticker to snapshot data (price, volume, etc.)
     """
     try:
-        client = RESTClient(api_key)
         snapshot_data = {}
+
+        databento_key = (
+            (api_key or "").strip() if isinstance(api_key, str) and api_key.startswith("db-") else ""
+        ) or os.getenv("DATABENTO_API_KEY", "").strip()
+
+        # Avoid treating Databento keys as Polygon keys when building snapshot fallback client.
+        incoming_key = (api_key or "").strip() if isinstance(api_key, str) else ""
+        polygon_key = ""
+        if incoming_key and not incoming_key.startswith("db-"):
+            polygon_key = incoming_key
+        if not polygon_key:
+            polygon_key = (
+                os.getenv("POLYGON_API_KEY", "").strip()
+                or os.getenv("POLYGON_STREAMING_KEY", "").strip()
+                or os.getenv("MASSIVE_API_KEY", "").strip()
+                or os.getenv("Massive_API", "").strip()
+            )
+        if polygon_key.startswith("db-"):
+            polygon_key = ""
+        index_tickers = {"I:SPX", "I:NDX", "I:RUT", "I:DJI", "I:VIX"}
+        if databento_key:
+            try:
+                import databento as db
+
+                client = db.Historical(databento_key)
+                end_date = datetime.now(timezone.utc).date()
+                start_date = end_date - timedelta(days=2)
+                start_date_str = start_date.isoformat()
+
+                for ticker in tickers:
+                    normalized_ticker = (ticker or "").strip().upper()
+                    if not normalized_ticker:
+                        continue
+
+                    # Real index tickers are not proxied here; they fall through to Polygon.
+                    if normalized_ticker in index_tickers:
+                        continue
+
+                    proxy_symbol = None
+                    db_symbol = normalized_ticker.replace("I:", "")
+                    if not db_symbol:
+                        continue
+
+                    try:
+                        # Do not pass `end` to avoid out-of-range errors when dataset availability lags current time.
+                        store = client.timeseries.get_range(
+                            dataset="EQUS.MINI",
+                            symbols=[db_symbol],
+                            schema="ohlcv-1m",
+                            start=start_date_str,
+                            limit=5,
+                        )
+                        df = store.to_df()
+                        if df is None or df.empty:
+                            continue
+
+                        if "symbol" in df.columns:
+                            df = df[df["symbol"].astype(str) == db_symbol]
+                        if df.empty:
+                            continue
+
+                        latest = df.iloc[-1]
+                        previous_close = df.iloc[-2]["close"] if len(df) > 1 else None
+
+                        snapshot_data[normalized_ticker] = {
+                            "ticker": normalized_ticker,
+                            "price": float(latest["close"]),
+                            "open": float(latest["open"]),
+                            "high": float(latest["high"]),
+                            "low": float(latest["low"]),
+                            "volume": float(latest["volume"]) if "volume" in latest and pd.notna(latest["volume"]) else None,
+                            "prev_close": float(previous_close) if previous_close is not None and pd.notna(previous_close) else None,
+                            "timestamp": datetime.now(),
+                            "source": "databento",
+                            "proxy_symbol": proxy_symbol,
+                            "databento_symbol": db_symbol,
+                        }
+                    except Exception as databento_error:
+                        print(f"Databento snapshot error for {normalized_ticker}: {type(databento_error).__name__}: {databento_error}")
+
+                # Continue to snapshot fallback for any unresolved index tickers.
+
+            except Exception as databento_error:
+                print(f"Databento unavailable: {type(databento_error).__name__}: {databento_error}")
+
+        if not polygon_key:
+            return snapshot_data if snapshot_data else None
+
+        client = RESTClient(polygon_key)
         
         try:
             # Get snapshot for indices using the correct API method

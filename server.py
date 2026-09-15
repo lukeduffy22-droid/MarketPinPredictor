@@ -1,6 +1,6 @@
 """
 FastAPI server entry point.
-Runs the 0-day prediction API with WebSocket ingestion.
+Runs the canonical backend API entrypoint.
 """
 import uvicorn
 import logging
@@ -13,7 +13,7 @@ logging.basicConfig(
 
 if __name__ == "__main__":
     uvicorn.run(
-        "app.api.main:app",
+        "backend.app:app",
         host="0.0.0.0",
         port=8000,
         reload=False,

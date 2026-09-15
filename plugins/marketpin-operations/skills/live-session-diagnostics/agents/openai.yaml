@@ -1,0 +1,8 @@
+interface:
+  display_name: "MarketPin Live Diagnostics"
+  short_description: "Check live session health and evidence"
+  brand_color: "#0B3558"
+  default_prompt: "Diagnose this MarketPinPredictor session from current runtime, audit, and persistence evidence."
+policy:
+  products: [CODEX]
+  allow_implicit_invocation: true

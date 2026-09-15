@@ -5,6 +5,11 @@ Critical for accurate minutes-to-close calculations during power hour.
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from app.utils.market_calendar import (
+    full_closure_iso_dates,
+    market_calendar_status,
+)
+
 try:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
@@ -29,45 +34,37 @@ EARLY_CLOSE_ET_DATES = {
     "2025-12-24",  # Christmas Eve
     # 2026
     "2026-11-27",  # Day after Thanksgiving
-    "2026-12-24",  # Christmas Eve (Thursday)
+    "2026-12-24",  # Christmas Eve
+    # 2027-2028, verified against NYSE hours-calendars on 2026-09-10.
+    # July 2, 2026 is a regular session, not an early close.
+    "2027-11-26",
+    "2028-07-03",
+    "2028-11-24",
 }
 
-# Full market closures - Update annually
-US_MARKET_HOLIDAYS = {
-    # 2024
-    "2024-01-01",  # New Year's Day
-    "2024-01-15",  # MLK Day
-    "2024-02-19",  # Presidents' Day
-    "2024-03-29",  # Good Friday
-    "2024-05-27",  # Memorial Day
-    "2024-06-19",  # Juneteenth
-    "2024-07-04",  # Independence Day
-    "2024-09-02",  # Labor Day
-    "2024-11-28",  # Thanksgiving
-    "2024-12-25",  # Christmas
-    # 2025
-    "2025-01-01",  # New Year's Day
-    "2025-01-20",  # MLK Day
-    "2025-02-17",  # Presidents' Day
-    "2025-04-18",  # Good Friday
-    "2025-05-26",  # Memorial Day
-    "2025-06-19",  # Juneteenth
-    "2025-07-04",  # Independence Day
-    "2025-09-01",  # Labor Day
-    "2025-11-27",  # Thanksgiving
-    "2025-12-25",  # Christmas
-    # 2026
-    "2026-01-01",  # New Year's Day
-    "2026-01-19",  # MLK Day
-    "2026-02-16",  # Presidents' Day
-    "2026-04-03",  # Good Friday
-    "2026-05-25",  # Memorial Day
-    "2026-06-19",  # Juneteenth
-    "2026-07-03",  # Independence Day observed (July 4 falls on Saturday)
-    "2026-09-07",  # Labor Day
-    "2026-11-26",  # Thanksgiving
-    "2026-12-25",  # Christmas
-}
+# Full closures are shared with the PowerShell scheduler through the reviewed
+# calendar file. The compatibility set remains available to older callers.
+US_MARKET_HOLIDAYS = set(full_closure_iso_dates())
+
+
+def now_utc() -> datetime:
+    """Return the current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def utc_iso(dt: Optional[datetime] = None) -> str:
+    """Return an explicit UTC ISO-8601 timestamp with Z suffix."""
+    value = dt or now_utc()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def format_clock_et(dt_utc: Optional[datetime] = None) -> str:
+    """Return a short ET clock label for user-facing UI captions."""
+    return now_et(dt_utc).strftime("%H:%M:%S ET")
 
 def now_et(dt_utc: Optional[datetime] = None) -> datetime:
     """Convert UTC datetime to ET, or get current ET time"""
@@ -81,9 +78,13 @@ def et_today(dt_et: Optional[datetime] = None) -> datetime:
     return d.replace(hour=0, minute=0, second=0, microsecond=0)
 
 def is_market_holiday(d: Optional[datetime] = None) -> bool:
-    """Check if given date is a market holiday"""
+    """Check full closure status, failing closed outside reviewed years."""
     base = et_today(d)
-    return base.date().isoformat() in US_MARKET_HOLIDAYS
+    status = market_calendar_status(base.date())
+    return bool(
+        not status["supported"]
+        or status["reason"] in {"regular_full_closure", "one_off_full_closure"}
+    )
 
 def is_early_close(d: Optional[datetime] = None) -> bool:
     """Check if given date has early close (1:00 PM ET)"""

@@ -262,9 +262,9 @@ class TestAggregateGex:
             compute_aggregate_gex("not a list")
     
     def test_aggregate_gex_missing_net_gex_key(self):
-        """Missing net_gex key raises ValueError."""
-        strikes = [{'strike': 100}]  # Missing 'net_gex'
-        with pytest.raises(ValueError, match="net_gex"):
+        """Missing supported GEX component keys raises ValueError."""
+        strikes = [{'strike': 100}]  # Missing call/put and legacy net GEX fields
+        with pytest.raises(ValueError, match="missing .*net_gex.*key"):
             compute_aggregate_gex(strikes)
 
 

@@ -5,7 +5,8 @@ Optimized for <200ms latency and minimal memory footprint.
 from collections import deque
 from typing import Deque, Tuple, Any, Dict, Optional, NamedTuple
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
+import os
 
 class IndexTick(NamedTuple):
     """Normalized index price tick"""
@@ -22,7 +23,7 @@ class OptTrade:
     is_call: bool
     exp: date  # Expiration date
     notional: float  # price * size
-    aggressor: int  # +1 for buy, -1 for sell
+    aggressor: int  # inferred +1 buy, -1 sell, or 0 unknown; never an observed holding
 
 class Ring1s:
     """Lock-free ring buffer with fixed capacity for 1-second aggregated data"""
@@ -55,50 +56,39 @@ class Ring1s:
         """Number of seconds of data available"""
         return len(self.q)
 
-# Backend-tracked live display symbols.
-TRACKED_INDEX_SYMBOLS = ("SPX", "NDX", "DJI", "RUT", "VIX")
-PREDICTION_SYMBOLS = ("SPX", "NDX", "DJI", "RUT")
-
 # Global per-symbol ring buffers
 INDEX_RINGS: Dict[str, Ring1s] = {
-    s: Ring1s() for s in TRACKED_INDEX_SYMBOLS
+    s: Ring1s() for s in ("SPX", "NDX", "DJI", "RUT")
 }
 
 FLOW_RINGS: Dict[str, Ring1s] = {
-    r: Ring1s() for r in PREDICTION_SYMBOLS
+    r: Ring1s() for r in ("SPX", "NDX", "DJI", "RUT")
 }
 
 # Session VWAP trackers (reset at market open)
 _vwap_state: Dict[str, Dict[str, float]] = {
-    s: {"sum_pv": 0.0, "sum_v": 0.0} for s in TRACKED_INDEX_SYMBOLS
+    s: {"sum_pv": 0.0, "sum_v": 0.0} for s in ("SPX", "NDX", "DJI", "RUT")
 }
+
+
+def ensure_symbol_registered(symbol: str):
+    """Ensure runtime data structures exist for dynamically configured symbols."""
+    clean = (symbol or "").strip().upper()
+    if not clean:
+        return
+
+    if clean not in INDEX_RINGS:
+        INDEX_RINGS[clean] = Ring1s()
+    if clean not in FLOW_RINGS:
+        FLOW_RINGS[clean] = Ring1s()
+    if clean not in _vwap_state:
+        _vwap_state[clean] = {"sum_pv": 0.0, "sum_v": 0.0}
 
 def update_session_vwap(symbol: str, price: float, size: float = 1.0):
     """Update running VWAP calculation for symbol"""
     if symbol in _vwap_state:
         _vwap_state[symbol]["sum_pv"] += price * size
         _vwap_state[symbol]["sum_v"] += size
-
-
-def record_live_index_tick(
-    symbol: str,
-    tick: IndexTick,
-    *,
-    update_vwap: bool = True,
-) -> None:
-    """Record a normalized live tick and update all session-derived state."""
-    if symbol not in INDEX_RINGS or tick.price <= 0:
-        return
-
-    INDEX_RINGS[symbol].add(tick.ts, tick)
-    if update_vwap:
-        update_session_vwap(symbol, tick.price, tick.size)
-
-    if symbol in PREDICTION_SYMBOLS:
-        from app.state.orb_tracker import update_orb
-
-        tick_time = datetime.fromtimestamp(tick.ts, tz=timezone.utc)
-        update_orb(symbol, tick.price, tick_time)
 
 def get_session_vwap(symbol: str) -> float:
     """Get current session VWAP for symbol"""
@@ -141,16 +131,15 @@ def get_latest_price_with_fallback(symbol: str, api_key: str = None) -> Optional
     Priority:
     1. Ring buffer (real-time WebSocket data)
     2. Database (last gamma snapshot spot price)
-    3. Polygon REST API (previous close)
-    
-    This ensures EOD data is available after hours for premium subscribers.
+    3. Databento snapshot (proxy ETF)
+    4. Polygon REST API (previous close)
     """
     # Try ring buffer first (fastest, real-time)
     price = get_latest_price(symbol)
     if price is not None:
         return price
-    
-    # Fallback 1: Database - get last known spot price from gamma snapshot
+
+    # Fallback 1: Database - fastest stable source during post-close freeze
     try:
         from database import get_latest_gamma_snapshot
         snapshot = get_latest_gamma_snapshot(symbol)
@@ -159,11 +148,31 @@ def get_latest_price_with_fallback(symbol: str, api_key: str = None) -> Optional
     except Exception as e:
         import logging
         logging.getLogger("ring_buffers").warning(f"Database fallback failed for {symbol}: {e}")
+
+    # Fallback 2: Databento snapshot for index proxy prices (bounded timeout)
+    try:
+        databento_key = os.getenv("DATABENTO_API_KEY", "").strip()
+        if databento_key:
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+            from websocket_streaming import get_snapshot_data
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(get_snapshot_data, databento_key, [f"I:{symbol}"])
+                snapshot = future.result(timeout=5.0)
+
+            if snapshot and f"I:{symbol}" in snapshot:
+                snap = snapshot[f"I:{symbol}"]
+                snap_price = snap.get("price") or snap.get("close")
+                if snap_price is not None:
+                    return float(snap_price)
+    except Exception as e:
+        import logging
+        logging.getLogger("ring_buffers").warning(f"Databento fallback failed for {symbol}: {e}")
     
     # Fallback 2: Polygon REST API - get previous close
     if api_key:
         try:
-            from polygon.rest import RESTClient
+            from polygon import RESTClient
             client = RESTClient(api_key)
             
             # Try to get the previous day's close for indices

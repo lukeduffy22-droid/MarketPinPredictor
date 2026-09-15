@@ -1,3 +1,8 @@
-torch>=2.0.0
+# PyTorch with CUDA 12.8 for Blackwell (RTX 50 series)
+# Install with:
+# pip install -r requirements_local.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
 numpy>=1.24.0
 pandas>=2.0.0

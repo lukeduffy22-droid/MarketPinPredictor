@@ -2,7 +2,6 @@
 import sys
 import os
 import json
-from pathlib import Path
 import pandas as pd
 
 def load_snapshot(path):
@@ -16,8 +15,8 @@ def extract_row(snap):
     gamma_pin = snap.get("primary_gamma_pin_strike") or snap.get("gamma_pin", None)
     gross_gex = snap.get("gross_gex", None)
     net_gex = snap.get("net_gex", None)
-    call_gex = snap.get("call_gex_total", snap.get("call_gex", None))
-    put_gex = snap.get("put_gex_total", snap.get("put_gex", None))
+    call_gex = snap.get("call_gex", snap.get("call_gex_total", None))
+    put_gex = snap.get("put_gex", snap.get("put_gex_total", None))
     is_valid = snap.get("validation_is_valid", False)
 
     return {
@@ -36,90 +35,66 @@ def extract_row(snap):
 def build_dataset(exports_dir, date_filter=None, include_invalid=False):
     """
     Build dataset from NDJSON files in exports/{SYMBOL}/{DATE}.ndjson structure.
-    
+
     Args:
         exports_dir: Root exports directory (e.g., ./exports)
         date_filter: Optional date string (YYYY-MM-DD) to filter specific date only
     """
     rows = []
     files_processed = 0
-    
+
     if not os.path.exists(exports_dir):
         print(f"Error: Directory not found: {exports_dir}")
         return pd.DataFrame()
-    
-    snapshot_files = sorted(
-        p for p in Path(exports_dir).rglob("*")
-        if p.is_file() and p.suffix.lower() in {".ndjson", ".json"}
-    )
 
-    if not snapshot_files:
-        print(f"Warning: No snapshot files found under {exports_dir}")
-        return pd.DataFrame()
+    for symbol_dir in os.listdir(exports_dir):
+        symbol_path = os.path.join(exports_dir, symbol_dir)
 
-    print(f"Discovered {len(snapshot_files)} snapshot file(s)")
+        if not os.path.isdir(symbol_path):
+            continue
 
-    date_filter_prefix = None
-    if date_filter:
-        # Used by audit snapshots named like YYYYMMDD-HHMMSS.json
-        date_filter_prefix = date_filter.replace("-", "")
+        for fname in os.listdir(symbol_path):
+            if not fname.endswith(".ndjson"):
+                continue
 
-    for full_path in snapshot_files:
-        fname = full_path.name
-
-        if date_filter:
-            if full_path.suffix.lower() == ".ndjson":
+            if date_filter:
                 file_date = fname.replace('.ndjson', '')
                 if file_date != date_filter:
                     continue
-            else:
-                if not fname.startswith(date_filter_prefix):
-                    continue
 
-        symbol_guess = full_path.parent.name
-        file_rows = 0
+            full_path = os.path.join(symbol_path, fname)
+            file_rows = 0
 
-        try:
-            if full_path.suffix.lower() == ".ndjson":
-                with open(full_path, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
+            with open(full_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
                         snap = json.loads(line)
                         if not snap.get("symbol"):
-                            snap["symbol"] = symbol_guess
-
+                            snap["symbol"] = symbol_dir
                         row = extract_row(snap)
-                        if include_invalid or row.get("is_valid"):
+                        spot_value = pd.to_numeric(row.get("spot"), errors="coerce")
+                        pin_value = pd.to_numeric(row.get("gamma_pin"), errors="coerce")
+                        valid = bool(row.get("is_valid")) and spot_value > 0 and pin_value > 0
+                        if include_invalid or valid:
                             rows.append(row)
                             file_rows += 1
-            else:
-                # Audit snapshots are one JSON object per file.
-                snap = load_snapshot(full_path)
-                if not snap.get("symbol"):
-                    snap["symbol"] = symbol_guess
+                    except Exception as e:
+                        print(f"Error parsing {fname}: {e}")
 
-                row = extract_row(snap)
-                if include_invalid or row.get("is_valid"):
-                    rows.append(row)
-                    file_rows += 1
-        except Exception as e:
-            print(f"Error parsing {full_path}: {e}")
+            files_processed += 1
+            print(f"  Processed {fname}: {file_rows} usable rows")
 
-        files_processed += 1
-        if file_rows:
-            print(f"  Processed {fname}: {file_rows} rows")
-    
     if not rows:
         print("Warning: No data found")
         return pd.DataFrame()
-    
+
     df = pd.DataFrame(rows)
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], errors="coerce", utc=True)
-    df = df.dropna(subset=["timestamp_utc"])
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
     df = df.sort_values("timestamp_utc").reset_index(drop=True)
-    
+
     print(f"Total: {len(rows)} rows from {files_processed} files")
     return df
 
@@ -139,17 +114,15 @@ if __name__ == "__main__":
 
     exports_dir = sys.argv[1]
     output_csv = sys.argv[2]
-    include_invalid = "--include-invalid" in sys.argv
-    date_filter = None
-    if len(sys.argv) > 3 and not sys.argv[3].startswith("--"):
-        date_filter = sys.argv[3]
+    date_filter = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else None
+    include_invalid = "--include-invalid" in sys.argv[3:]
 
     print(f"Building dataset from: {exports_dir}")
     if date_filter:
         print(f"Filtering to date: {date_filter}")
-    
+
     df = build_dataset(exports_dir, date_filter, include_invalid=include_invalid)
-    
+
     if not df.empty:
         df.to_csv(output_csv, index=False)
         print(f"Saved dataset to {output_csv}")

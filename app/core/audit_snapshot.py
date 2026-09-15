@@ -319,6 +319,14 @@ class AuditSnapshot:
     # D. Derived gamma metrics
     primary_gamma_pin_strike: float = 0.0
     primary_gamma_pin_abs_gex: float = 0.0
+    pin_runner_up_strike: Optional[float] = None
+    pin_runner_up_abs_gex: Optional[float] = None
+    pin_lead_abs_gex: Optional[float] = None
+    pin_lead_ratio: Optional[float] = None
+    pin_competition_threshold: Optional[float] = None
+    pin_is_contested: bool = False
+    pin_competition_reason: Optional[str] = None
+    pin_competition_formula_version: Optional[str] = None
     zero_gamma_level: Optional[float] = None
     zero_gamma_method: Optional[str] = None
     

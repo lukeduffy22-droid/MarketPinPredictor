@@ -23,20 +23,12 @@ log = logging.getLogger("audit_persistence")
 
 # Configuration
 AUDIT_LOG_DIR = Path("./logs/audit")
-VALIDATED_AUDIT_LOG_DIR = Path("./logs/audit_validated")
 MAX_SNAPSHOTS_PER_SYMBOL = 200
 
 
 def get_audit_dir(symbol: str) -> Path:
     """Get the audit directory for a symbol, creating if needed."""
     audit_dir = AUDIT_LOG_DIR / symbol.upper()
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    return audit_dir
-
-
-def get_validated_audit_dir(symbol: str) -> Path:
-    """Get the validated audit directory for a symbol, creating if needed."""
-    audit_dir = VALIDATED_AUDIT_LOG_DIR / symbol.upper()
     audit_dir.mkdir(parents=True, exist_ok=True)
     return audit_dir
 
@@ -151,90 +143,6 @@ def cleanup_old_snapshots(symbol: str) -> int:
         return 0
 
 
-def cleanup_old_validated_snapshots(symbol: str) -> int:
-    """
-    Remove oldest validated snapshots beyond MAX_SNAPSHOTS_PER_SYMBOL.
-
-    Returns:
-        Number of files deleted
-    """
-    try:
-        audit_dir = get_validated_audit_dir(symbol)
-        files = sorted(audit_dir.glob("*.json"))
-
-        if len(files) <= MAX_SNAPSHOTS_PER_SYMBOL:
-            return 0
-
-        files_to_delete = files[:-MAX_SNAPSHOTS_PER_SYMBOL]
-
-        deleted = 0
-        for f in files_to_delete:
-            try:
-                f.unlink()
-                deleted += 1
-            except Exception as e:
-                log.warning(f"Failed to delete old validated snapshot {f}: {e}")
-
-        if deleted > 0:
-            log.info(f"Cleaned up {deleted} old validated snapshots for {symbol}")
-
-        return deleted
-    except Exception as e:
-        log.error(f"Failed to cleanup old validated snapshots for {symbol}: {e}")
-        return 0
-
-
-def persist_validated_audit_snapshot(snapshot: AuditSnapshot) -> Optional[Path]:
-    """
-    Persist only validated snapshots to a separate, read-optimized store.
-
-    Returns:
-        Path to the written file, or None when snapshot is invalid or write fails.
-    """
-    if not snapshot.validation_is_valid:
-        return None
-
-    try:
-        audit_dir = get_validated_audit_dir(snapshot.symbol)
-        base_filename = generate_filename()
-        filepath = audit_dir / base_filename
-
-        counter = 1
-        while filepath.exists():
-            name_without_ext = base_filename.rsplit('.', 1)[0]
-            filepath = audit_dir / f"{name_without_ext}_{counter:03d}.json"
-            counter += 1
-            if counter > 999:
-                log.error(f"Too many validated snapshot collisions for {snapshot.symbol}")
-                return None
-
-        with open(filepath, 'w') as f:
-            f.write(snapshot.to_json())
-
-        cleanup_old_validated_snapshots(snapshot.symbol)
-        log.info(f"Validated audit snapshot saved: {filepath}")
-        return filepath
-    except Exception as e:
-        log.error(f"Failed to persist validated snapshot for {snapshot.symbol}: {e}")
-        return None
-
-
-def get_latest_validated_snapshot(symbol: str) -> Optional[AuditSnapshot]:
-    """Get the most recent validated audit snapshot for a symbol."""
-    try:
-        audit_dir = get_validated_audit_dir(symbol)
-        files = sorted(audit_dir.glob("*.json"))
-        if not files:
-            return None
-
-        with open(files[-1], 'r') as f:
-            data = json.load(f)
-        return dict_to_audit_snapshot(data)
-    except Exception as e:
-        log.error(f"Failed to get latest validated snapshot for {symbol}: {e}")
-        return None
-
-
 def get_latest_snapshot(symbol: str) -> Optional[AuditSnapshot]:
     """
     Get the most recent audit snapshot for a symbol.
@@ -316,6 +224,14 @@ def dict_to_audit_snapshot(data: dict) -> AuditSnapshot:
         top_strikes_by_abs_gex=data.get('top_strikes_by_abs_gex', []),
         primary_gamma_pin_strike=float(data.get('primary_gamma_pin_strike', 0)),
         primary_gamma_pin_abs_gex=float(data.get('primary_gamma_pin_abs_gex', 0)),
+        pin_runner_up_strike=data.get('pin_runner_up_strike'),
+        pin_runner_up_abs_gex=data.get('pin_runner_up_abs_gex'),
+        pin_lead_abs_gex=data.get('pin_lead_abs_gex'),
+        pin_lead_ratio=data.get('pin_lead_ratio'),
+        pin_competition_threshold=data.get('pin_competition_threshold'),
+        pin_is_contested=bool(data.get('pin_is_contested', False)),
+        pin_competition_reason=data.get('pin_competition_reason'),
+        pin_competition_formula_version=data.get('pin_competition_formula_version'),
         zero_gamma_level=data.get('zero_gamma_level'),
         zero_gamma_method=data.get('zero_gamma_method'),
         # NEW: Corrected GEX fields with call/put separation
@@ -364,6 +280,21 @@ def get_snapshot_count(symbol: str) -> int:
     return len(list_snapshot_files(symbol))
 
 
+def load_latest_snapshot_data(symbol: str) -> Optional[dict]:
+    """Load the newest audit JSON exactly as stored, including invalid rows."""
+    try:
+        files = sorted(get_audit_dir(symbol).glob("*.json"), reverse=True)
+        if not files:
+            return None
+        with open(files[0], "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["_source_file"] = str(files[0])
+        return data
+    except Exception as exc:
+        log.error("Failed to load latest raw snapshot for %s: %s", symbol, exc)
+        return None
+
+
 def load_last_valid_snapshot(symbol: str) -> Optional[AuditSnapshot]:
     """
     Load the most recent VALID audit snapshot for a symbol.
@@ -371,7 +302,8 @@ def load_last_valid_snapshot(symbol: str) -> Optional[AuditSnapshot]:
     This function is used during market close freeze to provide
     the last known good gamma state without any live data fetching.
     
-    CRITICAL: Only returns snapshots where validation_is_valid=True
+    CRITICAL: Only returns snapshots where validation_is_valid=True and an
+    explicit gamma_excluded_from_model=True is absent.
     
     Returns:
         Valid AuditSnapshot if found, None otherwise
@@ -386,7 +318,10 @@ def load_last_valid_snapshot(symbol: str) -> Optional[AuditSnapshot]:
                 with open(f, 'r') as fp:
                     data = json.load(fp)
                 
-                if data.get('validation_is_valid', False):
+                if (
+                    data.get('validation_is_valid', False)
+                    and data.get('gamma_excluded_from_model') is not True
+                ):
                     snapshot = dict_to_audit_snapshot(data)
                     log.info(f"Loaded last valid snapshot for {symbol}: {f.name}")
                     return snapshot
