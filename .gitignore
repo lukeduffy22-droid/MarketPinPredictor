@@ -95,6 +95,7 @@ exports/*/*.ndjson
 *.log
 ~$*
 ml_data_backup_*.csv
+data/etf_features_augmented.csv
 
 # High-volume closing-tape runtime artifacts
 data/closing_tape/
