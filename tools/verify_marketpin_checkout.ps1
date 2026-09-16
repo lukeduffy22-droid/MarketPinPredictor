@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ExpectedRoot = 'C:\Cprojectsgpu_app\MarketPinPredictor',
-    [string]$ExpectedBranch = 'copilot/vscode-mta88cnr-2s0u',
+    [string]$ExpectedBranch,
     [string]$EditorPath
 )
 
@@ -40,7 +40,7 @@ try {
         throw "Wrong checkout. Actual: $gitRoot ; expected: $expectedDirectory"
     }
     $branch = [string](Read-Git -Directory $gitRoot -GitArguments @('branch', '--show-current'))
-    if ($branch -cne $ExpectedBranch) {
+    if ($ExpectedBranch -and $branch -cne $ExpectedBranch) {
         throw "Unexpected branch '$branch'. Expected '$ExpectedBranch'. No branch was changed."
     }
 
@@ -62,10 +62,16 @@ try {
 
     $commit = Read-Git -Directory $gitRoot -GitArguments @('log', '-1', '--format=%h | %cI | %s')
     $changes = @(Read-Git -Directory $gitRoot -GitArguments @('status', '--short', '--untracked-files=normal'))
-    Write-Output 'PASS: canonical checkout and expected branch verified.'
+    Write-Output $(if ($ExpectedBranch) {
+        'PASS: canonical checkout and expected branch verified.'
+    }
+    else {
+        'PASS: canonical checkout verified; no branch constraint was requested.'
+    })
     Write-Output "Checked: $((Get-Date).ToString('o'))"
     Write-Output "Folder: $gitRoot"
     Write-Output "Branch: $branch"
+    Write-Output "Branch constraint: $(if ($ExpectedBranch) { $ExpectedBranch } else { 'not requested' })"
     Write-Output "Base commit: $commit"
     Write-Output "Uncommitted status entries: $($changes.Count) (includes runtime files and untracked directories)."
     Write-Output 'Local edits are part of this working copy; the base commit alone does not describe them.'

@@ -1,0 +1,80 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": [
+    "tests",
+    "-p",
+    "no:cacheprovider"
+  ],
+  "python.testing.cwd": "${workspaceFolder}",
+  "python.testing.autoTestDiscoverOnSaveEnabled": false,
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.exclude": [
+    "**/.venv/**",
+    "**/.history/**",
+    "**/.pytest_cache/**",
+    "**/__pycache__/**",
+    "**/logs/**",
+    "**/backups/**",
+    "**/output/**",
+    "**/outputs/**",
+    "**/exports/**",
+    "**/pytorch/**",
+    "**/vision/**",
+    "**/campaign-concept-studio/node_modules/**",
+    "**/data/closing_tape/**",
+    "**/data/databento_cache/**",
+    "**/data/databento_history/**",
+    "**/data/parquet/**",
+    "**/data/raw/**"
+  ],
+  "files.watcherExclude": {
+    "**/.venv/**": true,
+    "**/.history/**": true,
+    "**/.pytest_cache/**": true,
+    "**/__pycache__/**": true,
+    "**/logs/**": true,
+    "**/backups/**": true,
+    "**/output/**": true,
+    "**/outputs/**": true,
+    "**/exports/**": true,
+    "**/pytorch/**": true,
+    "**/vision/**": true,
+    "**/campaign-concept-studio/node_modules/**": true,
+    "**/data/closing_tape/**": true,
+    "**/data/databento_cache/**": true,
+    "**/data/databento_history/**": true,
+    "**/data/parquet/**": true,
+    "**/data/raw/**": true
+  },
+  "search.exclude": {
+    "**/.venv/**": true,
+    "**/.history/**": true,
+    "**/.pytest_cache/**": true,
+    "**/__pycache__/**": true,
+    "**/logs/**": true,
+    "**/backups/**": true,
+    "**/output/**": true,
+    "**/outputs/**": true,
+    "**/exports/**": true,
+    "**/pytorch/**": true,
+    "**/vision/**": true,
+    "**/campaign-concept-studio/node_modules/**": true,
+    "**/data/closing_tape/**": true,
+    "**/data/databento_cache/**": true,
+    "**/data/databento_history/**": true,
+    "**/data/parquet/**": true,
+    "**/data/raw/**": true
+  },
+  "git.repositoryScanIgnoredFolders": [
+    "pytorch",
+    "vision",
+    "backups",
+    "campaign-concept-studio/node_modules"
+  ],
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "files.associations": {
+    "*.psm1": "powershell"
+  }
+}

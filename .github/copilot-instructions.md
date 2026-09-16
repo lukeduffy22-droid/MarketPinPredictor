@@ -44,7 +44,7 @@ Use explicit file-scoped staging and review the staged name list. Never use `git
 3. Make the smallest behaviorally complete change and add focused tests.
 4. Keep observed, inferred, research-only, and production-authorized fields visibly distinct.
 5. Run targeted tests, then the relevant broader suite.
-6. Run `python tools/check_publication_boundary.py --base origin/friday-1/9` before pushing.
+6. Run `.\.venv\Scripts\python.exe -B tools/check_publication_boundary.py --base origin/friday-1/9` before pushing.
 
 Preserve unrelated work and do not reset, clean, force-push, merge unrelated histories, alter other worktrees, or restart the live feed unless the task explicitly requires it.
 
@@ -64,7 +64,11 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 .\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider
 ```
 
+Do not run `uv sync`, regenerate `uv.lock`, or replace the workstation `.venv` as a routine setup step. The checked-in project metadata includes legacy compatibility dependencies; use the existing canonical environment unless dependency work is explicitly in scope.
+
 Do not start the backend and Streamlit independently for a normal live session. Use `start_databento_app.ps1`, and treat HTTP 200 or an open port as insufficient readiness evidence.
+
+Before the scheduled 07:00/07:15 CT universe-prestage window, use `start_market_day.ps1 -CheckOnly` for a startup smoke check. Do not run the live launcher merely to prove readiness or repeatedly retry a failed premarket start; the installed SYSTEM AutoStart/Watchdog owns 07:00/07:15 prestage and 07:45/08:15 launch/recovery unless the user explicitly requests immediate guarded recovery after a scheduled opportunity fails.
 
 ## Coding standards
 

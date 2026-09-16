@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Query
 
@@ -69,17 +70,25 @@ def _live_snapshots(journal, streamer, symbols, *, configured):
     """Read against one runtime identity and fail closed if it keeps changing."""
 
     context = _runtime_context(streamer)
+    as_of_utc = datetime.now(timezone.utc)
 
     def build(binding):
         kwargs = _live_snapshot_kwargs(binding)
-        return {
-            symbol: journal.snapshot(
+        def snapshot(symbol):
+            return symbol, journal.snapshot(
                 symbol,
+                as_of_utc=as_of_utc,
                 configured=symbol in configured,
                 **kwargs,
             )
-            for symbol in symbols
-        }
+
+        if len(symbols) <= 1:
+            return dict(map(snapshot, symbols))
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(symbols)),
+            thread_name_prefix="orb-snapshot",
+        ) as executor:
+            return dict(executor.map(snapshot, symbols))
 
     snapshots = build(context)
     context_after = _runtime_context(streamer)

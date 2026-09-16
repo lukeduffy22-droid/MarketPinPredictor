@@ -1,0 +1,12 @@
+{
+  "folders": [
+    {
+      "name": "MarketPin - CANONICAL working copy",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "window.title": "MarketPin CANONICAL${separator}${dirty}${activeEditorLong}${separator}${rootPath}",
+    "workbench.editor.labelFormat": "long"
+  }
+}

@@ -276,6 +276,71 @@ def test_healthy_symbol_health_and_sse_burst_waits_for_bounded_capacity(read_ser
     asyncio.run(run())
 
 
+def test_orb_collection_and_health_remain_responsive_during_persistence_pressure(
+    read_service, monkeypatch
+):
+    class Streamer:
+        symbols = ["SPX", "NDX", "VIX", "RUT"]
+
+        @staticmethod
+        def get_subscription_context():
+            return {
+                "subscription_epoch_id": "a" * 64,
+                "subscription_generation": 7,
+                "handoff_status": "active",
+            }
+
+    class Journal:
+        @staticmethod
+        def snapshot(symbol, **_kwargs):
+            # Model a read delayed by concurrent SQLite persistence. Serial
+            # projection exceeds the bounded 150 ms runtime-read budget.
+            time.sleep(0.06)
+            return {"symbol": symbol, "capture_status": "unavailable"}
+
+    monkeypatch.setattr(orb, "get_streamer", lambda: Streamer())
+    monkeypatch.setattr(orb, "get_market_structure_journal", lambda: Journal())
+    monkeypatch.setattr(
+        health,
+        "_read_live_health_sample",
+        lambda: {
+            "health": {},
+            "pipeline": {
+                "transport_ready": False,
+                "collection_ready": False,
+                "calculation_ready": False,
+                "prediction_pipeline_ok": False,
+                "runtime_context_stable": True,
+            },
+            "stream_active": False,
+            "quant_inference_device": "cpu",
+            "runtime_controls": {},
+            "sampled_at_utc": "2026-09-14T19:45:16+00:00",
+        },
+    )
+    application = FastAPI()
+    application.include_router(health.router)
+    application.include_router(orb.router)
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://offline",
+        ) as client:
+            started = time.perf_counter()
+            orb_response, health_response = await asyncio.gather(
+                client.get("/v1/orb"), client.get("/health/live")
+            )
+            elapsed = time.perf_counter() - started
+        assert orb_response.status_code == 200
+        assert health_response.status_code == 200
+        assert orb_response.json()["runtime_context_stable"] is True
+        assert set(orb_response.json()["symbols"]) == {"SPX", "NDX", "VIX", "RUT"}
+        assert elapsed < 0.15
+
+    asyncio.run(run())
+
+
 def test_startup_health_progresses_during_coalesced_sse_burst(read_service, monkeypatch):
     import torch
 
