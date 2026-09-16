@@ -601,13 +601,14 @@ function Stop-MarketPinProcesses {
     Assert-OpeningAcceptanceMutationPreflight | Out-Null
 
     $processes = Get-CimInstance Win32_Process | Where-Object {
-        $_.CommandLine -and
-        $_.CommandLine.Contains($Root) -and (
-            $_.CommandLine.Contains("backend.app:app") -or
-            $_.CommandLine.Contains("server.py") -or
-            $_.CommandLine.Contains("app.py") -or
-            $_.CommandLine.Contains("streamlit_app.py")
-        )
+        (Test-MarketAppDirectComponentProcessRecord `
+            -ProcessRecord $_ `
+            -ProjectRoot $Root `
+            -Component 'backend') -or
+        (Test-MarketAppDirectComponentProcessRecord `
+            -ProcessRecord $_ `
+            -ProjectRoot $Root `
+            -Component 'dashboard')
     }
 
     if ($processes) {

@@ -48,6 +48,12 @@ def isolate_blocked_capture_receipts(monkeypatch, tmp_path):
         finally:
             streamer.audit_dir = original
     monkeypatch.setattr(DatabentoGammaStreamer, '_record_blocked_capture', isolated)
+    from backend.capture_attempts import record_opening_reference_failure
+    monkeypatch.setattr(
+        'backend.capture_attempts.record_opening_reference_failure',
+        lambda _audit_dir, failure: record_opening_reference_failure(
+            tmp_path / 'logs' / 'audit', failure),
+    )
 
 
 def test_prediction_publication_guard_blocks_generation_transition():

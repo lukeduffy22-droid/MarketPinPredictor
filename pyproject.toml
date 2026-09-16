@@ -2,7 +2,7 @@
 name = "repl-nix-workspace"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "api-session==1.4.2",
     "apig-wsgi==2.19.0",

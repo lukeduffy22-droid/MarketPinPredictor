@@ -1846,6 +1846,7 @@ class DatabentoGammaStreamer:
             str, deque[tuple[datetime, int, str]]
         ] = {symbol: deque(maxlen=4) for symbol in self.symbols}
         self._orb_reference_failed_attempt_count = 0
+        self._orb_reference_evidence_lock = threading.Lock()
         self._orb_reference_failed_attempts: deque[dict[str, object]] = deque(
             maxlen=ORB_REFERENCE_FAILED_ATTEMPT_LIMIT
         )
@@ -6240,6 +6241,7 @@ class DatabentoGammaStreamer:
         trading_date: date,
         captured_at_utc: datetime | None = None,
         now_utc: Callable[[], datetime] | None = None,
+        gate_evidence: dict[str, object] | None = None,
     ) -> tuple[dict[str, object] | None, str | None]:
         """Snapshot one market's quote and universe state under the quote lock."""
         # Index rebuilds are serialized, and each worker snapshots the complete
@@ -6346,6 +6348,24 @@ class DatabentoGammaStreamer:
             if quote
         }
 
+        if gate_evidence is not None:
+            gate_evidence.update(
+                snapshot_subscription_epoch_id=subscription_epoch_id,
+                snapshot_generation=generation,
+                snapshot_handoff_status=handoff_status,
+                selected_universe_sha256=selected_hash,
+                universe_provenance=provenance,
+                planned_primary_expiration=(
+                    mapping_primary_expiration.isoformat()
+                    if mapping_primary_expiration is not None else None
+                ),
+                selected_primary_contract_count=len(selected_symbols),
+                mapped_primary_contract_count=len(mapped_symbols),
+                mapping_conflict=mapping_conflict,
+                symbol_mapping_version=symbol_mapping_version,
+                available_quote_count=len(quotes),
+            )
+
         if handoff_status != "active":
             return None, "HANDOFF_NOT_ACTIVE"
         if generation <= 0:
@@ -6418,6 +6438,7 @@ class DatabentoGammaStreamer:
             "subscription_cutoff_monotonic": subscription_cutoff,
             "snapshot_monotonic": now_monotonic,
             "captured_at_utc": captured_at,
+            "opening_gate_evidence": gate_evidence,
         }, None
 
     def _compute_opening_reference_payload(
@@ -6439,6 +6460,17 @@ class DatabentoGammaStreamer:
         mapping_versions_by_symbol = snapshot["mapping_versions_by_symbol"]
         assert isinstance(mapping_versions_by_symbol, dict)
         pair_legs: dict[tuple[object, ...], dict[str, list[dict[str, object]]]] = {}
+        gate_evidence = snapshot.get("opening_gate_evidence")
+        rejections: dict[str, int] = {}
+
+        def reject_quote(reason: str) -> None:
+            rejections[reason] = rejections.get(reason, 0) + 1
+
+        if isinstance(gate_evidence, dict):
+            gate_evidence.update(
+                pair_evaluation="started", minimum_pair_count=MIN_PAIRED_QUOTES,
+                quote_rejections=rejections,
+            )
 
         for record in snapshot["records"]:
             if not isinstance(record, dict) or record.get("expiration_date") != primary_expiration:
@@ -6455,6 +6487,7 @@ class DatabentoGammaStreamer:
                 continue
             quote = quote_snapshot.get(raw_symbol)
             if not isinstance(quote, dict):
+                reject_quote("missing_quote")
                 continue
             received_monotonic = float(quote.get("received_monotonic") or 0.0)
             quote_age = now_monotonic - received_monotonic
@@ -6464,6 +6497,7 @@ class DatabentoGammaStreamer:
                 or quote_age < 0.0
                 or quote_age > QUOTE_FRESHNESS_SECONDS
             ):
+                reject_quote("generation_or_local_freshness_invalid")
                 continue
             try:
                 bid = float(quote.get("bid"))
@@ -6471,6 +6505,7 @@ class DatabentoGammaStreamer:
                 mid = float(quote.get("mid"))
                 strike = float(record.get("strike"))
             except (TypeError, ValueError):
+                reject_quote("invalid_price")
                 continue
             if (
                 not all(math.isfinite(value) for value in (bid, ask, mid, strike))
@@ -6479,6 +6514,7 @@ class DatabentoGammaStreamer:
                 or mid <= 0.0
                 or strike <= 0.0
             ):
+                reject_quote("invalid_price")
                 continue
             ts_event_ns = _record_timestamp_ns(quote, "ts_event_ns")
             ts_recv_ns = _record_timestamp_ns(quote, "ts_recv_ns")
@@ -6496,6 +6532,7 @@ class DatabentoGammaStreamer:
                 or re.fullmatch(r"[0-9a-f]{64}", mapping_version) is None
                 or mapping_version != current_mapping_version
             ):
+                reject_quote("timestamp_or_mapping_invalid")
                 continue
             multiplier = record.get("contract_multiplier")
             if multiplier is not None and pd.isna(multiplier):
@@ -6543,6 +6580,11 @@ class DatabentoGammaStreamer:
                     "pair_gap": abs(float(call["mid"]) - float(put["mid"])),
                 }
             )
+        if isinstance(gate_evidence, dict):
+            gate_evidence.update(
+                pair_evaluation="evaluated", complete_pair_count=len(complete_pairs),
+                incomplete_or_ambiguous_pair_count=len(pair_legs) - len(complete_pairs),
+            )
         if len(complete_pairs) < MIN_PAIRED_QUOTES:
             return None, "COMPLETE_PAIR_MINIMUM_NOT_MET"
 
@@ -6581,6 +6623,13 @@ class DatabentoGammaStreamer:
             (captured_at_ns - timestamp_ns) / 1_000_000_000
             for timestamp_ns in recv_values
         ]
+        if isinstance(gate_evidence, dict):
+            gate_evidence.update(
+                minimum_source_quote_age_seconds=min(quote_ages),
+                maximum_source_quote_age_seconds=max(quote_ages),
+                earliest_ts_event_ns=min(event_values), latest_ts_event_ns=max(event_values),
+                earliest_ts_recv_ns=min(recv_values), latest_ts_recv_ns=max(recv_values),
+            )
         if (
             min(quote_ages) < -CLOCK_SYNC_NEGATIVE_TOLERANCE_SECONDS
             or max(quote_ages) > QUOTE_FRESHNESS_SECONDS
@@ -7100,7 +7149,30 @@ class DatabentoGammaStreamer:
         window = live_subscription_window(observed_at)
         if window.get("state") != "regular_session":
             return {"recorded": False, "reason": "OUTSIDE_REGULAR_SESSION"}
-        clock_status = str(self._processing_clock_telemetry().get("status") or "unknown")
+        clock_evidence = self._processing_clock_telemetry()
+        clock_status = str(clock_evidence.get("status") or "unknown")
+        gate_evidence: dict[str, object] = {
+            "observed_at_utc": observed_at.isoformat(),
+            "processing_clock": clock_evidence,
+            "pair_evaluation": "not_evaluated",
+        }
+        with self._prediction_publication_lock:
+            gate_evidence["handoff"] = {
+                "status": self.handoff_status,
+                "reason": self.handoff_reason,
+                "required_symbols": list(self.required_handoff_symbols),
+                "missing_configured_symbols": list(self.missing_required_handoff_symbols),
+                "missing_fresh_symbols": [
+                    symbol for symbol in self.required_handoff_symbols
+                    if symbol not in self._fresh_markets_seen
+                ],
+                "fresh_observations": {
+                    symbol: {"generation": generation, "age_seconds": time.monotonic() - received}
+                    for symbol, (generation, received) in self._fresh_market_observations.items()
+                },
+            }
+        if attempt_diagnostics is not None:
+            attempt_diagnostics["opening_gate_evidence"] = gate_evidence
         if clock_status != "synchronized":
             return {
                 "recorded": False,
@@ -7112,6 +7184,7 @@ class DatabentoGammaStreamer:
             trading_date=trading_date,
             captured_at_utc=observed_at if observed_at_utc is not None else None,
             now_utc=clock,
+            gate_evidence=gate_evidence,
         )
         if snapshot is None:
             return {"recorded": False, "reason": reason}
@@ -7241,7 +7314,9 @@ class DatabentoGammaStreamer:
             if expected_subscription_generation is not None
             else int(self.active_generation)
         )
-        attempt_diagnostics: dict[str, object] = {}
+        attempt_diagnostics: dict[str, object] = {
+            "opening_gate_evidence": {"pair_evaluation": "not_evaluated", "gates_evaluated": False}
+        }
         try:
             result = dict(
                 self._capture_opening_reference_once(
@@ -7367,6 +7442,7 @@ class DatabentoGammaStreamer:
             "subscription_generation",
             "active_generation_after_persist",
             "active_generation_after_return",
+            "opening_gate_evidence",
         ):
             value = result.get(key)
             if value is not None:
@@ -7422,6 +7498,25 @@ class DatabentoGammaStreamer:
                     int(warning_state["suppressed_since_last_warning"]) + 1
                 )
                 self._orb_reference_failure_warning_suppressed_count += 1
+        # The bounded health deque and rate-limited log cannot retain a complete
+        # opening failure history. Append each opening-hour rejection separately;
+        # it is diagnostic evidence only and never an ORB sample or prediction.
+        opening_local = intended_bucket_utc.astimezone(_NY_TZ)
+        if (
+            (opening_local.hour == 9 and opening_local.minute >= 30
+             or opening_local.hour == 10 and opening_local.minute < 30)
+        ):
+            from backend.capture_attempts import record_opening_reference_failure
+
+            try:
+                with self._orb_reference_evidence_lock:
+                    record_opening_reference_failure(self.audit_dir, failure)
+                result["failure_evidence_recorded"] = True
+            except OSError as exc:
+                result["failure_evidence_recorded"] = False
+                result["failure_evidence_error"] = type(exc).__name__
+                logger.error("ORB opening failure evidence write failed: %s; evidence=%s",
+                             type(exc).__name__, json.dumps(failure, sort_keys=True, default=str))
         if warning_payload is not None:
             warning_payload["event"] = "orb_reference_attempt_failure_summary"
             warning_payload["warning_interval_seconds"] = (

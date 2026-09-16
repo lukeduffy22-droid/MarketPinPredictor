@@ -7,7 +7,7 @@ echo ""
 
 # Check Python
 if ! command -v python3 &> /dev/null; then
-    echo "Python3 not found. Please install Python 3.8+ first."
+    echo "Python3 not found. Please install Python 3.10+ first."
     exit 1
 fi
 

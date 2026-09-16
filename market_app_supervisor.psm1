@@ -1837,6 +1837,102 @@ function Get-MarketAppProcessIdentityToken {
     }
 }
 
+function Test-MarketAppCommandLineMarker {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$Marker,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine) -or
+        [string]::IsNullOrWhiteSpace($Marker)) {
+        return $false
+    }
+
+    $normalizedMarker = $Marker
+    if ([System.IO.Path]::GetExtension($Marker) -ieq '.py') {
+        $normalizedMarker = if ([System.IO.Path]::IsPathRooted($Marker)) {
+            [System.IO.Path]::GetFullPath($Marker)
+        }
+        else {
+            [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $Marker))
+        }
+    }
+
+    # Match a complete argument, not a filename substring. In particular,
+    # tools\marketpin_mcp_server.py must never satisfy the canonical
+    # C:\...\server.py marker used by backend lifecycle ownership checks.
+    $tokenCharacterClass = 'A-Za-z0-9_.:-'
+    $pattern = (
+        '(?<![' + $tokenCharacterClass + '])' +
+        [regex]::Escape($normalizedMarker) +
+        '(?![' + $tokenCharacterClass + '])'
+    )
+    return [regex]::IsMatch(
+        $CommandLine,
+        $pattern,
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+}
+
+function Test-MarketAppDirectComponentProcessRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$ProcessRecord,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][ValidateSet('backend', 'dashboard')][string]$Component
+    )
+
+    $normalizedRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $expectedExecutable = if ($Component -ceq 'backend') {
+        Join-Path $normalizedRoot '.venv\Scripts\python.exe'
+    }
+    else {
+        Join-Path $normalizedRoot '.venv\Scripts\streamlit.exe'
+    }
+    $expectedEntrypoint = if ($Component -ceq 'backend') {
+        Join-Path $normalizedRoot 'server.py'
+    }
+    else {
+        Join-Path $normalizedRoot 'app.py'
+    }
+
+    try {
+        $actualExecutable = [System.IO.Path]::GetFullPath(
+            [string]$ProcessRecord.ExecutablePath
+        )
+    }
+    catch {
+        return $false
+    }
+    if (-not [string]::Equals(
+        $actualExecutable,
+        [System.IO.Path]::GetFullPath($expectedExecutable),
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $false
+    }
+
+    $commandLine = ([string]$ProcessRecord.CommandLine).Replace('/', '\')
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        return $false
+    }
+    $normalizedEntrypoint = (
+        [System.IO.Path]::GetFullPath($expectedEntrypoint)
+    ).Replace('/', '\')
+    $escapedEntrypoint = [regex]::Escape($normalizedEntrypoint)
+    $pattern = '(?:^|\s)(?:"' + $escapedEntrypoint + '"|' +
+        $escapedEntrypoint + ')(?=\s|$)'
+    return [regex]::IsMatch(
+        $commandLine,
+        $pattern,
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+}
+
 function Get-MarketAppDirectBackendProcessIdentities {
     [CmdletBinding()]
     param(
@@ -1853,17 +1949,10 @@ function Get-MarketAppDirectBackendProcessIdentities {
     }
     $normalizedRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
     $identities = foreach ($record in $records) {
-        $verificationText = "$([string]$record.CommandLine)`n$([string]$record.ExecutablePath)"
-        $hasProjectRoot = (
-            $verificationText.IndexOf(
-                $normalizedRoot,
-                [StringComparison]::OrdinalIgnoreCase
-            ) -ge 0
-        )
-        $hasBackendMarker = [bool]($RequiredCommandMarkers | Where-Object {
-            $verificationText.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0
-        })
-        if (-not $hasProjectRoot -or -not $hasBackendMarker) {
+        if (-not (Test-MarketAppDirectComponentProcessRecord `
+            -ProcessRecord $record `
+            -ProjectRoot $normalizedRoot `
+            -Component 'backend')) {
             continue
         }
         $identityToken = Get-MarketAppProcessIdentityToken -ProcessRecord $record
@@ -2273,13 +2362,40 @@ function Test-MarketAppVerifiedProcess {
         if (-not $process) {
             break
         }
-        $verificationText = "$([string]$process.CommandLine)`n$([string]$process.ExecutablePath)"
+        $commandLine = [string]$process.CommandLine
+        $verificationText = "$commandLine`n$([string]$process.ExecutablePath)"
         if ($verificationText.IndexOf($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             $hasProjectRoot = $true
         }
-        if ($RequiredCommandMarkers | Where-Object {
-            $verificationText.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0
-        }) {
+        $requestsBackendEntrypoint = @($RequiredCommandMarkers | Where-Object {
+            $_ -ieq 'server.py'
+        }).Count -gt 0
+        $requestsDashboardEntrypoint = @($RequiredCommandMarkers | Where-Object {
+            $_ -ieq 'app.py'
+        }).Count -gt 0
+        $entrypointMatch = (
+            $requestsBackendEntrypoint -and
+            (Test-MarketAppDirectComponentProcessRecord `
+                -ProcessRecord $process `
+                -ProjectRoot $normalizedRoot `
+                -Component 'backend')
+        ) -or (
+            $requestsDashboardEntrypoint -and
+            (Test-MarketAppDirectComponentProcessRecord `
+                -ProcessRecord $process `
+                -ProjectRoot $normalizedRoot `
+                -Component 'dashboard')
+        )
+        $moduleMarkerMatch = $false
+        if (-not $requestsBackendEntrypoint -and -not $requestsDashboardEntrypoint) {
+            $moduleMarkerMatch = [bool]($RequiredCommandMarkers | Where-Object {
+                Test-MarketAppCommandLineMarker `
+                    -CommandLine $commandLine `
+                    -Marker $_ `
+                    -ProjectRoot $normalizedRoot
+            })
+        }
+        if ($entrypointMatch -or $moduleMarkerMatch) {
             $hasMarker = $true
         }
         if ($hasProjectRoot -and $hasMarker) {
@@ -2806,6 +2922,8 @@ Export-ModuleMember -Function @(
     'Assert-MarketAppExpectedListenerPid',
     'Wait-MarketAppProcessNetworkQuiescence',
     'Test-MarketAppProcessDescendsFrom',
+    'Test-MarketAppCommandLineMarker',
+    'Test-MarketAppDirectComponentProcessRecord',
     'Test-MarketAppVerifiedProcess',
     'Invoke-MarketAppVerifiedOrphanBackendCleanup',
     'Invoke-MarketAppBoundedAutomaticListenerStop',

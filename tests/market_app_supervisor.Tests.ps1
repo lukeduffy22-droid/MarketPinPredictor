@@ -677,6 +677,91 @@ Describe 'Exact process network quiescence' {
 
 Describe 'Verified orphan backend cleanup' {
     InModuleScope market_app_supervisor {
+        It 'matches the canonical backend argument without matching Copilot MCP helper filenames' {
+            $projectRoot = 'C:\MarketPinPredictor'
+            $records = @(
+                [pscustomobject]@{
+                    ProcessId = 4101
+                    ParentProcessId = 4000
+                    CreationDate = [datetime]'2026-09-16T02:00:00'
+                    ExecutablePath = 'C:\MarketPinPredictor\.venv\Scripts\python.exe'
+                    CommandLine = '"C:\MarketPinPredictor\.venv\Scripts\python.exe" "C:\MarketPinPredictor\tools\marketpin_mcp_server.py"'
+                },
+                [pscustomobject]@{
+                    ProcessId = 4102
+                    ParentProcessId = 4000
+                    CreationDate = [datetime]'2026-09-16T02:00:01'
+                    ExecutablePath = 'C:\MarketPinPredictor\.venv\Scripts\python.exe'
+                    CommandLine = '"C:\MarketPinPredictor\.venv\Scripts\python.exe" "C:\MarketPinPredictor\server.py"'
+                },
+                [pscustomobject]@{
+                    ProcessId = 4103
+                    ParentProcessId = 4000
+                    CreationDate = [datetime]'2026-09-16T02:00:02'
+                    ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+                    CommandLine = 'powershell.exe -Command "Review C:\MarketPinPredictor\server.py"'
+                }
+            )
+
+            $identities = @(Get-MarketAppDirectBackendProcessIdentities `
+                -ProjectRoot $projectRoot `
+                -RequiredCommandMarkers @('server.py', 'backend.app:app') `
+                -ProcessRecords $records)
+
+            $identities.Count | Should Be 1
+            $identities[0].ProcessId | Should Be 4102
+            Test-MarketAppCommandLineMarker `
+                -CommandLine $records[0].CommandLine `
+                -Marker 'server.py' `
+                -ProjectRoot $projectRoot | Should Be $false
+        }
+
+        It 'requires the canonical executable and entrypoint for direct component identity' {
+            $projectRoot = 'C:\MarketPinPredictor'
+            $backend = [pscustomobject]@{
+                ExecutablePath = 'C:\MarketPinPredictor\.venv\Scripts\python.exe'
+                CommandLine = '"C:/MarketPinPredictor/.venv/Scripts/python.exe" "C:/MarketPinPredictor/server.py"'
+            }
+            $dashboard = [pscustomobject]@{
+                ExecutablePath = 'C:\MarketPinPredictor\.venv\Scripts\streamlit.exe'
+                CommandLine = '"C:\MarketPinPredictor\.venv\Scripts\streamlit.exe" run "C:\MarketPinPredictor\app.py"'
+            }
+            $prompt = [pscustomobject]@{
+                ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+                CommandLine = 'powershell.exe -Command "inspect C:\MarketPinPredictor\server.py"'
+            }
+
+            Test-MarketAppDirectComponentProcessRecord `
+                -ProcessRecord $backend `
+                -ProjectRoot $projectRoot `
+                -Component backend | Should Be $true
+            Test-MarketAppDirectComponentProcessRecord `
+                -ProcessRecord $dashboard `
+                -ProjectRoot $projectRoot `
+                -Component dashboard | Should Be $true
+            Test-MarketAppDirectComponentProcessRecord `
+                -ProcessRecord $prompt `
+                -ProjectRoot $projectRoot `
+                -Component backend | Should Be $false
+        }
+
+        It 'rejects lookalike Python entrypoints and accepts exact module arguments' {
+            $projectRoot = 'C:\MarketPinPredictor'
+
+            Test-MarketAppCommandLineMarker `
+                -CommandLine 'python C:\MarketPinPredictor\simple_market_server.py' `
+                -Marker 'server.py' `
+                -ProjectRoot $projectRoot | Should Be $false
+            Test-MarketAppCommandLineMarker `
+                -CommandLine 'python C:\MarketPinPredictor\server.py.backup' `
+                -Marker 'server.py' `
+                -ProjectRoot $projectRoot | Should Be $false
+            Test-MarketAppCommandLineMarker `
+                -CommandLine 'python -m uvicorn backend.app:app --port 8000' `
+                -Marker 'backend.app:app' `
+                -ProjectRoot $projectRoot | Should Be $true
+        }
+
         It 'extracts only positive exact remote-port TCP owners' {
             $lines = @(
                 '  TCP    10.0.0.5:51000       1.2.3.4:13000      ESTABLISHED     4242',

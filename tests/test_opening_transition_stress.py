@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
@@ -50,6 +51,156 @@ REPRESENTATIVE_OPENING_PAIR_COUNTS = {
     "VIX": 48,
     "RUT": 98,
 }
+
+
+@pytest.fixture(autouse=True)
+def isolated_opening_receipts(monkeypatch, tmp_path):
+    from backend.capture_attempts import record_opening_reference_failure
+    monkeypatch.setattr(
+        'backend.capture_attempts.record_opening_reference_failure',
+        lambda _audit_dir, failure: record_opening_reference_failure(
+            tmp_path / 'logs' / 'audit', failure),
+    )
+
+
+@pytest.fixture
+def september_14_open(monkeypatch, tmp_path):
+    """Synthetic reproduction of the documented gate sequence, not raw replay."""
+    import sys
+    module = sys.modules[__name__]
+    trading_date = date(2026, 9, 14)
+    opening = datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "TRADING_DATE", trading_date)
+    monkeypatch.setattr(module, "OPEN_UTC", opening)
+    monkeypatch.setattr(module, "CAPTURE_UTC", opening + timedelta(milliseconds=250))
+    monkeypatch.setattr(module, "PRIMARY_EXPIRATIONS", dict.fromkeys(MARKET_SPECS, trading_date))
+    streamer = _build_opening_streamer(monkeypatch)
+    streamer.audit_dir = tmp_path / "logs" / "audit"
+    # Exercise the real clock classifier, including its insufficient-sample state.
+    monkeypatch.setattr(streamer, "_processing_clock_telemetry",
+                        DatabentoGammaStreamer._processing_clock_telemetry.__get__(streamer))
+    journal, engine, _, _ = _temp_wal_journal(tmp_path, monkeypatch)
+    try:
+        yield streamer, journal, engine, opening
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("market", ["SPX", "NDX"])
+def test_september_14_opening_gate_sequence_retains_evidence(september_14_open, market):
+    streamer, journal, engine, opening = september_14_open
+    now = opening + timedelta(milliseconds=250)
+
+    def capture():
+        result = streamer._capture_opening_reference_for_bucket(
+            market, opening, now_utc=lambda: now, journal=journal)
+        streamer._record_opening_reference_failed_attempt(
+            market=market, subscription_epoch_id=streamer.subscription_epoch_id,
+            subscription_generation=7, intended_bucket_utc=opening, result=result)
+        return result
+
+    unknown = capture()
+    assert unknown["reason"] == "PROCESSING_CLOCK_NOT_SYNCHRONIZED"
+    evidence = unknown["opening_gate_evidence"]
+    assert evidence["processing_clock"]["status"] == "unknown"
+    assert evidence["processing_clock"]["sample_count"] == 0
+    assert evidence["handoff"]["missing_fresh_symbols"] == ["SPX", "NDX"]
+    assert evidence["pair_evaluation"] == "not_evaluated"
+
+    streamer._receive_lag_window.extend([0.01] * streamer_module.CLOCK_SYNC_MIN_SAMPLES)
+    for _ in range(2):
+        warming = capture()
+        assert warming["reason"] == "HANDOFF_NOT_ACTIVE"
+        assert warming["opening_gate_evidence"]["processing_clock"]["status"] == "synchronized"
+    for index, symbol in enumerate(("SPX", "NDX")):
+        received = _publish_mappings_and_quotes(streamer, symbol, first_instrument_id=10000 + index * 10000)
+        streamer._record_fresh_market_and_maybe_activate(
+            symbol, generation=7, received_monotonic=received)
+    assert streamer.handoff_status == "active"
+    # Both required families can commit the exact first bucket after readiness.
+    accepted = capture()
+    assert accepted["recorded"] is True
+    assert accepted["progress_eligible"] is True
+    assert datetime.fromisoformat(accepted["sample_timestamp_utc"].replace("Z", "+00:00")) == opening
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM orb_reference_samples")).scalar_one() == 1
+        assert connection.execute(text("SELECT COUNT(*) FROM orb_reference_sample_decisions WHERE progress_eligible = 1")).scalar_one() == 1
+    receipt = streamer.audit_dir.parent / "opening_reference_attempts" / "2026-09-14.ndjson"
+    failures = [json.loads(line) for line in receipt.read_text().splitlines()]
+    assert len(failures) == 3  # Repeated handoff failures must not be suppressed.
+    assert all(item["intended_bucket_utc"] == opening.isoformat() for item in failures)
+    assert all(item["usable_for_prediction"] is False for item in failures)
+    assert all(item["evidence_role"] == "research_only_opening_diagnostic" for item in failures)
+
+
+@pytest.mark.parametrize("market", ["SPX", "NDX"])
+def test_september_14_thin_pairs_and_late_retry_never_backfill(september_14_open, market):
+    streamer, journal, engine, opening = september_14_open
+    streamer._receive_lag_window.extend([0.01] * streamer_module.CLOCK_SYNC_MIN_SAMPLES)
+    for index, symbol in enumerate(("SPX", "NDX")):
+        received = _publish_mappings_and_quotes(streamer, symbol, first_instrument_id=10000 + index * 10000)
+        streamer._record_fresh_market_and_maybe_activate(symbol, generation=7, received_monotonic=received)
+    streamer.quotes.clear()
+    result = streamer._capture_opening_reference_for_bucket(
+        market, opening, now_utc=lambda: opening + timedelta(seconds=1), journal=journal)
+    assert result["reason"] == "COMPLETE_PAIR_MINIMUM_NOT_MET"
+    evidence = result["opening_gate_evidence"]
+    assert evidence["complete_pair_count"] == 0
+    assert evidence["minimum_pair_count"] == streamer_module.MIN_PAIRED_QUOTES
+    assert evidence["pair_evaluation"] == "evaluated"
+    assert evidence["quote_rejections"]["missing_quote"] == evidence["selected_primary_contract_count"]
+    late = streamer._capture_opening_reference_for_bucket(
+        market, opening, now_utc=lambda: opening + timedelta(seconds=5), journal=journal)
+    assert late["recorded"] is False
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM orb_reference_samples")).scalar_one() == 0
+
+
+@pytest.mark.parametrize("market", ["SPX", "NDX"])
+def test_september_14_clock_skew_remains_distinct_and_ineligible(september_14_open, market):
+    streamer, journal, engine, opening = september_14_open
+    streamer._receive_lag_window.extend([-1.0] * streamer_module.CLOCK_SYNC_MIN_SAMPLES)
+    result = streamer._capture_opening_reference_for_bucket(
+        market, opening, now_utc=lambda: opening + timedelta(seconds=1), journal=journal)
+    assert result["recorded"] is False
+    assert result["reason"] == "PROCESSING_CLOCK_NOT_SYNCHRONIZED"
+    evidence = result["opening_gate_evidence"]["processing_clock"]
+    assert evidence["status"] == "unsynchronized"
+    assert evidence["material_negative_ratio"] == 1.0
+    assert evidence["sample_count"] == streamer_module.CLOCK_SYNC_MIN_SAMPLES
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM orb_reference_samples")).scalar_one() == 0
+
+
+def test_opening_receipt_disk_failure_is_explicit_and_cannot_accept(september_14_open, monkeypatch, caplog):
+    streamer, journal, _, opening = september_14_open
+    result = streamer._capture_opening_reference_for_bucket(
+        "SPX", opening, now_utc=lambda: opening + timedelta(seconds=1), journal=journal)
+
+    def unavailable(*_args):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr("backend.capture_attempts.record_opening_reference_failure", unavailable)
+    streamer._record_opening_reference_failed_attempt(
+        market="SPX", subscription_epoch_id=streamer.subscription_epoch_id,
+        subscription_generation=7, intended_bucket_utc=opening, result=result)
+    assert result["recorded"] is False
+    assert result["failure_evidence_recorded"] is False
+    assert result["failure_evidence_error"] == "OSError"
+    assert "ORB opening failure evidence write failed" in caplog.text
+
+
+def test_opening_timeout_receipt_reports_unavailable_gate_details(september_14_open):
+    streamer, _, _, opening = september_14_open
+    result = {"recorded": False, "progress_eligible": False,
+              "reason": "REFERENCE_ATTEMPT_DEADLINE_EXCEEDED"}
+    streamer._record_opening_reference_failed_attempt(
+        market="NDX", subscription_epoch_id=streamer.subscription_epoch_id,
+        subscription_generation=7, intended_bucket_utc=opening, result=result)
+    receipt = streamer.audit_dir.parent / "opening_reference_attempts" / "2026-09-14.ndjson"
+    evidence = json.loads(receipt.read_text())["opening_gate_evidence"]
+    assert evidence["gate_evidence_available"] is False
+    assert evidence["detail_unavailable_reason"] == result["reason"]
 
 
 def _temp_wal_journal(tmp_path, monkeypatch):

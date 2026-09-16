@@ -7,7 +7,7 @@ echo.
 REM Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo Python not found. Please install Python 3.8+ first.
+    echo Python not found. Please install Python 3.10+ first.
     pause
     exit /b 1
 )
