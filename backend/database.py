@@ -514,6 +514,15 @@ class OrbReferenceSample(Base):
             "sample_timestamp_utc",
         ),
         Index("idx_orb_reference_trading_date", "trading_date"),
+        # Keep the live metadata scan out of the large formula-input records.
+        # Existing databases use tools/install_orb_read_index.py; create_all
+        # only installs this automatically when creating a new table.
+        Index(
+            "idx_orb_reference_snapshot_metadata",
+            "symbol", "trading_date", "sample_timestamp_utc", "sample_id",
+            "captured_at_utc", "provider", "subscription_epoch_id",
+            "subscription_generation", "universe_sha256",
+        ),
         Index(
             "uix_orb_reference_logical_sample",
             "symbol",

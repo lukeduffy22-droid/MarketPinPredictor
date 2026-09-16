@@ -8,8 +8,55 @@ from app.utils.snapshot_history import (
     load_snapshots_for_local_day,
     local_day_utc_bounds,
     partition_snapshot_evidence,
+    snapshot_coverage_manifest,
+    snapshot_research_export_record,
     utc_partition_dates_for_local_day,
 )
+
+
+def test_research_export_redacts_local_paths_but_preserves_content_identity():
+    record = {
+        "symbol": "SPX",
+        "validation_is_valid": True,
+        "gamma_excluded_from_model": False,
+        "subscription_epoch_id": "a" * 64,
+        "subscription_generation": 1,
+        "universe_provenance": {
+            "source_path": r"C:\runtime\opra_universe.csv",
+            "source_sha256": "b" * 64,
+        },
+    }
+
+    exported = snapshot_research_export_record(record)
+
+    assert exported["universe_provenance"]["source_path"] is None
+    assert exported["universe_provenance"]["source_sha256"] == "b" * 64
+    assert exported["local_source_paths_redacted"] == 1
+    assert record["universe_provenance"]["source_path"].startswith("C:")
+
+
+def test_coverage_manifest_reports_absent_and_failed_symbols():
+    evidence = partition_snapshot_evidence(
+        [
+            {
+                "symbol": "SPX",
+                "validation_is_valid": False,
+                "gamma_excluded_from_model": True,
+            }
+        ]
+    )
+
+    manifest = snapshot_coverage_manifest(
+        {"SPX": evidence},
+        expected_symbols=("SPX", "NDX"),
+        trading_date="2026-09-16",
+    )
+
+    assert manifest["symbols"]["SPX"]["failed_or_unproven_records"] == 1
+    assert manifest["symbols"]["NDX"]["missing_evidence_reason"] == (
+        "NO_RETAINED_SNAPSHOT_RECORDS"
+    )
+    assert manifest["missing_expected_symbols"] == ["NDX"]
 
 
 def _write_records(path, records):

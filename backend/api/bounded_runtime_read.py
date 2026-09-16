@@ -118,9 +118,11 @@ def runtime_read_unavailable_payload(exc: RuntimeReadUnavailable) -> dict:
     }
 
 
-async def read_runtime_or_503(key: Hashable, reader: Callable[[], T]) -> T:
+async def read_runtime_or_503(
+    key: Hashable, reader: Callable[[], T], *, reads: BoundedRuntimeReads | None = None,
+) -> T:
     try:
-        return await runtime_reads.run(key, reader)
+        return await (reads if reads is not None else runtime_reads).run(key, reader)
     except RuntimeReadUnavailable as exc:
         raise HTTPException(
             status_code=503, detail=runtime_read_unavailable_payload(exc),

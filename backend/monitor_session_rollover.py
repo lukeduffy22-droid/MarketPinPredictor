@@ -79,6 +79,7 @@ _ROLLOVER_CADENCE = {
 _ROLLOVER_DIRECTIONAL_INTERPRETATION = (
     "ABSTAIN_NEW_SESSION_BASELINES_REQUIRED"
 )
+_MISSING_STATE_RECOVERY_MARKER = "missing_state_recovery_bootstrap"
 _WRAPPER_SESSION_FIELDS = (
     "mode",
     "mode_reason",
@@ -1327,13 +1328,18 @@ def _validate_prior_session_rollover_boundary(
         raise MonitorSessionRolloverError(
             "prior_session_rollover_event_type_invalid"
         )
-    _validate_current_event_receipt(
-        event,
-        state=state,
-        journal_dir=journal_dir,
-        target=str(session_date or ""),
-        event_id=event_id,
-    )
+    if state.get("state_recovery_bootstrap") is True:
+        _validate_missing_state_recovery_receipt(
+            event, state=state, target=str(session_date or "")
+        )
+    else:
+        _validate_current_event_receipt(
+            event,
+            state=state,
+            journal_dir=journal_dir,
+            target=str(session_date or ""),
+            event_id=event_id,
+        )
     _validate_opening_acceptance_receipts(
         state, records, require_notifications_acknowledged=True
     )
@@ -1401,6 +1407,100 @@ def _build_next_state(
     return result
 
 
+def _build_missing_state_recovery_event(
+    *, target: str, observed_utc: datetime, calendar: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Create an explicit, fail-closed boundary when the monitor state was lost.
+
+    This does not reconstruct skipped sessions or historical policy state.  It
+    starts the current session with empty baselines and records that provenance
+    in the durable journal before state is created.
+    """
+
+    return {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "event_id": f"{target}:session:session_rollover:v1",
+        "event_type": "session_rollover",
+        "observed_at_ct": observed_utc.astimezone(CT).isoformat(),
+        "observed_at_utc": _utc_iso(observed_utc),
+        "session_date": target,
+        "phase": "monitor_state_recovery",
+        "cadence": copy.deepcopy(_ROLLOVER_CADENCE),
+        "evidence": [_MISSING_STATE_RECOVERY_MARKER],
+        "symbols": {},
+        "alerts": [],
+        "directional_interpretation": _ROLLOVER_DIRECTIONAL_INTERPRETATION,
+        "research_hypotheses": [],
+        "market_calendar": copy.deepcopy(dict(calendar)),
+        "opening_acceptance_reset": _opening_reset(target),
+        "append_before_state_required": True,
+        "recovery_bootstrap": True,
+        "historical_state_reconstructed": False,
+    }
+
+
+def _build_missing_state_recovery_state(
+    *, target: str, observed_utc: datetime, event_id: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "session_date": target,
+        "updated_at_ct": observed_utc.astimezone(CT).isoformat(),
+        "updated_at_utc": _utc_iso(observed_utc),
+        "session_rollover_event_id": event_id,
+        "mode": "NORMAL",
+        # The scan ledger requires the canonical first-scan cadence seed.
+        # Recovery provenance is carried separately by the explicit marker.
+        "mode_reason": "session_rollover",
+        "elevated_since_ct": None,
+        "elevated_minimum_until_ct": None,
+        "stable_elevated_scan_count": 0,
+        "opening_acceptance": _opening_reset(target),
+        "prior_session_reference": None,
+        "comparison_baselines_eligibility": "new_session_uninitialized",
+        "comparison_baselines": {},
+        "pending_confirmations": {},
+        "pending_zero_gamma_confirmation": {},
+        "pending_pin_contest": {},
+        "pending_directional_confirmation": {},
+        "last_alerted_levels": {},
+        "preflight_alerts": {},
+        "runtime_alerts": {},
+        "last_alert": None,
+        "current_data_quality": {},
+        "last_scan_ct": None,
+        "last_scan_utc": None,
+        "last_eligible_scan_ct": None,
+        "last_scan_result": "missing_state_recovery_pending_first_scan",
+        "monitor_scan_ledger": {},
+        "data_quality_notification_outbox": armed_outbox(target, event_id),
+        "policy_evaluator": {},
+        "state_recovery_bootstrap": True,
+    }
+
+
+def _validate_missing_state_recovery_receipt(
+    event: Mapping[str, Any], *, state: Mapping[str, Any], target: str
+) -> None:
+    try:
+        observed = datetime.fromisoformat(
+            str(event.get("observed_at_utc") or "").replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise MonitorSessionRolloverError(
+            "missing_state_recovery_receipt_invalid"
+        ) from exc
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise MonitorSessionRolloverError("missing_state_recovery_receipt_invalid")
+    expected = _build_missing_state_recovery_event(
+        target=target,
+        observed_utc=observed.astimezone(timezone.utc),
+        calendar=market_calendar_status(date.fromisoformat(target)),
+    )
+    if dict(event) != expected or state.get("state_recovery_bootstrap") is not True:
+        raise MonitorSessionRolloverError("missing_state_recovery_receipt_invalid")
+
+
 def _base_result(
     *,
     state_path: Path,
@@ -1437,6 +1537,109 @@ def _base_result(
         "event_id": f"{target}:session:session_rollover:v1",
         "issues": [],
     }
+
+
+def _recover_missing_state(
+    *,
+    state_path: Path,
+    journal_path: Path,
+    target: str,
+    observed_utc: datetime,
+    calendar: Mapping[str, Any],
+    dry_run: bool,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    records, journal_raw, partial_tail, observed_raw = _read_target_journal_prefix(
+        journal_path
+    )
+    if partial_tail:
+        raise MonitorSessionRolloverError(
+            "missing_state_recovery_partial_journal_requires_manual_review"
+        )
+    event_id = str(result["event_id"])
+    matching = [row for row in records if row.get("event_id") == event_id]
+    if len(matching) > 1:
+        raise MonitorSessionRolloverError("duplicate_session_rollover_event")
+    if matching:
+        existing = matching[0]
+        try:
+            durable_observed = datetime.fromisoformat(
+                str(existing.get("observed_at_utc") or "").replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+        except (ValueError, TypeError) as exc:
+            raise MonitorSessionRolloverError(
+                "missing_state_recovery_receipt_invalid"
+            ) from exc
+        expected_event = _build_missing_state_recovery_event(
+            target=target, observed_utc=durable_observed, calendar=calendar
+        )
+        if existing != expected_event:
+            raise MonitorSessionRolloverError(
+                "missing_state_recovery_receipt_invalid"
+            )
+        effective_observed = durable_observed
+        result["durable_event_reused"] = True
+        result["commit_phase"] = "journal_durable"
+    else:
+        if records:
+            raise MonitorSessionRolloverError(
+                "missing_state_recovery_requires_empty_target_journal"
+            )
+        effective_observed = observed_utc
+        expected_event = _build_missing_state_recovery_event(
+            target=target, observed_utc=effective_observed, calendar=calendar
+        )
+    next_state = _build_missing_state_recovery_state(
+        target=target, observed_utc=effective_observed, event_id=event_id
+    )
+    result["next_state_sha256"] = _value_sha256(next_state)
+    if dry_run:
+        result.update(
+            {
+                "accepted": True,
+                "action": "would_recover_missing_state",
+                "observed_at_utc": _utc_iso(effective_observed),
+                "observed_at_ct": effective_observed.astimezone(CT).isoformat(),
+                "issues": [],
+            }
+        )
+        return result
+    if not matching:
+        _append_jsonl_durable(journal_path, expected_event)
+        result["journal_event_appended"] = True
+        result["commit_phase"] = "journal_durable"
+    current_raw = journal_path.read_bytes() if journal_path.exists() else b""
+    expected_raw = journal_raw if matching else journal_raw + _canonical_json_bytes(expected_event)
+    if current_raw != expected_raw:
+        raise MonitorSessionRolloverError(
+            "missing_state_recovery_journal_changed"
+        )
+    if state_path.exists():
+        raise MonitorSessionRolloverError("state_created_during_recovery")
+    _atomic_write_json(state_path, next_state)
+    result["state_updated"] = True
+    result["commit_phase"] = "post_state_replace_uncertain"
+    persisted, _persisted_raw, persisted_sha = _load_state(state_path)
+    if persisted != next_state:
+        raise MonitorSessionRolloverError(
+            "missing_state_recovery_postcondition_failed"
+        )
+    _validate_missing_state_recovery_receipt(
+        expected_event, state=persisted, target=target
+    )
+    result.update(
+        {
+            "accepted": True,
+            "action": "recovered_missing_state",
+            "state_updated": True,
+            "commit_phase": "complete",
+            "persisted_state_sha256": persisted_sha,
+            "observed_at_utc": _utc_iso(effective_observed),
+            "observed_at_ct": effective_observed.astimezone(CT).isoformat(),
+            "issues": [],
+        }
+    )
+    return result
 
 
 def prepare_monitor_session(
@@ -1503,6 +1706,16 @@ def prepare_monitor_session(
         return result
 
     def execute_locked() -> dict[str, Any]:
+        if not state_path.exists():
+            return _recover_missing_state(
+                state_path=state_path,
+                journal_path=journal_path,
+                target=target,
+                observed_utc=observed_utc,
+                calendar=calendar,
+                dry_run=dry_run,
+                result=result,
+            )
         state, _raw, state_sha256 = _load_state(state_path)
         prior_date = _canonical_date(state["session_date"])
         assert prior_date is not None
@@ -1522,6 +1735,17 @@ def prepare_monitor_session(
             raise MonitorSessionRolloverError("duplicate_session_rollover_event")
 
         if requested_date == prior_date:
+            if (
+                state.get("state_recovery_bootstrap") is True
+                and state.get("mode_reason") == _MISSING_STATE_RECOVERY_MARKER
+                and not state.get("monitor_scan_ledger")
+                and state.get("last_scan_utc") is None
+            ):
+                repaired = copy.deepcopy(state)
+                repaired["mode_reason"] = "session_rollover"
+                _atomic_write_json(state_path, repaired)
+                state, _raw, state_sha256 = _load_state(state_path)
+                result["state_updated"] = True
             opening = state.get("opening_acceptance") or {}
             if opening.get("session_date") != target:
                 raise MonitorSessionRolloverError(
@@ -1531,13 +1755,18 @@ def prepare_monitor_session(
                 raise MonitorSessionRolloverError(
                     "current_session_rollover_receipt_missing"
                 )
-            _validate_current_event_receipt(
-                matching[0],
-                state=state,
-                journal_dir=journal_dir,
-                target=target,
-                event_id=event_id,
-            )
+            if state.get("state_recovery_bootstrap") is True:
+                _validate_missing_state_recovery_receipt(
+                    matching[0], state=state, target=target
+                )
+            else:
+                _validate_current_event_receipt(
+                    matching[0],
+                    state=state,
+                    journal_dir=journal_dir,
+                    target=target,
+                    event_id=event_id,
+                )
             _validate_opening_acceptance_receipts(
                 state,
                 records,

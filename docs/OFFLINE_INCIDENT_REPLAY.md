@@ -28,3 +28,28 @@ Run the focused offline checks with:
 ```
 
 These figures are deterministic test workload parameters, not measurements from the live September 14 session. Live acceptance remains required before closing the incident.
+
+## Import actual opening receipts
+
+`import-opening` reads the retained `orb-reference-failed-attempt-v1` NDJSON without
+opening the live database or connecting to the feed. It counts every failure,
+separates symbol/epoch/generation/reason groups, and packages at most two examples
+per group by default. Original files remain unchanged. Each derived example binds
+the original file and line with SHA-256 and labels its conversion method separately
+from the producer schema and rejection reason.
+
+```powershell
+.\.venv\Scripts\python.exe -B tools\incident_replay.py import-opening `
+  logs\opening_reference_attempts\2026-09-16.ndjson `
+  --destination C:\runtime\incidents\opening-20260916
+.\.venv\Scripts\python.exe -B tools\incident_replay.py replay `
+  C:\runtime\incidents\opening-20260916\package
+```
+
+Clock counts/thresholds, handoff state, and complete-pair counts support independent
+checks of the associated producer rejection. A contradictory reason adds
+`PRODUCER_REASON_EVIDENCE_CONFLICT`; unsupported or missing checks retain
+`MISSING_EVIDENCE:independent_gate_recheck_unavailable`. This verifies retained
+diagnostics, not raw quote replay, session completeness, or model accuracy. All
+outputs remain research-only and unusable for prediction. Inputs over 64 MB,
+incomplete final lines, and files changing during import fail before export.

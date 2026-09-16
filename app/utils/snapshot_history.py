@@ -100,6 +100,77 @@ def snapshot_research_export_fields(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def snapshot_research_export_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Build a sanitized derived copy while preserving content identities."""
+
+    redacted_paths = 0
+
+    def sanitize(value: Any) -> Any:
+        nonlocal redacted_paths
+        if isinstance(value, dict):
+            result = {}
+            for key, nested in value.items():
+                if key == "source_path" and nested:
+                    result[key] = None
+                    redacted_paths += 1
+                else:
+                    result[key] = sanitize(nested)
+            return result
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    sanitized = sanitize(record)
+    return {
+        **sanitized,
+        **snapshot_research_export_fields(record),
+        "local_source_paths_redacted": redacted_paths,
+    }
+
+
+def snapshot_coverage_manifest(
+    evidence_by_symbol: dict[str, SnapshotEvidence],
+    *,
+    expected_symbols: Iterable[str],
+    trading_date: str,
+) -> dict[str, Any]:
+    """Describe complete export coverage without fabricating missing rows."""
+
+    expected = tuple(
+        dict.fromkeys(str(symbol).strip().upper() for symbol in expected_symbols if str(symbol).strip())
+    )
+    symbols = {}
+    observed_symbols = []
+    for symbol in sorted(set(expected) | set(evidence_by_symbol)):
+        evidence = evidence_by_symbol.get(symbol)
+        usable = len(evidence.usable_records) if evidence else 0
+        historical = len(evidence.historical_records) if evidence else 0
+        diagnostics = len(evidence.diagnostic_records) if evidence else 0
+        total = usable + historical + diagnostics
+        if total:
+            observed_symbols.append(symbol)
+        symbols[symbol] = {
+            "producer_pass_records": usable,
+            "historical_unverified_records": historical,
+            "failed_or_unproven_records": diagnostics,
+            "total_records": total,
+            "missing_evidence_reason": (
+                "NO_RETAINED_SNAPSHOT_RECORDS" if total == 0 else None
+            ),
+        }
+    observed = tuple(sorted(observed_symbols))
+    return {
+        "schema_version": "marketpin-snapshot-export-coverage.v1",
+        "trading_date": trading_date,
+        "expected_symbols": list(expected),
+        "observed_symbols": list(observed),
+        "missing_expected_symbols": sorted(set(expected) - set(observed)),
+        "symbols": symbols,
+        "research_only": True,
+        "accuracy_established": False,
+    }
+
+
 def partition_snapshot_evidence(
     records: Iterable[dict[str, Any]],
 ) -> SnapshotEvidence:

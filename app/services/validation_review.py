@@ -23,6 +23,8 @@ def validation_group(record):
 
 
 def method_archive(records):
+    from app.utils.snapshot_history import snapshot_research_export_record
+
     groups = {}
     for record in records:
         groups.setdefault(validation_group(record),[]).append(record)
@@ -30,7 +32,13 @@ def method_archive(records):
     with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as archive:
         archive.writestr('README.txt','Original source files are untouched. Records are grouped by declared validation policy or unrecorded field profile. Derived review_* labels are not retrospective revalidation. Producer pass is not forecast accuracy, training eligibility or current live authority.\n')
         for group,rows in groups.items():
-            archive.writestr(group+'.ndjson','\n'.join(json.dumps({**r,**validation_labels(r),'research_only':True,'current_live_eligible':False},default=str) for r in rows)+'\n')
+            archive.writestr(
+                group+'.ndjson',
+                '\n'.join(
+                    json.dumps(snapshot_research_export_record(r), default=str)
+                    for r in rows
+                )+'\n',
+            )
     return buffer.getvalue()
 
 

@@ -230,6 +230,15 @@ def _capture(
 
 
 def _api_client(monkeypatch, journal, active_streamer) -> TestClient:
+    class RehearsalDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            observed = journal.now_utc()
+            return observed.astimezone(tz) if tz is not None else observed.replace(tzinfo=None)
+
+    # The concurrent projection now binds one timestamp in the router. Keep
+    # that clock on the same simulated session as its temporary journal.
+    monkeypatch.setattr(orb_router, "datetime", RehearsalDateTime)
     monkeypatch.setattr(orb_router, "get_market_structure_journal", lambda: journal)
     monkeypatch.setattr(orb_router, "get_streamer", lambda: active_streamer["value"])
     api = FastAPI()

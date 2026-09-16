@@ -83,6 +83,8 @@ from app.utils.snapshot_history import (
     gamma_snapshot_provenance_status,
     load_snapshots_for_local_day,
     partition_snapshot_evidence,
+    snapshot_coverage_manifest,
+    snapshot_research_export_record,
     snapshot_research_export_fields,
 )
 from app.utils.opra_parity_history import (
@@ -905,16 +907,17 @@ def _confidence_display(prediction: dict[str, Any]) -> str:
     value = prediction.get("confidence")
     if not _is_number(value):
         return "Model quality score: unavailable"
+    score = float(value)  # type: ignore[arg-type]
     if prediction.get("confidence_calibrated") is True:
-        return f"Calibrated confidence: {float(value):.1f}%"
+        return f"Calibrated confidence: {score:.1f}%"
     kind = str(prediction.get("confidence_kind") or "unspecified_score")
     if kind == "data_quality_heuristic":
         return (
-            f"Data-quality score: {float(value):.1f}/100 "
+            f"Data-quality score: {score:.1f}/100 "
             "(heuristic; not a forecast probability)"
         )
     return (
-        f"Reported score: {float(value):.1f}/100 "
+        f"Reported score: {score:.1f}/100 "
         f"({kind}; calibration not verified)"
     )
 
@@ -1206,6 +1209,7 @@ def load_daily_pin_history(
         if provenance_status == DIAGNOSTIC_INVALID_SNAPSHOT:
             continue
         export_provenance = snapshot_research_export_fields(snap)
+        sanitized_snap = snapshot_research_export_record(snap)
         # Storage remains UTC; only the user-facing clock is localized.
         ts_str = _snapshot_timestamp_value(snap)
         time_display = format_display_timestamp(
@@ -1255,8 +1259,8 @@ def load_daily_pin_history(
             '_provenance_status': provenance_status,
             '_current_live_eligible': False,
             '_fallback_provenance': export_provenance['fallback_provenance'],
-            '_universe_provenance': json.dumps(snap.get('universe_provenance') or {}, separators=(',', ':')),
-            '_oi_analytics_provenance': json.dumps(snap.get('oi_analytics_provenance') or {}, separators=(',', ':')),
+            '_universe_provenance': json.dumps(sanitized_snap.get('universe_provenance') or {}, separators=(',', ':')),
+            '_oi_analytics_provenance': json.dumps(sanitized_snap.get('oi_analytics_provenance') or {}, separators=(',', ':')),
         })
 
     return pd.DataFrame(rows)
@@ -1290,10 +1294,13 @@ def create_eod_zip_export(
             'describe this export. Missing opening observations are not reconstructed. '
             'Validation policies and producer outcomes are separated in per-symbol '
             'validation-groups ZIP archives and validation-groups CSV folders. '
+            'coverage-manifest.json reports expected, observed, failed, and missing-symbol evidence. '
+            'Derived downloads redact machine-local source paths while preserving source hashes. '
             'review_* labels do not retrospectively validate unversioned records.\n',
         )
         symbols = list_gamma_snapshot_symbols('exports')
         all_data = []
+        evidence_by_symbol = {}
 
         for symbol in symbols:
             selection = _cached_local_snapshot_selection(
@@ -1303,6 +1310,7 @@ def create_eod_zip_export(
                 viewer_timezone.name,
             )
             evidence = partition_snapshot_evidence(selection.records)
+            evidence_by_symbol[symbol] = evidence
 
             if evidence.usable_records:
                 from app.services.validation_review import method_archive
@@ -1312,8 +1320,7 @@ def create_eod_zip_export(
                 historical_ndjson = '\n'.join(
                     json.dumps(
                         {
-                            **record,
-                            **snapshot_research_export_fields(record),
+                            **snapshot_research_export_record(record),
                         },
                         separators=(',', ':'),
                         default=str,
@@ -1328,7 +1335,7 @@ def create_eod_zip_export(
             if evidence.diagnostic_records:
                 zf.writestr(
                     f'{symbol}_{date_str}.failed_audits.ndjson',
-                    '\n'.join(json.dumps(record, separators=(',', ':'), default=str)
+                    '\n'.join(json.dumps(snapshot_research_export_record(record), separators=(',', ':'), default=str)
                               for record in evidence.diagnostic_records) + '\n',
                 )
 
@@ -1377,6 +1384,16 @@ def create_eod_zip_export(
             for method_key, method_frame in combined_df.groupby('review_validation_group', dropna=False):
                 method_folder = hashlib.sha256(str(method_key).encode()).hexdigest()
                 zf.writestr(f'validation-groups/{method_folder}/all_indices_{date_str}.csv', method_frame.to_csv(index=False))
+
+        coverage = snapshot_coverage_manifest(
+            evidence_by_symbol,
+            expected_symbols=("SPX", "NDX", "VIX", "RUT"),
+            trading_date=date_str,
+        )
+        zf.writestr(
+            'coverage-manifest.json',
+            json.dumps(coverage, sort_keys=True, indent=2) + '\n',
+        )
 
     buffer.seek(0)
     return buffer.getvalue()
@@ -4405,7 +4422,7 @@ else:
                     )
 
                 diagnostic_content = '\n'.join(
-                    json.dumps(record, separators=(',', ':'), default=str)
+                    json.dumps(snapshot_research_export_record(record), separators=(',', ':'), default=str)
                     for record in diagnostic_records
                 ) + '\n'
                 st.download_button(
@@ -4490,7 +4507,7 @@ else:
                         width='stretch',
                     )
                 diagnostic_content = '\n'.join(
-                    json.dumps(record, separators=(',', ':'), default=str)
+                    json.dumps(snapshot_research_export_record(record), separators=(',', ':'), default=str)
                     for record in diagnostic_records
                 ) + '\n'
                 st.download_button(
@@ -4501,7 +4518,7 @@ else:
                 )
 
             if any(payload_has_fallback_provenance(snap) for snap in all_records):
-                st.warning("FALLBACK RESEARCH: retained records include fallback universe or open-interest data. Downloads retain the original provenance; current authority is not established.")
+                st.warning("FALLBACK RESEARCH: retained records include fallback universe or open-interest data. Downloads retain provenance identities while redacting machine-local paths; current authority is not established.")
             if snapshots:
                 st.success(
                     f"Found {len(snapshots)} research gamma snapshots for "
@@ -4567,7 +4584,7 @@ else:
 
                     # Download buttons row
                     file_content = '\n'.join(
-                        json.dumps({**record, **snapshot_research_export_fields(record)},
+                        json.dumps(snapshot_research_export_record(record),
                                    separators=(',', ':'), default=str)
                         for record in snapshots
                     ) + '\n'

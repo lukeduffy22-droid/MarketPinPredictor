@@ -2064,15 +2064,23 @@ def _commit_predecessor(
             # dependency on this module while sharing its full receipt audit.
             from backend.monitor_session_rollover import (
                 _validate_current_event_receipt,
+                _validate_missing_state_recovery_receipt,
             )
 
-            _validate_current_event_receipt(
-                rollover_event,
-                state=state,
-                journal_dir=journal_dir,
-                target=str(state.get("session_date") or ""),
-                event_id=rollover_event_id,
-            )
+            if state.get("state_recovery_bootstrap") is True:
+                _validate_missing_state_recovery_receipt(
+                    rollover_event,
+                    state=state,
+                    target=str(state.get("session_date") or ""),
+                )
+            else:
+                _validate_current_event_receipt(
+                    rollover_event,
+                    state=state,
+                    journal_dir=journal_dir,
+                    target=str(state.get("session_date") or ""),
+                    event_id=rollover_event_id,
+                )
         except Exception as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise

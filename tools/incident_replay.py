@@ -22,6 +22,10 @@ def main() -> int:
     export.add_argument("--project-root", default=PROJECT_ROOT)
     replay = subparsers.add_parser("replay")
     replay.add_argument("package")
+    opening = subparsers.add_parser("import-opening", help="Import retained opening failure NDJSON")
+    opening.add_argument("source", type=Path)
+    opening.add_argument("--destination", required=True, type=Path)
+    opening.add_argument("--examples-per-group", type=int, default=2)
     arguments = parser.parse_args()
     if arguments.command == "export":
         result = export_incident_package(
@@ -29,6 +33,11 @@ def main() -> int:
             destination=arguments.destination,
             project_root=arguments.project_root,
         )
+    elif arguments.command == "import-opening":
+        from backend.opening_incident_import import import_opening_failures
+        result = import_opening_failures(
+            arguments.source, destination=arguments.destination, project_root=PROJECT_ROOT,
+            examples_per_group=arguments.examples_per_group)
     else:
         result = replay_incident_package(arguments.package)
     print(json.dumps(result, sort_keys=True, indent=2))

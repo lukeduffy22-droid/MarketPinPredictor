@@ -21,6 +21,42 @@ async def _until_set(event):
     await asyncio.wait_for(wait(), timeout=1.0)
 
 
+def test_health_admission_is_independent_of_saturated_projection_workers(monkeypatch):
+    projections = bounded.BoundedRuntimeReads(max_workers=2, timeout_seconds=0.5)
+    health_reads = bounded.BoundedRuntimeReads(max_workers=2, timeout_seconds=0.15)
+    monkeypatch.setattr(bounded, "runtime_reads", projections)
+    monkeypatch.setattr(health, "_runtime_reads", health_reads)
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+
+    def blocked(index):
+        entered[index].set()
+        assert release.wait(3)
+
+    async def run():
+        jobs = [asyncio.create_task(projections.run(i, lambda i=i: blocked(i)))
+                for i in range(2)]
+        try:
+            for event in entered:
+                await _until_set(event)
+            assert await health._read_or_503("live-health", lambda: {"fresh": True}) == {"fresh": True}
+            # Independent admission must not bypass an actual health lock stall.
+            with pytest.raises(HTTPException) as failure:
+                await health._read_or_503("blocked-health", lambda: release.wait(3))
+            assert failure.value.status_code == 503
+            assert failure.value.detail["usable_for_prediction"] is False
+        finally:
+            release.set()
+            await asyncio.gather(*jobs, return_exceptions=True)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        projections.close()
+        health_reads.close()
+
+
 @pytest.fixture
 def read_service(monkeypatch):
     service = bounded.BoundedRuntimeReads(max_workers=2, timeout_seconds=0.15)

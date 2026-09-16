@@ -182,6 +182,7 @@ CLOCK_SYNC_MIN_SAMPLES = 50
 CLOCK_SYNC_NEGATIVE_TOLERANCE_SECONDS = 0.050
 CLOCK_SYNC_MAX_NEGATIVE_RATIO = 0.01
 UNIVERSE_CACHE_VERSION = "definitions-v2"
+UNIVERSE_CACHE_METADATA_VERSION = "databento-universe-cache-metadata-v1"
 UNIVERSE_STAGE_FRAGMENT_VERSION = "market-fragment-v1"
 UNIVERSE_STAGE_FRAGMENT_COLUMNS = (
     "_stage_fragment_version",
@@ -427,9 +428,10 @@ def live_subscription_window(now_utc: datetime | None = None) -> dict[str, objec
     """Describe the bounded ET window in which a live OPRA client may connect.
 
     The backend starts 45 minutes before the cash open so symbol mappings and the
-    provider connection are warm for the opening print. After the cash close, on
-    weekends, and on market holidays, the process remains available for audit and
-    post-close work without repeatedly creating empty subscription generations.
+    provider connection are warm for the opening print. Quotes remain connected
+    for a 15-minute post-cash-close research window; calculations retain the
+    cash-session boundary. After collection closes, on weekends and holidays,
+    the process remains available for audit without empty subscription churn.
     """
     observed_utc = now_utc or datetime.now(timezone.utc)
     if observed_utc.tzinfo is None:
@@ -440,6 +442,7 @@ def live_subscription_window(now_utc: datetime | None = None) -> dict[str, objec
     non_trading_day = market_day.weekday() >= 5 or is_holiday(market_day)
     cash_open_et = open_time_et(observed_et)
     cash_close_et = close_time_et(observed_et)
+    collection_close_et = cash_close_et + timedelta(minutes=15)
     connect_from_et = cash_open_et - timedelta(
         seconds=PREOPEN_SUBSCRIPTION_LEAD_SECONDS
     )
@@ -456,6 +459,9 @@ def live_subscription_window(now_utc: datetime | None = None) -> dict[str, objec
     elif observed_et < cash_close_et:
         state = "regular_session"
         allowed = True
+    elif observed_et < collection_close_et:
+        state = "post_close_research"
+        allowed = True
     else:
         state = "post_close"
         allowed = False
@@ -468,6 +474,8 @@ def live_subscription_window(now_utc: datetime | None = None) -> dict[str, objec
         "connect_from_utc": connect_from_et.astimezone(timezone.utc).isoformat(),
         "cash_open_utc": cash_open_et.astimezone(timezone.utc).isoformat(),
         "cash_close_utc": cash_close_et.astimezone(timezone.utc).isoformat(),
+        "collection_close_utc": collection_close_et.astimezone(timezone.utc).isoformat(),
+        "prediction_session_allowed": state == "regular_session",
         "preopen_lead_seconds": PREOPEN_SUBSCRIPTION_LEAD_SECONDS,
     }
 
@@ -3249,6 +3257,57 @@ class DatabentoGammaStreamer:
         target_date = cache_date or current_market_date()
         return self.cache_dir / f"opra_universe_{target_date.isoformat()}_{self._cache_hash()}.csv"
 
+    @staticmethod
+    def _cache_metadata_path(cache_path: Path) -> Path:
+        return cache_path.with_suffix(cache_path.suffix + ".metadata.json")
+
+    def _load_cache_metadata(
+        self, cache_path: Path, *, trading_date: date
+    ) -> dict[str, object]:
+        metadata_path = self._cache_metadata_path(cache_path)
+        if not metadata_path.is_file():
+            return {}
+        try:
+            raw = metadata_path.read_bytes()
+            metadata = json.loads(raw.decode("utf-8"))
+            expected_fields = {
+                "contract_version",
+                "trading_date",
+                "source_date",
+                "source_sha256",
+                "provider_definition_end",
+                "provider_statistics_end",
+            }
+            if not isinstance(metadata, dict):
+                raise ValueError("universe cache metadata root is invalid")
+            definition_end = datetime.fromisoformat(
+                str(metadata.get("provider_definition_end") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+            statistics_end = datetime.fromisoformat(
+                str(metadata.get("provider_statistics_end") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+            if (
+                set(metadata) != expected_fields
+                or metadata.get("contract_version") != UNIVERSE_CACHE_METADATA_VERSION
+                or metadata.get("trading_date") != trading_date.isoformat()
+                or metadata.get("source_date") != trading_date.isoformat()
+                or metadata.get("source_sha256") != self._file_sha256(cache_path)
+                or definition_end.tzinfo is None
+                or statistics_end.tzinfo is None
+                or raw != (
+                    json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+            ):
+                raise ValueError("universe cache metadata identity is invalid")
+            return metadata
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Ignoring invalid Databento universe cache metadata %s: %s", metadata_path, exc)
+            return {}
+
     def _staged_market_cache_path(self, source_date: date, market: str) -> Path:
         return self.cache_dir / (
             f"opra_universe_fragment_{source_date.isoformat()}_"
@@ -3581,6 +3640,9 @@ class DatabentoGammaStreamer:
                     cache_path,
                 )
                 return False
+            retained_metadata = self._load_cache_metadata(
+                cache_path, trading_date=target_date
+            )
             self._apply_subscription_profile(
                 full_universe,
                 as_of=target_date,
@@ -3594,6 +3656,15 @@ class DatabentoGammaStreamer:
                     "source_rows": int(len(full_universe)),
                     "cache_age_seconds": round(max(0.0, cache_age), 3),
                     "refresh_recommended": refresh_recommended,
+                    "provider_definition_end": retained_metadata.get(
+                        "provider_definition_end"
+                    ),
+                    "provider_statistics_end": retained_metadata.get(
+                        "provider_statistics_end"
+                    ),
+                    "cache_metadata_status": (
+                        "verified" if retained_metadata else "missing_or_invalid"
+                    ),
                 },
             )
             self._universe_built_monotonic = time.monotonic()
@@ -3695,6 +3766,9 @@ class DatabentoGammaStreamer:
                     )
                     continue
 
+                retained_metadata = self._load_cache_metadata(
+                    path, trading_date=source_date
+                )
                 provenance = {
                     "mode": "prior_cache_filtered",
                     "trading_date": trading_date.isoformat(),
@@ -3706,8 +3780,15 @@ class DatabentoGammaStreamer:
                     "source_rows": source_rows,
                     "eligible_rows": eligible_rows,
                     "dropped_rows": source_rows - eligible_rows,
-                    "provider_definition_end": provider_definition_end.isoformat() if provider_definition_end else None,
-                    "provider_statistics_end": provider_statistics_end.isoformat() if provider_statistics_end else None,
+                    "provider_definition_end": retained_metadata.get(
+                        "provider_definition_end"
+                    ),
+                    "provider_statistics_end": retained_metadata.get(
+                        "provider_statistics_end"
+                    ),
+                    "cache_metadata_status": (
+                        "verified" if retained_metadata else "missing_or_invalid"
+                    ),
                 }
                 self._apply_subscription_profile(source, as_of=trading_date, provenance=provenance)
                 selected_markets = set(self.universe["market"].astype(str)) if not self.universe.empty else set()
@@ -3734,6 +3815,8 @@ class DatabentoGammaStreamer:
         *,
         trading_date: date | None = None,
         mark_active: bool = True,
+        provider_definition_end: datetime | None = None,
+        provider_statistics_end: datetime | None = None,
     ) -> Path | None:
         frame = full_universe if full_universe is not None else self.full_universe
         if frame.empty:
@@ -3741,9 +3824,38 @@ class DatabentoGammaStreamer:
         target_date = trading_date or current_market_date()
         cache_path = self._cache_path(target_date)
         temporary_path = cache_path.with_suffix(cache_path.suffix + f".{uuid.uuid4().hex}.tmp")
+        metadata_path = self._cache_metadata_path(cache_path)
+        temporary_metadata_path = metadata_path.with_suffix(
+            metadata_path.suffix + f".{uuid.uuid4().hex}.tmp"
+        )
         try:
             frame.to_csv(temporary_path, index=False)
             os.replace(temporary_path, cache_path)
+            if provider_definition_end is not None and provider_statistics_end is not None:
+                if (
+                    provider_definition_end.tzinfo is None
+                    or provider_statistics_end.tzinfo is None
+                ):
+                    raise ValueError("provider cache cutoffs must be timezone-aware")
+                metadata = {
+                    "contract_version": UNIVERSE_CACHE_METADATA_VERSION,
+                    "trading_date": target_date.isoformat(),
+                    "source_date": target_date.isoformat(),
+                    "source_sha256": self._file_sha256(cache_path),
+                    "provider_definition_end": provider_definition_end.astimezone(
+                        timezone.utc
+                    ).isoformat(),
+                    "provider_statistics_end": provider_statistics_end.astimezone(
+                        timezone.utc
+                    ).isoformat(),
+                }
+                temporary_metadata_path.write_text(
+                    json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temporary_metadata_path, metadata_path)
+            else:
+                metadata_path.unlink(missing_ok=True)
             if mark_active:
                 self._universe_built_monotonic = time.monotonic()
             logger.info("Saved Databento universe cache: %s", cache_path)
@@ -3752,6 +3864,7 @@ class DatabentoGammaStreamer:
             logger.warning("Failed to save Databento universe cache: %s", exc)
             try:
                 temporary_path.unlink(missing_ok=True)
+                temporary_metadata_path.unlink(missing_ok=True)
             except OSError:
                 pass
             return None
@@ -4247,6 +4360,8 @@ class DatabentoGammaStreamer:
             full_universe,
             trading_date=source_date,
             mark_active=False,
+            provider_definition_end=definition_end,
+            provider_statistics_end=statistics_end,
         )
         if cache_path is None:
             raise RuntimeError(f"Failed to atomically stage Databento universe cache for {source_date}")
@@ -4528,7 +4643,12 @@ class DatabentoGammaStreamer:
             ):
                 return
             raise RuntimeError(reason)
-        cache_path = self._save_cached_universe(full_universe, trading_date=trading_date)
+        cache_path = self._save_cached_universe(
+            full_universe,
+            trading_date=trading_date,
+            provider_definition_end=definition_end,
+            provider_statistics_end=statistics_end,
+        )
         self._apply_subscription_profile(
             full_universe,
             as_of=trading_date,
@@ -6045,6 +6165,7 @@ class DatabentoGammaStreamer:
         # tearing down a warming connection. It must not suppress opening gamma
         # observations needed by ORB capture.
         if market_is_closed():
+            self._capture_post_close_quotes()
             return
         now = time.monotonic()
         if self._compute_is_suspended(now):
@@ -6191,6 +6312,28 @@ class DatabentoGammaStreamer:
                         asyncio.run(output)
                 except Exception as exc:
                     logger.error("Databento callback error: %s", exc)
+
+    def _capture_post_close_quotes(self) -> None:
+        """Retain sampled post-cash-close quotes without publishing forecasts."""
+        window = self._subscription_window()
+        if window.get("state") != "post_close_research":
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_post_close_capture", float("-inf")) < 5.0:
+            return
+        self._last_post_close_capture = now
+        from backend.post_close_quotes import append_quote_sample
+        with self._prediction_publication_lock, self._fresh_quote_lock:
+            epoch = self.subscription_epoch_id
+            generation = self.active_generation
+            quotes = {symbol: dict(quote) for symbol, quote in self.quotes.items()}
+        try:
+            append_quote_sample(
+                Path(__file__).resolve().parents[1] / "logs" / "post_close_quotes",
+                window, quotes, epoch=epoch, generation=generation,
+            )
+        except OSError as exc:
+            logger.warning("Post-close research quote capture failed: %s", exc)
 
     def _compute_loop(self) -> None:
         """Run calculations away from the latency-sensitive record consumer."""
@@ -6459,6 +6602,17 @@ class DatabentoGammaStreamer:
         assert isinstance(quote_snapshot, dict)
         mapping_versions_by_symbol = snapshot["mapping_versions_by_symbol"]
         assert isinstance(mapping_versions_by_symbol, dict)
+        trading_date = snapshot["trading_date"]
+        assert isinstance(trading_date, date)
+        session_start_ns = int(datetime(
+            trading_date.year, trading_date.month, trading_date.day,
+            9, 30, tzinfo=_NY_TZ,
+        ).timestamp() * 1_000_000_000)
+        session_end_ns = int(datetime(
+            trading_date.year, trading_date.month, trading_date.day,
+            16, 0, tzinfo=_NY_TZ,
+        ).timestamp() * 1_000_000_000)
+        captured_at_ns = int(captured_at_utc.timestamp() * 1_000_000_000)
         pair_legs: dict[tuple[object, ...], dict[str, list[dict[str, object]]]] = {}
         gate_evidence = snapshot.get("opening_gate_evidence")
         rejections: dict[str, int] = {}
@@ -6533,6 +6687,19 @@ class DatabentoGammaStreamer:
                 or mapping_version != current_mapping_version
             ):
                 reject_quote("timestamp_or_mapping_invalid")
+                continue
+            # Reject ineligible candidates before ranking the contributing pairs.
+            # A freshly received CBBO can retain an earlier session's event
+            # timestamp; selecting it first used to poison the entire sample
+            # even when enough other fully eligible pairs were available.
+            provider_age = (captured_at_ns - ts_recv_ns) / 1_000_000_000
+            if (provider_age < -CLOCK_SYNC_NEGATIVE_TOLERANCE_SECONDS
+                    or provider_age > QUOTE_FRESHNESS_SECONDS):
+                reject_quote("provider_timestamp_freshness_invalid")
+                continue
+            if not (session_start_ns <= ts_event_ns < session_end_ns
+                    and session_start_ns <= ts_recv_ns < session_end_ns):
+                reject_quote("provider_timestamp_outside_regular_session")
                 continue
             multiplier = record.get("contract_multiplier")
             if multiplier is not None and pd.isna(multiplier):

@@ -17,10 +17,10 @@ from backend.api.helpers import (
 )
 from backend.api.lifecycle import runtime_control_health
 from backend.api.bounded_runtime_read import (
+    BoundedRuntimeReads,
     RuntimeReadUnavailable,
-    read_runtime_or_503 as _read_or_503,
+    read_runtime_or_503,
     runtime_read_unavailable_payload as _unavailable_read_payload,
-    runtime_reads as _runtime_reads,
 )
 from backend.ai_predictor import inference_device
 from backend.api.schemas import HealthResponse, WorkstationEventV1
@@ -41,6 +41,14 @@ from backend.streamer import get_streamer
 from backend.workstation import workstation_state_store
 
 router = APIRouter(tags=["health"])
+
+# Keep slow ORB/GEX projections from consuming health/SSE read admission.
+# This still bounds lock-bound health reads and never caches stale authority.
+_runtime_reads = BoundedRuntimeReads(max_workers=2, timeout_seconds=1.0)
+
+
+async def _read_or_503(key, reader):
+    return await read_runtime_or_503(key, reader, reads=_runtime_reads)
 
 SUBSCRIBED_SYMBOLS_DIAGNOSTICS_URL = "/databento/universe"
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]

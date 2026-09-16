@@ -54,7 +54,13 @@ def test_zip_download_separates_method_csvs_without_touching_sources():
     from typing import Optional
     import pandas as pd
     from app.utils.display_time import DisplayTimezone, resolve_display_timezone, format_display_timestamp
-    from app.utils.snapshot_history import SnapshotSelection, partition_snapshot_evidence, snapshot_research_export_fields
+    from app.utils.snapshot_history import (
+        SnapshotSelection,
+        partition_snapshot_evidence,
+        snapshot_coverage_manifest,
+        snapshot_research_export_fields,
+        snapshot_research_export_record,
+    )
     rows=[{'symbol':'SPX','generated_at_utc':'2026-09-14T19:00:00+00:00',
            'validation_is_valid':True,'gamma_excluded_from_model':False,
            'subscription_epoch_id':'a'*64,'subscription_generation':1,
@@ -71,6 +77,8 @@ def test_zip_download_separates_method_csvs_without_touching_sources():
         'list_gamma_snapshot_symbols':lambda *args:['SPX'],
         '_cached_local_snapshot_selection':lambda *args:SnapshotSelection(tuple(rows),(),0),
         'partition_snapshot_evidence':partition_snapshot_evidence,
+        'snapshot_coverage_manifest':snapshot_coverage_manifest,
+        'snapshot_research_export_record':snapshot_research_export_record,
         'snapshot_research_export_fields':snapshot_research_export_fields,
         'gamma_snapshot_provenance_status':gamma_snapshot_provenance_status,
         'DIAGNOSTIC_INVALID_SNAPSHOT':DIAGNOSTIC_INVALID_SNAPSHOT,

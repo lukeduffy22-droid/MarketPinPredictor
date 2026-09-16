@@ -24,6 +24,10 @@ def _positive_finite(value: Any) -> bool:
     return math.isfinite(number) and number > 0
 
 
+def _mapping(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def finalize_snapshot_export_payload(
     payload: Mapping[str, Any],
     *,
@@ -85,8 +89,36 @@ def finalize_snapshot_export_payload(
     if subscription_context.get("handoff_status") != "active":
         reasons.append("SUBSCRIPTION_NOT_ACTIVE")
 
+    calculation_inputs = _mapping(source.get("_calculation_inputs"))
+    parameters = _mapping(calculation_inputs.get("parameters"))
+    oi_provenance = _mapping(
+        payload.get("oi_analytics_provenance")
+        or source.get("oi_analytics_provenance")
+    )
+    quote_freshness_limit = parameters.get("quote_freshness_seconds")
+    provider_statistics_end = oi_provenance.get("provider_statistics_end")
+    replay_missing_evidence = []
+    if not _positive_finite(quote_freshness_limit):
+        replay_missing_evidence.append("quote_freshness_limit_seconds")
+        quote_freshness_limit = None
+    if not isinstance(provider_statistics_end, str) or not provider_statistics_end.strip():
+        replay_missing_evidence.append("provider_statistics_end")
+        provider_statistics_end = None
+
+    timestamp_utc = payload.get("timestamp_utc") or payload.get("generated_at_utc")
+    legacy_timestamp = payload.get("timestamp")
+
     return {
         **payload,
+        "timestamp": timestamp_utc or legacy_timestamp,
+        "producer_timestamp_legacy": legacy_timestamp,
+        "timestamp_semantics": "aware_utc_canonical_with_legacy_preserved",
+        "quote_freshness_limit_seconds": quote_freshness_limit,
+        "open_interest_provider_statistics_end_utc": provider_statistics_end,
+        "transport_counter_scope": "shared_databento_stream",
+        "transport_counter_semantics": "cumulative_process_totals_not_symbol_counts",
+        "replay_evidence_complete": not replay_missing_evidence,
+        "replay_missing_evidence": replay_missing_evidence,
         "usable_for_prediction": not reasons,
         "is_fallback": bool(fallback),
         "calculation_inputs_persisted": calculation_persisted is True,

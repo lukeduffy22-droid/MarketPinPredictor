@@ -898,3 +898,75 @@ def test_valid_current_day_cache_remains_usable_when_refresh_is_recommended(tmp_
     provenance = streamer.subscription_metadata["universe_provenance"]
     assert provenance["mode"] == "current_day_cache"
     assert provenance["refresh_recommended"] is True
+
+
+def test_current_day_cache_restores_hash_bound_provider_cutoffs(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend.databento_streamer.MIN_PRIMARY_STRIKE_PAIRS", 1)
+    trading_date = date(2026, 8, 26)
+    definition_end = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    statistics_end = datetime(2026, 8, 26, 11, 0, tzinfo=timezone.utc)
+    frame = pd.DataFrame([
+        {
+            "market": "SPX", "symbol": "SPXW  260826C05000000",
+            "expiration_date": trading_date, "option_type": "C", "strike": 5000.0,
+            "open_interest": 100.0,
+        },
+        {
+            "market": "SPX", "symbol": "SPXW  260826P05000000",
+            "expiration_date": trading_date, "option_type": "P", "strike": 5000.0,
+            "open_interest": 100.0,
+        },
+    ])
+    writer = DatabentoGammaStreamer(["SPX"])
+    writer.cache_dir = tmp_path
+    cache_path = writer._save_cached_universe(
+        frame,
+        trading_date=trading_date,
+        provider_definition_end=definition_end,
+        provider_statistics_end=statistics_end,
+    )
+    assert cache_path is not None
+
+    reader = DatabentoGammaStreamer(["SPX"])
+    reader.cache_dir = tmp_path
+    assert reader._load_cached_universe(trading_date) is True
+
+    provenance = reader.subscription_metadata["universe_provenance"]
+    assert provenance["cache_metadata_status"] == "verified"
+    assert provenance["provider_definition_end"] == definition_end.isoformat()
+    assert provenance["provider_statistics_end"] == statistics_end.isoformat()
+
+
+def test_current_day_cache_does_not_trust_tampered_cutoff_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend.databento_streamer.MIN_PRIMARY_STRIKE_PAIRS", 1)
+    trading_date = date(2026, 8, 26)
+    frame = pd.DataFrame([
+        {
+            "market": "SPX", "symbol": "SPXW  260826C05000000",
+            "expiration_date": trading_date, "option_type": "C", "strike": 5000.0,
+            "open_interest": 100.0,
+        },
+        {
+            "market": "SPX", "symbol": "SPXW  260826P05000000",
+            "expiration_date": trading_date, "option_type": "P", "strike": 5000.0,
+            "open_interest": 100.0,
+        },
+    ])
+    writer = DatabentoGammaStreamer(["SPX"])
+    writer.cache_dir = tmp_path
+    cache_path = writer._save_cached_universe(
+        frame,
+        trading_date=trading_date,
+        provider_definition_end=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+        provider_statistics_end=datetime(2026, 8, 26, 11, 0, tzinfo=timezone.utc),
+    )
+    assert cache_path is not None
+    writer._cache_metadata_path(cache_path).write_text("{}", encoding="utf-8")
+
+    reader = DatabentoGammaStreamer(["SPX"])
+    reader.cache_dir = tmp_path
+    assert reader._load_cached_universe(trading_date) is True
+
+    provenance = reader.subscription_metadata["universe_provenance"]
+    assert provenance["cache_metadata_status"] == "missing_or_invalid"
+    assert provenance["provider_statistics_end"] is None

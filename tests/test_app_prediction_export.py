@@ -17,6 +17,8 @@ from app.utils.snapshot_history import (
     HISTORICAL_UNVERIFIED_SUBSCRIPTION_IDENTITY,
     gamma_snapshot_provenance_status,
     partition_snapshot_evidence,
+    snapshot_coverage_manifest,
+    snapshot_research_export_record,
     snapshot_research_export_fields,
 )
 from backend.workstation import payload_has_fallback_provenance
@@ -81,6 +83,8 @@ def _load_snapshot_export_functions(records):
         ),
         "gamma_snapshot_provenance_status": gamma_snapshot_provenance_status,
         "partition_snapshot_evidence": partition_snapshot_evidence,
+        "snapshot_coverage_manifest": snapshot_coverage_manifest,
+        "snapshot_research_export_record": snapshot_research_export_record,
         "snapshot_research_export_fields": snapshot_research_export_fields,
         "current_local_date": lambda _timezone: "2026-09-04",
         "list_gamma_snapshot_symbols": lambda _root: ["SPX"],
@@ -361,8 +365,13 @@ def test_eod_zip_separates_recorded_and_legacy_process_identity_as_research():
         frames = [pd.read_csv(BytesIO(archive.read(name))) for name in csv_names]
         assert all(frame['review_validation_group'].nunique() == 1 for frame in frames)
         history_csv = pd.concat(frames, ignore_index=True)
+        coverage = json.loads(archive.read("coverage-manifest.json"))
     assert history_csv["subscription_generation"].tolist() == [2, 1]
     assert history_csv["current_live_eligible"].tolist() == [False, False]
+    assert coverage["schema_version"] == "marketpin-snapshot-export-coverage.v1"
+    assert coverage["symbols"]["SPX"]["total_records"] == 2
+    assert coverage["missing_expected_symbols"] == ["NDX", "RUT", "VIX"]
+    assert coverage["accuracy_established"] is False
 
 
 def _load_zip_download_renderer():

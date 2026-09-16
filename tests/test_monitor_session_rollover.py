@@ -21,6 +21,38 @@ TOOL = ROOT / "tools" / "prepare_market_monitor_session.py"
 TUESDAY_UTC = datetime(2026, 9, 8, 12, 45, tzinfo=timezone.utc)
 
 
+def test_missing_state_bootstraps_current_session_fail_closed(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    journal_dir = tmp_path / "journal"
+    observed = datetime(2026, 9, 16, 17, 35, tzinfo=timezone.utc)
+
+    result = rollover.prepare_monitor_session(
+        state_path=state_path,
+        journal_dir=journal_dir,
+        observed_at_utc=observed,
+        session_date="2026-09-16",
+    )
+
+    assert result["accepted"] is True
+    assert result["action"] == "recovered_missing_state"
+    assert result["commit_phase"] == "complete"
+    state = json.loads(state_path.read_text("utf-8"))
+    assert state["session_date"] == "2026-09-16"
+    assert state["state_recovery_bootstrap"] is True
+    assert state["policy_evaluator"] == {}
+    assert state["comparison_baselines"] == {}
+    assert state["last_scan_utc"] is None
+
+    repeated = rollover.prepare_monitor_session(
+        state_path=state_path,
+        journal_dir=journal_dir,
+        observed_at_utc=observed + timedelta(minutes=1),
+        session_date="2026-09-16",
+    )
+    assert repeated["accepted"] is True
+    assert repeated["action"] == "already_current"
+
+
 def _legacy_level(
     symbol: str,
     *,

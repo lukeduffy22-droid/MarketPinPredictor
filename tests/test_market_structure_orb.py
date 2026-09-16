@@ -1770,6 +1770,16 @@ def test_orb_snapshot_loader_bounds_full_day_growth_without_changing_projection(
     # Runtime reads must not sort a second full-session provenance window or
     # hydrate the growing post-open audit payload merely to publish two rows.
     assert len(projection_reads) == 2
+    with temp_engine.connect() as connection:
+        metadata_sql, metadata_parameters = projection_reads[0]
+        plan = connection.exec_driver_sql(
+            "EXPLAIN QUERY PLAN " + metadata_sql, metadata_parameters
+        ).fetchall()
+    assert any(
+        "COVERING INDEX idx_orb_reference_snapshot_metadata" in row[3]
+        for row in plan
+    )
+    assert not any("TEMP B-TREE" in row[3] for row in plan)
     assert all("row_number" not in sql and "formula_inputs_json" not in sql
                for sql, _parameters in projection_reads)
     assert len(projection_reads[-1][1]) == 2

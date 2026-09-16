@@ -44,7 +44,10 @@ def capture(tmp_path, monkeypatch):
         "calculation_id": "capture-one",
         "universe_provenance": {"is_fallback": False},
         "oi_analytics_provenance": {"is_fallback": False},
-        "_calculation_inputs": {"rejection_counts": {}},
+        "_calculation_inputs": {
+            "rejection_counts": {},
+            "parameters": {"quote_freshness_seconds": 10.0},
+        },
     }
     return streamer, source, audited
 
@@ -104,6 +107,30 @@ def test_matching_persisted_capture_can_remain_eligible(capture):
     assert audited[0]["calculation_inputs_persisted"] is True
     assert audited[0]["prediction_eligibility_reasons"] == []
     assert audited[0]["prediction_eligibility_scope"] == "capture_input_at_write_requires_lifecycle_revalidation"
+    assert audited[0]["quote_freshness_limit_seconds"] == 10.0
+    assert audited[0]["transport_counter_scope"] == "shared_databento_stream"
+    assert audited[0]["transport_counter_semantics"] == (
+        "cumulative_process_totals_not_symbol_counts"
+    )
+    assert audited[0]["replay_evidence_complete"] is False
+    assert audited[0]["replay_missing_evidence"] == ["provider_statistics_end"]
+    assert audited[0]["timestamp"] == audited[0]["timestamp_utc"]
+    assert audited[0]["producer_timestamp_legacy"] is not None
+
+
+def test_exact_oi_cutoff_and_freshness_make_replay_evidence_complete(capture):
+    streamer, source, audited = capture
+    source["oi_analytics_provenance"]["provider_statistics_end"] = (
+        "2026-09-16T12:00:00+00:00"
+    )
+
+    assert streamer._write_snapshot(source) is True
+
+    assert audited[0]["replay_evidence_complete"] is True
+    assert audited[0]["replay_missing_evidence"] == []
+    assert audited[0]["open_interest_provider_statistics_end_utc"] == (
+        "2026-09-16T12:00:00+00:00"
+    )
 
 
 def test_generation_changed_during_persistence_is_not_restamped(capture, monkeypatch):
