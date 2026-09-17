@@ -3490,6 +3490,211 @@ def score_prediction_snapshots(
         db.close()
 
 
+def get_prediction_score_backlog(
+    symbol: str | None = None,
+    trading_date: date | None = None,
+    *,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Return explicit legacy snapshots that can be scored against verified closes.
+
+    This is a read-only operator aid.  It deliberately does not score anything,
+    and any later score remains diagnostic research only.
+    """
+    if limit <= 0 or limit > 5000:
+        raise ValueError("limit must be between 1 and 5000")
+    normalized_symbol = symbol.upper() if symbol else None
+    db = SessionLocal()
+    try:
+        if trading_date is None:
+            latest_date = db.query(func.max(EODCloseObservation.trading_date)).filter(
+                EODCloseObservation.source_verified == True,
+            )
+            if normalized_symbol:
+                latest_date = latest_date.filter(
+                    EODCloseObservation.symbol == normalized_symbol
+                )
+            trading_date = latest_date.scalar()
+        if trading_date is None:
+            return {
+                "schema_version": "marketpin-legacy-score-backlog.v1",
+                "status": "missing_verified_close_evidence",
+                "symbol": normalized_symbol,
+                "trading_date": None,
+                "read_only": True,
+                "evidence_scope": DIAGNOSTIC_ACCURACY_SCOPE,
+                "training_eligible": False,
+                "performance_claim_eligible": False,
+                "limit": limit,
+                "groups": [],
+                "totals": {
+                    "scoreable": 0,
+                    "already_scored": 0,
+                    "blocked": 0,
+                    "candidate_predictions": 0,
+                },
+            }
+
+        close_query = db.query(EODCloseObservation).filter(
+            EODCloseObservation.trading_date == trading_date,
+            EODCloseObservation.source_verified == True,
+        )
+        if normalized_symbol:
+            close_query = close_query.filter(EODCloseObservation.symbol == normalized_symbol)
+        close_rows = close_query.order_by(
+            EODCloseObservation.symbol,
+            EODCloseObservation.id.desc(),
+        ).all()
+        latest_close_by_symbol: dict[str, EODCloseObservation] = {}
+        for close in close_rows:
+            latest_close_by_symbol.setdefault(close.symbol, close)
+
+        prediction_query = db.query(PredictionSnapshot).filter(
+            PredictionSnapshot.trading_date == trading_date,
+        )
+        if normalized_symbol:
+            prediction_query = prediction_query.filter(
+                PredictionSnapshot.symbol == normalized_symbol
+            )
+        predictions = prediction_query.order_by(
+            PredictionSnapshot.symbol,
+            PredictionSnapshot.timestamp_utc,
+            PredictionSnapshot.id,
+        ).limit(limit).all()
+
+        prediction_ids = [row.id for row in predictions]
+        existing_scores: set[tuple[int, int]] = set()
+        if prediction_ids and latest_close_by_symbol:
+            close_ids = [row.id for row in latest_close_by_symbol.values()]
+            existing_scores = {
+                (row.prediction_id, row.close_observation_id)
+                for row in db.query(PredictionAccuracyObservation).filter(
+                    PredictionAccuracyObservation.prediction_id.in_(prediction_ids),
+                    PredictionAccuracyObservation.close_observation_id.in_(close_ids),
+                ).all()
+            }
+
+        groups: dict[str, dict[str, Any]] = {}
+        totals = {
+            "scoreable": 0,
+            "already_scored": 0,
+            "blocked": 0,
+            "candidate_predictions": len(predictions),
+        }
+        for prediction in predictions:
+            group = groups.setdefault(
+                prediction.symbol,
+                {
+                    "symbol": prediction.symbol,
+                    "trading_date": trading_date.isoformat(),
+                    "latest_verified_close": None,
+                    "scoreable_prediction_ids": [],
+                    "already_scored_prediction_ids": [],
+                    "blocked_predictions": [],
+                    "score_request": None,
+                },
+            )
+            close = latest_close_by_symbol.get(prediction.symbol)
+            if close is None:
+                group["blocked_predictions"].append({
+                    "prediction_id": prediction.id,
+                    "reason": "missing_verified_eod_close",
+                })
+                totals["blocked"] += 1
+                continue
+            group["latest_verified_close"] = {
+                "close_observation_id": close.id,
+                "official_close": close.official_close,
+                "source": close.source,
+                "source_reference": close.source_reference,
+                "source_artifact_sha256": close.source_artifact_sha256,
+                "observed_at_utc": close.observed_at_utc.isoformat(),
+            }
+            if (prediction.id, close.id) in existing_scores:
+                group["already_scored_prediction_ids"].append(prediction.id)
+                totals["already_scored"] += 1
+                continue
+            reason = None
+            if prediction.is_valid is not True:
+                reason = "prediction_not_valid"
+            else:
+                try:
+                    source_payload = json.loads(prediction.source_payload_json or "{}")
+                except json.JSONDecodeError:
+                    source_payload = {}
+                if not isinstance(source_payload, dict):
+                    source_payload = {}
+                calculation_id = str(source_payload.get("calculation_id") or "").strip()
+                if not calculation_id:
+                    reason = "missing_calculation_id"
+                else:
+                    calculation = db.query(GammaCalculationRun).join(
+                        GammaCalculationInputBlob,
+                        GammaCalculationInputBlob.calculation_run_id == GammaCalculationRun.id,
+                    ).filter(
+                        GammaCalculationRun.calculation_id == calculation_id,
+                        GammaCalculationRun.symbol == prediction.symbol,
+                        GammaCalculationRun.trading_date == trading_date,
+                        GammaCalculationRun.status == "valid",
+                    ).first()
+                    if calculation is None:
+                        reason = "missing_valid_calculation_and_input_blob"
+            if reason is not None:
+                group["blocked_predictions"].append({
+                    "prediction_id": prediction.id,
+                    "reason": reason,
+                })
+                totals["blocked"] += 1
+                continue
+            group["scoreable_prediction_ids"].append(prediction.id)
+            totals["scoreable"] += 1
+
+        for group in groups.values():
+            scoreable_ids = sorted(group["scoreable_prediction_ids"])
+            if not scoreable_ids:
+                continue
+            close = latest_close_by_symbol[group["symbol"]]
+            selection_payload = {
+                "schema_version": "marketpin-legacy-score-selection.v1",
+                "symbol": group["symbol"],
+                "trading_date": trading_date.isoformat(),
+                "close_observation_id": close.id,
+                "prediction_ids": scoreable_ids,
+                "evidence_scope": DIAGNOSTIC_ACCURACY_SCOPE,
+                "training_eligible": False,
+            }
+            selection_sha = hashlib.sha256(
+                json.dumps(
+                    selection_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            group["score_request"] = {
+                "symbol": group["symbol"],
+                "trading_date": trading_date.isoformat(),
+                "prediction_ids": scoreable_ids,
+                "selection_evidence_sha256": selection_sha,
+                "writes_diagnostic_scores_only": True,
+            }
+
+        return {
+            "schema_version": "marketpin-legacy-score-backlog.v1",
+            "status": "ready" if totals["scoreable"] else "no_scoreable_predictions",
+            "symbol": normalized_symbol,
+            "trading_date": trading_date.isoformat(),
+            "read_only": True,
+            "evidence_scope": DIAGNOSTIC_ACCURACY_SCOPE,
+            "training_eligible": False,
+            "performance_claim_eligible": False,
+            "limit": limit,
+            "groups": list(groups.values()),
+            "totals": totals,
+        }
+    finally:
+        db.close()
+
+
 def _accuracy_payload(row: PredictionAccuracyObservation) -> dict[str, Any]:
     return {
         "score_key": row.score_key, "prediction_id": row.prediction_id,

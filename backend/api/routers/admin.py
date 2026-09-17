@@ -8,7 +8,12 @@ from fastapi import APIRouter, HTTPException
 
 from backend.api.helpers import normalize_symbol
 from backend.api.schemas import DatabentoCacheRefreshRequest, EODCloseRequest
-from backend.database import get_prediction_score_summary, score_prediction_snapshots, upsert_eod_close
+from backend.database import (
+    get_prediction_score_backlog,
+    get_prediction_score_summary,
+    score_prediction_snapshots,
+    upsert_eod_close,
+)
 from backend.streamer import get_streamer
 
 router = APIRouter(tags=["admin"])
@@ -101,6 +106,37 @@ async def prediction_scores(symbol: Optional[str] = None, trading_date: Optional
         except ValueError:
             raise HTTPException(status_code=400, detail="trading_date must be YYYY-MM-DD")
     return get_prediction_score_summary(normalize_symbol(symbol) if symbol else None, parsed_date)
+
+
+@router.get(
+    "/prediction-score-backlog",
+    summary="List legacy predictions ready for explicit verified-close scoring",
+    description=(
+        "Read-only diagnostic work queue. Returns scoreable prediction IDs and blocked "
+        "reasons after verified close evidence exists. It never writes scores, never "
+        "changes training eligibility, and never creates a model-accuracy claim."
+    ),
+)
+async def prediction_score_backlog(
+    symbol: Optional[str] = None,
+    trading_date: Optional[str] = None,
+    limit: int = 500,
+):
+    """Return explicit score requests for verified-close diagnostic feedback."""
+    parsed_date = None
+    if trading_date:
+        try:
+            parsed_date = date.fromisoformat(trading_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="trading_date must be YYYY-MM-DD")
+    try:
+        return get_prediction_score_backlog(
+            normalize_symbol(symbol) if symbol else None,
+            parsed_date,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post(

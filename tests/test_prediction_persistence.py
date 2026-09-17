@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 import backend.database as database_module
 from backend.database import (
     _trading_date,
+    get_prediction_score_backlog,
     get_prediction_score_summary,
     init_db,
     save_gamma_calculation_inputs,
@@ -250,6 +251,91 @@ def test_scoring_refuses_implicit_broad_intraday_selection(isolated_prediction_s
         assert session.query(database_module.PredictionSnapshot).filter(
             database_module.PredictionSnapshot.scored_at_utc.isnot(None)
         ).count() == 0
+
+
+def test_score_backlog_lists_only_verified_close_explicit_score_requests(
+    isolated_prediction_store,
+):
+    init_db()
+    trading_day = date(2026, 6, 18)
+    calculation_id = "22222222-2222-2222-2222-222222222222"
+    assert save_gamma_calculation_inputs(
+        {
+            "calculation_id": calculation_id,
+            "symbol": "SPX",
+            "calculated_at_utc": "2026-06-18T15:29:59Z",
+            "provider": "test",
+            "status": "valid",
+            "formula_version": "test-v1",
+        },
+        {"input_schema_version": "gamma-inputs-v1", "rows": [{"strike": 100.0}]},
+    ) is not None
+    scoreable = save_prediction_snapshot(
+        {
+            "symbol": "SPX", "provider": "test", "model_version": "test_v1",
+            "model_type": "unit-test", "timestamp": "2026-06-18T15:30:00",
+            "usable": True, "current_price": 100.0, "predicted_close": 101.0,
+            "confidence": 70.0, "feature_snapshot": {}, "signals": [],
+            "pin_payload": {"calculation_id": calculation_id},
+        },
+        prediction_mode="unit",
+    )
+    blocked = save_prediction_snapshot(
+        {
+            "symbol": "SPX", "provider": "test", "model_version": "test_v1",
+            "model_type": "unit-test", "timestamp": "2026-06-18T15:31:00",
+            "usable": True, "current_price": 100.0, "predicted_close": 102.0,
+            "confidence": 70.0, "feature_snapshot": {}, "signals": [],
+            "pin_payload": {},
+        },
+        prediction_mode="unit",
+    )
+    upsert_verified_eod_close(
+        "SPX", trading_day, 101.0, "sp-global-official",
+        source_reference="https://www.spglobal.com/spdji/official-close",
+        source_artifact_sha256="a" * 64,
+        observed_at_utc=datetime(2026, 6, 18, 21, 1, tzinfo=timezone.utc),
+    )
+
+    backlog = get_prediction_score_backlog("SPX", trading_day)
+
+    assert backlog["read_only"] is True
+    assert backlog["evidence_scope"] == "diagnostic_research_only"
+    assert backlog["training_eligible"] is False
+    assert backlog["performance_claim_eligible"] is False
+    assert backlog["totals"] == {
+        "scoreable": 1,
+        "already_scored": 0,
+        "blocked": 1,
+        "candidate_predictions": 2,
+    }
+    group = backlog["groups"][0]
+    assert group["scoreable_prediction_ids"] == [scoreable.id]
+    assert group["blocked_predictions"] == [{
+        "prediction_id": blocked.id,
+        "reason": "missing_calculation_id",
+    }]
+    score_request = group["score_request"]
+    assert score_request["writes_diagnostic_scores_only"] is True
+    assert score_request["prediction_ids"] == [scoreable.id]
+    assert len(score_request["selection_evidence_sha256"]) == 64
+    with database_module.SessionLocal() as session:
+        assert session.query(database_module.PredictionAccuracyObservation).count() == 0
+
+    score = score_prediction_snapshots(
+        "SPX",
+        trading_day,
+        prediction_ids=score_request["prediction_ids"],
+        selection_evidence_sha256=score_request["selection_evidence_sha256"],
+    )
+    assert score["scored"] == 1
+    assert score["training_eligible"] is False
+
+    scored_backlog = get_prediction_score_backlog("SPX", trading_day)
+    scored_group = scored_backlog["groups"][0]
+    assert scored_group["scoreable_prediction_ids"] == []
+    assert scored_group["already_scored_prediction_ids"] == [scoreable.id]
+    assert scored_backlog["totals"]["already_scored"] == 1
 
 
 def test_explicit_scoring_rejects_missing_calculation_lineage(isolated_prediction_store):
