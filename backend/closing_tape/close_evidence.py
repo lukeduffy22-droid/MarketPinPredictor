@@ -127,8 +127,11 @@ def resolve_verified_close_artifact(
         if path.is_file()
     ) if directory.is_dir() else []
     if len(matches) != 1:
-        raise ValueError(
-            "verified close vault must contain exactly one artifact for the content hash"
+        from .close_registry import resolve_registered_close_artifact
+
+        return resolve_registered_close_artifact(
+            root, trading_date=trading_day, symbol=normalized_symbol,
+            source_artifact_sha256=artifact_hash, max_bytes=max_bytes,
         )
     artifact = matches[0]
     try:
@@ -163,9 +166,7 @@ def resolve_verified_close_artifact_by_hash(
         if path.is_file()
     ) if root.is_dir() else []
     if len(matches) != 1:
-        raise ValueError(
-            "verified close vault must contain exactly one artifact for the content hash"
-        )
+        return _resolve_registered_hash_matches(root, matches, artifact_hash, max_bytes)
     artifact = matches[0]
     try:
         relative = artifact.relative_to(root)
@@ -181,6 +182,29 @@ def resolve_verified_close_artifact_by_hash(
         source_artifact_sha256=artifact_hash,
         max_bytes=max_bytes,
     )
+
+
+def _resolve_registered_hash_matches(root, paths, artifact_hash, max_bytes):
+    from .close_registry import resolve_registered_close_artifact
+
+    if not paths:
+        raise ValueError("verified close vault must contain exactly one artifact for the content hash")
+    identities = set()
+    for path in paths:
+        relative = path.relative_to(root)
+        if len(relative.parts) != 3:
+            raise ValueError("verified close artifact path is not canonical")
+        identities.add(relative.parts[:2])
+    # A multi-day source (e.g. official history CSV) may have identical bytes
+    # retained for several sessions. Require an explicit receipt for each one.
+    resolved = [
+        resolve_registered_close_artifact(
+            root, trading_date=day, symbol=symbol,
+            source_artifact_sha256=artifact_hash, max_bytes=max_bytes,
+        )
+        for day, symbol in sorted(identities)
+    ]
+    return resolved[0]
 
 
 def resolve_verified_close_artifacts_by_hashes(
@@ -208,9 +232,10 @@ def resolve_verified_close_artifacts_by_hashes(
     resolved: dict[str, Path] = {}
     for artifact_hash, paths in matches.items():
         if len(paths) != 1:
-            raise ValueError(
-                "verified close vault must contain exactly one artifact for the content hash"
+            resolved[artifact_hash] = _resolve_registered_hash_matches(
+                root, paths, artifact_hash, max_bytes
             )
+            continue
         relative = paths[0].relative_to(root)
         if len(relative.parts) != 3:
             raise ValueError("verified close artifact path is not canonical")

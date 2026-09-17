@@ -3849,9 +3849,8 @@ class DatabentoGammaStreamer:
                         timezone.utc
                     ).isoformat(),
                 }
-                temporary_metadata_path.write_text(
-                    json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
+                temporary_metadata_path.write_bytes(
+                    (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
                 )
                 os.replace(temporary_metadata_path, metadata_path)
             else:
@@ -5115,6 +5114,8 @@ class DatabentoGammaStreamer:
                 "gex": net_strike_gex,
                 "call_gex": call_gex,
                 "put_gex": put_gex,
+                "call_calculated_contracts": int((strike_rows["option_type"] == "C").sum()),
+                "put_calculated_contracts": int((strike_rows["option_type"] == "P").sum()),
                 "net_gex": net_strike_gex,
                 "abs_gex": abs(net_strike_gex),
                 "total_gex": call_gex + put_gex,

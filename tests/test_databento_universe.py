@@ -926,6 +926,10 @@ def test_current_day_cache_restores_hash_bound_provider_cutoffs(tmp_path, monkey
         provider_statistics_end=statistics_end,
     )
     assert cache_path is not None
+    # Canonical metadata bytes must survive Windows newline handling unchanged.
+    metadata_bytes = writer._cache_metadata_path(cache_path).read_bytes()
+    assert metadata_bytes.endswith(b"\n")
+    assert b"\r" not in metadata_bytes
 
     reader = DatabentoGammaStreamer(["SPX"])
     reader.cache_dir = tmp_path

@@ -130,12 +130,14 @@ async def read_runtime_or_503(
         ) from exc
 
 
-def bounded_runtime_endpoint(reader):
+def bounded_runtime_endpoint(reader=None, *, reads: BoundedRuntimeReads | None = None):
     """Make an otherwise synchronous runtime projection an isolated async API."""
+    if reader is None:
+        return lambda function: bounded_runtime_endpoint(function, reads=reads)
     @wraps(reader)
     async def endpoint(*args, **kwargs):
         key = (reader.__module__, reader.__qualname__, args, tuple(sorted(kwargs.items())))
-        return await read_runtime_or_503(key, lambda: reader(*args, **kwargs))
+        return await read_runtime_or_503(key, lambda: reader(*args, **kwargs), reads=reads)
     # FastAPI resolves postponed annotations against the endpoint globals.
     # Evaluate in the original module, where its date/schema types are defined.
     endpoint.__signature__ = inspect.signature(reader, eval_str=True)
