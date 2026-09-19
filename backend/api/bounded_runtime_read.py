@@ -22,11 +22,17 @@ T = TypeVar("T")
 class RuntimeReadUnavailable(RuntimeError):
     """A read could not establish current runtime state within its budget."""
 
+    def __init__(self, reason: str, *, diagnostics: dict | None = None):
+        super().__init__(reason)
+        self.diagnostics = diagnostics or {}
+
 
 @dataclass(frozen=True)
 class _Read:
     future: Future
     deadline: float
+    started_at: float
+    key_label: str
 
 
 class BoundedRuntimeReads:
@@ -47,6 +53,50 @@ class BoundedRuntimeReads:
         )
         self._lock = threading.Lock()
         self._reads: dict[Hashable, _Read] = {}
+
+    @staticmethod
+    def _key_label(key: Hashable) -> str:
+        """Return an endpoint identity without serializing request arguments."""
+        if (
+            isinstance(key, tuple)
+            and len(key) >= 2
+            and isinstance(key[0], str)
+            and isinstance(key[1], str)
+        ):
+            return f"{key[0]}.{key[1]}"
+        return type(key).__name__
+
+    def diagnostics(self, *, requested_key: Hashable | None = None) -> dict:
+        """Describe unfinished capacity without exposing request values."""
+        now = time.monotonic()
+        with self._lock:
+            active = [
+                {
+                    "reader": read.key_label,
+                    "age_seconds": round(max(0.0, now - read.started_at), 3),
+                    "deadline_exceeded": now > read.deadline,
+                }
+                for read in self._reads.values()
+                if not read.future.done()
+            ]
+        return {
+            "requested_reader": (
+                self._key_label(requested_key) if requested_key is not None else None
+            ),
+            "active_read_count": len(active),
+            "max_workers": self._max_workers,
+            "timeout_seconds": self._timeout_seconds,
+            "oldest_active_seconds": max(
+                (row["age_seconds"] for row in active), default=0.0
+            ),
+            "active_reads": active,
+        }
+
+    def _unavailable(self, reason: str, key: Hashable) -> RuntimeReadUnavailable:
+        return RuntimeReadUnavailable(
+            reason,
+            diagnostics=self.diagnostics(requested_key=key),
+        )
 
     def _finished(self, key: Hashable, read: _Read) -> None:
         with self._lock:
@@ -70,14 +120,20 @@ class BoundedRuntimeReads:
                         self._reads.pop(completed_key, None)
                 read = self._reads.get(key)
                 if read is None and len(self._reads) < self._max_workers:
-                    read = _Read(self._executor.submit(reader), admission_deadline)
+                    started_at = time.monotonic()
+                    read = _Read(
+                        self._executor.submit(reader),
+                        admission_deadline,
+                        started_at,
+                        self._key_label(key),
+                    )
                     self._reads[key] = read
                     created = True
             if read is not None:
                 break
             remaining = admission_deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeReadUnavailable("RUNTIME_READ_BUSY")
+                raise self._unavailable("RUNTIME_READ_BUSY", key)
             # Wait in the existing request coroutine, without submitting or
             # creating any queued/background task for excess requests.
             await asyncio.sleep(min(0.01, remaining))
@@ -90,16 +146,16 @@ class BoundedRuntimeReads:
         while not read.future.done():
             remaining = read.deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeReadUnavailable("RUNTIME_READ_TIMEOUT")
+                raise self._unavailable("RUNTIME_READ_TIMEOUT", key)
             await asyncio.sleep(min(0.01, remaining))
         if time.monotonic() > read.deadline:
-            raise RuntimeReadUnavailable("RUNTIME_READ_TIMEOUT")
+            raise self._unavailable("RUNTIME_READ_TIMEOUT", key)
         try:
             return read.future.result()
         except HTTPException:
             raise  # Preserve existing 404/409/503 and their evidence reasons.
         except Exception as exc:
-            raise RuntimeReadUnavailable("RUNTIME_READ_FAILED") from exc
+            raise self._unavailable("RUNTIME_READ_FAILED", key) from exc
 
     def close(self) -> None:
         """Join completed test/service workers; callers must release test locks."""
@@ -110,12 +166,15 @@ runtime_reads = BoundedRuntimeReads(max_workers=2, timeout_seconds=1.0)
 
 
 def runtime_read_unavailable_payload(exc: RuntimeReadUnavailable) -> dict:
-    return {
+    payload = {
         "status": "unavailable", "reason": str(exc),
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
         "prediction_pipeline_ok": False, "runtime_context_stable": False,
         "usable_for_prediction": False,
     }
+    if exc.diagnostics:
+        payload["runtime_read"] = exc.diagnostics
+    return payload
 
 
 async def read_runtime_or_503(
@@ -130,12 +189,14 @@ async def read_runtime_or_503(
         ) from exc
 
 
-def bounded_runtime_endpoint(reader):
+def bounded_runtime_endpoint(reader=None, *, reads: BoundedRuntimeReads | None = None):
     """Make an otherwise synchronous runtime projection an isolated async API."""
+    if reader is None:
+        return lambda function: bounded_runtime_endpoint(function, reads=reads)
     @wraps(reader)
     async def endpoint(*args, **kwargs):
         key = (reader.__module__, reader.__qualname__, args, tuple(sorted(kwargs.items())))
-        return await read_runtime_or_503(key, lambda: reader(*args, **kwargs))
+        return await read_runtime_or_503(key, lambda: reader(*args, **kwargs), reads=reads)
     # FastAPI resolves postponed annotations against the endpoint globals.
     # Evaluate in the original module, where its date/schema types are defined.
     endpoint.__signature__ = inspect.signature(reader, eval_str=True)

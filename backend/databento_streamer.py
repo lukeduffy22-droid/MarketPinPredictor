@@ -707,11 +707,13 @@ def batch_iv_gamma_gex(
     iv_values = np.full(row_count, np.nan, dtype=np.float64)
     gamma_values = np.full(row_count, np.nan, dtype=np.float64)
     gex_values = np.full(row_count, np.nan, dtype=np.float64)
+    rejection_reasons = np.full(row_count, "unknown", dtype="U32")
     empty_result = {
         "valid_mask": valid_mask,
         "iv": iv_values,
         "gamma": gamma_values,
         "gex": gex_values,
+        "rejection_reason": rejection_reasons,
     }
     if row_count == 0:
         return empty_result
@@ -721,6 +723,7 @@ def batch_iv_gamma_gex(
     except (TypeError, ValueError, OverflowError):
         spot_value = math.nan
     if not math.isfinite(spot_value) or spot_value <= 0:
+        rejection_reasons[:] = "invalid_spot"
         return empty_result
 
     is_call = option_type_values == "C"
@@ -737,12 +740,18 @@ def batch_iv_gamma_gex(
         & (year_values > 0.0)
         & (is_call | is_put)
     )
+    rejection_reasons[~finite_inputs] = "nonfinite_input"
+    rejection_reasons[finite_inputs & (strike_values <= 0.0)] = "invalid_strike"
+    rejection_reasons[finite_inputs & (year_values <= 0.0)] = "invalid_time_to_expiry"
+    rejection_reasons[finite_inputs & ~(is_call | is_put)] = "invalid_option_type"
     intrinsic_values = np.where(
         is_call,
         np.maximum(spot_value - strike_values, 0.0),
         np.maximum(strike_values - spot_value, 0.0),
     )
-    candidate_indices = np.flatnonzero(base_valid & (mid_values > intrinsic_values))
+    price_above_intrinsic = mid_values > intrinsic_values
+    rejection_reasons[base_valid & ~price_above_intrinsic] = "price_not_above_intrinsic"
+    candidate_indices = np.flatnonzero(base_valid & price_above_intrinsic)
     if candidate_indices.size == 0:
         return empty_result
 
@@ -777,6 +786,7 @@ def batch_iv_gamma_gex(
         & (lower_errors <= 0.0)
         & (upper_errors >= 0.0)
     )
+    rejection_reasons[candidate_indices] = "iv_root_not_bracketed"
     solved_indices = candidate_indices[bracket_mask]
     if solved_indices.size == 0:
         return empty_result
@@ -838,11 +848,13 @@ def batch_iv_gamma_gex(
         & np.isfinite(solved_gammas)
         & np.isfinite(solved_gex)
     )
+    rejection_reasons[solved_indices] = "nonfinite_result"
     final_indices = solved_indices[finite_results]
     valid_mask[final_indices] = True
     iv_values[final_indices] = solved_vols[finite_results]
     gamma_values[final_indices] = solved_gammas[finite_results]
     gex_values[final_indices] = solved_gex[finite_results]
+    rejection_reasons[final_indices] = "valid"
     return empty_result
 
 
@@ -3849,9 +3861,8 @@ class DatabentoGammaStreamer:
                         timezone.utc
                     ).isoformat(),
                 }
-                temporary_metadata_path.write_text(
-                    json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
+                temporary_metadata_path.write_bytes(
+                    (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
                 )
                 os.replace(temporary_metadata_path, metadata_path)
             else:
@@ -4946,6 +4957,18 @@ class DatabentoGammaStreamer:
             chain["open_interest"].to_numpy(dtype=np.float64, copy=False),
         )
         valid_mask = batch["valid_mask"]
+        chain["calculation_status"] = batch["rejection_reason"]
+        option_type_values = chain["option_type"].to_numpy(dtype="U1", copy=False)
+        calculation_exclusion_counts: dict[str, dict[str, int]] = {}
+        for option_type, side_name in (("C", "call"), ("P", "put")):
+            side_reasons = batch["rejection_reason"][option_type_values == option_type]
+            reason_values, reason_counts = np.unique(side_reasons, return_counts=True)
+            calculation_exclusion_counts[side_name] = {
+                str(reason): int(count)
+                for reason, count in zip(reason_values, reason_counts)
+                if str(reason) != "valid"
+            }
+        diagnostic["iv_gamma_exclusion_counts"] = calculation_exclusion_counts
         expiration_timestamps = pd.to_datetime(chain["expiration_date"], errors="coerce")
         days_to_expiry = (
             (expiration_timestamps - pd.Timestamp(current_market_date()))
@@ -5098,6 +5121,38 @@ class DatabentoGammaStreamer:
         self.last_calculation_diagnostics[market] = dict(diagnostic)
         min_days = float(calc["days_to_expiry"].min())
         max_days = float(calc["days_to_expiry"].max())
+
+        def _side_calculation_evidence(strike: float, option_type: str) -> tuple[str, list[str]]:
+            calculated_rows = same_day_calc[
+                (same_day_calc["strike"] == strike)
+                & (same_day_calc["option_type"] == option_type)
+            ]
+            if not calculated_rows.empty:
+                return "calculated", []
+            candidate_rows = chain[
+                (chain["expiration_date"] == primary_expiration)
+                & (chain["strike"] == strike)
+                & (chain["option_type"] == option_type)
+            ]
+            if not candidate_rows.empty:
+                reasons = sorted(
+                    {
+                        str(reason)
+                        for reason in candidate_rows["calculation_status"]
+                        if str(reason) != "valid"
+                    }
+                )
+                return "excluded", reasons or ["calculation_result_unavailable"]
+            observed_rows = spot_chain[
+                (spot_chain["strike"] == strike)
+                & (spot_chain["option_type"] == option_type)
+            ]
+            if observed_rows.empty:
+                return "excluded", ["no_fresh_current_quote"]
+            if not bool((observed_rows["open_interest"] > 0).any()):
+                return "excluded", ["no_positive_open_interest"]
+            return "excluded", ["outside_calculation_selection"]
+
         top_strikes = []
         for strike, value in top:
             strike_rows = same_day_calc[same_day_calc["strike"] == strike].copy()
@@ -5110,11 +5165,19 @@ class DatabentoGammaStreamer:
             else:
                 days_to_expiry = float(strike_rows["days_to_expiry"].min())
             expirations = sorted(str(expiration) for expiration in strike_rows["expiration_date"].dropna().unique())
+            call_status, call_exclusion_reasons = _side_calculation_evidence(strike, "C")
+            put_status, put_exclusion_reasons = _side_calculation_evidence(strike, "P")
             top_strikes.append({
                 "strike": strike,
                 "gex": net_strike_gex,
                 "call_gex": call_gex,
                 "put_gex": put_gex,
+                "call_calculated_contracts": int((strike_rows["option_type"] == "C").sum()),
+                "put_calculated_contracts": int((strike_rows["option_type"] == "P").sum()),
+                "call_calculation_status": call_status,
+                "put_calculation_status": put_status,
+                "call_exclusion_reasons": call_exclusion_reasons,
+                "put_exclusion_reasons": put_exclusion_reasons,
                 "net_gex": net_strike_gex,
                 "abs_gex": abs(net_strike_gex),
                 "total_gex": call_gex + put_gex,
@@ -5294,6 +5357,7 @@ class DatabentoGammaStreamer:
                 "put_iv_mean": put_iv_mean,
                 "skew": put_iv_mean - call_iv_mean if put_iv_mean is not None and call_iv_mean is not None else None,
             },
+            "calculation_exclusion_counts": calculation_exclusion_counts,
             "truncation": truncation,
             "confidence": round(max(confidence, 0.0), 2),
             "confidence_factors": confidence_factors,
@@ -5600,6 +5664,9 @@ class DatabentoGammaStreamer:
             "vol_regime": result.get("vol_regime"),
             "vol_regime_iv": result.get("vol_regime_iv"),
             "skew_metrics": result.get("skew_metrics"),
+            "calculation_exclusion_counts": result.get(
+                "calculation_exclusion_counts"
+            ) or {},
             "truncation": result.get("truncation"),
             "validation_is_valid": validation_is_valid,
             "validation_failure_reasons": validation_failure_reasons,

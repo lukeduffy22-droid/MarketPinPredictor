@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Query
 
-from ..bounded_runtime_read import bounded_runtime_endpoint
+from ..bounded_runtime_read import BoundedRuntimeReads, bounded_runtime_endpoint
 from backend.config import DATABENTO_SUPPORTED_SYMBOLS
 from backend.market_structure import get_market_structure_journal
 from backend.streamer import get_streamer
 
 router = APIRouter(tags=["market-data"])
+# Concurrent full-day projections competed for reads and missed the deadline.
+# Serialize ORB work, retaining bounded admission and no completed-result cache.
+_orb_reads = BoundedRuntimeReads(max_workers=1, timeout_seconds=1.0)
 
 DEFAULT_ORB_INDEX_SYMBOLS = ("SPX", "NDX", "VIX", "RUT")
 
@@ -82,13 +84,7 @@ def _live_snapshots(journal, streamer, symbols, *, configured):
                 **kwargs,
             )
 
-        if len(symbols) <= 1:
-            return dict(map(snapshot, symbols))
-        with ThreadPoolExecutor(
-            max_workers=min(4, len(symbols)),
-            thread_name_prefix="orb-snapshot",
-        ) as executor:
-            return dict(executor.map(snapshot, symbols))
+        return dict(map(snapshot, symbols))
 
     snapshots = build(context)
     context_after = _runtime_context(streamer)
@@ -117,7 +113,7 @@ def _live_snapshots(journal, streamer, symbols, *, configured):
     "/v1/orb",
     summary="Get sampled opening ranges for configured markets (v1)",
 )
-@bounded_runtime_endpoint
+@bounded_runtime_endpoint(reads=_orb_reads)
 def get_all_orb(
     trading_date: date | None = None,
     as_of_utc: datetime | None = None,
@@ -172,7 +168,7 @@ def get_all_orb(
     "/v1/orb/{symbol}",
     summary="Get one sampled opening range (v1)",
 )
-@bounded_runtime_endpoint
+@bounded_runtime_endpoint(reads=_orb_reads)
 def get_orb(
     symbol: str,
     trading_date: date | None = None,

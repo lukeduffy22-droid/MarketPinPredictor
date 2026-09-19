@@ -369,7 +369,10 @@ def test_eod_zip_separates_recorded_and_legacy_process_identity_as_research():
     assert history_csv["subscription_generation"].tolist() == [2, 1]
     assert history_csv["current_live_eligible"].tolist() == [False, False]
     assert coverage["schema_version"] == "marketpin-snapshot-export-coverage.v1"
-    assert coverage["symbols"]["SPX"]["total_records"] == 2
+    assert coverage["symbols"]["SPX"]["total_records"] == 3
+    assert coverage["symbols"]["SPX"]["producer_pass_records"] == 1
+    assert coverage["symbols"]["SPX"]["historical_unverified_records"] == 1
+    assert coverage["symbols"]["SPX"]["failed_or_unproven_records"] == 1
     assert coverage["missing_expected_symbols"] == ["NDX", "RUT", "VIX"]
     assert coverage["accuracy_established"] is False
 

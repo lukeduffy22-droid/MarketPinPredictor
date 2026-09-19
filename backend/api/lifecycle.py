@@ -753,6 +753,8 @@ async def lifespan(app: FastAPI):
     workstation_task = asyncio.create_task(
         run_workstation_state_loop(streamer, coordinator)
     )
+    from backend.diagnostic_automation import run_diagnostic_review_loop
+    diagnostic_task = asyncio.create_task(run_diagnostic_review_loop())
 
     logger.info("✅ API ready for requests")
     try:
@@ -764,10 +766,12 @@ async def lifespan(app: FastAPI):
         streaming_task.cancel()
         market_structure_task.cancel()
         workstation_task.cancel()
+        diagnostic_task.cancel()
         await asyncio.gather(
             streaming_task,
             market_structure_task,
             workstation_task,
+            diagnostic_task,
             return_exceptions=True,
         )
         _application_sleep_guard.release()

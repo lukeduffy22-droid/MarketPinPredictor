@@ -497,6 +497,9 @@ def test_expiration_view_preserves_exact_dates_and_explicit_missing_evidence():
     assert primary["validation_status"] == "valid_primary"
     assert primary["max_pain"] is None
     assert primary["calculation_coverage_ratio"] == 0.5
+    assert primary["planned_contracts"] == 50
+    assert primary["subscribed_contracts"] is None
+    assert primary["calculation_coverage_basis"] == "planned_contracts"
     assert tomorrow["validation_status"] == "valid_profile_context"
     assert tomorrow["validation_is_valid"] is True
     assert tomorrow["quote_coverage_ratio"] == 0.75
@@ -506,6 +509,11 @@ def test_expiration_view_preserves_exact_dates_and_explicit_missing_evidence():
     assert missing["validation_status"] == "unavailable"
     assert missing["gamma_pin"] is None
     assert missing["gross_gex"] is None
+    assert missing["planned_contracts"] == 30
+    assert missing["subscription_status"] == "unverified"
+    assert missing["quote_age_seconds"] is None
+    assert missing["freshness_status"] == "unknown"
+    assert missing["freshness_scope"] == "unavailable"
     assert missing["open_interest_as_of_utc"] is None
     assert view["open_interest_as_of_utc"] is None
     assert view["provenance"]["source_date"] == "2026-08-25"

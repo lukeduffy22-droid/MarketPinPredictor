@@ -250,6 +250,72 @@ def test_readiness_audit_accepts_only_full_hash_aligned_evidence(tmp_path):
     )
 
 
+@pytest.mark.parametrize("artifact_case", ["duplicate", "missing", "valid"])
+def test_close_reconciliation_upgrades_only_proven_completed_session(tmp_path, artifact_case):
+    from backend.closing_tape.close_registry import reconcile_verified_close_artifact
+    from backend.closing_tape.dataset import load_scored_marketpin_closes
+
+    config, catalog = _complete_catalog(tmp_path)
+    catalog.update_feed_status(config.session_id, "opra_options", {
+        "source_kind": HISTORICAL_SOURCE_KIND,
+        "evidence_contract_version": HISTORICAL_EVIDENCE_CONTRACT_VERSION,
+        "operational_counters_applicable": 0,
+        "source_manifest_path": str(config.output_dir / "complete-eligible.dbn"),
+    })
+    catalog.record_finalization_run({
+        "run_key": "historical-registry-fixture", "session_id": config.session_id,
+        "feed_name": "opra_options", "source_sha256": "a" * 64,
+        "evidence_contract_version": HISTORICAL_EVIDENCE_CONTRACT_VERSION,
+        "attempted_at_utc": "2026-08-25T20:22:00+00:00", "complete": 1,
+        "issues_json": "[]", "report_json": "{}",
+    })
+    market = tmp_path / "data/market_data.db"
+    vault = tmp_path / "data/verified_close_sources"
+    with sqlite3.connect(market) as connection:
+        connection.execute("""CREATE TABLE eod_close_observations (
+            id INTEGER PRIMARY KEY, symbol TEXT, trading_date TEXT,
+            official_close REAL, source TEXT, source_reference TEXT,
+            source_verified INTEGER, observed_at_utc TEXT,
+            source_artifact_sha256 TEXT, correction_of_id INTEGER)""")
+        for family in FAMILIES:
+            digest = _write_close_artifact(tmp_path, "2026-08-25", family)
+            connection.execute("""INSERT INTO eod_close_observations
+                (symbol, trading_date, official_close, source, source_reference,
+                 source_verified, observed_at_utc, source_artifact_sha256)
+                VALUES (?, '2026-08-25', 100, ?, ?, 1, '2026-08-25T21:00:00+00:00', ?)""",
+                (family, SOURCES[family], REFERENCES[family], digest))
+            if family == "SPX":
+                target_hash = digest
+                target = vault / "2026-08-25/SPX" / f"{digest}.txt"
+    if artifact_case == "duplicate":
+        target.with_suffix(".html").write_bytes(target.read_bytes())
+    elif artifact_case == "missing":
+        target.unlink()
+    # SQLite read-only connections may create transient WAL/SHM coordination files.
+    def tape_bytes():
+        return {p: p.read_bytes() for p in config.output_dir.rglob("*")
+                if p.is_file() and not p.name.endswith(("-shm", "-wal"))}
+    tape_before = tape_bytes()
+    market_before = market.read_bytes()
+    before = audit_training_readiness(tmp_path)
+    assert before.eligible_sessions == 1, before.sessions_detail[0].reasons
+    assert before.model_evidence_sessions == (1 if artifact_case == "valid" else 0)
+    identity = dict(trading_date="2026-08-25", symbol="SPX", source_artifact_sha256=target_hash)
+    if artifact_case == "missing":
+        with pytest.raises(ValueError):
+            reconcile_verified_close_artifact(vault, **identity)
+        with pytest.raises(ValueError, match="verified close artifact failed"):
+            load_scored_marketpin_closes(market, verified_artifact_root=vault)
+    else:
+        reconcile_verified_close_artifact(vault, **identity)
+        assert len(load_scored_marketpin_closes(market, verified_artifact_root=vault)) == 5
+    after = audit_training_readiness(tmp_path)
+    assert after.model_evidence_sessions == (0 if artifact_case == "missing" else 1)
+    assert not after.model_training_ready
+    assert market.read_bytes() == market_before
+    assert tape_bytes() == tape_before
+
+
 def test_immutable_observation_count_is_content_addressed(tmp_path):
     config, catalog = _complete_catalog(tmp_path)
     with catalog.connect() as connection:

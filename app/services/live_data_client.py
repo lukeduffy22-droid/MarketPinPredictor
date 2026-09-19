@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import pandas as pd
 import requests
+from app.utils.gamma_wall_evidence import normalize_gamma_walls
 
 from app.services.sidebar_live_state import SidebarStateBatch, retained_prediction_matches_state
 from backend.prediction_authority import build_prediction_authority
@@ -280,7 +281,7 @@ def build_expiration_profile_view(
                 same_day_authority = payload_same_day_authority
             selection_basis = selection_basis or payload_primary_selection_basis
         calculated_contracts = _finite_number(profile.get("contracts")) if profile else None
-        subscribed_contracts = _finite_number(subscription.get("contracts"))
+        planned_contracts = _finite_number(subscription.get("contracts"))
         profile_quote_coverage = None
         profile_quote_age = None
         profile_open_interest = None
@@ -308,21 +309,21 @@ def build_expiration_profile_view(
                 for reason in (profile.get("validation_failure_reasons") or [])
                 if reason
             ]
-        effective_quote_age = profile_quote_age if profile_quote_age is not None else quote_age
+        effective_quote_age = (profile_quote_age if profile_quote_age is not None else quote_age) if profile else None
         if effective_quote_age is None:
             profile_freshness_status = "unknown"
         elif stale_after_seconds is not None and effective_quote_age > float(stale_after_seconds):
             profile_freshness_status = "stale"
         else:
             profile_freshness_status = "fresh"
-        profile_freshness_scope = "profile" if profile_quote_age is not None else "shared_payload"
+        profile_freshness_scope = ("profile" if profile_quote_age is not None else "shared_payload") if profile else "unavailable"
         calculation_coverage_ratio = None
         if (
             calculated_contracts is not None
-            and subscribed_contracts is not None
-            and subscribed_contracts > 0
+            and planned_contracts is not None
+            and planned_contracts > 0
         ):
-            calculation_coverage_ratio = calculated_contracts / subscribed_contracts
+            calculation_coverage_ratio = calculated_contracts / planned_contracts
 
         required_values = {
             "gamma pin": _finite_number(profile.get("pin")) if profile else None,
@@ -335,7 +336,7 @@ def build_expiration_profile_view(
         if profile is None:
             status = "unavailable"
             validation_is_valid: bool | None = False
-            reasons.append("No calculated GEX profile was returned for this subscribed expiration")
+            reasons.append("No calculated GEX profile was returned for this planned expiration; active subscription is unverified")
         elif missing_fields:
             status = "invalid"
             validation_is_valid = False
@@ -406,7 +407,10 @@ def build_expiration_profile_view(
                 "pin_abs_gex": _finite_number(profile.get("pin_abs_gex")) if profile else None,
                 "blend_weight": _finite_number(profile.get("blend_weight")) if profile else None,
                 "calculated_contracts": calculated_contracts,
-                "subscribed_contracts": subscribed_contracts,
+                "planned_contracts": planned_contracts,
+                "subscribed_contracts": None,
+                "subscription_status": "unverified",
+                "calculation_coverage_basis": "planned_contracts",
                 "calculation_coverage_ratio": calculation_coverage_ratio,
                 "quote_coverage_ratio": profile_quote_coverage,
                 "quote_age_seconds": effective_quote_age,
@@ -1125,16 +1129,7 @@ def build_databento_prediction_from_payloads(
         payload_age_seconds=age_seconds,
         stale_after_seconds=stale_after_seconds,
     )
-    gamma_walls = pd.DataFrame(top_strikes)
-    if not gamma_walls.empty:
-        if "net_gex" not in gamma_walls.columns and "gex" in gamma_walls.columns:
-            gamma_walls["net_gex"] = gamma_walls["gex"]
-        if "total_gex" not in gamma_walls.columns and "net_gex" in gamma_walls.columns:
-            gamma_walls["total_gex"] = gamma_walls["net_gex"].abs()
-        if "days_to_expiry" not in gamma_walls.columns:
-            gamma_walls["days_to_expiry"] = 0
-        if "expiration_count" not in gamma_walls.columns:
-            gamma_walls["expiration_count"] = 1
+    gamma_walls = normalize_gamma_walls(pd.DataFrame(top_strikes))
 
     return (
         {

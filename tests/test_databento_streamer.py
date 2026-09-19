@@ -3750,6 +3750,20 @@ def test_snapshot_payload_has_truthful_pregates_and_diagnostics(monkeypatch):
         payload["top_strike_share"]
     )
     assert all(row["abs_gex"] == pytest.approx(abs(row["net_gex"])) for row in payload["top_strikes_by_abs_gex"])
+    assert all(
+        row["call_calculated_contracts"] + row["put_calculated_contracts"] > 0
+        for row in payload["top_strikes_by_abs_gex"]
+    )
+    assert all(
+        row["call_calculation_status"] in {"calculated", "excluded"}
+        and row["put_calculation_status"] in {"calculated", "excluded"}
+        and isinstance(row["call_exclusion_reasons"], list)
+        and isinstance(row["put_exclusion_reasons"], list)
+        for row in payload["top_strikes_by_abs_gex"]
+    )
+    assert payload["calculation_exclusion_counts"] == result[
+        "calculation_exclusion_counts"
+    ]
 
 
 def test_structured_invalid_snapshot_is_audited_but_never_writes_gamma_pin(tmp_path, monkeypatch):

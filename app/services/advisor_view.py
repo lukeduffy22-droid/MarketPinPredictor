@@ -80,8 +80,6 @@ def render_advisor(symbols, preferences_path=PREFERENCES):
             st.warning('Selected symbols changed. Analyze Live State again to inspect the new selection.')
         render_degradation_header(report)
         render_symbol_cards(context)
-        from app.services.diagnostic_agent import render_diagnostic_agent
-        render_diagnostic_agent(context, capabilities)
         selected = []
         saved = st.session_state.advisor_saved or {}
         restored = {p.get('id') for p in saved.get('proposals', []) if isinstance(p, dict)} if saved.get('source_fingerprint') == capabilities['fingerprint'] else set()
@@ -110,6 +108,9 @@ def render_advisor(symbols, preferences_path=PREFERENCES):
                 st.success('Selection saved to local UI preferences. No code or model changes executed.')
     else:
         st.caption('Select Analyze Live State to collect diagnostics. No live requests run automatically.')
+    from app.services.diagnostic_agent import render_diagnostic_agent
+    render_diagnostic_agent(st.session_state.get('live_advisor_context') or
+                            {'requested_symbols': list(symbols)}, capabilities)
     saved = st.session_state.advisor_saved
     if saved:
         if saved.get('source_fingerprint') != capabilities['fingerprint']:

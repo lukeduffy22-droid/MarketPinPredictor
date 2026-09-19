@@ -75,6 +75,7 @@ from app.utils.display_time import (
     resolve_display_timezone,
 )
 from app.utils.export_catalog import list_gamma_snapshot_symbols
+from app.utils.gamma_wall_evidence import normalize_gamma_walls
 from app.utils.snapshot_history import (
     DIAGNOSTIC_INVALID_SNAPSHOT,
     SnapshotSelection,
@@ -3768,12 +3769,12 @@ else:
                             quote_coverage = row.get('quote_coverage_ratio')
                             quote_age = row.get('quote_age_seconds')
                             calculated_contracts = row.get('calculated_contracts')
-                            subscribed_contracts = row.get('subscribed_contracts')
+                            planned_contracts = row.get('planned_contracts')
                             contract_coverage = "N/A"
-                            if _is_number(calculated_contracts) or _is_number(subscribed_contracts):
+                            if _is_number(calculated_contracts) or _is_number(planned_contracts):
                                 used = f"{int(float(calculated_contracts))}" if _is_number(calculated_contracts) else "?"
-                                subscribed = f"{int(float(subscribed_contracts))}" if _is_number(subscribed_contracts) else "?"
-                                contract_coverage = f"{used}/{subscribed}"
+                                planned = f"{int(float(planned_contracts))}" if _is_number(planned_contracts) else "?"
+                                contract_coverage = f"{used}/{planned}"
                             expiration_display_rows.append({
                                 'Expiration': row.get('expiration') or 'Unavailable',
                                 'Scope': _expiration_scope_label(
@@ -3800,7 +3801,8 @@ else:
                                     _fmt_gex_units(row.get('net_gex'))
                                     if _is_number(row.get('net_gex')) else 'N/A'
                                 ),
-                                'Calculated/Subscribed': contract_coverage,
+                                'Calculated/Planned': contract_coverage,
+                                'Subscription': row.get('subscription_status') or 'Unverified',
                                 'Calculation Coverage': (
                                     f"{float(coverage):.1%}" if _is_number(coverage) else 'Unavailable'
                                 ),
@@ -3826,8 +3828,8 @@ else:
                             width='stretch',
                         )
                         st.caption(
-                            "Calculation coverage is calculated contracts divided by subscribed contracts; "
-                            "it is not independent quote coverage. Only the primary row receives the current "
+                            "Calculation coverage is calculated contracts divided by planned contracts; "
+                            "it does not verify active subscriptions or quote coverage. Only the primary row receives the current "
                             "production validation gate. Tomorrow, max-pain, and other cross-expiration values "
                             "are analytical context—not guaranteed targets or evidence of dealer intent."
                         )
@@ -3883,32 +3885,21 @@ else:
                         st.write("**Major Gamma Walls (Top Strike Levels):**")
 
                         # Format the gamma walls dataframe
-                        gamma_walls_display = gex['gamma_walls'].copy()
-                        gex_aliases = ['gex', 'net_gamma', 'total_gex', 'Net GEX', 'net_gex_b']
-                        for col in gex_aliases:
-                            if col in gamma_walls_display.columns and 'net_gex' not in gamma_walls_display.columns:
-                                gamma_walls_display['net_gex'] = gamma_walls_display[col]
-                                break
-                        if 'total_gex' not in gamma_walls_display.columns and 'net_gex' in gamma_walls_display.columns:
-                            gamma_walls_display['total_gex'] = pd.to_numeric(gamma_walls_display['net_gex'], errors='coerce').abs()
-                        if 'days_to_expiry' not in gamma_walls_display.columns:
-                            gamma_walls_display['days_to_expiry'] = 0
-                        if 'expiration_count' not in gamma_walls_display.columns:
-                            gamma_walls_display['expiration_count'] = 1
+                        gamma_walls_display = normalize_gamma_walls(gex['gamma_walls'])
 
                         if 'strike' in gamma_walls_display.columns:
                             gamma_walls_display['strike'] = gamma_walls_display['strike'].apply(lambda x: f"${float(x):.0f}" if pd.notna(x) else "")
                         if 'net_gex' in gamma_walls_display.columns:
                             gamma_walls_display['net_gex'] = gamma_walls_display['net_gex'].apply(lambda x: _fmt_gex_units(x) if pd.notna(x) else "")
                         if 'total_gex' in gamma_walls_display.columns:
-                            gamma_walls_display['total_gex'] = gamma_walls_display['total_gex'].apply(lambda x: _fmt_gex_units(x) if pd.notna(x) else "")
+                            gamma_walls_display['total_gex'] = gamma_walls_display['total_gex'].apply(lambda x: _fmt_gex_units(x) if pd.notna(x) else "N/A")
                         if 'days_to_expiry' in gamma_walls_display.columns:
                             def _format_days(row):
                                 value = row.get('days_to_expiry')
                                 if not pd.notna(value):
-                                    return ""
+                                    return "N/A"
                                 label = f"{float(value):.0f} days"
-                                if row.get('expiration_count', 1) and float(row.get('expiration_count', 1)) > 1:
+                                if pd.notna(row.get('expiration_count')) and float(row['expiration_count']) > 1:
                                     label += " avg"
                                 return label
                             gamma_walls_display['days_to_expiry'] = gamma_walls_display.apply(_format_days, axis=1)
@@ -3921,7 +3912,8 @@ else:
                             'expiration_count': 'Expiries'
                         })
 
-                        st.dataframe(gamma_walls_display, width='stretch')
+                        st.dataframe(gamma_walls_display.fillna('N/A'), width='stretch')
+                        st.caption("Side sums cover calculated contracts only. Missing or unverified zero sides are N/A; net values can represent partial coverage.")
 
                     # Create gamma exposure bar chart if we have strike-level data
                     gex_df = pd.DataFrame()

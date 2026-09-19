@@ -110,6 +110,43 @@ def test_timeouts_and_cancellations_keep_capacity_until_actual_worker_completes(
         release.set()
 
 
+def test_unavailable_payload_identifies_stuck_readers_without_request_values():
+    service = bounded.BoundedRuntimeReads(max_workers=1, timeout_seconds=0.05)
+    release = threading.Event()
+    entered = threading.Event()
+    secret_argument = "must-not-be-serialized"
+
+    def blocked():
+        entered.set()
+        assert release.wait(3.0)
+
+    async def run():
+        key = ("backend.api.routers.gex", "symbol_dashboard", (secret_argument,))
+        pending = asyncio.create_task(service.run(key, blocked))
+        await _until_set(entered)
+        with pytest.raises(bounded.RuntimeReadUnavailable) as failure:
+            await service.run(("backend.api.routers.health", "live"), lambda: {})
+        payload = bounded.runtime_read_unavailable_payload(failure.value)
+        assert payload["reason"] == "RUNTIME_READ_BUSY"
+        diagnostics = payload["runtime_read"]
+        assert diagnostics["active_read_count"] == 1
+        assert diagnostics["max_workers"] == 1
+        assert diagnostics["active_reads"][0]["reader"] == (
+            "backend.api.routers.gex.symbol_dashboard"
+        )
+        assert diagnostics["active_reads"][0]["deadline_exceeded"] is True
+        assert secret_argument not in json.dumps(payload)
+        release.set()
+        with pytest.raises(bounded.RuntimeReadUnavailable, match="RUNTIME_READ_TIMEOUT"):
+            await pending
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        service.close()
+
+
 def test_completed_read_is_not_reused_before_delayed_callback_cleanup():
     service = bounded.BoundedRuntimeReads(max_workers=2, timeout_seconds=0.5)
     reader_entered = threading.Event()
@@ -329,8 +366,8 @@ def test_orb_collection_and_health_remain_responsive_during_persistence_pressure
     class Journal:
         @staticmethod
         def snapshot(symbol, **_kwargs):
-            # Model a read delayed by concurrent SQLite persistence. Serial
-            # projection exceeds the bounded 150 ms runtime-read budget.
+            # ORB has its own one-second serial budget. Health must still
+            # complete within its shorter budget while the projection runs.
             time.sleep(0.06)
             return {"symbol": symbol, "capture_status": "unavailable"}
 
@@ -364,15 +401,17 @@ def test_orb_collection_and_health_remain_responsive_during_persistence_pressure
             base_url="http://offline",
         ) as client:
             started = time.perf_counter()
-            orb_response, health_response = await asyncio.gather(
-                client.get("/v1/orb"), client.get("/health/live")
-            )
+            pending_orb = asyncio.create_task(client.get("/v1/orb"))
+            health_response = await client.get("/health/live")
+            health_elapsed = time.perf_counter() - started
+            orb_response = await pending_orb
             elapsed = time.perf_counter() - started
         assert orb_response.status_code == 200
         assert health_response.status_code == 200
         assert orb_response.json()["runtime_context_stable"] is True
         assert set(orb_response.json()["symbols"]) == {"SPX", "NDX", "VIX", "RUT"}
-        assert elapsed < 0.15
+        assert health_elapsed < 0.15
+        assert elapsed < 1.0
 
     asyncio.run(run())
 
