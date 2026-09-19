@@ -26,8 +26,11 @@ Git repository.
 
 ## Use
 
-The corpus is retained for historical feature generation, chronological model
-training, validation, and backtesting. Training jobs must document the dataset
+The corpus is retained for historical feature generation, validation, and
+backtesting. The unclassified `historical_data/options/` subtree must not be
+used for training, validation, or backtesting until a full hash/content
+inventory confirms that it is not duplicated and is correctly symbol-filtered.
+Any training job using a separately classified subset must document the dataset
 location and use chronological train, validation, and test splits to avoid
 future-data leakage.
 
