@@ -166,6 +166,50 @@ PIN_CONTEXT_LINEAR_V1 = FormulaDefinition(
 )
 
 
+# A separately versioned research candidate.  V1 above is intentionally frozen
+# as the rejected promotion benchmark.  This candidate changes one thing only:
+# the zero-gamma term is removed so its incremental value can be measured with
+# chronological, session-level evidence instead of by loosening live gates.
+PIN_CONTEXT_NO_ZERO_GAMMA_V2 = FormulaDefinition(
+    formula_id="shadow-pin-context-no-zero-gamma",
+    version="0.2.0-preregistered",
+    description=(
+        "Five-minute contextual ablation candidate that preserves the frozen "
+        "0.1.0 coefficients except for removing the zero-gamma feature."
+    ),
+    equation=(
+        "delta_bps = clip[-75,75](0.00 + 0.10*pin_gap_bps "
+        "+ 0.12*momentum_5m_bps + 0.08*pin_concentration_bps "
+        "+ 0.05*gex_balance_pin_bps); "
+        "predicted_price(t+300s) = spot_t*(1 + delta_bps/10000)"
+    ),
+    prediction_horizon_seconds=300,
+    required_raw_features=(
+        "spot",
+        "gamma_pin",
+        "gross_gex",
+        "net_gex",
+        "top_strike_share",
+        "spot_return_5m",
+    ),
+    feature_units={
+        key: value
+        for key, value in PIN_CONTEXT_LINEAR_V1.feature_units.items()
+        if key not in {"zero_gamma", "zero_gamma_gap_bps"}
+    },
+    transformations={
+        key: value
+        for key, value in PIN_CONTEXT_LINEAR_V1.transformations.items()
+        if key != "zero_gamma_gap_bps"
+    },
+    coefficients={
+        key: value
+        for key, value in PIN_CONTEXT_LINEAR_V1.coefficients.items()
+        if key != "zero_gamma_gap_bps"
+    },
+)
+
+
 @dataclass(frozen=True, kw_only=True)
 class ShadowGuardrails:
     """Fail-closed thresholds for research scoring.
@@ -174,7 +218,7 @@ class ShadowGuardrails:
     later live integration should configure them from measured OPRA throughput.
     """
 
-    allowed_symbols: tuple[str, ...] = ("SPX", "NDX")
+    allowed_symbols: tuple[str, ...] = ("SPX", "NDX", "RUT")
     max_quote_age_seconds: float = 10.0
     max_receive_to_process_lag_seconds: float = 5.0
     min_quote_coverage: float = 0.10
@@ -325,8 +369,16 @@ class ShadowFormulaEngine:
             if formula.identity == NAIVE_LAST_PRICE_V1.identity:
                 delta_bps = 0.0
                 transformed = {}
-            elif formula.identity == PIN_CONTEXT_LINEAR_V1.identity:
-                transformed = self._pin_context_features(observation)
+            elif formula.identity in {
+                PIN_CONTEXT_LINEAR_V1.identity,
+                PIN_CONTEXT_NO_ZERO_GAMMA_V2.identity,
+            }:
+                transformed = self._pin_context_features(
+                    observation,
+                    include_zero_gamma=(
+                        "zero_gamma_gap_bps" in formula.coefficients
+                    ),
+                )
                 delta_bps = formula.intercept_bps + sum(
                     formula.coefficients[name] * transformed[name]
                     for name in formula.coefficients
@@ -604,20 +656,29 @@ class ShadowFormulaEngine:
         return snapshot
 
     @staticmethod
-    def _pin_context_features(observation: PointInTimeObservation) -> dict[str, float]:
+    def _pin_context_features(
+        observation: PointInTimeObservation,
+        *,
+        include_zero_gamma: bool = True,
+    ) -> dict[str, float]:
         spot = float(observation.spot)  # validated before this method is called
         pin_gap = _clip(10_000.0 * (float(observation.gamma_pin) - spot) / spot, -200.0, 200.0)
-        zero_gap = _clip(10_000.0 * (float(observation.zero_gamma) - spot) / spot, -200.0, 200.0)
         momentum = _clip(10_000.0 * float(observation.spot_return_5m), -100.0, 100.0)
         share = float(observation.top_strike_share)
         balance = abs(float(observation.net_gex) / float(observation.gross_gex))
-        return {
+        transformed = {
             "pin_gap_bps": pin_gap,
-            "zero_gamma_gap_bps": zero_gap,
             "momentum_5m_bps": momentum,
             "pin_concentration_bps": pin_gap * share,
             "gex_balance_pin_bps": pin_gap * balance,
         }
+        if include_zero_gamma:
+            transformed["zero_gamma_gap_bps"] = _clip(
+                10_000.0 * (float(observation.zero_gamma) - spot) / spot,
+                -200.0,
+                200.0,
+            )
+        return transformed
 
     def _data_quality_confidence(self, observation: PointInTimeObservation) -> float:
         fresh = float(observation.fresh_quote_count or 0)

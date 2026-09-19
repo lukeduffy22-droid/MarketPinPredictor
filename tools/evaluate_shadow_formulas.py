@@ -33,6 +33,9 @@ WALK_FORWARD_MIN_TRAIN_SESSIONS = 5
 WALK_FORWARD_MIN_INDEPENDENT_SESSIONS = 10
 WALK_FORWARD_MIN_SESSIONS_PER_SYMBOL = 5
 WALK_FORWARD_MIN_PURGED_FOLDS = 5
+PROMOTION_MIN_HELD_OUT_SESSIONS = 60
+V2_CANDIDATE_ID = "shadow-pin-context-no-zero-gamma"
+V2_CANDIDATE_VERSION = "0.2.0-preregistered"
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -420,6 +423,185 @@ def _abstention_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(reasons.most_common())
 
 
+def _observation_key(row: dict[str, Any]) -> tuple[str, str, int, str, int] | None:
+    identity = _process_identity(row)
+    if identity is None:
+        return None
+    return (
+        str(row.get("symbol") or "").upper(),
+        str(row.get("prediction_timestamp_utc") or ""),
+        int(row.get("horizon_seconds") or 0),
+        identity[0],
+        identity[1],
+    )
+
+
+def _context_features_from_snapshot(row: dict[str, Any]) -> dict[str, float] | None:
+    snapshot = _safe_json(row.get("feature_snapshot_json"), {})
+    if not isinstance(snapshot, dict):
+        return None
+    values = {
+        name: _finite(snapshot.get(name))
+        for name in (
+            "spot", "gamma_pin", "zero_gamma", "gross_gex", "net_gex",
+            "top_strike_share", "spot_return_5m",
+        )
+    }
+    if any(value is None for value in values.values()):
+        return None
+    spot = float(values["spot"])
+    gross = float(values["gross_gex"])
+    if spot <= 0 or gross <= 0:
+        return None
+    pin_gap = max(-200.0, min(200.0, 10_000.0 * (float(values["gamma_pin"]) - spot) / spot))
+    zero_gap = max(-200.0, min(200.0, 10_000.0 * (float(values["zero_gamma"]) - spot) / spot))
+    momentum = max(-100.0, min(100.0, 10_000.0 * float(values["spot_return_5m"])))
+    return {
+        "spot": spot,
+        "pin_gap_bps": pin_gap,
+        "zero_gamma_gap_bps": zero_gap,
+        "momentum_5m_bps": momentum,
+        "pin_concentration_bps": pin_gap * float(values["top_strike_share"]),
+        "gex_balance_pin_bps": pin_gap * abs(float(values["net_gex"]) / gross),
+    }
+
+
+def _counterfactual_price(
+    features: dict[str, float],
+    *,
+    omit: frozenset[str] = frozenset(),
+) -> float:
+    coefficients = {
+        "pin_gap_bps": 0.10,
+        "zero_gamma_gap_bps": 0.03,
+        "momentum_5m_bps": 0.12,
+        "pin_concentration_bps": 0.08,
+        "gex_balance_pin_bps": 0.05,
+    }
+    delta_bps = sum(
+        coefficient * features[name]
+        for name, coefficient in coefficients.items()
+        if name not in omit
+    )
+    delta_bps = max(-75.0, min(75.0, delta_bps))
+    return features["spot"] * (1.0 + delta_bps / 10_000.0)
+
+
+def _chronological_ablation(rows: list[dict[str, Any]]) -> dict[str, object]:
+    """Evaluate fixed equations by held-out CT session without fitting.
+
+    The first five sessions are a temporal warm-up. Every later session is a
+    separate test fold. Session boundaries provide more than the 300-second
+    embargo, and no coefficient is selected or fitted from a held-out fold.
+    """
+    by_key: dict[tuple[str, str, int, str, int], dict[str, dict[str, Any]]] = defaultdict(dict)
+    for row in rows:
+        key = _observation_key(row)
+        if key is not None:
+            by_key[key][str(row.get("formula_id") or "")] = row
+
+    examples: list[dict[str, Any]] = []
+    contested: list[dict[str, Any]] = []
+    for key, formulas in by_key.items():
+        baseline = formulas.get(BASELINE_ID)
+        frozen = formulas.get(CANDIDATE_ID)
+        if baseline is None or frozen is None:
+            continue
+        realized = _finite(baseline.get("realized_price"))
+        baseline_prediction = _finite(baseline.get("predicted_price"))
+        timestamp = _parse_timestamp(baseline.get("prediction_timestamp_utc"))
+        features = _context_features_from_snapshot(frozen)
+        if realized is None or baseline_prediction is None or timestamp is None or features is None:
+            continue
+        reasons = _safe_json(frozen.get("abstention_reasons_json"), [])
+        reasons = [str(reason) for reason in reasons] if isinstance(reasons, list) else []
+        stored_frozen_prediction = _finite(frozen.get("predicted_price"))
+        item = {
+            "symbol": key[0],
+            "session": timestamp.astimezone(CENTRAL).date().isoformat(),
+            "realized_price": realized,
+            "baseline_price": baseline_prediction,
+            "frozen_v1_price": (
+                stored_frozen_prediction
+                if stored_frozen_prediction is not None
+                else _counterfactual_price(features)
+            ),
+            "v2_no_zero_gamma_price": _counterfactual_price(
+                features, omit=frozenset({"zero_gamma_gap_bps"})
+            ),
+            "no_pin_concentration_price": _counterfactual_price(
+                features, omit=frozenset({"pin_concentration_bps"})
+            ),
+        }
+        if int(frozen.get("abstained") or 0) == 0:
+            examples.append(item)
+        elif reasons and all(reason.startswith("PIN_CONTESTED") for reason in reasons):
+            contested.append(item)
+
+    sessions = sorted({str(item["session"]) for item in examples})
+    held_out_sessions = sessions[WALK_FORWARD_MIN_TRAIN_SESSIONS:]
+    held_out = [item for item in examples if item["session"] in set(held_out_sessions)]
+
+    def metrics(field: str, selected: list[dict[str, Any]]) -> dict[str, object]:
+        synthetic = [
+            {"predicted_price": item[field], "realized_price": item["realized_price"]}
+            for item in selected
+        ]
+        return _metrics(synthetic)
+
+    folds = []
+    for test_session in held_out_sessions:
+        selected = [item for item in held_out if item["session"] == test_session]
+        folds.append({
+            "test_session": test_session,
+            "train_sessions": [session for session in sessions if session < test_session],
+            "rows": len(selected),
+            "baseline": metrics("baseline_price", selected),
+            "frozen_v1": metrics("frozen_v1_price", selected),
+            "v2_no_zero_gamma": metrics("v2_no_zero_gamma_price", selected),
+        })
+
+    status = "insufficient_held_out_sessions"
+    if len(held_out_sessions) >= PROMOTION_MIN_HELD_OUT_SESSIONS:
+        status = "research_evidence_available_no_automatic_promotion"
+    return {
+        "executed": True,
+        "fit_performed": False,
+        "split_unit": "America/Chicago trading session",
+        "embargo_seconds": WALK_FORWARD_EMBARGO_SECONDS,
+        "warmup_sessions": sessions[:WALK_FORWARD_MIN_TRAIN_SESSIONS],
+        "held_out_sessions": held_out_sessions,
+        "held_out_session_count": len(held_out_sessions),
+        "minimum_held_out_sessions_for_promotion_review": PROMOTION_MIN_HELD_OUT_SESSIONS,
+        "status": status,
+        "promotion_supported": False,
+        "candidate": {
+            "formula_id": V2_CANDIDATE_ID,
+            "formula_version": V2_CANDIDATE_VERSION,
+            "fitted": False,
+            "promotion_allowed": False,
+        },
+        "held_out_metrics": {
+            "baseline": metrics("baseline_price", held_out),
+            "frozen_v1": metrics("frozen_v1_price", held_out),
+            "v2_no_zero_gamma": metrics("v2_no_zero_gamma_price", held_out),
+            "no_pin_concentration_ablation": metrics(
+                "no_pin_concentration_price", held_out
+            ),
+        },
+        "folds": folds,
+        "contested_pin_counterfactual": {
+            "live_guardrail_changed": False,
+            "rows": len(contested),
+            "frozen_v1": metrics("frozen_v1_price", contested),
+            "v2_no_zero_gamma": metrics("v2_no_zero_gamma_price", contested),
+            "warning": (
+                "Offline diagnostic only; contested-pin rows remain live abstentions."
+            ),
+        },
+    }
+
+
 def evaluate(journal_path: Path) -> dict[str, object]:
     resolved = journal_path.resolve()
     if not resolved.is_file():
@@ -453,6 +635,19 @@ def evaluate(journal_path: Path) -> dict[str, object]:
         and (timestamp := _parse_timestamp(row.get("prediction_timestamp_utc"))) is not None
     })
     walk_forward_status = _walk_forward_status(rows, trading_dates)
+    abstention_reasons = _abstention_counts(rows)
+    missing_calculation_id_rows = sum(
+        count
+        for reason, count in abstention_reasons.items()
+        if reason == "MISSING_PROVENANCE:calculation_id"
+    )
+    insufficient_pair_rows = sum(
+        count
+        for reason, count in abstention_reasons.items()
+        if reason == "INSUFFICIENT_PAIRED_QUOTES"
+        or reason.startswith("INSUFFICIENT_PRIMARY_PAIR_COVERAGE")
+    )
+    backlog_rows = abstention_reasons.get("RECEIVE_TO_PROCESSING_BACKLOG", 0)
     invalid_identity_rows = sum(_process_identity(row) is None for row in rows)
     selection_and_regime_limits = [
         (
@@ -485,15 +680,40 @@ def evaluate(journal_path: Path) -> dict[str, object]:
         "integrity_checks": _integrity_checks(rows),
         "formula_symbol_results": _formula_summary(rows),
         "paired_candidate_vs_baseline": _paired_comparison(rows),
-        "abstention_reasons": _abstention_counts(rows),
+        "abstention_reasons": abstention_reasons,
         "walk_forward_validation": walk_forward_status,
+        "chronological_candidate_evaluation": _chronological_ablation(rows),
+        "provenance_identifier_audit": {
+            "historical_rows_missing_calculation_id": missing_calculation_id_rows,
+            "backfill_performed": False,
+            "current_ingestion_contract": (
+                "Lifecycle recording requires a nonblank committed calculation_id and a "
+                "positive subscription generation; immutable historical rows are not rewritten."
+            ),
+        },
+        "operational_priorities": [
+            {
+                "priority": "P1",
+                "issue": "quote_pairing",
+                "historical_abstention_instances": insufficient_pair_rows,
+            },
+            {
+                "priority": "P1",
+                "issue": "receive_to_processing_backlog",
+                "historical_abstention_instances": backlog_rows,
+            },
+        ],
         "selection_and_regime_limits": selection_and_regime_limits,
         "decision": {
             "state": "SHADOW_ONLY",
             "promotion_supported": False,
+            "frozen_benchmark": (
+                "shadow-pin-context-linear:0.1.0-preregistered"
+            ),
+            "frozen_benchmark_disposition": "REJECTED_PROMOTION_CANDIDATE",
             "recommendation": (
-                "Collect multiple independent sessions, repair coverage/provenance abstentions, then run "
-                "purged chronological walk-forward validation before considering any coefficient fitting."
+                "Keep 0.1.0 frozen, repair P1 quote-pairing/backlog coverage, and collect "
+                "session-level held-out evidence for the separately versioned 0.2.0 ablation."
             ),
         },
     }

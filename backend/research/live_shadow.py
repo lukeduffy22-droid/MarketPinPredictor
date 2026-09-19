@@ -21,6 +21,7 @@ from backend.optional_family_canary import CORE_PRIMARY_PAIR_COVERAGE_RATIO
 from backend.research.shadow_formula import (
     NAIVE_LAST_PRICE_V1,
     PIN_CONTEXT_LINEAR_V1,
+    PIN_CONTEXT_NO_ZERO_GAMMA_V2,
     FormulaDefinition,
     ShadowFormulaEngine,
     ShadowGuardrails,
@@ -75,9 +76,20 @@ def _optional_int(value: Any) -> int | None:
 
 def _process_identity(payload: Mapping[str, Any]) -> tuple[str, int] | None:
     epoch_id = str(payload.get("subscription_epoch_id") or "").strip()
-    generation = _optional_int(payload.get("subscription_generation"))
+    raw_generation = payload.get("subscription_generation")
+    if isinstance(raw_generation, bool):
+        generation = None
+    elif isinstance(raw_generation, int):
+        generation = raw_generation
+    elif isinstance(raw_generation, str) and raw_generation.strip().isdigit():
+        generation = int(raw_generation.strip())
+    else:
+        generation = None
+    calculation_id = payload.get("calculation_id")
     if (
-        len(epoch_id) != 64
+        not isinstance(calculation_id, str)
+        or not calculation_id.strip()
+        or len(epoch_id) != 64
         or any(character not in "0123456789abcdef" for character in epoch_id)
         or generation is None
         or generation <= 0
@@ -106,6 +118,7 @@ class LiveShadowResearchRecorder:
         formulas: Sequence[FormulaDefinition] = (
             NAIVE_LAST_PRICE_V1,
             PIN_CONTEXT_LINEAR_V1,
+            PIN_CONTEXT_NO_ZERO_GAMMA_V2,
         ),
         max_quote_age_seconds: float = 30.0,
     ) -> None:
@@ -160,6 +173,10 @@ class LiveShadowResearchRecorder:
             payload.get("price") if payload.get("price") is not None else payload.get("spot_last")
         )
         process_identity = _process_identity(payload)
+        if process_identity is None:
+            return LiveShadowRecordResult(
+                skipped_reason="MISSING_COMMITTED_PROVENANCE_IDENTITY"
+            )
 
         momentum = self._spot_return(symbol, process_identity, index_at, spot)
         required_features = {
