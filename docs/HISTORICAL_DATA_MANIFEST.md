@@ -21,7 +21,8 @@ Git repository.
 - Files: 10,227 CSV files and 2 pickle files.
 - Size: approximately 114.64 GiB.
 - Top-level groups: `aggregates/`, `combined_indices/`, `options/`, `s3_indices/`, and `training_datasets/`.
-- File timestamps observed: 2026-09-16 00:52 through 2026-09-16 01:04 local time.
+- File modification timestamps observed: 2026-09-16 00:52 through 2026-09-16 01:04 local time.
+- Market-data coverage date range: unknown pending the full content inventory.
 
 ## Use
 
