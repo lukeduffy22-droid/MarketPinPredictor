@@ -59,7 +59,7 @@ def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     )
 
     assert first.error is None
-    assert first.saved_count == 2
+    assert first.saved_count == 3
     by_formula = {prediction.formula.formula_id: prediction for prediction in first.predictions}
     assert by_formula["shadow-naive-last-price"].abstained is False
     assert by_formula["shadow-pin-context-linear"].abstained is True
@@ -74,7 +74,7 @@ def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     )
 
     assert second.error is None
-    assert second.saved_count == 2
+    assert second.saved_count == 3
     assert second.scored_count == 1
     candidate = next(
         prediction
@@ -87,9 +87,9 @@ def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     assert candidate.predicted_price is not None
 
     state = load_shadow_research_state(path)
-    assert state["summary"]["journal_rows"] == 4
-    assert state["summary"]["eligible_forecasts"] == 3
-    assert state["summary"]["abstentions"] == 1
+    assert state["summary"]["journal_rows"] == 6
+    assert state["summary"]["eligible_forecasts"] == 4
+    assert state["summary"]["abstentions"] == 2
     assert state["summary"]["scored_outcomes"] == 1
     assert state["summary"]["production_replacements"] == 0
 
@@ -104,13 +104,30 @@ def test_live_shadow_fails_closed_on_negative_receive_lag(tmp_path):
         processed_at_utc=index_at - timedelta(milliseconds=200),
     )
 
-    assert result.saved_count == 2
+    assert result.saved_count == 3
     assert all(prediction.abstained for prediction in result.predictions)
     assert all(
         "NEGATIVE_RECEIVE_TO_PROCESSING_LAG" in prediction.abstention_reasons
         for prediction in result.predictions
     )
     assert all(prediction.predicted_price is None for prediction in result.predictions)
+
+
+def test_live_shadow_never_persists_missing_committed_provenance_identity(tmp_path):
+    path = tmp_path / "shadow.db"
+    recorder = LiveShadowResearchRecorder(journal_path=path, enabled=True)
+    index_at = datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
+    payload = _payload(index_at, calculation_id="committed")
+    payload["calculation_id"] = " "
+
+    result = recorder.record(
+        payload,
+        processed_at_utc=index_at + timedelta(milliseconds=50),
+    )
+
+    assert result.skipped_reason == "MISSING_COMMITTED_PROVENANCE_IDENTITY"
+    assert result.saved_count == 0
+    assert not path.exists()
 
 
 def test_live_shadow_fails_closed_on_low_primary_pair_coverage(tmp_path):
@@ -193,14 +210,14 @@ def test_duplicate_symbol_index_is_preserved_as_abstention(tmp_path):
         processed_at_utc=index_at + timedelta(seconds=1),
     )
 
-    assert duplicate.saved_count == 2
+    assert duplicate.saved_count == 3
     assert all(prediction.abstained for prediction in duplicate.predictions)
     assert all(
         "DUPLICATE_SYMBOL_INDEX_TIMESTAMP" in prediction.abstention_reasons
         for prediction in duplicate.predictions
     )
     with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM shadow_prediction_journal").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM shadow_prediction_journal").fetchone()[0] == 6
 
 
 def test_process_restart_resets_momentum_duplicate_and_outcome_alignment(tmp_path):
@@ -222,7 +239,7 @@ def test_process_restart_resets_momentum_duplicate_and_outcome_alignment(tmp_pat
         same_index_new_process,
         processed_at_utc=first_index + timedelta(seconds=1),
     )
-    assert same_index.saved_count == 2
+    assert same_index.saved_count == 3
     assert all(
         "DUPLICATE_SYMBOL_INDEX_TIMESTAMP" not in prediction.abstention_reasons
         for prediction in same_index.predictions

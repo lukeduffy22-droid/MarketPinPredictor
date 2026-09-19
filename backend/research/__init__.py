@@ -3,6 +3,7 @@
 from .shadow_formula import (
     NAIVE_LAST_PRICE_V1,
     PIN_CONTEXT_LINEAR_V1,
+    PIN_CONTEXT_NO_ZERO_GAMMA_V2,
     FormulaDefinition,
     PointInTimeObservation,
     ShadowFormulaEngine,
@@ -15,6 +16,7 @@ from .shadow_formula import (
 __all__ = [
     "NAIVE_LAST_PRICE_V1",
     "PIN_CONTEXT_LINEAR_V1",
+    "PIN_CONTEXT_NO_ZERO_GAMMA_V2",
     "FormulaDefinition",
     "PointInTimeObservation",
     "ShadowFormulaEngine",

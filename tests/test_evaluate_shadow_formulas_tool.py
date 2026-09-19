@@ -176,6 +176,21 @@ def test_shadow_walk_forward_status_reports_ready_without_fitting_or_promotion(t
     assert status["independent_session_count"] == 10
     assert status["paired_scored_sessions_by_symbol"] == {"SPX": 10, "NDX": 10}
     assert report["decision"]["promotion_supported"] is False
+    chronological = report["chronological_candidate_evaluation"]
+    assert chronological["executed"] is True
+    assert chronological["fit_performed"] is False
+    assert chronological["held_out_session_count"] == 5
+    assert chronological["promotion_supported"] is False
+    assert chronological["candidate"] == {
+        "formula_id": "shadow-pin-context-no-zero-gamma",
+        "formula_version": "0.2.0-preregistered",
+        "fitted": False,
+        "promotion_allowed": False,
+    }
+    assert chronological["held_out_metrics"]["v2_no_zero_gamma"]["n"] == 10
+    assert report["decision"]["frozen_benchmark_disposition"] == (
+        "REJECTED_PROMOTION_CANDIDATE"
+    )
 
 
 def test_shadow_evaluator_never_pairs_different_process_epochs(tmp_path):
