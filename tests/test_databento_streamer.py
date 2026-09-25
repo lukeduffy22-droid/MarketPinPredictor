@@ -3766,6 +3766,132 @@ def test_snapshot_payload_has_truthful_pregates_and_diagnostics(monkeypatch):
     ]
 
 
+def test_primary_exclusion_audit_accounts_for_each_calculation_stage(monkeypatch):
+    monkeypatch.setattr("backend.databento_streamer.validate_underlying", lambda *_args: {})
+    streamer = _synthetic_gex_streamer(call_oi=2_000, put_oi=100)
+    expiration = current_market_date()
+    now = time.monotonic()
+    streamer.subscription_cutoff_monotonic = now - 1.0
+    template_quote = next(iter(streamer.quotes.values())).copy()
+    extra_rows = []
+
+    for strike, open_interest, quoted_sides in (
+        (103.0, 0.0, {"C"}),
+        (104.0, 0.0, {"C", "P"}),
+        (110.0, 10.0, {"C", "P"}),
+    ):
+        for option_type in ("C", "P"):
+            symbol = raw_option_symbol("SPXW", expiration, option_type, strike)
+            extra_rows.append(
+                {
+                    "market": "SPX",
+                    "symbol": symbol,
+                    "strike": strike,
+                    "option_type": option_type,
+                    "expiration_date": expiration,
+                    "open_interest": open_interest,
+                }
+            )
+            if option_type not in quoted_sides:
+                continue
+            mid = black_scholes_price(
+                100.0, strike, 1 / 365.0, 0.25, option_type
+            )
+            quote = dict(template_quote)
+            quote.update(
+                {
+                    "bid": mid * 0.99,
+                    "ask": mid * 1.01,
+                    "mid": mid,
+                    "received_monotonic": now,
+                    "generation": 1,
+                    "instrument_id": int(strike * 100)
+                    + (0 if option_type == "C" else 1),
+                }
+            )
+            streamer.quotes[symbol] = quote
+
+    streamer.universe = pd.concat(
+        [streamer.universe, pd.DataFrame(extra_rows)], ignore_index=True
+    )
+
+    result = streamer._calculate_pin("SPX")
+
+    assert result is not None
+    audit = result["primary_exclusion_audit"]
+    assert audit["schema_version"] == "primary-exclusion-audit-v1"
+    assert audit["stages"]["selected_primary_universe"] == {
+        "rows": 16,
+        "strikes": 8,
+        "call_rows": 8,
+        "put_rows": 8,
+    }
+    assert audit["stages"]["fresh_primary_quotes"] == {
+        "rows": 15,
+        "strikes": 8,
+        "excluded_rows_from_previous": 1,
+    }
+    assert audit["stages"]["fresh_primary_pairs"] == {
+        "strikes": 7,
+        "excluded_strikes_from_previous": 1,
+    }
+    assert audit["exclusion_reasons"]["quote_eligibility"] == {
+        "NO_CACHED_QUOTE": 1
+    }
+    assert audit["exclusion_reasons"]["pairing"] == {
+        "MISSING_FRESH_CALL_SIDE": 0,
+        "MISSING_FRESH_PUT_SIDE": 1,
+    }
+    assert audit["stages"]["positive_oi_in_calculation_band"] == {
+        "rows": 10,
+        "strikes": 5,
+        "excluded_rows_from_previous": 5,
+    }
+    assert audit["exclusion_reasons"]["calculation_selection"] == {
+        "NONPOSITIVE_OPEN_INTEREST": 3,
+        "OUTSIDE_CALCULATION_BAND": 2,
+    }
+    assert audit["stages"]["iv_gamma_valid"] == {
+        "rows": 10,
+        "strikes": 5,
+        "excluded_rows_from_previous": 0,
+    }
+    assert audit["stages"]["final_primary_gex"] == {
+        "rows": 10,
+        "strikes": 5,
+        "nonzero_strikes": 5,
+        "zero_gex_strikes": 0,
+    }
+    assert streamer.last_calculation_diagnostics["SPX"][
+        "primary_exclusion_audit"
+    ] == audit
+    assert streamer._snapshot_payload(result)["primary_exclusion_audit"] == audit
+
+
+def test_primary_exclusion_audit_survives_no_current_quotes_failure():
+    streamer = _synthetic_gex_streamer(call_oi=2_000, put_oi=100)
+    streamer.quotes.clear()
+
+    result = streamer._calculate_pin("SPX")
+
+    assert result is None
+    diagnostics = streamer.last_calculation_diagnostics["SPX"]
+    assert diagnostics["failure_reason"] == "NO_CURRENT_QUOTES"
+    audit = diagnostics["primary_exclusion_audit"]
+    assert audit["stages"]["selected_primary_universe"]["rows"] == 10
+    assert audit["stages"]["fresh_primary_quotes"] == {
+        "rows": 0,
+        "strikes": 0,
+        "excluded_rows_from_previous": 10,
+    }
+    assert audit["exclusion_reasons"]["quote_eligibility"] == {
+        "NO_CACHED_QUOTE": 10
+    }
+    assert streamer.get_health()["calculation_diagnostics"]["SPX"][
+        "primary_exclusion_audit"
+    ] == audit
+
+
 def test_structured_invalid_snapshot_is_audited_but_never_writes_gamma_pin(tmp_path, monkeypatch):
     import backend.database as backend_database
     import database as root_database

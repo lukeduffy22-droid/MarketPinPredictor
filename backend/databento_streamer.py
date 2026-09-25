@@ -4756,6 +4756,30 @@ class DatabentoGammaStreamer:
             "subscription_generation": self.active_generation,
             "market": market,
         }
+        primary_exclusion_audit: dict[str, object] = {
+            "schema_version": "primary-exclusion-audit-v1",
+            "market": market,
+            "primary_expiration": None,
+            "counting_basis": {
+                "rows": "option contracts",
+                "strikes": "unique primary-expiration strike prices",
+                "exclusion_reasons": (
+                    "row-filter reasons are mutually exclusive; call/put side counts "
+                    "may overlap"
+                ),
+            },
+            "policy": {
+                "quote_freshness_seconds": QUOTE_FRESHNESS_SECONDS,
+                "minimum_paired_quotes": MIN_PAIRED_QUOTES,
+                "moneyness_lower_multiplier": MONEYNESS_LOWER,
+                "moneyness_upper_multiplier": MONEYNESS_UPPER,
+                "minimum_primary_strikes": MIN_PRIMARY_STRIKES,
+                "minimum_nonzero_strikes": MIN_NONZERO_STRIKES,
+            },
+            "stages": {},
+            "exclusion_reasons": {},
+        }
+        diagnostic["primary_exclusion_audit"] = primary_exclusion_audit
         rows = []
 
         def _fail(result_reason: str) -> None:
@@ -4775,9 +4799,61 @@ class DatabentoGammaStreamer:
             return None
 
         self._ensure_universe_index()
-        for row in self._universe_records_by_market.get(market, ()):
+        primary_exclusion_audit["primary_expiration"] = (
+            planned_primary_expiration.isoformat()
+        )
+        market_universe_records = list(
+            self._universe_records_by_market.get(market, ())
+        )
+        primary_universe_records_for_audit = [
+            row
+            for row in market_universe_records
+            if row.get("expiration_date") == planned_primary_expiration
+        ]
+        primary_universe_strikes = {
+            float(row["strike"]) for row in primary_universe_records_for_audit
+        }
+        primary_exclusion_audit["stages"]["selected_primary_universe"] = {
+            "rows": int(len(primary_universe_records_for_audit)),
+            "strikes": int(len(primary_universe_strikes)),
+            "call_rows": int(
+                sum(
+                    str(row.get("option_type")) == "C"
+                    for row in primary_universe_records_for_audit
+                )
+            ),
+            "put_rows": int(
+                sum(
+                    str(row.get("option_type")) == "P"
+                    for row in primary_universe_records_for_audit
+                )
+            ),
+        }
+        quote_exclusion_counts: dict[str, int] = {}
+
+        def _count_quote_exclusion(reason: str) -> None:
+            quote_exclusion_counts[reason] = quote_exclusion_counts.get(reason, 0) + 1
+
+        for row in market_universe_records:
             quote = self.quotes.get(str(row["symbol"]))
-            if not quote or not self._quote_is_current(quote):
+            quote_is_current = bool(quote) and self._quote_is_current(quote)
+            if not quote_is_current:
+                if row.get("expiration_date") == planned_primary_expiration:
+                    if not quote:
+                        _count_quote_exclusion("NO_CACHED_QUOTE")
+                    else:
+                        received = float(quote.get("received_monotonic") or 0.0)
+                        generation = int(quote.get("generation") or 0)
+                        if received <= 0.0:
+                            _count_quote_exclusion("MISSING_RECEIVE_CLOCK")
+                        elif generation != self.active_generation:
+                            _count_quote_exclusion("WRONG_SUBSCRIPTION_GENERATION")
+                        elif received < self.subscription_cutoff_monotonic:
+                            _count_quote_exclusion("BEFORE_SUBSCRIPTION_CUTOFF")
+                        elif time.monotonic() - received > QUOTE_FRESHNESS_SECONDS:
+                            _count_quote_exclusion("STALE_QUOTE")
+                        else:
+                            _count_quote_exclusion("OTHER_CURRENTNESS_REJECTION")
                 continue
             rows.append({
                 "symbol": row["symbol"],
@@ -4802,6 +4878,24 @@ class DatabentoGammaStreamer:
                 "mapping_start_ts_ns": quote.get("mapping_start_ts_ns"),
                 "mapping_end_ts_ns": quote.get("mapping_end_ts_ns"),
             })
+        primary_exclusion_audit["exclusion_reasons"]["quote_eligibility"] = (
+            quote_exclusion_counts
+        )
+        fresh_primary_rows_for_audit = [
+            row
+            for row in rows
+            if row.get("expiration_date") == planned_primary_expiration
+        ]
+        primary_exclusion_audit["stages"]["fresh_primary_quotes"] = {
+            "rows": int(len(fresh_primary_rows_for_audit)),
+            "strikes": int(
+                len({float(row["strike"]) for row in fresh_primary_rows_for_audit})
+            ),
+            "excluded_rows_from_previous": int(
+                len(primary_universe_records_for_audit)
+                - len(fresh_primary_rows_for_audit)
+            ),
+        }
         chain = pd.DataFrame(rows)
         if chain.empty:
             _fail("NO_CURRENT_QUOTES")
@@ -4857,6 +4951,34 @@ class DatabentoGammaStreamer:
         paired_quote_count = len(paired)
         call_quote_count = int((spot_chain["option_type"] == "C").sum())
         put_quote_count = int((spot_chain["option_type"] == "P").sum())
+        fresh_call_strikes = {
+            float(value)
+            for value in spot_chain.loc[
+                spot_chain["option_type"] == "C", "strike"
+            ]
+        }
+        fresh_put_strikes = {
+            float(value)
+            for value in spot_chain.loc[
+                spot_chain["option_type"] == "P", "strike"
+            ]
+        }
+        fresh_primary_strikes = fresh_call_strikes | fresh_put_strikes
+        paired_fresh_strikes = fresh_call_strikes & fresh_put_strikes
+        primary_exclusion_audit["stages"]["fresh_primary_pairs"] = {
+            "strikes": int(len(paired_fresh_strikes)),
+            "excluded_strikes_from_previous": int(
+                len(fresh_primary_strikes) - len(paired_fresh_strikes)
+            ),
+        }
+        primary_exclusion_audit["exclusion_reasons"]["pairing"] = {
+            "MISSING_FRESH_CALL_SIDE": int(
+                len(fresh_primary_strikes - fresh_call_strikes)
+            ),
+            "MISSING_FRESH_PUT_SIDE": int(
+                len(fresh_primary_strikes - fresh_put_strikes)
+            ),
+        }
         market_plan = (self.subscription_metadata.get("markets") or {}).get(market, {})
         primary_plan = next(
             (
@@ -4937,10 +5059,32 @@ class DatabentoGammaStreamer:
         if self.handoff_status == "active" and clock_status != "synchronized":
             _fail(f"PROCESSING_CLOCK_NOT_SYNCHRONIZED: {clock_status}")
             return None
-        chain = chain[
-            (chain["open_interest"] > 0)
-            & chain["strike"].between(calculation_lower_strike, calculation_upper_strike)
-        ].copy()
+        positive_oi_mask = chain["open_interest"] > 0
+        calculation_band_mask = chain["strike"].between(
+            calculation_lower_strike, calculation_upper_strike
+        )
+        primary_row_mask = chain["expiration_date"] == spot_expiration
+        primary_selection_input = chain.loc[primary_row_mask]
+        primary_selection_retained_mask = (
+            primary_row_mask & positive_oi_mask & calculation_band_mask
+        )
+        primary_selection_retained = chain.loc[primary_selection_retained_mask]
+        primary_exclusion_audit["stages"]["positive_oi_in_calculation_band"] = {
+            "rows": int(len(primary_selection_retained)),
+            "strikes": int(primary_selection_retained["strike"].nunique()),
+            "excluded_rows_from_previous": int(
+                len(primary_selection_input) - len(primary_selection_retained)
+            ),
+        }
+        primary_exclusion_audit["exclusion_reasons"]["calculation_selection"] = {
+            "NONPOSITIVE_OPEN_INTEREST": int(
+                (primary_row_mask & ~positive_oi_mask).sum()
+            ),
+            "OUTSIDE_CALCULATION_BAND": int(
+                (primary_row_mask & positive_oi_mask & ~calculation_band_mask).sum()
+            ),
+        }
+        chain = chain[positive_oi_mask & calculation_band_mask].copy()
         diagnostic["moneyness_filtered_rows"] = int(len(chain))
         calculation_now = datetime.now(timezone.utc)
         expiration_years = {
@@ -4969,6 +5113,30 @@ class DatabentoGammaStreamer:
                 if str(reason) != "valid"
             }
         diagnostic["iv_gamma_exclusion_counts"] = calculation_exclusion_counts
+        primary_chain_mask = chain["expiration_date"] == spot_expiration
+        primary_valid_mask = primary_chain_mask.to_numpy(dtype=bool) & valid_mask
+        primary_iv_gamma_rows = chain.loc[primary_valid_mask]
+        primary_iv_gamma_exclusions: dict[str, dict[str, int]] = {}
+        primary_mask_values = primary_chain_mask.to_numpy(dtype=bool)
+        for option_type, side_name in (("C", "call"), ("P", "put")):
+            side_mask = primary_mask_values & (option_type_values == option_type)
+            side_reasons = batch["rejection_reason"][side_mask]
+            reason_values, reason_counts = np.unique(side_reasons, return_counts=True)
+            primary_iv_gamma_exclusions[side_name] = {
+                str(reason): int(count)
+                for reason, count in zip(reason_values, reason_counts)
+                if str(reason) != "valid"
+            }
+        primary_exclusion_audit["stages"]["iv_gamma_valid"] = {
+            "rows": int(primary_valid_mask.sum()),
+            "strikes": int(primary_iv_gamma_rows["strike"].nunique()),
+            "excluded_rows_from_previous": int(
+                int(primary_chain_mask.sum()) - int(primary_valid_mask.sum())
+            ),
+        }
+        primary_exclusion_audit["exclusion_reasons"]["iv_gamma"] = (
+            primary_iv_gamma_exclusions
+        )
         expiration_timestamps = pd.to_datetime(chain["expiration_date"], errors="coerce")
         days_to_expiry = (
             (expiration_timestamps - pd.Timestamp(current_market_date()))
@@ -5187,6 +5355,13 @@ class DatabentoGammaStreamer:
             })
         strike_count = len(gex_by_strike)
         nonzero_strike_count = sum(abs(float(value)) > 1e-10 for value in gex_by_strike.values())
+        primary_exclusion_audit["stages"]["final_primary_gex"] = {
+            "rows": int(len(same_day_calc)),
+            "strikes": int(strike_count),
+            "nonzero_strikes": int(nonzero_strike_count),
+            "zero_gex_strikes": int(strike_count - nonzero_strike_count),
+        }
+        self.last_calculation_diagnostics[market] = dict(diagnostic)
         top_strike_share = abs(float(top[0][1])) / gross_gex if top and gross_gex > 0 else 0.0
         inference_features = gamma_structure_inference_features(
             spot=spot,
@@ -5358,6 +5533,7 @@ class DatabentoGammaStreamer:
                 "skew": put_iv_mean - call_iv_mean if put_iv_mean is not None and call_iv_mean is not None else None,
             },
             "calculation_exclusion_counts": calculation_exclusion_counts,
+            "primary_exclusion_audit": primary_exclusion_audit,
             "truncation": truncation,
             "confidence": round(max(confidence, 0.0), 2),
             "confidence_factors": confidence_factors,
@@ -5667,6 +5843,7 @@ class DatabentoGammaStreamer:
             "calculation_exclusion_counts": result.get(
                 "calculation_exclusion_counts"
             ) or {},
+            "primary_exclusion_audit": result.get("primary_exclusion_audit") or {},
             "truncation": result.get("truncation"),
             "validation_is_valid": validation_is_valid,
             "validation_failure_reasons": validation_failure_reasons,
