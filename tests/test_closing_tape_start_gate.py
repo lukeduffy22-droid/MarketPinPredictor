@@ -40,6 +40,7 @@ def _ready_primary_payloads():
         "connection_limit_circuit_state": "closed",
         "connection_limit_retry_not_before_utc": None,
         "connection_limit_cooldown_remaining_seconds": 0.0,
+        "compute_backpressure_remaining_seconds": 0.0,
         "last_client_close_status": "not_attempted",
         "last_client_close_elapsed_seconds": None,
         "pre_auth_transport_guard_status": "installed",
@@ -167,21 +168,9 @@ def test_primary_capture_gate_accepts_clean_all_four_exact_opening_ranges():
     [
         (
             lambda health, _live, _orb: health.__setitem__(
-                "provider_queue_full_warnings", 1
+                "provider_skipped_records", 1
             ),
-            "PRIMARY_HEALTH_PROVIDER_QUEUE_FULL_WARNINGS_NONZERO",
-        ),
-        (
-            lambda health, _live, _orb: health.__setitem__(
-                "reconnect_attempts", 1
-            ),
-            "PRIMARY_HEALTH_RECONNECT_ATTEMPTS_NONZERO",
-        ),
-        (
-            lambda health, _live, _orb: health.__setitem__(
-                "connection_limit_rejections_total", 1
-            ),
-            "PRIMARY_HEALTH_CONNECTION_LIMIT_REJECTIONS_TOTAL_NONZERO",
+            "PRIMARY_HEALTH_PROVIDER_SKIPPED_RECORDS_NONZERO",
         ),
         (
             lambda health, _live, _orb: health.__setitem__(
@@ -202,22 +191,22 @@ def test_primary_capture_gate_accepts_clean_all_four_exact_opening_ranges():
             "PRIMARY_HEALTH_PRE_AUTH_TRANSPORT_ABORT_FAILURES_TOTAL_NONZERO",
         ),
         (
-            lambda health, _live, _orb: health.__setitem__(
-                "last_client_close_status", "pre_auth_close_unacknowledged"
-            ),
-            "PRIMARY_CLIENT_CLOSE_LIFECYCLE_NOT_CLEAN",
-        ),
-        (
             lambda health, _live, _orb: health["subscription_staging"].__setitem__(
-                "state", "primary_active"
+                "state", "canceled"
             ),
-            "PRIMARY_STAGED_SUBSCRIPTION_NOT_FULL_ACTIVE",
+            "PRIMARY_STAGED_SUBSCRIPTION_STATE_UNSAFE",
         ),
         (
-            lambda _health, _live, orb: orb["symbols"]["RUT"]["opening_ranges"][
-                "60m"
-            ].__setitem__("capture_status", "partial"),
-            "PRIMARY_ORB_60M_INCOMPLETE:RUT",
+            lambda health, _live, _orb: health.__setitem__(
+                "compute_backpressure_remaining_seconds", 2.0
+            ),
+            "PRIMARY_COMPUTE_BACKPRESSURE_ACTIVE",
+        ),
+        (
+            lambda health, _live, _orb: health.pop(
+                "compute_backpressure_remaining_seconds"
+            ),
+            "PRIMARY_COMPUTE_BACKPRESSURE_INVALID",
         ),
     ],
 )
@@ -237,6 +226,30 @@ def test_primary_capture_gate_defers_on_pressure_or_incomplete_orb(
     assert decision["allowed"] is False
     assert decision["state"] == "primary_capture_not_ready"
     assert expected_issue in decision["issues"]
+
+
+def test_primary_capture_gate_allows_degraded_forecast_and_incomplete_orb():
+    health, live, orb = _ready_primary_payloads()
+    health["subscription_staging"]["state"] = "frozen"
+    health["provider_queue_full_warnings"] = 1
+    health["reconnect_attempts"] = 1
+    health["connection_limit_rejections_total"] = 1
+    live["all_configured_collection_ready"] = False
+    live["calculation_ready"] = False
+    live["prediction_pipeline_ok"] = False
+    orb["symbols"]["RUT"]["opening_ranges"]["60m"]["capture_status"] = "partial"
+
+    decision = primary_capture_start_decision(
+        health_payload=health,
+        live_payload=live,
+        orb_payload=orb,
+        trading_day=date(2026, 8, 25),
+    )
+
+    assert decision["allowed"] is True
+    assert decision["readiness_scope"] == "transport_and_primary_subscription_only"
+    assert "PRIMARY_STAGED_SUBSCRIPTION_DEGRADED:frozen" in decision["diagnostics"]
+    assert "PRIMARY_LIVE_PREDICTION_PIPELINE_OK_NOT_READY" in decision["diagnostics"]
 
 
 def test_cli_primary_readiness_failure_is_retryable_defer(monkeypatch, capsys):
@@ -392,7 +405,7 @@ def _runtime_timeout_error():
     )
 
 
-def test_primary_probe_retries_transient_orb_read_without_bypassing_gates(monkeypatch):
+def test_primary_probe_does_not_fetch_orb_and_retains_historical_diagnostics(monkeypatch):
     payloads = _ready_primary_payloads()
     payloads[0]["provider_queue_full_warnings"] = 1
     probe_clock = _ProbeClock()
@@ -405,10 +418,7 @@ def test_primary_probe_retries_transient_orb_read_without_bypassing_gates(monkey
             return payloads[0]
         if url.endswith("/health/live"):
             return payloads[1]
-        if len(calls) == 3:
-            probe_clock.now += 1.0
-            raise _runtime_timeout_error()
-        return payloads[2]
+        pytest.fail(f"unexpected readiness endpoint: {url}")
 
     monkeypatch.setattr(start_gate, "_fetch_json", fetch)
     result = start_gate.probe_primary_capture_readiness(
@@ -416,18 +426,13 @@ def test_primary_probe_retries_transient_orb_read_without_bypassing_gates(monkey
         trading_day=date(2026, 8, 25),
     )
 
-    assert result["allowed"] is False
-    assert "PRIMARY_HEALTH_PROVIDER_QUEUE_FULL_WARNINGS_NONZERO" in result["issues"]
-    assert [row["endpoint"] for row in result["endpoint_checks"]] == ["/health", "/health/live", "/v1/orb"]
-    assert result["endpoint_checks"][-1]["attempts"] == [
-        {"status": "unavailable", "failure": "HTTP_503:RUNTIME_READ_TIMEOUT"},
-        {"status": "available"},
-    ]
-    assert calls[-1][1] == pytest.approx(1.0)
-    assert len(calls) == 4
+    assert result["allowed"] is True
+    assert "PRIMARY_HEALTH_PROVIDER_QUEUE_FULL_WARNINGS_HISTORICAL_NONZERO" in result["diagnostics"]
+    assert [row["endpoint"] for row in result["endpoint_checks"]] == ["/health", "/health/live"]
+    assert len(calls) == 2
 
 
-def test_primary_probe_failure_identifies_endpoint_and_sanitized_status(monkeypatch):
+def test_primary_probe_failure_identifies_live_endpoint_and_sanitized_status(monkeypatch):
     payloads = _ready_primary_payloads()
     monkeypatch.setattr(start_gate, "clock", _ProbeClock())
     calls = []
@@ -437,8 +442,8 @@ def test_primary_probe_failure_identifies_endpoint_and_sanitized_status(monkeypa
         if url.endswith("/health"):
             return payloads[0]
         if url.endswith("/health/live"):
-            return payloads[1]
-        raise _runtime_timeout_error()
+            raise _runtime_timeout_error()
+        pytest.fail(f"unexpected readiness endpoint: {url}")
 
     monkeypatch.setattr(start_gate, "_fetch_json", fetch)
     result = start_gate.probe_primary_capture_readiness(
@@ -447,9 +452,9 @@ def test_primary_probe_failure_identifies_endpoint_and_sanitized_status(monkeypa
     )
 
     assert result["allowed"] is False
-    assert result["issues"] == ["PRIMARY_READINESS_ENDPOINT_UNAVAILABLE:/v1/orb:HTTP_503:RUNTIME_READ_TIMEOUT"]
+    assert result["issues"] == ["PRIMARY_READINESS_ENDPOINT_UNAVAILABLE:/health/live:HTTP_503:RUNTIME_READ_TIMEOUT"]
     assert len(result["endpoint_checks"][-1]["attempts"]) == 2
-    assert len(calls) == 4
+    assert len(calls) == 3
 
 
 def test_endpoint_timeout_retry_shares_three_second_budget(monkeypatch):
@@ -548,7 +553,7 @@ def test_start_gate_allows_launch_after_opening_orb_and_before_close_minus_15(tm
     assert decision["prior_nonempty_dbn_count"] == 0
 
 
-def test_start_gate_blocks_automatic_replay_when_prior_same_day_dbn_exists(tmp_path):
+def test_start_gate_allows_one_bounded_recovery_when_prior_dbn_exists(tmp_path):
     day_dir = tmp_path / "data" / "closing_tape" / "2026-08-25"
     day_dir.mkdir(parents=True)
     (day_dir / "opra_options.orphaned.dbn").write_bytes(b"DBN prior evidence")
@@ -559,10 +564,27 @@ def test_start_gate_blocks_automatic_replay_when_prior_same_day_dbn_exists(tmp_p
         now=datetime(2026, 8, 25, 19, 42, 38, tzinfo=UTC),
     )
 
-    assert decision["allowed"] is False
-    assert decision["state"] == "recovery_replay_blocked"
+    assert decision["allowed"] is True
+    assert decision["state"] == "allowed_recovery"
     assert decision["prior_nonempty_dbn_count"] == 1
-    assert "automatic cash-open replay recovery is blocked" in decision["reason"]
+    assert "one bounded recovery replay" in decision["reason"]
+
+
+def test_start_gate_blocks_after_bounded_recovery_limit(tmp_path):
+    day_dir = tmp_path / "data" / "closing_tape" / "2026-08-25"
+    day_dir.mkdir(parents=True)
+    (day_dir / "opra_options.first.dbn").write_bytes(b"first")
+    (day_dir / "opra_options.second.dbn").write_bytes(b"second")
+
+    decision = recorder_start_decision(
+        tmp_path,
+        trading_day=date(2026, 8, 25),
+        now=datetime(2026, 8, 25, 19, 42, 38, tzinfo=UTC),
+    )
+
+    assert decision["allowed"] is False
+    assert decision["state"] == "recovery_attempt_limit_reached"
+    assert decision["prior_nonempty_dbn_count"] == 2
 
 
 def test_start_gate_ignores_zero_byte_dbn_from_failed_first_attempt(tmp_path):
@@ -581,16 +603,29 @@ def test_start_gate_ignores_zero_byte_dbn_from_failed_first_attempt(tmp_path):
     assert decision["prior_nonempty_dbn_count"] == 0
 
 
-def test_start_gate_refuses_partial_launch_at_analysis_cutoff(tmp_path):
+def test_start_gate_allows_capture_only_at_analysis_cutoff(tmp_path):
     decision = recorder_start_decision(
         tmp_path,
         trading_day=date(2026, 8, 25),
         now=datetime(2026, 8, 25, 19, 45, tzinfo=UTC),
     )
 
+    assert decision["allowed"] is True
+    assert decision["state"] == "allowed"
+    assert decision["analysis_eligible"] is False
+    assert decision["capture_mode"] == "capture_only"
+
+
+def test_start_gate_refuses_launch_at_hard_stop_boundary(tmp_path):
+    decision = recorder_start_decision(
+        tmp_path,
+        trading_day=date(2026, 8, 25),
+        now=datetime(2026, 8, 25, 20, 20, tzinfo=UTC),
+    )
+
     assert decision["allowed"] is False
     assert decision["state"] == "too_late"
-    assert decision["reason"] == "close-minus-15 analysis cutoff has passed"
+    assert decision["reason"] == "closing-tape stop boundary has passed"
 
 
 def test_start_gate_refuses_non_session_day(tmp_path):

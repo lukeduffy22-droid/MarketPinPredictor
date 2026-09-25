@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import time as clock
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.error import HTTPError, URLError
@@ -15,12 +15,20 @@ from .config import ET, UTC, build_session_config
 
 
 # The primary live backend owns the opening hour. The closing-tape stream can
-# request a same-day replay from the cash open, so starting it immediately
-# after the 60-minute ORB is complete preserves the full tape without making a
-# second broad OPRA client compete with opening gamma/ORB capture.
+# request a same-day replay from the cash open, so starting after the opening
+# protection window preserves the full tape without making a second broad OPRA
+# client compete with opening capture. Forecast and ORB validity are deliberately
+# not recorder prerequisites: invalid predictions must abstain, but they must not
+# prevent immutable source evidence from being retained.
 AUTOMATIC_START_NOT_BEFORE_ET = time(10, 35)
 PRIMARY_CAPTURE_FAMILIES = ("SPX", "NDX", "VIX", "RUT")
-PRIMARY_CAPTURE_ORB_WINDOWS = {"5m": 60, "60m": 720}
+PRIMARY_CAPTURE_SAFE_STAGING_STATES = {
+    "primary_active",
+    "full_active",
+    "full_active_integrity_warning",
+    "frozen",
+}
+MAX_AUTOMATIC_CAPTURE_ATTEMPTS = 2
 PRIMARY_READINESS_TIMEOUT_SECONDS = 2.0
 PRIMARY_READINESS_MAX_TIMEOUT_SECONDS = 3.0
 PRIMARY_READINESS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -57,31 +65,24 @@ def _finite(value: object) -> float | None:
     return candidate if math.isfinite(candidate) else None
 
 
-def _aware_datetime(value: object) -> datetime | None:
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed.tzinfo is not None else None
-
-
 def primary_capture_start_decision(
     *,
     health_payload: object,
     live_payload: object,
-    orb_payload: object,
+    orb_payload: object | None = None,
     trading_day: date,
 ) -> dict[str, object]:
-    """Validate the already-running primary before an optional OPRA client starts.
+    """Validate transport safety before an independent evidence recorder starts.
 
     This function is pure: callers supply retained HTTP payloads and it neither
-    opens a provider connection nor mutates runtime or database state.
+    opens a provider connection nor mutates runtime or database state. Forecast,
+    calculation, quote-pair, and ORB readiness remain downstream analysis gates.
     """
 
     health = _mapping(health_payload)
     live = _mapping(live_payload)
-    orb = _mapping(orb_payload)
     issues: list[str] = []
+    diagnostics: list[str] = []
 
     epoch = health.get("subscription_epoch_id")
     generation = health.get("active_generation")
@@ -111,19 +112,30 @@ def primary_capture_start_decision(
         issues.append("PRIMARY_HEALTH_SUBSCRIPTION_SUPPRESSED")
     if str(health.get("last_error") or "").strip():
         issues.append("PRIMARY_HEALTH_LAST_ERROR_PRESENT")
+    # Skips are evidence loss and remain blocking. Cumulative recovered warning,
+    # reconnect, and rejection counters are retained as diagnostics; requiring
+    # them to remain zero forever made one recovered event suppress the day's
+    # closing tape even after transport had returned to a safe state.
     for field in (
-        "provider_queue_full_warnings",
-        "provider_slow_client_warnings",
         "provider_skipped_record_warnings",
         "provider_skipped_records",
-        "reconnect_attempts",
-        "connection_limit_rejections_total",
         "connection_limit_consecutive",
         "pre_auth_transport_aborts_total",
         "pre_auth_transport_abort_failures_total",
     ):
         if type(health.get(field)) is not int or health.get(field) != 0:
             issues.append(f"PRIMARY_HEALTH_{field.upper()}_NONZERO")
+    for field in (
+        "provider_queue_full_warnings",
+        "provider_slow_client_warnings",
+        "reconnect_attempts",
+        "connection_limit_rejections_total",
+    ):
+        value = health.get(field)
+        if type(value) is not int or value < 0:
+            issues.append(f"PRIMARY_HEALTH_{field.upper()}_INVALID")
+        elif value:
+            diagnostics.append(f"PRIMARY_HEALTH_{field.upper()}_HISTORICAL_NONZERO")
     if str(health.get("connection_limit_circuit_state") or "").lower() != "closed":
         issues.append("PRIMARY_CONNECTION_LIMIT_CIRCUIT_NOT_CLOSED")
     if health.get("connection_limit_retry_not_before_utc") is not None:
@@ -133,17 +145,11 @@ def primary_capture_start_decision(
         issues.append("PRIMARY_CONNECTION_LIMIT_COOLDOWN_ACTIVE_OR_INVALID")
     if health.get("pre_auth_transport_guard_status") != "installed":
         issues.append("PRIMARY_PRE_AUTH_TRANSPORT_GUARD_NOT_INSTALLED")
-    if health.get("last_client_close_status") != "not_attempted":
-        issues.append("PRIMARY_CLIENT_CLOSE_LIFECYCLE_NOT_CLEAN")
-    if health.get("last_client_close_elapsed_seconds") is not None:
-        issues.append("PRIMARY_CLIENT_CLOSE_ELAPSED_UNEXPECTED")
-    for field in (
-        "last_pre_auth_transport_event",
-        "last_pre_auth_transport_reason",
-        "last_pre_auth_transport_event_utc",
-    ):
-        if health.get(field) is not None:
-            issues.append(f"PRIMARY_HEALTH_{field.upper()}_PRESENT")
+    backpressure = _finite(health.get("compute_backpressure_remaining_seconds"))
+    if backpressure is None or backpressure < 0.0:
+        issues.append("PRIMARY_COMPUTE_BACKPRESSURE_INVALID")
+    elif backpressure > 0.0:
+        issues.append("PRIMARY_COMPUTE_BACKPRESSURE_ACTIVE")
 
     required = set(PRIMARY_CAPTURE_FAMILIES)
     if not required.issubset(_symbol_set(health.get("symbols_requested"))):
@@ -159,8 +165,11 @@ def primary_capture_start_decision(
             issues.append(f"PRIMARY_FAMILY_SUBSCRIPTION_NOT_READY:{symbol}")
 
     staging = _mapping(health.get("subscription_staging"))
-    if str(staging.get("state") or "").lower() != "full_active":
-        issues.append("PRIMARY_STAGED_SUBSCRIPTION_NOT_FULL_ACTIVE")
+    staging_state = str(staging.get("state") or "").lower()
+    if staging_state not in PRIMARY_CAPTURE_SAFE_STAGING_STATES:
+        issues.append("PRIMARY_STAGED_SUBSCRIPTION_STATE_UNSAFE")
+    elif staging_state != "full_active":
+        diagnostics.append(f"PRIMARY_STAGED_SUBSCRIPTION_DEGRADED:{staging_state}")
     primary_counts = _mapping(staging.get("primary_contract_counts"))
     for symbol in PRIMARY_CAPTURE_FAMILIES:
         if type(primary_counts.get(symbol)) is not int or int(
@@ -168,17 +177,10 @@ def primary_capture_start_decision(
         ) <= 0:
             issues.append(f"PRIMARY_STAGED_FAMILY_MISSING:{symbol}")
 
-    sampler = _mapping(health.get("orb_reference_sampler"))
-    if sampler.get("thread_alive") is not True or sampler.get("interval_seconds") != 5:
-        issues.append("PRIMARY_ORB_SAMPLER_NOT_READY")
-
     expected_live_true = (
         "stream_connected",
         "stream_progressing",
         "collection_ready",
-        "all_configured_collection_ready",
-        "calculation_ready",
-        "prediction_pipeline_ok",
         "runtime_context_stable",
     )
     for field in expected_live_true:
@@ -197,135 +199,25 @@ def primary_capture_start_decision(
     ):
         issues.append("PRIMARY_LIVE_RUNTIME_IDENTITY_MISMATCH")
 
-    context = _mapping(orb.get("active_runtime_context"))
-    if (
-        orb.get("schema_version") != "marketpin-reference-orb.collection.v2"
-        or orb.get("runtime_binding_applied") is not True
-        or orb.get("runtime_context_stable") is not True
-        or context.get("subscription_epoch_id") != epoch
-        or context.get("subscription_generation") != generation
-        or str(context.get("handoff_status") or "").lower() != "active"
+    for field in (
+        "all_configured_collection_ready",
+        "calculation_ready",
+        "prediction_pipeline_ok",
     ):
-        issues.append("PRIMARY_ORB_RUNTIME_IDENTITY_MISMATCH")
-    if not required.issubset(_symbol_set(orb.get("configured_symbols"))):
-        issues.append("PRIMARY_ORB_CONFIGURED_FAMILIES_MISSING")
-    if not required.issubset(_symbol_set(orb.get("requested_symbols"))):
-        issues.append("PRIMARY_ORB_REQUESTED_FAMILIES_MISSING")
-
-    symbols = _mapping(orb.get("symbols"))
-    for symbol in PRIMARY_CAPTURE_FAMILIES:
-        state = _mapping(symbols.get(symbol))
-        if not state:
-            issues.append(f"PRIMARY_ORB_SYMBOL_MISSING:{symbol}")
-            continue
-        if state.get("trading_date") != trading_day.isoformat() or state.get(
-            "configured"
-        ) is not True:
-            issues.append(f"PRIMARY_ORB_SESSION_INVALID:{symbol}")
-        provenance = _mapping(state.get("provenance"))
-        if (
-            provenance.get("runtime_binding_applied") is not True
-            or provenance.get("range_provenance_aligned") is not True
-            or provenance.get("current_vs_range_aligned") is not True
-            or provenance.get("active_runtime_epoch_aligned") is not True
-            or provenance.get("active_subscription_epoch_id") != epoch
-            or provenance.get("active_subscription_generation") != generation
-        ):
-            issues.append(f"PRIMARY_ORB_PROVENANCE_INVALID:{symbol}")
-        if _mapping(state.get("last_known_reference")).get("runtime_aligned") is not True:
-            issues.append(f"PRIMARY_ORB_CURRENT_REFERENCE_UNALIGNED:{symbol}")
-        if symbol in {"SPX", "NDX"}:
-            pin = _mapping(state.get("pin_behavior"))
-            if (
-                state.get("directional_evidence_eligible") is not True
-                or state.get("combined_structure_directional_evidence_eligible")
-                is not True
-                or pin.get("level_availability_status") != "available"
-                or (_finite(pin.get("gamma_pin")) or 0.0) <= 0.0
-                or (_finite(pin.get("max_pain")) or 0.0) <= 0.0
-            ):
-                issues.append(f"PRIMARY_DIRECTIONAL_PIN_STATE_NOT_READY:{symbol}")
-
-        windows = _mapping(state.get("opening_ranges"))
-        for window_name, expected_samples in PRIMARY_CAPTURE_ORB_WINDOWS.items():
-            window = _mapping(windows.get(window_name))
-            capture = _mapping(window.get("capture_evidence"))
-            sample_count = capture.get("sample_count")
-            recorded_expected = capture.get("expected_sample_count")
-            ratio = _finite(capture.get("capture_ratio"))
-            first_lag = _finite(capture.get("first_sample_lag_seconds"))
-            end_gap = _finite(capture.get("end_gap_seconds"))
-            max_gap = _finite(capture.get("max_gap_seconds"))
-            range_start = _aware_datetime(window.get("range_start_utc"))
-            range_end = _aware_datetime(window.get("range_end_utc"))
-            expected_start = datetime.combine(
-                trading_day, time(9, 30), tzinfo=ET
-            ).astimezone(UTC)
-            # Avoid importing a second calendar implementation: the expected
-            # duration is already encoded by the contract's exact sample count.
-            expected_end = expected_start + timedelta(minutes=int(window_name[:-1]))
-            coherent_ratio = (
-                sample_count / expected_samples
-                if type(sample_count) is int and expected_samples > 0
-                else None
-            )
-            opening_price = _finite(window.get("opening_price"))
-            orb_high = _finite(window.get("orb_high"))
-            orb_low = _finite(window.get("orb_low"))
-            current_price = _finite(window.get("current_price"))
-            price_evidence_ok = bool(
-                opening_price is not None
-                and opening_price > 0.0
-                and orb_high is not None
-                and orb_high > 0.0
-                and orb_low is not None
-                and orb_low > 0.0
-                and current_price is not None
-                and current_price > 0.0
-                and orb_low <= opening_price <= orb_high
-            )
-            timing_ok = bool(
-                range_start is not None
-                and range_end is not None
-                and range_start.astimezone(UTC) == expected_start
-                and range_end.astimezone(UTC) == expected_end
-                and first_lag == 0.0
-                and end_gap is not None
-                and 0.0 <= end_gap <= 30.0
-                and max_gap is not None
-                and 0.0 <= max_gap <= 30.0
-            )
-            capture_ok = bool(
-                window.get("capture_status") == "complete"
-                and window.get("duration_minutes") == int(window_name[:-1])
-                and window.get("orb_complete") is True
-                and window.get("clock_status") == "closed"
-                and window.get("current_reference_fresh") is True
-                and type(sample_count) is int
-                and type(recorded_expected) is int
-                and recorded_expected == expected_samples
-                and 0 < sample_count <= expected_samples
-                and ratio is not None
-                and ratio >= 0.95
-                and ratio <= 1.0
-                and coherent_ratio is not None
-                and math.isclose(ratio, coherent_ratio, rel_tol=0.0, abs_tol=1e-12)
-                and capture.get("opening_bucket_present") is True
-                and price_evidence_ok
-                and timing_ok
-            )
-            if not capture_ok:
-                issues.append(f"PRIMARY_ORB_{window_name.upper()}_INCOMPLETE:{symbol}")
+        if live.get(field) is not True:
+            diagnostics.append(f"PRIMARY_LIVE_{field.upper()}_NOT_READY")
 
     issues = list(dict.fromkeys(issues))
+    diagnostics = list(dict.fromkeys(diagnostics))
     return {
         "allowed": not issues,
         "state": "primary_capture_ready" if not issues else "primary_capture_not_ready",
         "reason": None if not issues else "; ".join(issues),
         "issues": issues,
+        "diagnostics": diagnostics,
+        "readiness_scope": "transport_and_primary_subscription_only",
         "trading_date": trading_day.isoformat(),
         "required_families": list(PRIMARY_CAPTURE_FAMILIES),
-        "required_orb_windows": list(PRIMARY_CAPTURE_ORB_WINDOWS),
         "subscription_epoch_id": epoch if _sha256_identity(epoch) else None,
         "subscription_generation": generation if type(generation) is int else None,
     }
@@ -444,11 +336,11 @@ def probe_primary_capture_readiness(
             "issues": [issue],
             "trading_date": trading_day.isoformat(),
             "required_families": list(PRIMARY_CAPTURE_FAMILIES),
-            "required_orb_windows": list(PRIMARY_CAPTURE_ORB_WINDOWS),
+            "readiness_scope": "transport_and_primary_subscription_only",
         }
     payloads = []
     endpoint_checks = []
-    for path in ("/health", "/health/live", "/v1/orb?symbols=SPX%2CNDX%2CVIX%2CRUT"):
+    for path in ("/health", "/health/live"):
         payload, check = _probe_endpoint(origin + path, timeout)
         endpoint_checks.append(check)
         if payload is None:
@@ -462,14 +354,14 @@ def probe_primary_capture_readiness(
                 "issues": [issue],
                 "trading_date": trading_day.isoformat(),
                 "required_families": list(PRIMARY_CAPTURE_FAMILIES),
-                "required_orb_windows": list(PRIMARY_CAPTURE_ORB_WINDOWS),
+                "readiness_scope": "transport_and_primary_subscription_only",
                 "endpoint_checks": endpoint_checks,
             }
         payloads.append(payload)
     decision = primary_capture_start_decision(
         health_payload=payloads[0],
         live_payload=payloads[1],
-        orb_payload=payloads[2],
+        orb_payload=None,
         trading_day=trading_day,
     )
     return {**decision, "endpoint_checks": endpoint_checks}
@@ -484,13 +376,10 @@ def recorder_start_decision(
     """Return a fail-closed decision for starting a complete daily recorder.
 
     A launch before the opening-range protection boundary is deferred because
-    the recorder can replay from the cash open. A launch at or after the
-    close-minus-15 analysis horizon cannot satisfy the session contract and
-    would create a misleading partial session. The launcher checks for an
-    active recorder before reaching this gate, so a non-empty same-day DBN here
-    is orphaned evidence: automatically replaying the full session again could
-    starve the primary gamma/ORB stream. Existing processes remain protected by
-    the process lock and supervisor.
+    the recorder can replay from the cash open. The close-minus-15 boundary
+    controls analysis eligibility, not immutable capture. A bounded second
+    attempt is permitted when an earlier non-empty DBN exists; process locks,
+    transport readiness, and the hard stop boundary still protect the primary.
     """
     observed = now or datetime.now(UTC)
     if observed.tzinfo is None:
@@ -529,20 +418,25 @@ def recorder_start_decision(
     elif observed_utc < start_not_before_utc:
         state = "not_yet_due"
         reason = "opening gamma and 60-minute ORB protection window is active"
-    elif observed_utc >= config.analysis_due_utc:
+    elif observed_utc >= config.stop_due_utc:
         state = "too_late"
-        reason = "close-minus-15 analysis cutoff has passed"
-    elif prior_dbn_evidence:
-        state = "recovery_replay_blocked"
+        reason = "closing-tape stop boundary has passed"
+    elif len(prior_dbn_evidence) >= MAX_AUTOMATIC_CAPTURE_ATTEMPTS:
+        state = "recovery_attempt_limit_reached"
         reason = (
-            "non-empty same-day DBN evidence already exists; automatic cash-open "
-            "replay recovery is blocked to protect the primary gamma and ORB stream"
+            "automatic closing-tape recovery attempt limit reached; preserve "
+            "existing DBN evidence and require operator review"
         )
+    elif prior_dbn_evidence:
+        state = "allowed_recovery"
+        reason = "one bounded recovery replay is allowed before the hard stop boundary"
     else:
         state = "allowed"
         reason = None
+    analysis_eligible = bool(observed_utc < config.analysis_due_utc)
+    capture_mode = "capture_and_analyze" if analysis_eligible else "capture_only"
     return {
-        "allowed": state == "allowed",
+        "allowed": state in {"allowed", "allowed_recovery"},
         "state": state,
         "reason": reason,
         "trading_date": trading_day.isoformat(),
@@ -551,6 +445,9 @@ def recorder_start_decision(
         "analysis_due_utc": config.analysis_due_utc.isoformat(),
         "stop_due_utc": config.stop_due_utc.isoformat(),
         "prior_nonempty_dbn_count": len(prior_dbn_evidence),
+        "maximum_automatic_capture_attempts": MAX_AUTOMATIC_CAPTURE_ATTEMPTS,
+        "analysis_eligible": analysis_eligible,
+        "capture_mode": capture_mode,
     }
 
 
@@ -562,8 +459,8 @@ def parser() -> argparse.ArgumentParser:
         "--require-primary-ready",
         action="store_true",
         help=(
-            "Require the existing loopback backend and exact all-four 5m/60m "
-            "ORB evidence before authorizing the optional recorder."
+            "Require safe transport and active primary family subscriptions "
+            "before authorizing the optional recorder."
         ),
     )
     result.add_argument(
@@ -601,15 +498,14 @@ def main(argv: list[str] | None = None) -> int:
                 reason=primary["reason"],
             )
         else:
-            # Endpoint reads are bounded but can straddle the close-minus-15
-            # boundary. Re-evaluate the pure owner/time gate after I/O so a
-            # pre-cutoff decision cannot authorize a post-cutoff process.
+            # Endpoint reads are bounded but can straddle the hard stop or move
+            # the launch from analysis-eligible to capture-only. Re-evaluate
+            # the owner/time gate after I/O before authorizing the process.
             post_probe = recorder_start_decision(
                 args.project_root,
                 trading_day=trading_day,
             )
-            if not post_probe["allowed"]:
-                decision = {**post_probe, "primary_capture": primary}
+            decision = {**post_probe, "primary_capture": primary}
     print(json.dumps(decision, sort_keys=True, separators=(",", ":")))
     if decision["allowed"]:
         return 0

@@ -654,6 +654,13 @@ Automatic launches are deferred until 10:35 ET, five minutes after the
 60-minute opening range is complete. The recorder then requests its TCBBO replay
 from the 09:30 ET cash open, preserving the full-session tape while keeping its
 broad second OPRA client out of the opening gamma and ORB capture window.
+Recorder authorization depends on current transport safety, stable runtime
+identity, and active SPX/NDX/VIX/RUT primary subscriptions. Forecast validity,
+quote-pair coverage, and ORB completeness remain analysis gates: they can force
+an abstention, but cannot suppress immutable raw capture. Historical recovered
+queue/reconnect counters are retained as diagnostics while active backpressure,
+skipped records, an open connection-limit circuit, or missing subscriptions
+still fail closed.
 
 For the guarded RUT opening canary, the live-subscription ceiling is 3,200
 contracts. On the 2026-09-04 current-day universe this retained every primary
@@ -661,8 +668,12 @@ and next-listed call/put pair for SPX, NDX, VIX, and RUT with zero reservation
 shortfall, while trimming 400 far-shadow contracts. The four-family plan is
 therefore no larger than the measured 3,204-contract core-only plan; the live
 canary still rolls RUT back if SPX/NDX freshness, lag, or coverage deteriorates.
-The launcher refuses to create a misleading partial session at or after the
-close-minus-15 analysis cutoff and preserves one log pair per recovery attempt.
+At the close-minus-15 cutoff the launcher switches to capture-only mode rather
+than discarding the remaining evidence. It continues to refuse starts after the
+hard stop boundary and permits at most one bounded same-day recovery replay.
+Every successful process start preserves one log pair and an append-only launch
+receipt containing the process ID, capture mode, and expected/observed catalog,
+status, DBN, stdout, and stderr paths.
 
 Offline finalization records per-stage wall-clock timings and record throughput
 for integrity, open-interest replay, minute construction/persistence, and parity

@@ -67,9 +67,9 @@ if ($gateExitCode -eq 4) {
 }
 if ($gateExitCode -eq 3) {
     $gate = $gateJson | ConvertFrom-Json
-    if ([string]$gate.state -eq 'recovery_replay_blocked') {
+    if ([string]$gate.state -eq 'recovery_attempt_limit_reached') {
         [pscustomobject]@{
-            Status = 'recovery_replay_blocked'
+            Status = 'recovery_attempt_limit_reached'
             Pid = $null
             Reason = $gate.reason
             PriorNonemptyDbnCount = $gate.prior_nonempty_dbn_count
@@ -88,13 +88,16 @@ if ($gateExitCode -eq 3) {
 if ($gateExitCode -ne 0) {
     throw "Closing-tape start gate failed with exit code $gateExitCode."
 }
+$gate = $gateJson | ConvertFrom-Json
 
 if ($CheckOnly) {
-    $gate = $gateJson | ConvertFrom-Json
     [pscustomobject]@{
         Status = 'ready_to_start'
         Pid = $null
         Reason = $gate.reason
+        GateState = $gate.state
+        CaptureMode = $gate.capture_mode
+        AnalysisEligible = [bool]$gate.analysis_eligible
         StartNotBeforeUtc = ([DateTimeOffset]$gate.start_not_before_utc).ToUniversalTime().ToString('o')
         AnalysisDueUtc = ([DateTimeOffset]$gate.analysis_due_utc).ToUniversalTime().ToString('o')
     }
@@ -115,7 +118,7 @@ $arguments = @(
     '--project-root', $projectRoot,
     '--trading-date', $TradingDate
 )
-if ($NoAnalysis) { $arguments += '--no-analysis' }
+if ($NoAnalysis -or [string]$gate.capture_mode -eq 'capture_only') { $arguments += '--no-analysis' }
 if ($NoParquet) { $arguments += '--no-parquet' }
 
 $process = Start-Process `
@@ -139,10 +142,40 @@ if ($process.HasExited) {
     throw "Closing-tape recorder exited during startup (code $($process.ExitCode)).`n$errorTail"
 }
 
+$catalogPath = Join-Path $sessionDir 'closing_tape.sqlite'
+$statusPath = Join-Path $sessionDir 'status.json'
+$dbnPaths = @(Get-ChildItem -LiteralPath $sessionDir -Filter '*.dbn' -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+$receiptPath = Join-Path $sessionDir "launch-receipt.$launchStamp.json"
+$receipt = [ordered]@{
+    schema_version = 'marketpin.closing-tape-launch-receipt.v1'
+    trading_date = $TradingDate
+    observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    process_id = $process.Id
+    process_running = $true
+    gate_state = [string]$gate.state
+    capture_mode = [string]$gate.capture_mode
+    analysis_eligible = [bool]$gate.analysis_eligible
+    catalog_path = $catalogPath
+    catalog_observed = [bool](Test-Path -LiteralPath $catalogPath -PathType Leaf)
+    status_path = $statusPath
+    status_observed = [bool](Test-Path -LiteralPath $statusPath -PathType Leaf)
+    dbn_paths = $dbnPaths
+    dbn_observed = [bool]($dbnPaths.Count -gt 0)
+    stdout_path = $stdoutPath
+    stderr_path = $stderrPath
+}
+$receipt | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $receiptPath -Encoding utf8
+
 [pscustomobject]@{
     Status = 'started'
     Pid = $process.Id
-    StatusPath = (Join-Path $sessionDir 'status.json')
+    GateState = $gate.state
+    CaptureMode = $gate.capture_mode
+    AnalysisEligible = [bool]$gate.analysis_eligible
+    CatalogPath = $catalogPath
+    StatusPath = $statusPath
+    DbnPaths = $dbnPaths
+    LaunchReceiptPath = $receiptPath
     Stdout = $stdoutPath
     Stderr = $stderrPath
 }

@@ -3675,12 +3675,12 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
     It 'returns closing-tape status without terminating the parent supervisor runspace' {
         $startClosingScript | Should Not Match '(?m)^\s*exit\b'
         $startClosingScript | Should Match "Status = 'not_yet_due'[\s\S]+\r?\n\s*return"
-        $startClosingScript | Should Match "Status = 'recovery_replay_blocked'[\s\S]+\r?\n\s*return"
+        $startClosingScript | Should Match "Status = 'recovery_attempt_limit_reached'[\s\S]+\r?\n\s*return"
         $startClosingScript | Should Match "Status = 'outside_start_window'[\s\S]+\r?\n\s*return"
         $startClosingScript | Should Match "Status = 'already_running'[\s\S]+\r?\n\s*return"
     }
 
-    It 'defers the broad closing-tape stream until the opening ORB is complete' {
+    It 'defers the broad closing-tape stream until transport and primary subscriptions are safe' {
         $ensureScript | Should Match 'closing_tape_deferred_for_opening_capture'
         $ensureScript | Should Match "resultStatus -eq 'not_yet_due'"
         $ensureScript | Should Match 'protect_opening_gamma_and_orb'
@@ -3689,11 +3689,18 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startClosingScript | Should Match '--require-primary-ready'
     }
 
-    It 'preserves prior tape evidence instead of auto-replaying it during live hours' {
-        $ensureScript | Should Match "resultStatus -eq 'recovery_replay_blocked'"
-        $ensureScript | Should Match 'closing_tape_recovery_replay_blocked'
+    It 'preserves tape evidence after the bounded recovery attempt limit' {
+        $ensureScript | Should Match "resultStatus -eq 'recovery_attempt_limit_reached'"
+        $ensureScript | Should Match 'closing_tape_recovery_attempt_limit_reached'
         $ensureScript | Should Match 'action=preserve_primary_backend'
         $ensureScript | Should Match "resultStatus -eq 'outside_start_window'[\s\S]+Resolve-MarketAppPostCloseFinalizeResult"
+    }
+
+    It 'records catalog DBN status process and runtime-log launch evidence' {
+        $startClosingScript | Should Match 'marketpin\.closing-tape-launch-receipt\.v1'
+        $startClosingScript | Should Match 'catalog_path[\s\S]+status_path[\s\S]+dbn_paths'
+        $startClosingScript | Should Match 'stdout_path[\s\S]+stderr_path'
+        $startClosingScript | Should Match "capture_mode[\s\S]+capture_only"
     }
 
     It 'limits explicit restart execution to the requested component' {

@@ -1983,7 +1983,7 @@ try {
         else {
             $gateResult = & $ClosingTapeScript -TradingDate $tradingDate -NoParquet -CheckOnly
             $gateStatus = [string]$gateResult.Status
-            if ($gateStatus -notin @('ready_to_start', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_replay_blocked')) {
+            if ($gateStatus -notin @('ready_to_start', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_attempt_limit_reached')) {
                 throw "Closing-tape check-only gate returned unexpected status: $gateStatus"
             }
             Write-WatchdogLog `
@@ -1999,7 +1999,7 @@ try {
                 $result = & $ClosingTapeScript -TradingDate $tradingDate -NoParquet
             }
             $resultStatus = [string]$result.Status
-            if ($resultStatus -notin @('started', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_replay_blocked')) {
+            if ($resultStatus -notin @('started', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_attempt_limit_reached')) {
                 throw "Closing-tape launcher returned unexpected status: $resultStatus"
             }
             Write-WatchdogLog `
@@ -2013,14 +2013,12 @@ try {
             elseif ($resultStatus -eq 'primary_capture_not_ready') {
                 Write-WatchdogLog `
                     -Event 'closing_tape_deferred_for_primary_capture' `
-                    -Message "component=closing_tape action=defer reason=primary_or_all_four_orb_not_ready"
+                    -Message "component=closing_tape action=defer reason=primary_transport_or_subscription_unsafe"
             }
-            elseif ($resultStatus -eq 'recovery_replay_blocked') {
-                # Preserve the prior raw tape and the healthy primary backend.
-                # An operator can reconstruct/finalize the orphan after hours;
-                # never launch another full-session OPRA replay automatically.
+            elseif ($resultStatus -eq 'recovery_attempt_limit_reached') {
+                # Preserve both bounded attempts and require operator review.
                 Write-WatchdogLog `
-                    -Event 'closing_tape_recovery_replay_blocked' `
+                    -Event 'closing_tape_recovery_attempt_limit_reached' `
                     -Message "component=closing_tape prior_nonempty_dbn_count=$($result.PriorNonemptyDbnCount) action=preserve_primary_backend"
             }
             elseif ($resultStatus -eq 'outside_start_window') {
