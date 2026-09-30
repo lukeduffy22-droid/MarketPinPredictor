@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-18T18:45:56.488127+00:00",
+  "report_id": "6a965ce325d841b6f6e7ea16de4db217d707e1093a5a87a6a3573cd65109b132",
+  "source_fingerprint": "b9a99141b6b3b32ac079916e388a52252b3f43939e25c539234e8be830135397",
+  "source_hashes": {
+    "app.py": "762f77813c15682bc3000cf01fe99d48616a470f31d3bf063fab12f08f2164b0",
+    "app/services/__init__.py": "1b5fbd9ec345f5b72d90426b818752aea5059663b6a8b8950c6e2d25fafd7c99",
+    "app/services/advisor_view.py": "0b3b906d58103055255557e2a7f174a29dc50db21339999d251aa442d62af405",
+    "app/services/advisor_workflow.py": "e57185b7e15bb40d414d5b379008e47b3fee3e91af6886c82c51b6e8b21cce40",
+    "app/services/ai_service.py": "c48f7644b7f540bae3613dd75e751cc57772408d28c8d7acf0ed54de9d224d2c",
+    "app/services/capture_review.py": "c9bc9e1b64832f51662c8148e9015d6b926b7e66fab18daa08541b6395345bbf",
+    "app/services/closing_prices.py": "9e771ad7cb9af731549497d66637ad3fdaa63afa77ca33a36bb4f1b4bf7e4b31",
+    "app/services/dashboard_status.py": "496e27f0ec06e602b7e7cecd98e3a1ff7898b56f4fb8a2e2b298fa8a9a81e9e6",
+    "app/services/databento_symbol_catalog.py": "1abf5e33808a828ac855cdde55fb4928ffa55af0a69980e7ff6a9f32f3632678",
+    "app/services/diagnostic_agent.py": "ed4a3974ce5c9421ab894cc899f8e8b11681074850d1a8b56bfdb62b4d379201",
+    "app/services/diagnostic_history.py": "d9ee1eb9cfc671481d93520abca8ef45869f3126d17edc17b6742c74e81547de",
+    "app/services/forecast_research_view.py": "601a9dff36064979df8ed1985ebf41d5287cf0d1269f62c80e920b7dd67dc26e",
+    "app/services/live_advisor.py": "dfc02f81107eeb6218c09de2e9680f9542d999653c27b8056f53efb95630f835",
+    "app/services/live_data_client.py": "f6fd4d68c199f622382f1310f6c90e3b994d623ab928ba23cfff45dcbc265c9c",
+    "app/services/live_panel_view.py": "660a9e326a6d23f1ffd039a896471cea6289082b828abe1f55d0c23fabb3368c",
+    "app/services/market_event_scanner.py": "33f8784b6705d44c31a24a90f5df54c36ad1cd40a8bcfbe1ddff377e09426592",
+    "app/services/orb_view.py": "897dceeb2c8b2a841ce946d056f41812f1ed289d790efb31391ca33afae881fa",
+    "app/services/retained_parity_view.py": "e91f0e2da1c5f52a55265edbb63fde7afd9da6f68560eeda5a6f73345cadc800",
+    "app/services/shadow_research_view.py": "2bccd01e681c5affea34618cc697acdcd52c8e2abab756602afe333d25939014",
+    "app/services/sidebar_live_state.py": "a3e37a067c7198c4dca55c6858a814386ed7c1acd13087cd24cdad53514da80b",
+    "app/services/trend_research_view.py": "b89283d33f74d4ccaeacffa2a8b036f058f9ef9146caf87cf7ce277a8ff1245d",
+    "app/services/validation_review.py": "c8717c5450c30c78a2849d8f5224271b146b9183f78135bd39750a0c133aa34f"
+  },
+  "context_timestamp": "2026-09-18T18:44:55.415134+00:00",
+  "proposals": [
+    {
+      "title": "Verify changed advisor layout and functionality",
+      "change_summary": "Check status visibility, retained-observation labels, and save/download behavior in the changed UI. Review source differences before proposing further edits.",
+      "evidence": "Source hashes changed: app/services/advisor_view.py, app/services/diagnostic_agent.py, app/services/diagnostic_history.py",
+      "target_files": [
+        "app/services/advisor_view.py",
+        "app/services/diagnostic_agent.py",
+        "app/services/diagnostic_history.py"
+      ],
+      "risk_level": "Low",
+      "expected_impact": "Proposed benefit requires verification; no accuracy claim.",
+      "id": "d84d4f5e398d5c3c3a49601f1daf12e7d72d16b0246c6215dd9e8b1e3861d91d"
+    }
+  ],
+  "research_only": true,
+  "decision_grade": false,
+  "action": "implementation_review_only"
+}

@@ -31,14 +31,14 @@ Write-Output "Inventory time: $((Get-Date).ToString('o'))"
 Write-Output ''
 Write-Output '=== FOLDER SIZES (GB) ==='
 Get-ChildItem -LiteralPath $ParentRoot -Directory -Force |
-    ForEach-Object {
-        [PSCustomObject]@{
-            SizeGB = Get-FolderSize -Path $_.FullName
-            Path = $_.FullName
-        }
-    } |
-    Sort-Object SizeGB -Descending |
-    Format-Table -AutoSize
+ForEach-Object {
+    [PSCustomObject]@{
+        SizeGB = Get-FolderSize -Path $_.FullName
+        Path   = $_.FullName
+    }
+} |
+Sort-Object SizeGB -Descending |
+Format-Table -AutoSize
 
 Write-Output '=== CHECKOUTS AND WORKTREES ==='
 $worktreeLines = @(& git --no-optional-locks -C $ProjectRoot worktree list --porcelain 2>$null)
@@ -58,11 +58,11 @@ if ($current.Count -gt 0) { $entries += [PSCustomObject]$current }
 $entries | ForEach-Object {
     $branch = $_.PSObject.Properties['Branch']
     [PSCustomObject]@{
-        Branch = if ($null -ne $branch) { $branch.Value } else { '<detached>' }
-        Commit = $_.Commit
+        Branch  = if ($null -ne $branch) { $branch.Value } else { '<detached>' }
+        Commit  = $_.Commit
         Changes = Get-GitStatusCount -Directory $_.Path
-        SizeGB = Get-FolderSize -Path $_.Path
-        Path = $_.Path
+        SizeGB  = Get-FolderSize -Path $_.Path
+        Path    = $_.Path
     }
 } | Format-Table -AutoSize
 
