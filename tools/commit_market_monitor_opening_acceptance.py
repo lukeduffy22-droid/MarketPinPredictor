@@ -31,6 +31,9 @@ def _parser() -> argparse.ArgumentParser:
         choices=(
             "startup",
             "first_eligible_gamma_capture",
+            "first_opening_bucket",
+            "complete_15m_orb",
+            "complete_30m_orb",
             "complete_5m_orb",
             "complete_60m_orb",
         ),

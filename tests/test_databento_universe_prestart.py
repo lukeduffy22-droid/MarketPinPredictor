@@ -19,11 +19,13 @@ class _FakeStreamer:
         stage_error=None,
         fallback=False,
         staged_prior=None,
+        current_provenance_overrides=None,
     ):
         self._current_loads = iter(current_loads)
         self._stage_error = stage_error
         self._fallback = fallback
         self._staged_prior = staged_prior
+        self._current_provenance_overrides = current_provenance_overrides or {}
         self.api_key = "secret-test-key"
         self.live_symbols = []
         self.stage_calls = 0
@@ -79,7 +81,22 @@ class _FakeStreamer:
                     "mode": "current_day_cache",
                     "trading_date": trading_date.isoformat(),
                     "source_date": trading_date.isoformat(),
+                    "source_sha256": "a" * 64,
                     "is_fallback": False,
+                    "cache_metadata_status": "verified",
+                    "provider_definition_start": (
+                        f"{trading_date.isoformat()}T00:00:00+00:00"
+                    ),
+                    "provider_definition_end": (
+                        f"{trading_date.isoformat()}T12:00:00+00:00"
+                    ),
+                    "provider_statistics_start": (
+                        f"{trading_date.isoformat()}T00:00:00+00:00"
+                    ),
+                    "provider_statistics_end": (
+                        f"{trading_date.isoformat()}T11:00:00+00:00"
+                    ),
+                    **self._current_provenance_overrides,
                 },
             }
         return loaded
@@ -189,6 +206,36 @@ def test_prestart_stages_and_revalidates_missing_current_day_cache():
     assert result["current_day_cache_ready"] is True
     assert fake.stage_calls == 1
     assert fake.fallback_calls == 0
+
+
+def test_prestart_rebuilds_loaded_cache_when_sidecar_proof_is_unverified():
+    fake = _FakeStreamer(
+        current_loads=[True, True],
+        current_provenance_overrides={"cache_metadata_status": "missing_or_invalid"},
+    )
+
+    def stage_verified_cache(*, trading_date):
+        fake.stage_calls += 1
+        fake._current_provenance_overrides = {}
+        return {
+            "mode": "databento_discovery_staged",
+            "trading_date": trading_date.isoformat(),
+            "is_fallback": False,
+        }
+
+    fake.stage_current_day_universe_cache = stage_verified_cache
+
+    result = prepare_current_day_universe_cache(
+        symbols=["SPX", "NDX"],
+        trading_date=date(2026, 8, 26),
+        streamer_factory=_factory(fake),
+    )
+
+    assert result["status"] == "staged"
+    assert result["provenance_label"] == CURRENT_DAY_LABEL
+    assert result["current_day_cache_ready"] is True
+    assert result["provenance"]["cache_metadata_status"] == "verified"
+    assert fake.stage_calls == 1
 
 
 def test_prestart_revalidates_staged_cache_when_refresh_flag_is_set(monkeypatch):
@@ -325,4 +372,34 @@ def test_cache_only_fails_closed_without_cache_and_never_discovers_provider():
 
     assert fake.stage_calls == 0
     assert fake.prior_stage_calls == 0
+    assert fake.fallback_calls == 1
+
+
+@pytest.mark.parametrize(
+    "provenance_overrides",
+    [
+        {"cache_metadata_status": "missing_or_invalid"},
+        {"source_sha256": "not-a-sha256"},
+        {"provider_definition_start": None},
+        {"provider_statistics_end": "2026-08-27T01:00:00+00:00"},
+    ],
+)
+def test_cache_only_never_authorizes_unverified_current_day_proof(
+    provenance_overrides,
+):
+    fake = _FakeStreamer(
+        current_loads=[True],
+        fallback=False,
+        current_provenance_overrides=provenance_overrides,
+    )
+
+    with pytest.raises(RuntimeError, match="provider discovery is disabled"):
+        prepare_current_day_universe_cache(
+            symbols=["SPX", "NDX"],
+            trading_date=date(2026, 8, 26),
+            cache_only=True,
+            streamer_factory=_factory(fake),
+        )
+
+    assert fake.stage_calls == 0
     assert fake.fallback_calls == 1

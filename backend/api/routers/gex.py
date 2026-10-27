@@ -17,6 +17,7 @@ from backend.api.schemas import MarketDataResponse, WorkstationStateV1
 from backend.config import LIVE_DATA_STALE_AFTER_SECONDS
 from backend.database import save_prediction_snapshot  # legacy monkeypatch compatibility
 from backend.streamer import get_streamer
+from backend.structural_regime_live import FIELD as STRUCTURAL_FIELD, abstention
 from backend.workstation import (
     PREDICTIVE_PIN_PAYLOAD_FIELDS,
     build_workstation_state,
@@ -29,6 +30,23 @@ from backend.workstation import (
 router = APIRouter(tags=["market-data"])
 
 _PREDICTIVE_NUMERIC_FIELDS = PREDICTIVE_PIN_PAYLOAD_FIELDS
+
+
+def _structural_for_symbol(streamer: object, symbol: str) -> dict:
+    state = runtime_bound_workstation_state(
+        streamer, workstation_state_store.get(symbol), symbol=symbol,
+    )
+    prediction = state.get("prediction") or {}
+    return prediction.get(STRUCTURAL_FIELD) or abstention(
+        "LIFECYCLE_PREDICTION_UNAVAILABLE",
+        *((state.get("health") or {}).get("validation_failure_reasons") or []),
+    )
+
+
+@router.get("/structural-regime/{symbol}", summary="Read research-only structural close estimate")
+@bounded_runtime_endpoint
+def get_structural_regime(symbol: str):
+    return _structural_for_symbol(get_streamer(), normalize_symbol(symbol))
 
 
 def _unpublished_gex_payload(streamer: object, symbol: str) -> tuple[dict | None, dict]:

@@ -229,6 +229,9 @@ def test_concurrent_callers_still_coalesce_one_in_flight_read():
     "/orb?symbols=SPX", "/v1/orb/SPX",
 ])
 def test_lock_bound_gex_and_prediction_routes_do_not_block_unrelated_requests(read_service, monkeypatch, path):
+    # Exercise the real timeout path without spending the production ORB
+    # collection budget waiting for this deliberately unreleased test lock.
+    monkeypatch.setattr(orb._orb_reads, "_timeout_seconds", 0.15)
     release = threading.Event()
     entered = threading.Event()
 
@@ -262,6 +265,58 @@ def test_lock_bound_gex_and_prediction_routes_do_not_block_unrelated_requests(re
         asyncio.run(run())
     finally:
         release.set()
+
+
+def test_four_symbol_orb_budget_allows_slow_progress_without_duplicate_work(monkeypatch):
+    calls = []
+    entered = threading.Event()
+
+    class Streamer:
+        symbols = ["SPX", "NDX", "VIX", "RUT"]
+
+        @staticmethod
+        def get_subscription_context():
+            return {"subscription_epoch_id": "a" * 64,
+                    "subscription_generation": 7, "handoff_status": "active"}
+
+    class Journal:
+        @staticmethod
+        def snapshot(symbol, **kwargs):
+            calls.append((symbol, kwargs["as_of_utc"]))
+            entered.set()
+            # Each symbol is inside the former one-second budget, but the
+            # complete serial collection exceeds it (the observed failure).
+            time.sleep(0.30)
+            return {"symbol": symbol, "capture_status": "partial",
+                    "directional_evidence_eligible": False}
+
+    monkeypatch.setattr(orb, "get_streamer", lambda: Streamer())
+    monkeypatch.setattr(orb, "get_market_structure_journal", lambda: Journal())
+    application = FastAPI()
+    application.include_router(orb.router)
+
+    @application.get("/responsive")
+    async def responsive():
+        return {"ok": True}
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://offline"
+        ) as client:
+            first = asyncio.create_task(client.get("/v1/orb"))
+            await _until_set(entered)
+            second = asyncio.create_task(client.get("/v1/orb"))
+            assert (await asyncio.wait_for(client.get("/responsive"), 0.15)).status_code == 200
+            responses = await asyncio.gather(first, second)
+        assert all(response.status_code == 200 for response in responses)
+        assert responses[0].json() == responses[1].json()
+        assert responses[0].json()["runtime_context_stable"] is True
+        assert all(not item["directional_evidence_eligible"]
+                   for item in responses[0].json()["symbols"].values())
+        assert [symbol for symbol, _ in calls] == Streamer.symbols
+        assert len({stamp for _, stamp in calls}) == 1
+
+    asyncio.run(run())
 
 
 def test_healthy_symbol_health_and_sse_burst_waits_for_bounded_capacity(read_service, monkeypatch):
@@ -596,4 +651,29 @@ def test_idle_workstation_polling_preserves_heartbeat_cadence_and_event_cursor(r
         finally:
             await iterator.aclose()
 
+    asyncio.run(run())
+
+def test_clock_diagnostics_survive_rest_and_sse_projection(read_service, monkeypatch):
+    from backend.api.routers import health
+    from app.services.live_panel_view import _clock_status_message
+    telemetry = {'status': 'unknown', 'reason': 'INSUFFICIENT_LIVE_TIMING_SAMPLES',
+                 'sample_count': 49, 'minimum_samples': 50}
+    monkeypatch.setattr(health, '_read_live_health_sample', lambda: {
+        'health': {'processing_clock_telemetry': telemetry}, 'pipeline': {},
+        'quant_inference_device': 'cpu', 'runtime_controls': {},
+        'sampled_at_utc': '2026-09-29T13:30:00+00:00',
+    })
+    async def run():
+        result = await health.health_live_status()
+        assert result['processing_clock_telemetry'] == telemetry
+        response = await health.events_live()
+        stream = response.body_iterator
+        try:
+            event = await anext(stream)
+            payload = json.loads(event.split('data: ', 1)[1].strip())
+            diagnostic = payload['health']['processing_clock_telemetry']
+            assert diagnostic == telemetry
+            assert _clock_status_message(diagnostic)[0] == 'info'
+        finally:
+            await stream.aclose()
     asyncio.run(run())

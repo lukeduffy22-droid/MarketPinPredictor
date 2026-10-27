@@ -39,7 +39,11 @@ def _governance_access(
     request: Request,
     supplied_token: str | None = Depends(_ACCESS_HEADER),
 ) -> None:
-    expected = str(os.getenv("MARKETPIN_GOVERNANCE_ACCESS_TOKEN") or "").strip()
+    from backend.governance_credentials import governance_token
+    try:
+        expected = governance_token()
+    except ValueError:
+        raise HTTPException(status_code=503, detail="Prediction-governance access configuration is invalid")
     if len(expected) < 16:
         raise HTTPException(
             status_code=503,

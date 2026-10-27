@@ -90,6 +90,29 @@ Describe 'Opening acceptance launch preflight' {
         $guardedAutomaticStops.Count | Should Be $automaticStops.Count
     }
 
+    It 'uses a bounded longer readiness budget only for backend startup' {
+        $startBody = [regex]::Match(
+            $EnsureSource,
+            '(?s)function Start-VerifiedComponent \{.*?(?=\r?\nfunction Invoke-OpeningAcceptancePreflight)'
+        ).Value
+        $startBody | Should Match '\[ValidateRange\(1, 300\)\]\[int\]\$StartupTimeoutSeconds = 90'
+        $startBody | Should Match '-TimeoutSeconds \$StartupTimeoutSeconds'
+
+        $backendCall = [regex]::Match(
+            $EnsureSource,
+            '(?s)\$backendLaunchResult = Start-VerifiedComponent.*?(?=\r?\n\s*if \(\$backendRecoveryCompletionPending\))'
+        ).Value
+        $dashboardCall = [regex]::Match(
+            $EnsureSource,
+            '(?s)\$dashboardLaunchResult = Start-VerifiedComponent.*?(?=\r?\n\s*if \(\$dashboardRecoveryCompletionPending\))'
+        ).Value
+        $backendCall | Should Match '-StartupTimeoutSeconds 180'
+        $backendCall | Should Match '-RequireStrongListenerIdentity'
+        $dashboardCall | Should Match '-StartupTimeoutSeconds 90'
+        $dashboardCall | Should Not Match '-RequireStrongListenerIdentity'
+        $dashboardCall | Should Not Match '-StartupTimeoutSeconds 180'
+    }
+
     It 'clears verified orphan backends before provider preparation and rechecks before launch' {
         $preparationAssignment = $EnsureSource.IndexOf(
             '$universePreparation = $preparedBackendUniverse'
@@ -171,7 +194,10 @@ Describe 'Opening acceptance launch preflight' {
         $ClosingTapeConfigSource | Should Not Match '\.mkdir\(|os\.makedirs'
         $StartClosingTapeSource | Should Match '--require-primary-ready'
         $ClosingTapeGateSource | Should Match 'PRIMARY_CAPTURE_FAMILIES = \("SPX", "NDX", "VIX", "RUT"\)'
-        $ClosingTapeGateSource | Should Match 'PRIMARY_ORB_\{window_name\.upper\(\)\}_INCOMPLETE:\{symbol\}'
+        # Capture is independent of analysis eligibility; preserve the Sep 29
+        # repair without removing the explicit processing-clock transport gate.
+        $ClosingTapeGateSource | Should Not Match 'PRIMARY_ORB_\{window_name\.upper\(\)\}_INCOMPLETE:\{symbol\}'
+        $ClosingTapeGateSource | Should Match 'PRIMARY_PROCESSING_CLOCK_NOT_SYNCHRONIZED'
     }
 
     It 'propagates the guarded child launcher exit code to Task Scheduler' {

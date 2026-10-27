@@ -16,11 +16,11 @@ $BackendEntrypoint = [System.IO.Path]::GetFullPath((Join-Path $AppDir 'server.py
 $DashboardEntrypoint = [System.IO.Path]::GetFullPath((Join-Path $AppDir 'app.py'))
 $OpeningAcceptancePreflightScript = Join-Path $AppDir 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 67
-$OpeningAcceptancePreflightRequiredModuleCount = 50
+$OpeningAcceptancePreflightRequiredFileCount = 74
+$OpeningAcceptancePreflightRequiredModuleCount = 56
 # Keep the manual full-stack launcher aligned with the scheduled recovery's
 # bounded live-I/O headroom.
-$OpeningAcceptancePreflightTimeoutSeconds = 150
+$OpeningAcceptancePreflightTimeoutSeconds = 300
 $InvocationId = [guid]::NewGuid().ToString('N')
 $script:OpeningAcceptancePreflightResult = $null
 Import-Module -Name $SupervisorModule -Force -ErrorAction Stop
@@ -566,6 +566,10 @@ if (-not $UseRemoteDatabase) {
     $env:DATABASE_URL = "sqlite:///$sqlitePath"
 }
 $env:MARKET_DATA_PROVIDER = "databento"
+if (-not (Test-Path Env:MARKETPIN_HOST_CLOCK_SHADOW_ENABLED)) {
+    # Independent read-only clock observations; no opening-admission authority.
+    $env:MARKETPIN_HOST_CLOCK_SHADOW_ENABLED = '1'
+}
 # Protect opening SPX/NDX capacity. ETF families remain supported canaries but
 # are not part of the launch-critical subscription.
 $env:DATABENTO_SYMBOLS = if ($EnableRutCanary) { "SPX,NDX,VIX,RUT" } else { "SPX,NDX,VIX" }
@@ -600,7 +604,7 @@ function Stop-MarketPinProcesses {
     # future caller cannot bypass the source/schema proof accidentally.
     Assert-OpeningAcceptanceMutationPreflight | Out-Null
 
-    $processes = Get-CimInstance Win32_Process | Where-Object {
+    $directProcesses = @(Get-CimInstance Win32_Process | Where-Object {
         (Test-MarketAppDirectComponentProcessRecord `
             -ProcessRecord $_ `
             -ProjectRoot $Root `
@@ -609,11 +613,54 @@ function Stop-MarketPinProcesses {
             -ProcessRecord $_ `
             -ProjectRoot $Root `
             -Component 'dashboard')
+    })
+
+    # A venv executable can be a launcher whose child owns the socket. Stop
+    # verified listeners before their parents so ancestry remains available
+    # for ownership checks and a surviving child cannot strand an occupied port.
+    $processes = @()
+    $plannedIds = @{}
+    foreach ($port in @(8000, 8501)) {
+        foreach ($listenerId in @(Get-MarketAppListenerProcessIds -Port $port)) {
+            if (-not (Test-MarketAppVerifiedProcess `
+                -ProcessId $listenerId -ProjectRoot $Root `
+                -RequiredCommandMarkers @('backend.app:app', 'server.py', 'streamlit', 'app.py'))) {
+                throw "Refusing to stop PID $listenerId because it is not a verified MarketPinPredictor process."
+            }
+            $listenerRecord = Get-CimInstance Win32_Process -Filter "ProcessId=$listenerId" -ErrorAction Stop
+            if (-not $listenerRecord) {
+                throw "Verified listener PID $listenerId disappeared while planning startup. Retry after rechecking ownership."
+            }
+            if (-not $plannedIds.ContainsKey([int]$listenerId)) {
+                $processes += $listenerRecord
+                $plannedIds[[int]$listenerId] = $true
+            }
+        }
+    }
+    foreach ($directProcess in $directProcesses) {
+        if (-not $plannedIds.ContainsKey([int]$directProcess.ProcessId)) {
+            $processes += $directProcess
+            $plannedIds[[int]$directProcess.ProcessId] = $true
+        }
+    }
+    $plannedIdentities = @{}
+    foreach ($proc in $processes) {
+        $createdAt = [datetime]$proc.CreationDate
+        if ($createdAt -eq [datetime]::MinValue -or [int]$proc.ProcessId -le 0) {
+            throw "Refusing to stop PID $($proc.ProcessId) without a creation-time identity."
+        }
+        $identityToken = "$($proc.ProcessId)|$($createdAt.ToUniversalTime().Ticks)"
+        $plannedIdentities[[int]$proc.ProcessId] = $identityToken
     }
 
     if ($processes) {
         $pids = @()
         foreach ($proc in $processes) {
+            $currentIdentity = Get-MarketAppProcessIdentityTokenById -ProcessId $proc.ProcessId
+            if (-not $currentIdentity) { continue }
+            if ($currentIdentity -cne $plannedIdentities[[int]$proc.ProcessId]) {
+                throw "Refusing to stop PID $($proc.ProcessId) because its creation-time identity changed."
+            }
             if (-not (Test-MarketAppVerifiedProcess `
                 -ProcessId $proc.ProcessId `
                 -ProjectRoot $Root `
@@ -666,7 +713,7 @@ function Wait-ForHttpEndpoint {
         [ValidateSet('BackendHealth', 'StreamlitHealth')]
         [string]$ExpectedEndpointContract,
 
-        [int]$TimeoutSeconds = 90
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 90
     )
 
     $listenerPid = Wait-MarketAppOwnedEndpoint `
@@ -741,6 +788,10 @@ if (-not (Test-Path -LiteralPath $StreamlitExe -PathType Leaf)) {
 }
 
 Write-Host "  Project dir : $AppDir"
+& $PythonExe (Join-Path $AppDir 'tools\configure_diagnostic_access.py') --ensure
+if ($LASTEXITCODE -ne 0) {
+    throw 'Private diagnostic passport access configuration failed; startup aborted before process changes.'
+}
 Write-Host "  Python      : $PythonExe"
 Write-Host ""
 
@@ -799,6 +850,7 @@ Write-StartupSupervisorLog `
 
 $backendProcess = Start-Process `
     -FilePath $PythonExe `
+    -WindowStyle Hidden `
     -ArgumentList @(
         ('"' + $BackendEntrypoint + '"')
     ) `
@@ -824,7 +876,7 @@ $dashboardProcess = Start-Process -FilePath $StreamlitExe -ArgumentList @(
     # which can crash Python dataclass decoration mid-import.
     "--server.fileWatcherType",
     "none"
-) -WorkingDirectory $AppDir `
+) -WorkingDirectory $AppDir -WindowStyle Hidden `
     -RedirectStandardOutput $dashboardLogPaths.StandardOutputPath `
     -RedirectStandardError $dashboardLogPaths.StandardErrorPath `
     -PassThru
@@ -840,7 +892,7 @@ if (-not (Wait-ForHttpEndpoint `
     -Port 8000 `
     -LaunchProcessId $backendProcess.Id `
     -ExpectedEndpointContract 'BackendHealth' `
-    -TimeoutSeconds 90)) {
+    -TimeoutSeconds 180)) {
     Write-Host "Backend failed to start. Cleaning up processes." -ForegroundColor Red
     Stop-StartupProcesses -BackendProcess $backendProcess -DashboardProcess $dashboardProcess
     throw 'Backend launch ownership/readiness verification failed.'
@@ -894,11 +946,17 @@ Write-StartupSupervisorLog `
 
 if ($env:MARKETPIN_FORECAST_RESEARCH_AUTOSTART -ne '0') {
     try {
-        & (Join-Path $AppDir 'tools\start_forecast_research.ps1')
+        $researchResult = & (Join-Path $AppDir 'tools\start_forecast_research.ps1')
+        Write-StartupSupervisorLog -Event 'research_supervision' -Message "component=research status=$($researchResult.Status) code=$($researchResult.Code)"
     }
     catch {
         Write-Warning "Independent forecast research did not start: $($_.Exception.GetType().Name). Core capture remains running."
     }
+}
+
+& $PythonExe (Join-Path $AppDir 'tools\configure_diagnostic_access.py') --check-live
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning 'Diagnostic passport API access is not verified. Inspect the safe readiness result before requesting forecast explanations.'
 }
 
 if (-not $NoBrowser) {

@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -125,6 +126,7 @@ CURRENT_DAY_LABEL = "CURRENT_DAY_CACHE"
 PRIOR_SESSION_FALLBACK_LABEL = "PRIOR_SESSION_FALLBACK"
 PROVIDER_ALLOWED_MODE = "provider_allowed"
 CACHE_ONLY_MODE = "cache_only"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _safe_nonnegative_int(value: object) -> int:
@@ -236,6 +238,58 @@ def _safe_error_message(error: Exception, api_key: str | None) -> str:
     return f"{error.__class__.__name__}: {message}"
 
 
+def _verified_current_day_provenance(
+    provenance: Mapping[str, object], *, trading_date: date
+) -> bool:
+    """Authorize only hash-bound provider evidence for the exact UTC day."""
+
+    try:
+        definition_start = datetime.fromisoformat(
+            str(provenance.get("provider_definition_start") or "").replace(
+                "Z", "+00:00"
+            )
+        )
+        definition_end = datetime.fromisoformat(
+            str(provenance.get("provider_definition_end") or "").replace(
+                "Z", "+00:00"
+            )
+        )
+        statistics_start = datetime.fromisoformat(
+            str(provenance.get("provider_statistics_start") or "").replace(
+                "Z", "+00:00"
+            )
+        )
+        statistics_end = datetime.fromisoformat(
+            str(provenance.get("provider_statistics_end") or "").replace(
+                "Z", "+00:00"
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+
+    source_start = datetime.combine(
+        trading_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    source_stop = source_start + timedelta(days=1)
+    source_sha256 = str(provenance.get("source_sha256") or "")
+    return bool(
+        provenance.get("mode") == "current_day_cache"
+        and provenance.get("is_fallback") is False
+        and provenance.get("cache_metadata_status") == "verified"
+        and provenance.get("trading_date") == trading_date.isoformat()
+        and provenance.get("source_date") == trading_date.isoformat()
+        and _SHA256_PATTERN.fullmatch(source_sha256)
+        and definition_start.tzinfo is not None
+        and definition_end.tzinfo is not None
+        and statistics_start.tzinfo is not None
+        and statistics_end.tzinfo is not None
+        and definition_start.astimezone(timezone.utc) == source_start
+        and statistics_start.astimezone(timezone.utc) == source_start
+        and source_start < definition_end.astimezone(timezone.utc) <= source_stop
+        and source_start < statistics_end.astimezone(timezone.utc) <= source_stop
+    )
+
+
 def prepare_current_day_universe_cache(
     *,
     symbols: list[str],
@@ -253,23 +307,25 @@ def prepare_current_day_universe_cache(
     preparation_mode = CACHE_ONLY_MODE if cache_only else PROVIDER_ALLOWED_MODE
     streamer = streamer_factory(symbols)
 
-    if streamer._load_cached_universe(
+    current_cache_loaded = streamer._load_cached_universe(
         target_date,
         ignore_refresh_flag=cache_only,
-    ):
+    )
+    if current_cache_loaded:
         provenance = dict(streamer.subscription_metadata.get("universe_provenance") or {})
-        return {
-            "status": "ready",
-            "preparation_mode": preparation_mode,
-            "provenance_label": CURRENT_DAY_LABEL,
-            "current_day_cache_ready": True,
-            "selected_contract_count": len(streamer.live_symbols),
-            "selected_universe_sha256": streamer.subscription_metadata.get(
-                "selected_universe_sha256"
-            ),
-            "provenance": provenance,
-            **_market_evidence_fields(streamer, symbols),
-        }
+        if _verified_current_day_provenance(provenance, trading_date=target_date):
+            return {
+                "status": "ready",
+                "preparation_mode": preparation_mode,
+                "provenance_label": CURRENT_DAY_LABEL,
+                "current_day_cache_ready": True,
+                "selected_contract_count": len(streamer.live_symbols),
+                "selected_universe_sha256": streamer.subscription_metadata.get(
+                    "selected_universe_sha256"
+                ),
+                "provenance": provenance,
+                **_market_evidence_fields(streamer, symbols),
+            }
 
     if cache_only:
         # Keep this branch above every provider-backed staging call.  The
@@ -316,6 +372,12 @@ def prepare_current_day_universe_cache(
                 f"staged cache for {target_date} did not pass current-day load validation"
             )
         provenance = dict(streamer.subscription_metadata.get("universe_provenance") or {})
+        if not _verified_current_day_provenance(
+            provenance, trading_date=target_date
+        ):
+            raise RuntimeError(
+                f"staged cache for {target_date} lacks verified hash-bound provider cutoff metadata"
+            )
         return {
             "status": "staged",
             "preparation_mode": PROVIDER_ALLOWED_MODE,

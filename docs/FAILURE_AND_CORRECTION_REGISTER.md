@@ -14,6 +14,14 @@ Scope: same-day predictions first, then movement up to one week. Research-only o
 
 Mandatory reference for future premarket reviews: [Premarket and opening evidence checklist](PREMARKET_EVIDENCE_CHECKLIST.md).
 
+## September 30 pre-session update
+
+- **MP-2026-09-29-OPEN — OPEN, installed for next startup:** The complete versioned CBBO timing, early clock-evidence collection, immutable storage and automatic opening-readback release is now installed in the canonical checkout. A fingerprint-bound additive database bootstrap passed. All 148,847 legacy samples and 148,847 decisions have identical before/after row hashes and unchanged legacy trigger definitions. Offline checks passed: 618 Python and 29 PowerShell cases. Loaded runtime and exact September 30 opening capture remain NOT YET VERIFIED; source/tests/schema do not close the incident.
+- **MP-2026-09-29-TAPE — OPEN:** Retained raw-tape status shows a remote connection reset at 11:58 AM CT and an incomplete session. The previous relative-database launch defect remains corrected; repeated provider/network failures and exhaustion of bounded recovery remain unresolved live risks.
+- **MP-2026-09-29-CLOSE-COVERAGE — OPEN:** Final retained SPX/NDX audits still fail pair count or pair coverage. Do not infer valid snapshots from rejected-audit persistence or lower eligibility thresholds.
+
+Deployment evidence, backup/rollback location, preserved failures, schedule verification and September 30 live follow-up: [September 30 readiness report](../output/next_session_readiness_20260930T0536Z/REPORT.md). Earlier entries above retain their historical status; this update distinguishes current preparation from live acceptance.
+
 Validation-method preservation and broader legacy audit: [2026-09-14 findings and acceptance gates](VALIDATION_METHODS_AND_LEGACY_AUDIT.md). Labels and separated exports are source-tested (205 tests); runtime activation remains OPEN. VIX gate suitability, ETF evaluation leakage, and conditional model-identity risks remain OPEN; no model or threshold tuning was performed.
 
 ## Record template
@@ -29,3 +37,10 @@ Validation-method preservation and broader legacy audit: [2026-09-14 findings an
 - Deployment: loaded runtime identity and UI/backend postconditions; or NOT VERIFIED.
 - Recurrence prevention: checklist item and regression test.
 - Closure: only after the specific acceptance criteria pass. Keep history when reopening; do not replace original observations.
+
+
+## October 27 pre-open repair following October 26
+
+Installed and loaded in the canonical October checkout: active-subscription canary coverage, first-bucket retry cadence, and listener-before-wrapper manual restart with creation-time checks. Validation: 375 Python and 211 PowerShell cases passed; all 74 startup source hashes match; SQLite WAL/quick_check and CUDA passed; authenticated diagnostics are responding. Automatic October 27 pre-stage/launch tasks remain enabled.
+
+OPEN until live acceptance: exact opening bucket, fresh quote/pair coverage, genuine feed pressure, trained-model availability and lifecycle gates, and optional EQUS entitlement. Historical invalid/missing records remain unchanged. See [October 26 incident and October 27 preparation](incidents/2026-10-26-opening-repair.md).

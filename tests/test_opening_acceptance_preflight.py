@@ -59,6 +59,7 @@ RELEASE_CRITICAL_SOURCE_PATHS = {
     "backend/closing_tape/catalog.py",
     "backend/closing_tape/config.py",
     "backend/closing_tape/live_recorder.py",
+    "backend/closing_tape/recovery.py",
     "backend/closing_tape/start_gate.py",
     "start_closing_tape.ps1",
     "tools/prepare_databento_universe_cache.py",
@@ -114,6 +115,23 @@ def _create_contract_database(path: Path) -> None:
                 f'CREATE UNIQUE INDEX "{index}" '
                 'ON "orb_reference_sample_decisions" ("sample_id")'
             )
+        # New interval evidence is additive; a complete launch schema includes both stores.
+        for old, new, columns, triggers, indexes in (
+            ("orb_reference_samples", "orb_cbbo_reference_samples",
+             preflight_module.REQUIRED_ORB_CBBO_REFERENCE_COLUMNS,
+             preflight_module.REQUIRED_ORB_CBBO_REFERENCE_TRIGGERS,
+             preflight_module.REQUIRED_ORB_CBBO_REFERENCE_INDEXES),
+            ("orb_reference_sample_decisions", "orb_cbbo_reference_sample_decisions",
+             REQUIRED_ORB_REFERENCE_DECISION_COLUMNS,
+             preflight_module.REQUIRED_ORB_CBBO_REFERENCE_DECISION_TRIGGERS,
+             preflight_module.REQUIRED_ORB_CBBO_REFERENCE_DECISION_INDEXES),
+        ):
+            column_sql = ", ".join(f'"{column}" TEXT' for column in sorted(columns))
+            connection.execute(f'CREATE TABLE "{new}" ({column_sql})')
+            for trigger in triggers:
+                connection.execute(f'CREATE TRIGGER "{trigger}" BEFORE INSERT ON "{new}" WHEN 0 BEGIN SELECT 1; END')
+            for index in indexes:
+                connection.execute(f'CREATE UNIQUE INDEX "{index}" ON "{new}" ("sample_id")')
         connection.commit()
     finally:
         connection.close()
@@ -182,6 +200,8 @@ def test_database_contract_quick_checks_only_required_opening_tables(
         'PRAGMA quick_check("market_structure_observations")',
         'PRAGMA quick_check("orb_reference_samples")',
         'PRAGMA quick_check("orb_reference_sample_decisions")',
+        'PRAGMA quick_check("orb_cbbo_reference_samples")',
+        'PRAGMA quick_check("orb_cbbo_reference_sample_decisions")',
     }
 
 

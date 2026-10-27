@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import sqlite3
 
-from app.services.diagnostic_agent import build_packet, diagnose
+from app.services.diagnostic_agent import build_packet, diagnose, encode_diagnostic_input, MAX_DIAGNOSTIC_INPUT_BYTES
 from app.services.diagnostic_history import CT, save_review
 from app.services.advisor_workflow import inspect_capabilities
 from backend.forecast_calendar import session_bounds
@@ -23,7 +23,6 @@ QUESTION = ('Review this completed capture session against the failure register.
             'do not claim deployment, incident closure, continuous capture or improved prediction accuracy '
             'without the specific evidence. Give bounded next-session acceptance checks.')
 MAX_ATTEMPTS = 2
-MAX_PACKET_BYTES = 64_000
 
 
 def due_session(now):
@@ -76,17 +75,9 @@ def _write_once(path, content):
 
 def collect_packet(day, root):
     """Bounded runtime poll plus retained files; failures stay explicit."""
-    import requests
-    context = {'timestamp_utc': datetime.now(timezone.utc).isoformat(),
-               'requested_symbols': ['SPX', 'NDX', 'RUT', 'VIX'], 'pipeline': {}}
-    try:
-        response = requests.get('http://127.0.0.1:8000/health/live', timeout=3)
-        response.raise_for_status()
-        context['pipeline'] = response.json()
-    except (requests.RequestException, ValueError):
-        context['timestamp_utc'] = None
+    from app.services.diagnostic_runtime import collect_live_packet
     capabilities = inspect_capabilities(root)
-    packet = build_packet(context, capabilities, root, day)
+    packet = collect_live_packet(['SPX', 'NDX', 'RUT', 'VIX'], capabilities, root, day)
     packet['evidence']['automation'] = {
         'policy': 'post-close-v1', 'pid': os.getpid(), 'research_only': True,
         'meaning': 'Backend evidence capture only; no code changes or incident closure.',
@@ -142,7 +133,8 @@ def run_once(root=ROOT, *, now=None, packet_factory=collect_packet,
         if hashlib.sha256(raw).hexdigest() != job['packet_sha256']:
             raise ValueError('Stored evidence hash mismatch')
         available = bool(os.getenv('OPENAI_API_KEY')) if api_available is None else api_available
-        if len(raw) > MAX_PACKET_BYTES:
+        if (len(raw) > MAX_DIAGNOSTIC_INPUT_BYTES or
+                len(encode_diagnostic_input(QUESTION, json.loads(raw)).encode()) > MAX_DIAGNOSTIC_INPUT_BYTES):
             connection.execute("UPDATE jobs SET status='INPUT_LIMIT', updated_at_utc=? WHERE session_date=?", (stamp, day))
             connection.commit()
             return {'session_date': day, 'status': 'INPUT_LIMIT'}
@@ -160,7 +152,8 @@ def run_once(root=ROOT, *, now=None, packet_factory=collect_packet,
                            (attempt, stamp, day))
         connection.commit()
         try:
-            result = reviewer(QUESTION, json.loads(raw))
+            result = (reviewer(QUESTION, json.loads(raw), root=root) if reviewer is diagnose
+                      else reviewer(QUESTION, json.loads(raw)))
             if result.get('packet') != json.loads(raw) or result.get('execution_status') != 'PROPOSED_ONLY':
                 raise ValueError('Review does not bind the retained evidence')
             path = save_review(result, root)
@@ -172,8 +165,8 @@ def run_once(root=ROOT, *, now=None, packet_factory=collect_packet,
             with connection:
                 connection.execute('UPDATE jobs SET status=?, next_attempt_utc=?, error_kind=?, updated_at_utc=? WHERE session_date=?',
                     (status, (now + timedelta(minutes=15)).isoformat() if retry else None,
-                     type(exc).__name__, stamp, day))
-            return {'session_date': day, 'status': status, 'error_kind': type(exc).__name__}
+                     getattr(exc, 'category', type(exc).__name__), stamp, day))
+            return {'session_date': day, 'status': status, 'error_kind': getattr(exc, 'category', type(exc).__name__)}
         with connection:
             connection.execute("UPDATE jobs SET status='COMPLETE',review_path=?,error_kind=NULL,updated_at_utc=? WHERE session_date=?",
                                (str(path), stamp, day))

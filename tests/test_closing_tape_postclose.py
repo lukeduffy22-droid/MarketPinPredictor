@@ -1,12 +1,19 @@
 import json
 import os
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
+from backend.closing_tape.catalog import TapeCatalog
 from backend.closing_tape.contracts import (
     HISTORICAL_EVIDENCE_CONTRACT_VERSION,
     HISTORICAL_SOURCE_KIND,
 )
-from backend.closing_tape.postclose import postclose_finalize_decision
+from backend.closing_tape.postclose import (
+    finalize_closed_session_if_due,
+    postclose_finalize_decision,
+)
 from backend.closing_tape.replay import REPLAY_DECODER_VERSION
 from tests.test_closing_tape_readiness import _complete_catalog
 
@@ -136,6 +143,133 @@ def test_postclose_finalizer_noops_for_matching_passing_audit(tmp_path):
 
     assert decision["action"] == "already_finalized"
     assert decision["session_id"] == config.session_id
+
+
+def test_postclose_already_finalized_retries_immutable_checkpoint(
+    tmp_path, monkeypatch
+):
+    config, _catalog = _complete_catalog(tmp_path)
+    checkpointed = []
+
+    def _checkpoint(catalog):
+        checkpointed.append(catalog.path.resolve())
+        return (0, 0, 0)
+
+    monkeypatch.setattr(TapeCatalog, "checkpoint_wal_for_immutable_read", _checkpoint)
+
+    result = finalize_closed_session_if_due(
+        tmp_path,
+        trading_day=date(2026, 8, 25),
+        now=datetime(2026, 8, 25, 20, 25, tzinfo=UTC),
+    )
+
+    assert result["action"] == "already_finalized"
+    assert result["session_id"] == config.session_id
+    assert checkpointed == [config.catalog_path.resolve()]
+
+
+def test_postclose_already_finalized_fails_closed_when_checkpoint_is_busy(
+    tmp_path, monkeypatch
+):
+    _config, _catalog = _complete_catalog(tmp_path)
+
+    def _busy(_catalog):
+        raise RuntimeError("closing-tape WAL checkpoint was busy")
+
+    monkeypatch.setattr(TapeCatalog, "checkpoint_wal_for_immutable_read", _busy)
+
+    with pytest.raises(RuntimeError, match="checkpoint was busy"):
+        finalize_closed_session_if_due(
+            tmp_path,
+            trading_day=date(2026, 8, 25),
+            now=datetime(2026, 8, 25, 20, 25, tzinfo=UTC),
+        )
+
+
+def test_postclose_unchanged_incomplete_retries_immutable_checkpoint(
+    tmp_path, monkeypatch
+):
+    config, _catalog, _source = _incomplete_audit_catalog(tmp_path)
+    checkpointed = []
+
+    def _checkpoint(catalog):
+        checkpointed.append(catalog.path.resolve())
+        return (0, 0, 0)
+
+    monkeypatch.setattr(TapeCatalog, "checkpoint_wal_for_immutable_read", _checkpoint)
+
+    result = finalize_closed_session_if_due(
+        tmp_path,
+        trading_day=date(2026, 8, 25),
+        now=datetime(2026, 8, 25, 20, 25, tzinfo=UTC),
+    )
+
+    assert result["action"] == "incomplete"
+    assert result["session_id"] == config.session_id
+    assert result["deduplicated"] is True
+    assert checkpointed == [config.catalog_path.resolve()]
+
+
+def test_postclose_unchanged_incomplete_checkpoint_publishes_wal_to_base_file(
+    tmp_path,
+):
+    config, _catalog, _source = _incomplete_audit_catalog(tmp_path)
+    marker = "committed-in-wal"
+    writer = sqlite3.connect(config.catalog_path)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "UPDATE tape_sessions SET error=? WHERE session_id=?",
+            (marker, config.session_id),
+        )
+        writer.commit()
+
+        with sqlite3.connect(
+            f"file:{config.catalog_path.resolve()}?immutable=1", uri=True
+        ) as base_only:
+            before = base_only.execute(
+                "SELECT error FROM tape_sessions WHERE session_id=?",
+                (config.session_id,),
+            ).fetchone()
+        assert before is not None
+        assert before[0] != marker
+
+        result = finalize_closed_session_if_due(
+            tmp_path,
+            trading_day=date(2026, 8, 25),
+            now=datetime(2026, 8, 25, 20, 25, tzinfo=UTC),
+        )
+
+        assert result["action"] == "incomplete"
+        assert result["deduplicated"] is True
+        with sqlite3.connect(
+            f"file:{config.catalog_path.resolve()}?immutable=1", uri=True
+        ) as base_only:
+            after = base_only.execute(
+                "SELECT error FROM tape_sessions WHERE session_id=?",
+                (config.session_id,),
+            ).fetchone()
+        assert after == (marker,)
+    finally:
+        writer.close()
+
+
+def test_postclose_unchanged_incomplete_fails_closed_when_checkpoint_is_busy(
+    tmp_path, monkeypatch
+):
+    _config, _catalog, _source = _incomplete_audit_catalog(tmp_path)
+
+    def _busy(_catalog):
+        raise RuntimeError("closing-tape WAL checkpoint was busy")
+
+    monkeypatch.setattr(TapeCatalog, "checkpoint_wal_for_immutable_read", _busy)
+
+    with pytest.raises(RuntimeError, match="checkpoint was busy"):
+        finalize_closed_session_if_due(
+            tmp_path,
+            trading_day=date(2026, 8, 25),
+            now=datetime(2026, 8, 25, 20, 25, tzinfo=UTC),
+        )
 
 
 def test_postclose_finalizer_requests_upgrade_when_audit_is_missing(tmp_path):

@@ -10,48 +10,15 @@ from tests.test_databento_reader_publication_lock import _mapping, _quote, _stre
 import backend.databento_streamer as stream_module
 
 
-class _PauseAfterHealthPublicationSample:
-    """Schedule a publisher between health's first and second identity reads."""
-
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.depth = threading.local()
-        self.first_sample_released = threading.Event()
-        self.resume_health = threading.Event()
-        self.health_waiting_again = threading.Event()
-        self.paused_once = False
-
-    def __enter__(self):
-        is_health = threading.current_thread().name == "health-sample"
-        if is_health and self.paused_once:
-            self.health_waiting_again.set()
-        self.lock.acquire()
-        self.depth.value = getattr(self.depth, "value", 0) + 1
-        return self
-
-    def __exit__(self, *_args):
-        self.depth.value -= 1
-        self.lock.release()
-        if (
-            threading.current_thread().name == "health-sample"
-            and self.depth.value == 0
-            and not self.paused_once
-        ):
-            self.paused_once = True
-            self.first_sample_released.set()
-            assert self.resume_health.wait(3.0)
-
-
 def test_actual_health_sample_cannot_block_reader_behind_delayed_publication(monkeypatch):
     streamer = _streamer(monkeypatch)
-    publication_lock = _PauseAfterHealthPublicationSample()
-    streamer._prediction_publication_lock = publication_lock
     first_consumed = threading.Event()
     release_second = threading.Event()
     second_stored = threading.Event()
     captured = []
     errors = []
     health_results = []
+    health_completed = threading.Event()
     original_store = streamer._store_quote
 
     def record_store(symbol, payload):
@@ -93,6 +60,8 @@ def test_actual_health_sample_cannot_block_reader_behind_delayed_publication(mon
             health_results.append(streamer.get_health())
         except BaseException as exc:
             errors.append(exc)
+        finally:
+            health_completed.set()
 
     reader = threading.Thread(target=run_reader, name="quote-reader", daemon=True)
     health = threading.Thread(target=run_health, name="health-sample", daemon=True)
@@ -100,22 +69,19 @@ def test_actual_health_sample_cannot_block_reader_behind_delayed_publication(mon
     try:
         assert first_consumed.wait(3.0)
         assert streamer.handoff_status == "active"
-        health.start()
-        assert publication_lock.first_sample_released.wait(3.0)
         with streamer.prediction_publication_guard(
             subscription_epoch_id=streamer.subscription_epoch_id,
             subscription_generation=1,
         ) as allowed:
             assert allowed
-            publication_lock.resume_health.set()
-            assert publication_lock.health_waiting_again.wait(3.0)
+            health.start()
+            health_progressed = health_completed.wait(0.5)
             quote_lock_available = streamer._fresh_quote_lock.acquire(blocking=False)
             if quote_lock_available:
                 streamer._fresh_quote_lock.release()
             release_second.set()
             reader_progressed = second_stored.wait(0.3)
     finally:
-        publication_lock.resume_health.set()
         release_second.set()
         streamer.is_running = False
         reader.join(timeout=3.0)
@@ -125,6 +91,7 @@ def test_actual_health_sample_cannot_block_reader_behind_delayed_publication(mon
     assert not reader.is_alive() and not health.is_alive()
     assert not errors
     assert health_results
+    assert health_progressed, "health waited for publication persistence"
     assert quote_lock_available, "health held the quote lock while waiting for publication"
     assert reader_progressed, "health made delayed publication block the actual quote reader"
     assert [payload["generation"] for payload in captured] == [1, 1]

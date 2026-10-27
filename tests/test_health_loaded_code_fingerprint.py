@@ -42,6 +42,7 @@ OPENING_LAUNCHER_OWNERS = {
     "market_app_supervisor.psm1",
     "market_calendar.psm1",
     "start_market_day.ps1",
+    "tools/clock_recovery.psm1",
     "ensure_market_app.ps1",
     "start_databento_app.ps1",
     "start_closing_tape.ps1",
@@ -64,6 +65,7 @@ CLOSING_TAPE_STARTUP_DEPENDENCIES = {
     "backend/closing_tape/catalog.py",
     "backend/closing_tape/config.py",
     "backend/closing_tape/live_recorder.py",
+    "backend/closing_tape/recovery.py",
     "backend/closing_tape/start_gate.py",
 }
 OPENING_ACCEPTANCE_OWNER_DEPENDENCIES = {

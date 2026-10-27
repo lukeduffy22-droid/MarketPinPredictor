@@ -13,6 +13,12 @@ if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     throw "MarketPin Python environment was not found: $pythonPath"
 }
 
+# Match ensure_market_app.ps1 for direct launches too. The recorder loads .env;
+# a legacy relative DATABASE_URL there must not route closing analysis to a
+# different database from the running backend.
+$sqlitePath = (Join-Path $projectRoot 'data\market_data.db').Replace('\', '/')
+$env:DATABASE_URL = "sqlite:///$sqlitePath"
+
 $sessionDir = Join-Path $projectRoot "data\closing_tape\$TradingDate"
 $logDir = Join-Path $projectRoot 'logs\runtime'
 $pidPath = Join-Path $sessionDir 'recorder.pid'
@@ -67,9 +73,9 @@ if ($gateExitCode -eq 4) {
 }
 if ($gateExitCode -eq 3) {
     $gate = $gateJson | ConvertFrom-Json
-    if ([string]$gate.state -eq 'recovery_replay_blocked') {
+    if ([string]$gate.state -eq 'recovery_attempt_limit_reached') {
         [pscustomobject]@{
-            Status = 'recovery_replay_blocked'
+            Status = 'recovery_attempt_limit_reached'
             Pid = $null
             Reason = $gate.reason
             PriorNonemptyDbnCount = $gate.prior_nonempty_dbn_count
@@ -88,13 +94,16 @@ if ($gateExitCode -eq 3) {
 if ($gateExitCode -ne 0) {
     throw "Closing-tape start gate failed with exit code $gateExitCode."
 }
+$gate = $gateJson | ConvertFrom-Json
 
 if ($CheckOnly) {
-    $gate = $gateJson | ConvertFrom-Json
     [pscustomobject]@{
         Status = 'ready_to_start'
         Pid = $null
         Reason = $gate.reason
+        GateState = $gate.state
+        CaptureMode = $gate.capture_mode
+        AnalysisEligible = [bool]$gate.analysis_eligible
         StartNotBeforeUtc = ([DateTimeOffset]$gate.start_not_before_utc).ToUniversalTime().ToString('o')
         AnalysisDueUtc = ([DateTimeOffset]$gate.analysis_due_utc).ToUniversalTime().ToString('o')
     }
@@ -115,7 +124,7 @@ $arguments = @(
     '--project-root', $projectRoot,
     '--trading-date', $TradingDate
 )
-if ($NoAnalysis) { $arguments += '--no-analysis' }
+if ($NoAnalysis -or [string]$gate.capture_mode -eq 'capture_only') { $arguments += '--no-analysis' }
 if ($NoParquet) { $arguments += '--no-parquet' }
 
 $process = Start-Process `
@@ -139,10 +148,67 @@ if ($process.HasExited) {
     throw "Closing-tape recorder exited during startup (code $($process.ExitCode)).`n$errorTail"
 }
 
+$catalogPath = Join-Path $sessionDir 'closing_tape.sqlite'
+$statusPath = Join-Path $sessionDir 'status.json'
+$loadedSource = $null
+$loadedSourceVerification = 'NOT_YET_VERIFIED'
+try {
+    if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
+        $currentStatus = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+        $loadedSource = $currentStatus.runtime.loaded_source
+        $reportedOwner = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$currentStatus.pid)" -ErrorAction Stop
+        $belongsToLaunch = $reportedOwner -and (
+            [int]$reportedOwner.ProcessId -eq $process.Id -or
+            [int]$reportedOwner.ParentProcessId -eq $process.Id)
+        $matches = $belongsToLaunch -and
+            $loadedSource.schema_version -eq 'marketpin-recorder-loaded-source.v1' -and
+            [int]$loadedSource.process_id -eq [int]$currentStatus.pid -and
+            ([DateTimeOffset]$loadedSource.captured_at_utc).UtcDateTime -ge $process.StartTime.ToUniversalTime()
+        foreach ($relative in @('backend/closing_tape/live_recorder.py','backend/closing_tape/recovery.py')) {
+            $expected = (Get-FileHash -LiteralPath (Join-Path $projectRoot $relative) -Algorithm SHA256).Hash.ToLowerInvariant()
+            $matches = $matches -and $loadedSource.files.$relative.sha256 -eq $expected
+        }
+        if ($matches) { $loadedSourceVerification = 'MATCHES_STARTED_RECORDER' }
+    }
+} catch {
+    # Capture may be warming and has priority. Missing evidence remains unknown;
+    # never stop a valid writer because a launch-time status read was incomplete.
+    $loadedSourceVerification = 'NOT_YET_VERIFIED'
+}
+$dbnPaths = @(Get-ChildItem -LiteralPath $sessionDir -Filter '*.dbn' -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+$receiptPath = Join-Path $sessionDir "launch-receipt.$launchStamp.json"
+$receipt = [ordered]@{
+    schema_version = 'marketpin.closing-tape-launch-receipt.v1'
+    trading_date = $TradingDate
+    observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    process_id = $process.Id
+    process_running = $true
+    gate_state = [string]$gate.state
+    capture_mode = [string]$gate.capture_mode
+    analysis_eligible = [bool]$gate.analysis_eligible
+    catalog_path = $catalogPath
+    catalog_observed = [bool](Test-Path -LiteralPath $catalogPath -PathType Leaf)
+    status_path = $statusPath
+    status_observed = [bool](Test-Path -LiteralPath $statusPath -PathType Leaf)
+    loaded_source = $loadedSource
+    loaded_source_verification = $loadedSourceVerification
+    dbn_paths = $dbnPaths
+    dbn_observed = [bool]($dbnPaths.Count -gt 0)
+    stdout_path = $stdoutPath
+    stderr_path = $stderrPath
+}
+$receipt | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $receiptPath -Encoding utf8
+
 [pscustomobject]@{
     Status = 'started'
     Pid = $process.Id
-    StatusPath = (Join-Path $sessionDir 'status.json')
+    GateState = $gate.state
+    CaptureMode = $gate.capture_mode
+    AnalysisEligible = [bool]$gate.analysis_eligible
+    CatalogPath = $catalogPath
+    StatusPath = $statusPath
+    DbnPaths = $dbnPaths
+    LaunchReceiptPath = $receiptPath
     Stdout = $stdoutPath
     Stderr = $stderrPath
 }

@@ -281,10 +281,23 @@ _MILESTONES: tuple[tuple[str, str, str, time], ...] = (
         time(9, 30),
     ),
 )
+# Supplemental milestones are optional in historical state. Never change the
+# base flags used to hash and replay earlier immutable milestone receipts.
+_SUPPLEMENTAL_MILESTONES = {
+    "first_opening_bucket", "complete_15m_orb", "complete_30m_orb",
+}
+_MILESTONES += (
+    ("first_opening_bucket", "first_opening_bucket_notified", "first_opening_bucket", time(8, 30, 5)),
+    ("complete_15m_orb", "complete_15m_orb_notified", "complete_15m_orb", time(8, 45)),
+    ("complete_30m_orb", "complete_30m_orb_notified", "complete_30m_orb", time(9, 0)),
+)
 _MILESTONE_BY_NAME = {item[0]: item for item in _MILESTONES}
 _MILESTONE_DEPENDENCIES = {
     "startup": (),
     "first_eligible_gamma_capture": (),
+    "first_opening_bucket": ("startup",),
+    "complete_15m_orb": ("startup",),
+    "complete_30m_orb": ("startup",),
     "complete_5m_orb": ("startup",),
     "complete_60m_orb": ("startup", "complete_5m_orb"),
 }
@@ -1804,6 +1817,31 @@ def _validate_gamma_evidence(
         )
 
 
+def _validate_first_opening_bucket(report, *, session_date, epoch, generation):
+    _validate_orb_reference_decision_contract(report)
+    database = _mapping(report.get("database"), "database_report_missing")
+    evidence = _mapping(database.get("orb_reference_rows"), "orb_reference_rows_missing")
+    start = datetime.combine(date.fromisoformat(session_date), time(8, 30), tzinfo=_CT).astimezone(_UTC)
+    for symbol in _OPENING_SYMBOLS:
+        row = _mapping(evidence.get(symbol), f"orb_reference_missing:{symbol}")
+        receipts = row.get("first_bucket_receipts")
+        if not isinstance(receipts, list) or len(receipts) != 1:
+            raise MonitorOpeningAcceptanceError(f"orb_first_bucket_missing_or_ambiguous:{symbol}")
+        receipt = _mapping(receipts[0], f"orb_first_bucket_invalid:{symbol}")
+        sample = _parse_aware(receipt.get("sample_timestamp_utc"), "first_bucket_sample_time").astimezone(_UTC)
+        captured = _parse_aware(receipt.get("captured_at_utc"), "first_bucket_capture_time").astimezone(_UTC)
+        decided = _parse_aware(receipt.get("progress_decided_at_utc"), "first_bucket_decision_time").astimezone(_UTC)
+        sample_id = receipt.get("sample_id")
+        if (sample != start or not sample <= captured <= decided < start + timedelta(seconds=5)
+                or receipt.get("subscription_epoch_id") != epoch
+                or type(receipt.get("subscription_generation")) is not int
+                or receipt["subscription_generation"] != generation
+                or receipt.get("timestamp_contract_version") not in {"provider-event.v1", "databento-cbbo-interval.v1"}
+                or not isinstance(sample_id, str) or len(sample_id) != 64
+                or any(char not in "0123456789abcdef" for char in sample_id)):
+            raise MonitorOpeningAcceptanceError(f"orb_first_bucket_identity_or_timing_invalid:{symbol}")
+
+
 def _validate_orb_window(
     report: Mapping[str, Any],
     *,
@@ -2158,7 +2196,7 @@ def _normalize_report(
             raise MonitorOpeningAcceptanceError(
                 "inspector_out_of_scope_issue_invalid"
             )
-    elif milestone not in {"complete_5m_orb", "complete_60m_orb"}:
+    elif milestone not in {"first_opening_bucket", "complete_5m_orb", "complete_15m_orb", "complete_30m_orb", "complete_60m_orb"}:
         if out_of_scope:
             raise MonitorOpeningAcceptanceError(
                 "inspector_out_of_scope_issues_not_allowed"
@@ -2240,10 +2278,12 @@ def _normalize_report(
             epoch=epoch,
             generation=generation,
         )
-    if milestone == "complete_5m_orb":
+    if milestone == "first_opening_bucket":
+        _validate_first_opening_bucket(normalized, session_date=session_date, epoch=epoch, generation=generation)
+    if milestone in {"complete_5m_orb", "complete_15m_orb", "complete_30m_orb"}:
         _validate_orb_window(
             normalized,
-            window_name="5m",
+            window_name=milestone.split("_")[1],
             session_date=session_date,
             epoch=epoch,
             generation=generation,
@@ -2783,6 +2823,7 @@ def _bounded_report_projection(report: Mapping[str, Any]) -> dict[str, Any]:
                     (
                         "row_count",
                         "opening_bucket_present",
+                        "first_bucket_receipts",
                         "opening_capture_ratio",
                         "advancing_5s_evidence",
                         "provider_source_timestamps_advancing",
@@ -2841,6 +2882,8 @@ def milestone_event_id(session_date: str, milestone: str) -> str:
 def _owned_projection(opening: Mapping[str, Any], *, session_date: str) -> dict[str, Any]:
     projection: dict[str, Any] = {"session_date": session_date}
     for _name, flag, detail, _due in _MILESTONES:
+        if _name in _SUPPLEMENTAL_MILESTONES and flag not in opening and detail not in opening:
+            continue
         value = opening.get(flag)
         if type(value) is not bool:
             raise MonitorOpeningAcceptanceError(f"opening_flag_invalid:{flag}")
@@ -3186,7 +3229,9 @@ def _event_symbols(report: Mapping[str, Any], milestone: str) -> dict[str, Any]:
             }
             for symbol in _CORE_SYMBOLS
         }
-    window_name = "5m" if milestone == "complete_5m_orb" else "60m"
+    if milestone == "first_opening_bucket":
+        return {symbol: copy.deepcopy((report["database"]["orb_reference_rows"].get(symbol) or {}).get("first_bucket_receipts", [])) for symbol in _OPENING_SYMBOLS}
+    window_name = milestone.split("_")[1]
     return {
         symbol: copy.deepcopy(
             dict(

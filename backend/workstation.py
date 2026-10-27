@@ -35,6 +35,7 @@ PREDICTIVE_PIN_PAYLOAD_FIELDS = frozenset(
         "expected_close",
         "close_range_low",
         "close_range_high",
+        "structural_regime_prediction",
     }
 )
 _NONLIVE_PREDICTION_MODES = frozenset(
@@ -166,6 +167,47 @@ def sanitize_workstation_state_pin_payload(
                 prediction_copy.get("pin_payload")
             )
         if _state_has_governed_live_prediction(sanitized, prediction_copy):
+            structural = prediction_copy.get("structural_regime_prediction")
+            if isinstance(structural, Mapping) and structural.get("status") == "AVAILABLE":
+                target = _parse_timestamp(structural.get("target_close_utc"))
+                structural_source = sanitized.get("pin_payload") or {}
+                observed = _parse_timestamp(structural.get("as_of_utc"))
+                parent_observed = _source_datetime(structural_source)
+                independent = structural.get("source_binding") == "independent_committed_calculation.v1"
+                hash_valid = False
+                if independent:
+                    try:
+                        body = {key: value for key, value in structural.items()
+                                if key not in {"prediction_id", "journal_status"}}
+                        digest = hashlib.sha256(json.dumps(body, sort_keys=True,
+                            separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+                        hash_valid = digest == structural.get("prediction_id")
+                    except (TypeError, ValueError):
+                        pass
+                structural_reason = None
+                if any(structural.get(key) != sanitized.get(key) for key in (
+                    "symbol", "subscription_epoch_id", "subscription_generation",
+                )) or not isinstance(structural.get("calculation_id"), str) or not structural["calculation_id"].strip():
+                    structural_reason = "STRUCTURAL_SOURCE_IDENTITY_MISMATCH"
+                elif independent and not hash_valid:
+                    structural_reason = "STRUCTURAL_COMMITTED_CONTENT_MISMATCH"
+                elif independent and (observed is None or parent_observed is None
+                        or observed > parent_observed
+                        or not 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= LIVE_DATA_STALE_AFTER_SECONDS):
+                    structural_reason = "STRUCTURAL_COMMITTED_SOURCE_STALE_MISSING_OR_FUTURE"
+                elif not independent and structural.get("calculation_id") != structural_source.get("calculation_id"):
+                    structural_reason = "STRUCTURAL_SOURCE_IDENTITY_MISMATCH"
+                elif not independent and observed != parent_observed:
+                    structural_reason = "STRUCTURAL_SOURCE_TIMESTAMP_MISMATCH"
+                elif target is None or datetime.now(timezone.utc) >= target:
+                    structural_reason = "OUTSIDE_CASH_SESSION"
+                if structural_reason:
+                    prediction_copy["structural_regime_prediction"] = {
+                        "status": "ABSTAIN", "reasons": [structural_reason],
+                        "research_only": True, "decision_grade": False,
+                        "predicted_close": None, "band_low": None, "band_high": None,
+                        "confidence": None, "inputs": None, "regime": None,
+                    }
             sanitized["prediction"] = prediction_copy
         else:
             status = str(sanitized.get("status") or "unavailable").lower()
@@ -622,6 +664,15 @@ def build_workstation_state(
             }
         )
 
+    # Independently hash the actual inference input, never copy the passport's hash.
+    forecast_source = prediction.get("pin_payload") if isinstance(prediction, Mapping) else None
+    forecast_source_hash = None
+    if isinstance(forecast_source, Mapping) and forecast_source:
+        from backend.prediction_passport import source_payload_sha256
+        try:
+            forecast_source_hash = source_payload_sha256(forecast_source)
+        except (TypeError, ValueError):
+            pass  # An unencodable input cannot acquire an independently verified hash.
     state = {
         "contract_version": STATE_CONTRACT_VERSION,
         "sequence": 0,
@@ -631,6 +682,7 @@ def build_workstation_state(
         "forecast_state": passport_state,
         "decision_grade": decision_grade,
         "prediction_snapshot_id": prediction_snapshot_id,
+        "forecast_source_payload_sha256": forecast_source_hash,
         "symbol": normalized,
         "status": status,
         "generated_at_utc": _utc_iso(),

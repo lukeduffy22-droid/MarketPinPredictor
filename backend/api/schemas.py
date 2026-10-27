@@ -21,6 +21,7 @@ class PredictionResponse(BaseModel):
     prediction_mode: str
     is_estimate: bool
     prediction_authority: Dict[str, Any]
+    structural_regime_prediction: Optional[Dict[str, Any]] = None
 
 
 class HealthResponse(BaseModel):
@@ -71,6 +72,7 @@ class WorkstationStateV1(BaseModel):
     ] = None
     decision_grade: bool
     prediction_snapshot_id: Optional[int] = None
+    forecast_source_payload_sha256: Optional[str] = None
     symbol: str
     status: Literal[
         "warming", "live", "stale", "invalid", "closed_context", "unavailable"

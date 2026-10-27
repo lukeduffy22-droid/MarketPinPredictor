@@ -185,3 +185,35 @@ def test_publication_barrier_still_serializes_generation_change(monkeypatch):
         subscription_generation=4,
     ) as stale_allowed:
         assert not stale_allowed
+
+
+def test_accepted_quote_burst_skips_redundant_stall_checks(monkeypatch):
+    streamer = _streamer(monkeypatch)
+    checks = []
+    monkeypatch.setattr(streamer, "_stream_stalled", lambda: checks.append(streamer.messages_received) or False)
+
+    class FakeLocalClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def subscribe(self, **kwargs):
+            pass
+
+        def __iter__(self):
+            yield _mapping()
+            for _ in range(1000):
+                yield _quote()
+            # Control messages must still detect a transport that stopped quotes.
+            yield SimpleNamespace(code=0)
+            streamer.is_running = False
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(stream_module.db, "Live", FakeLocalClient)
+    streamer._run_live()
+    assert streamer.messages_received == 1000
+    assert checks == [0, 1000]
+    assert streamer._last_progress_monotonic > 0
+    assert streamer._fresh_quote_counts() == {"SPX": 1}
+    assert streamer.reconnect_attempts == 0

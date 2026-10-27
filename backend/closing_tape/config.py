@@ -14,6 +14,7 @@ from backend.database_target import configured_market_database_path
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")
 UTC = timezone.utc
+OFFICIAL_CLOSE_PUBLICATION_ET = time(18, 0)
 
 DEFAULT_OPTION_PARENTS = (
     "SPX.OPT",
@@ -135,6 +136,15 @@ def _market_times(trading_day: date) -> tuple[datetime, datetime, datetime, date
     # allow final control messages and a graceful DBN close.
     stop_et = close_et + (timedelta(minutes=20) if close_hour == 16 else timedelta(minutes=20))
     return tuple(item.astimezone(UTC) for item in (open_et, analysis_et, close_et, stop_et))
+
+
+def official_close_publication_cutoff_utc(trading_day: date) -> datetime:
+    """Return the earliest approved official-close publication time."""
+    return datetime.combine(
+        trading_day,
+        OFFICIAL_CLOSE_PUBLICATION_ET,
+        tzinfo=ET,
+    ).astimezone(UTC)
 
 
 def build_session_config(

@@ -59,6 +59,22 @@ def _prediction(symbol: str = "SPX"):
     }
 
 
+def test_forecast_source_hash_is_computed_from_input_not_copied_from_passport():
+    from backend.prediction_passport import _canonical_hash
+    payload=_payload()
+    prediction=_prediction()
+    prediction['pin_payload']=dict(payload)
+    passport=_passport()
+    state=build_workstation_state(symbol='SPX',payload=payload,prediction=prediction,passport=passport)
+    assert state['forecast_source_payload_sha256']==_canonical_hash(prediction['pin_payload'])
+    changed={**prediction,'pin_payload':{**payload,'price':7501.0}}
+    state2=build_workstation_state(symbol='SPX',payload=payload,prediction=changed,passport=passport)
+    assert state2['forecast_source_payload_sha256']!=state['forecast_source_payload_sha256']
+    prediction['pin_payload']['timestamp']=datetime.now(timezone.utc)
+    state3=build_workstation_state(symbol='SPX',payload=payload,prediction=prediction,passport=passport)
+    assert state3['forecast_source_payload_sha256']==_canonical_hash(prediction['pin_payload'])
+
+
 def _passport(
     label: str = "research",
     *,

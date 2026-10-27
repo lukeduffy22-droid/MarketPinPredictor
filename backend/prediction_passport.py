@@ -194,6 +194,11 @@ def _canonical_hash(value: Mapping[str, Any]) -> str:
     return _sha256_text(_canonical_json(value))
 
 
+def source_payload_sha256(value: Mapping[str, Any]) -> str:
+    """Public encoding contract for independent binding of the inference input."""
+    return _canonical_hash(value)
+
+
 def _sha256_evidence(value: Any) -> tuple[str | None, bool]:
     """Return normalized SHA-256 evidence and whether supplied evidence was invalid."""
     if value is None:

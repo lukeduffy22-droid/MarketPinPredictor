@@ -855,12 +855,17 @@ def _verified_close_evidence(
                             "verified close correction lineage is missing, non-causal, or forked"
                         )
                     children[parent_id] = row
-                resolve_verified_close_artifact(
-                    project_root / "data" / "verified_close_sources",
-                    trading_date=trading_date,
-                    symbol=symbol,
-                    source_artifact_sha256=str(row["source_artifact_sha256"]),
-                )
+                try:
+                    resolve_verified_close_artifact(
+                        project_root / "data" / "verified_close_sources",
+                        trading_date=trading_date,
+                        symbol=symbol,
+                        source_artifact_sha256=str(row["source_artifact_sha256"]),
+                    )
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        f"{trading_date}/{symbol}, observation {row['id']}: {exc}"
+                    ) from exc
             if len(roots) != 1:
                 raise ValueError(
                     "verified close observations require exactly one causal root"

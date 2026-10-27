@@ -89,8 +89,11 @@ def test_review_archive_is_idempotent_and_does_not_replace_prior_sessions(tmp_pa
 def test_ui_saves_dated_review_and_labels_it_when_date_changes(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
     import app.services.diagnostic_agent as agent
+    import app.services.diagnostic_runtime as runtime
     monkeypatch.setattr(agent, 'ROOT', tmp_path)
-    monkeypatch.setattr(agent, 'diagnose', lambda question, packet: {
+    monkeypatch.setattr(runtime, 'collect_live_packet', lambda symbols, capabilities, root, day:
+                        agent.build_packet({'requested_symbols': symbols}, capabilities, root, day))
+    monkeypatch.setattr(agent, 'diagnose', lambda question, packet, **kwargs: {
         **_review(packet['session_date_ct']), 'packet': packet})
     app = AppTest.from_string(
         'from app.services.diagnostic_agent import render_diagnostic_agent\n'
@@ -98,8 +101,7 @@ def test_ui_saves_dated_review_and_labels_it_when_date_changes(tmp_path, monkeyp
     ).run()
     app.date_input(key='diagnostic_session_date').set_value(date(2026, 9, 17)).run()
     app.text_area[0].set_value('Review this session')
-    next(b for b in app.button if b.label == 'Ask AI to review this evidence').click().run()
-    next(b for b in app.button if b.label == 'Save dated review to local history').click().run()
+    next(b for b in app.button if b.label == 'Refresh live evidence and ask AI').click().run()
     assert not app.exception
     assert len(load_reviews(tmp_path, '2026-09-17')) == 1
     app.date_input(key='diagnostic_session_date').set_value(date(2026, 9, 18)).run()

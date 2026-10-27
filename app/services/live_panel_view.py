@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
+from app.services.retained_forecasts import render_retained_forecasts
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -59,6 +61,24 @@ def _pipeline_status_message(
     return "warning", "Prediction pipeline status: ABSTAIN (current runtime is not eligible)"
 
 
+def _clock_status_message(telemetry: Any) -> tuple[str, str] | None:
+    """Keep provider-clock warmup distinct from a measured clock failure."""
+    if not isinstance(telemetry, dict):
+        return None
+    status = telemetry.get("status")
+    count = telemetry.get("sample_count")
+    minimum = telemetry.get("minimum_samples")
+    if type(count) is not int or type(minimum) is not int or minimum <= 0 or count < 0:
+        return None
+    if status == "unknown":
+        return "info", f"Clock check warming: {count}/{minimum} live timing samples. Clock readiness is not yet established."
+    if status == "unsynchronized":
+        return "warning", "Provider clock check failed: received intervals are ahead of the processing clock beyond the permitted tolerance."
+    if status == "synchronized":
+        return "caption", f"Provider clock check passed at this observation ({count} live timing samples)."
+    return None
+
+
 def _current_valid_pin_symbols(
     pipeline: Any,
     valid_symbols: list[str],
@@ -82,6 +102,13 @@ def _closing_tape_status_message(payload: dict[str, Any]) -> tuple[str, str]:
             or (payload.get("reasons") or ["status request failed"])[0]
         )
         return "error", f"Capture status unavailable: {reason}"
+    if payload.get("catalog_available") is False:
+        day = str(payload.get("trading_date") or "the requested date")
+        return (
+            "warning",
+            f"Capture evidence missing for {day}: no closing-tape catalog was found. "
+            "Counts for this date are unavailable; model-training requirements do not hide these counts.",
+        )
     state = str(payload.get("state") or "unavailable").lower()
     if state == "complete" and payload.get("usable_for_research"):
         return "success", "Capture: complete and integrity-verified for research"
@@ -99,6 +126,12 @@ def _closing_tape_analysis_message(payload: dict[str, Any]) -> tuple[str, str]:
         return (
             "error",
             "Close-minus-15 analysis: unknown because capture status could not be read",
+        )
+    if payload.get("catalog_available") is False:
+        return (
+            "warning",
+            "Close-minus-15 analysis: unavailable because capture evidence is missing "
+            "for the requested date. Refreshing cannot supply a missing recording.",
         )
 
     session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
@@ -389,22 +422,23 @@ def render_closing_tape_evidence() -> None:
         with col1:
             raw_feed = observed.get("raw_feed") or {}
             value = raw_feed.get("trade_records") if observed.get("available") else None
-            st.metric("Observed trades", f"{int(value):,}" if value is not None else "Unavailable")
+            st.metric("Observed trades", f"{int(value):,}" if value is not None else "—")
         with col2:
             value = observed.get("minute_rows") if observed.get("available") else None
-            st.metric("Observed minutes", f"{int(value):,}" if value is not None else "Unavailable")
+            st.metric("Observed minutes", f"{int(value):,}" if value is not None else "—")
         with col3:
             value = inferred.get("minute_rows") if inferred.get("available") else None
-            st.metric("Inferred minutes", f"{int(value):,}" if value is not None else "Unavailable")
+            st.metric("Inferred minutes", f"{int(value):,}" if value is not None else "—")
         with col4:
             value = observed.get("open_interest_rows") if observed.get("available") else None
-            st.metric("Daily OI rows", f"{int(value):,}" if value is not None else "Unavailable")
+            st.metric("Daily OI rows", f"{int(value):,}" if value is not None else "—")
         with col5:
             value = (
                 observed.get("instrument_definition_observations")
                 if observed.get("available") else None
             )
-            st.metric("Observed definitions", f"{int(value):,}" if value is not None else "Unavailable")
+            st.metric("Observed definitions", f"{int(value):,}" if value is not None else "—")
+        st.caption("— means unavailable, not zero. Counts above apply only to the requested capture date.")
         st.caption(
             "Observed = provider DBN records and reproducible arithmetic aggregates. "
             "Inferred = trade-price-versus-pre-trade-NBBO estimates; OPRA does not publish "
@@ -447,9 +481,14 @@ def render_closing_tape_evidence() -> None:
             )
         else:
             st.caption(
-                "Verified production close evidence: unavailable ("
+                "Verified close archive: unavailable ("
                 + str(close_evidence.get("reason") or "no verified observations")
                 + ")."
+            )
+            st.caption(
+                "This archive check includes earlier close records and their correction history. "
+                "Readiness totals below use latest verified close records and do not prove that "
+                "the full archive passed validation."
             )
         methods = inferred.get("methods") or []
         if methods:
@@ -542,6 +581,10 @@ def render_closing_tape_evidence() -> None:
         else:
             st.warning(str(promoted["message"]))
         st.markdown("**Evidence accumulation**")
+        st.caption(
+            "These totals accumulate independent sessions across dates. They are separate from "
+            "today's capture availability; refreshing or lowering a threshold cannot recover missing evidence."
+        )
         readiness_warning = _readiness_inventory_warning(readiness)
         readiness_unavailable = readiness_warning is not None
         if readiness_warning is not None:
@@ -651,23 +694,38 @@ def _render_databento_cache_maintenance() -> None:
         st.error(f"Could not clear cache: {str(exc)[:80]}")
 
 
-def render_backend_streaming_status() -> None:
+def _live_status_unavailable_message(snapshot: dict[str, Any]) -> str:
+    failures = snapshot.get("read_failures") or []
+    failure = next((row for row in failures if row.get("endpoint") == "/health"),
+                   failures[-1] if failures else {})
+    reason = failure.get("backend_reason") or failure.get("transport_message") or failure.get("transport_error")
+    detail = f" ({reason})" if reason else ""
+    return f"Live status unavailable{detail}; current eligibility is not verified."
+
+
+def render_backend_streaming_status(live_snapshot: dict[str, Any] | None = None) -> None:
     """Render backend streaming diagnostics using SSE-first unified snapshots."""
     st.subheader("Backend Streaming Status")
 
     try:
-        live_snapshot = fetch_live_status_snapshot(timeout_seconds=1.2)
+        if live_snapshot is None:
+            live_snapshot = fetch_live_status_snapshot(timeout_seconds=1.2)
         health_data = (live_snapshot or {}).get("health") or {}
         universe_data = (live_snapshot or {}).get("universe") or {}
         pipeline_data = (live_snapshot or {}).get("pipeline") or {}
         snapshot_source = str((live_snapshot or {}).get("source") or "poll")
         snapshot_age = _snapshot_age_seconds((live_snapshot or {}).get("timestamp_utc"))
 
+        render_retained_forecasts(pipeline_data)
+
         if not health_data:
-            st.warning("Backend not responding")
+            st.warning(_live_status_unavailable_message(live_snapshot or {}))
+            st.caption("A failed status read does not establish that recording stopped.")
             return
 
         st.caption(f"Live status source: {snapshot_source.upper()}")
+        if (live_snapshot or {}).get("timestamp_utc"):
+            st.caption(f"Status observed at {(live_snapshot or {})['timestamp_utc']}; refresh to recheck.")
         _render_event_age_indicator(snapshot_age)
 
         ws_status = health_data.get("websocket", "unknown")
@@ -703,6 +761,11 @@ def render_backend_streaming_status() -> None:
                     st.warning("Databento cache is stale")
         with detail_col3:
             st.caption(f"Schema: {health_data.get('schema', 'N/A')}")
+
+        clock_message = _clock_status_message(health_data.get("processing_clock_telemetry"))
+        if clock_message:
+            level, message = clock_message
+            getattr(st, level)(message)
 
         if ws_status != "active":
             if last_error:
@@ -749,7 +812,7 @@ def render_backend_streaming_status() -> None:
         root_contract_counts = universe_data.get("root_contract_counts") or health_data.get("root_contract_counts") or {}
 
         if current_valid_symbols:
-            st.success(f"Current Databento pins: {', '.join(current_valid_symbols)}")
+            st.success(f"Databento pins eligible at last check: {', '.join(current_valid_symbols)}")
         elif valid_symbols:
             st.warning(
                 "Retained Databento pin context only; current epoch/generation "

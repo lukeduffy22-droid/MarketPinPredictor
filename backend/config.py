@@ -3,6 +3,7 @@ Configuration for production FastAPI backend
 """
 import os
 from pathlib import Path
+from sqlalchemy.engine import make_url
 from backend.market_universe import (
 	DEFAULT_TRACKED_SYMBOLS, EQUITY_CONTEXT_SYMBOLS, EXPANDED_OPRA_SYMBOLS,
 	resolve_equity_context_symbols,
@@ -25,8 +26,27 @@ DATA_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
+def resolve_database_url(configured: str | None = None) -> str:
+	"""Resolve a persistent database URL without allowing cwd-relative SQLite files."""
+	value = configured or f"sqlite:///{DATA_DIR / 'market_data.db'}"
+	try:
+		url = make_url(value)
+	except Exception as exc:
+		raise RuntimeError("DATABASE_URL is invalid") from exc
+	if url.get_backend_name() == "sqlite":
+		database = str(url.database or "").strip()
+		if not database or database == ":memory:":
+			raise RuntimeError("DATABASE_URL must select a persistent SQLite file")
+		if not Path(database).is_absolute():
+			raise RuntimeError(
+				"DATABASE_URL must use an absolute SQLite path; relative paths can split "
+				"MarketPin persistence"
+			)
+	return value
+
+
 # Database
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'market_data.db'}")
+DATABASE_URL = resolve_database_url(os.getenv("DATABASE_URL"))
 
 # Market Data API
 POLYGON_API_KEY = os.getenv("Massive_API") or os.getenv("POLYGON_API_KEY")

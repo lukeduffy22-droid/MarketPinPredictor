@@ -22,7 +22,34 @@ def utc(value):
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
-def load_research_history(database_path, symbols, *, as_of_utc, runtime_context=None):
+def _quarantine_conflicting_references(rows, symbol):
+    """Reject every ambiguous source instant without choosing a revision.
+
+    Repeated parity calculations can retain different prices against the same
+    quote timestamp. Keep both observations and their real availability times;
+    only the read projection is invalidated. Existing model validity gates then
+    abstain on a conflicting current snapshot and can accept later fresh input.
+    """
+    groups = {}
+    for row in rows:
+        if row.get("kind") == "daily_close" or not row.get("valid"):
+            continue
+        identity = (row.get("subscription_epoch_id"), row.get("subscription_generation"),
+                    row["timestamp_utc"])
+        groups.setdefault(identity, []).append(row)
+    diagnostics = []
+    for identity, observations in groups.items():
+        if len({row["reference_price"] for row in observations}) <= 1:
+            continue
+        for row in observations:
+            row.update(valid=False, validation_status="conflicting_source_observations",
+                       options_context_valid=False,
+                       research_rejection_reason="CONFLICTING_SOURCE_OBSERVATIONS")
+        diagnostics.append(f"{symbol}:CONFLICTING_SOURCE_OBSERVATIONS:{identity[2]}:{len(observations)}")
+    return diagnostics
+
+
+def load_research_history(database_path, symbols, *, as_of_utc, runtime_context=None, include_intraday=True):
     """Read one coherent WAL snapshot; preserve event AND availability cutoffs.
 
     OPRA parity prices remain derived references, never official cash quotes.
@@ -45,7 +72,7 @@ def load_research_history(database_path, symbols, *, as_of_utc, runtime_context=
         conn.execute("BEGIN")
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for symbol in histories:
-            if "market_structure_observations" in tables:
+            if include_intraday and "market_structure_observations" in tables:
                 rows = conn.execute(
                     "SELECT * FROM market_structure_observations WHERE symbol=? AND trading_date=? "
                     "AND source_timestamp_utc<=? AND captured_at_utc<=? "
@@ -83,6 +110,7 @@ def load_research_history(database_path, symbols, *, as_of_utc, runtime_context=
                     if not row["valid"]:
                         row["validation_status"] = "runtime_unverified"
                     histories[symbol].append(row)
+                diagnostics.extend(_quarantine_conflicting_references(histories[symbol], symbol))
             if "eod_close_observations" in tables:
                 rows = conn.execute(
                     "SELECT * FROM eod_close_observations WHERE symbol=? "

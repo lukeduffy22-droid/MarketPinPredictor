@@ -34,6 +34,7 @@ REQUIRED_FILES = (
     "market_calendar.psm1",
     "config/us_cash_equity_calendar.json",
     "start_market_day.ps1",
+    "tools/clock_recovery.psm1",
     "ensure_market_app.ps1",
     "start_databento_app.ps1",
     "start_closing_tape.ps1",
@@ -45,6 +46,7 @@ REQUIRED_FILES = (
     "app/services/live_data_client.py",
     "app/services/live_panel_view.py",
     "app/services/orb_view.py",
+    "app/services/options_structure_view.py",
     "app/services/retained_parity_view.py",
     "app/services/sidebar_live_state.py",
     "app/utils/market_calendar.py",
@@ -66,10 +68,15 @@ REQUIRED_FILES = (
     "backend/closing_tape/catalog.py",
     "backend/closing_tape/config.py",
     "backend/closing_tape/live_recorder.py",
+    "backend/closing_tape/recovery.py",
     "backend/closing_tape/start_gate.py",
     "backend/database.py",
+    "backend/quote_timing.py",
+    "backend/host_clock_shadow.py",
+    "backend/opening_capture_receipts.py",
     "backend/database_target.py",
     "backend/databento_streamer.py",
+    "backend/subscription_segment.py",
     "backend/historical_context.py",
     "backend/inference.py",
     "backend/market_structure.py",
@@ -99,8 +106,10 @@ REQUIRED_FILES = (
     "tools/prepare_market_monitor_session.py",
 )
 REQUIRED_MODULES = (
+    "backend.host_clock_shadow",
     "app.services.sidebar_live_state",
     "app.services.orb_view",
+    "app.services.options_structure_view",
     "app.utils.market_calendar",
     "app.utils.market_time",
     "app.utils.time_et",
@@ -109,6 +118,7 @@ REQUIRED_MODULES = (
     "backend.closing_tape.catalog",
     "backend.closing_tape.config",
     "backend.closing_tape.live_recorder",
+    "backend.closing_tape.recovery",
     "backend.closing_tape.start_gate",
     "backend.api.helpers",
     "backend.api.bounded_runtime_read",
@@ -120,8 +130,11 @@ REQUIRED_MODULES = (
     "backend.api.routers.predict",
     "backend.config",
     "backend.database",
+    "backend.quote_timing",
+    "backend.opening_capture_receipts",
     "backend.database_target",
     "backend.databento_streamer",
+    "backend.subscription_segment",
     "backend.historical_context",
     "backend.inference",
     "backend.market_structure",
@@ -262,10 +275,27 @@ REQUIRED_ORB_REFERENCE_DECISION_TRIGGERS = {
 REQUIRED_ORB_REFERENCE_DECISION_INDEXES = {
     "uix_orb_reference_decision_sample_id"
 }
+REQUIRED_ORB_CBBO_REFERENCE_COLUMNS = REQUIRED_ORB_REFERENCE_COLUMNS | {
+    "timestamp_contract_version", "quote_schema", "trade_timestamp_count",
+}
+REQUIRED_ORB_CBBO_REFERENCE_TRIGGERS = {
+    name.replace("orb_reference", "orb_cbbo_reference") for name in REQUIRED_ORB_REFERENCE_TRIGGERS
+}
+REQUIRED_ORB_CBBO_REFERENCE_DECISION_TRIGGERS = {
+    name.replace("orb_reference", "orb_cbbo_reference") for name in REQUIRED_ORB_REFERENCE_DECISION_TRIGGERS
+}
+REQUIRED_ORB_CBBO_REFERENCE_INDEXES = {
+    name.replace("orb_reference", "orb_cbbo_reference") for name in REQUIRED_ORB_REFERENCE_INDEXES
+}
+REQUIRED_ORB_CBBO_REFERENCE_DECISION_INDEXES = {
+    name.replace("orb_reference", "orb_cbbo_reference") for name in REQUIRED_ORB_REFERENCE_DECISION_INDEXES
+}
 _BOOTSTRAPPABLE_MISSING_COLUMNS = {
     "market_structure_observations": {"subscription_epoch_id"},
     "orb_reference_samples": {"subscription_epoch_id"},
     "orb_reference_sample_decisions": set(),
+    "orb_cbbo_reference_samples": set(),
+    "orb_cbbo_reference_sample_decisions": set(),
 }
 _BOOTSTRAPPABLE_MISSING_OBJECT_CODES = {
     "RUNTIME_DATABASE_MISSING",
@@ -568,6 +598,8 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
                 REQUIRED_ORB_REFERENCE_DECISION_COLUMNS,
             ),
         )
+        table_contracts += (("orb_cbbo_reference_samples", REQUIRED_ORB_CBBO_REFERENCE_COLUMNS),
+                            ("orb_cbbo_reference_sample_decisions", REQUIRED_ORB_REFERENCE_DECISION_COLUMNS))
         observed_columns: dict[str, set[str]] = {}
         for table_name, required_columns in table_contracts:
             table_exists = bool(
@@ -625,6 +657,8 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
                 REQUIRED_ORB_REFERENCE_DECISION_TRIGGERS,
             ),
         )
+        trigger_contracts += (("orb_cbbo_reference_samples", REQUIRED_ORB_CBBO_REFERENCE_TRIGGERS),
+                              ("orb_cbbo_reference_sample_decisions", REQUIRED_ORB_CBBO_REFERENCE_DECISION_TRIGGERS))
         for table_name, required_triggers in trigger_contracts:
             triggers = _database_names(
                 connection,
@@ -662,6 +696,11 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
                 REQUIRED_ORB_REFERENCE_DECISION_INDEXES,
                 ("sample_id",),
             ),
+        )
+        index_contracts += tuple(
+            (name.replace("orb_reference", "orb_cbbo_reference"),
+             {index.replace("orb_reference", "orb_cbbo_reference") for index in indexes}, columns)
+            for name, indexes, columns in index_contracts
         )
         for table_name, required_indexes, identity_columns in index_contracts:
             indexes = _database_names(
@@ -724,6 +763,8 @@ def _database_issue_is_bootstrappable(issue: dict[str, Any]) -> bool:
     if code == "RUNTIME_IMMUTABILITY_TRIGGERS_MISSING":
         expected = {
             "market_structure_observations": REQUIRED_MARKET_STRUCTURE_TRIGGERS,
+            "orb_cbbo_reference_samples": REQUIRED_ORB_CBBO_REFERENCE_TRIGGERS,
+            "orb_cbbo_reference_sample_decisions": REQUIRED_ORB_CBBO_REFERENCE_DECISION_TRIGGERS,
             "orb_reference_samples": REQUIRED_ORB_REFERENCE_TRIGGERS,
             "orb_reference_sample_decisions": (
                 REQUIRED_ORB_REFERENCE_DECISION_TRIGGERS
@@ -733,6 +774,8 @@ def _database_issue_is_bootstrappable(issue: dict[str, Any]) -> bool:
     if code == "RUNTIME_UNIQUE_INDEX_MISSING":
         expected = {
             "market_structure_observations": set(),
+            "orb_cbbo_reference_samples": REQUIRED_ORB_CBBO_REFERENCE_INDEXES,
+            "orb_cbbo_reference_sample_decisions": REQUIRED_ORB_CBBO_REFERENCE_DECISION_INDEXES,
             "orb_reference_samples": REQUIRED_ORB_REFERENCE_INDEXES,
             "orb_reference_sample_decisions": (
                 REQUIRED_ORB_REFERENCE_DECISION_INDEXES

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import requests
 
@@ -91,3 +92,25 @@ def test_health_live_exposes_subscription_session_authority(monkeypatch):
     assert payload["subscription_session_state"] == "non_trading_day"
     assert payload["subscription_allowed"] is False
     assert payload["subscription_window"] == session_window
+
+
+def test_sse_session_and_pipeline_share_one_observation(monkeypatch):
+    sample = {
+        'health': {'subscription_session_state': 'regular_session',
+                   'subscription_allowed': True,
+                   'subscription_window': {'trading_date': '2026-09-25'}},
+        'pipeline': {'prediction_pipeline_ok': False},
+        'sampled_at_utc': '2026-09-25T18:00:00+00:00',
+    }
+    async def read(*_args): return sample
+    monkeypatch.setattr(health_router._runtime_reads, 'run', read)
+    async def event():
+        response = await health_router.events_live()
+        iterator = response.body_iterator
+        first = await anext(iterator)
+        await iterator.aclose()
+        return json.loads(first.split('data: ', 1)[1])
+    payload = asyncio.run(event())
+    assert market_session_status_from_health(payload['health'])['state'] == 'open'
+    assert payload['timestamp_utc'] == sample['sampled_at_utc']
+    assert payload['pipeline']['prediction_pipeline_ok'] is False

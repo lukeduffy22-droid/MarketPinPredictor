@@ -92,12 +92,24 @@ def test_ambiguous_timeout_and_interrupted_job_are_not_retried(tmp_path):
 
 def test_oversized_packet_and_not_due_never_call_ai(tmp_path):
     def oversized(day, root):
-        return {**packet(day, root), 'padding': 'x' * 64000}
+        from app.services.diagnostic_agent import MAX_DIAGNOSTIC_INPUT_BYTES
+        return {**packet(day, root), 'padding': 'x' * MAX_DIAGNOSTIC_INPUT_BYTES}
     def unexpected(*args):
         pytest.fail('AI must not be called')
     assert run_once(tmp_path, now=NOW.replace(hour=19), reviewer=unexpected)['status'] == 'NOT_DUE'
     assert not (tmp_path / 'data').exists()
     assert run_once(tmp_path, now=NOW, packet_factory=oversized, reviewer=unexpected, api_available=True)['status'] == 'INPUT_LIMIT'
+
+
+def test_packet_above_old_limit_uses_shared_budget_without_retrying_old_jobs(tmp_path):
+    def expanded(day,root):
+        return {**packet(day,root),'padding':'x'*65000}
+    assert run_once(tmp_path,now=NOW,packet_factory=expanded,reviewer=review,api_available=True)['status']=='COMPLETE'
+    with sqlite3.connect(tmp_path/'data/diagnostic_automation/jobs.sqlite') as c:
+        c.execute("UPDATE jobs SET status='INPUT_LIMIT'")
+    def unexpected(*args):
+        pytest.fail('Historical terminal job must not be retried')
+    assert run_once(tmp_path,now=NOW,reviewer=unexpected,api_available=True)['status']=='INPUT_LIMIT'
 
 
 def test_loop_disable_and_cancellation(monkeypatch, tmp_path):

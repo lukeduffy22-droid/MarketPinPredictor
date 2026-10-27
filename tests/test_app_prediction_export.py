@@ -136,6 +136,29 @@ def _snapshot_records():
     ]
 
 
+def test_frozen_pin_history_table_accepts_actual_loader_schema():
+    """Execute the actual table consumer against retained snapshot rows."""
+    namespace, timezone = _load_snapshot_export_functions(_snapshot_records())
+    history = namespace["load_daily_pin_history"]("SPX", "2026-09-04", timezone)
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    module = ast.parse(app_path.read_text(encoding="utf-8"))
+    table = next(
+        node for node in ast.walk(module)
+        if isinstance(node, ast.With)
+        and "Intraday Pin History" in ast.unparse(node.items[0].context_expr)
+    )
+    rendered = []
+    namespace.update(
+        pin_history=history,
+        st=SimpleNamespace(dataframe=lambda frame, **kwargs: rendered.append(frame)),
+    )
+    exec(compile(ast.Module(body=table.body[:2], type_ignores=[]), str(app_path), "exec"), namespace)
+    assert len(rendered) == 1
+    assert len(rendered[0]) == 2  # Invalid evidence stays excluded.
+    assert {"Producer Check", "Validation Method", "Validation Policy", "Provenance"} <= set(rendered[0])
+    assert not history["_current_live_eligible"].any()
+
+
 def test_full_export_handles_partial_indicator_availability_without_mixed_types():
     export_to_csv = _load_export_to_csv()
     predictions = {

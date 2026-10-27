@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -877,7 +878,7 @@ def test_valid_current_day_cache_remains_usable_when_refresh_is_recommended(tmp_
     streamer = DatabentoGammaStreamer(["SPX"])
     streamer.cache_dir = tmp_path
     cache_path = streamer._cache_path(trading_date)
-    pd.DataFrame([
+    frame = pd.DataFrame([
         {
             "market": "SPX", "symbol": "SPXW  260826C05000000",
             "expiration_date": trading_date, "option_type": "C", "strike": 5000.0,
@@ -888,7 +889,18 @@ def test_valid_current_day_cache_remains_usable_when_refresh_is_recommended(tmp_
             "expiration_date": trading_date, "option_type": "P", "strike": 5000.0,
             "open_interest": 100.0,
         },
-    ]).to_csv(cache_path, index=False)
+    ])
+    source_start = datetime.combine(
+        trading_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    assert streamer._save_cached_universe(
+        frame,
+        trading_date=trading_date,
+        provider_definition_start=source_start,
+        provider_definition_end=source_start + timedelta(hours=12),
+        provider_statistics_start=source_start,
+        provider_statistics_end=source_start + timedelta(hours=11),
+    ) == cache_path
     monkeypatch.setattr("backend.databento_streamer.UNIVERSE_REFRESH_SECONDS", 10.0)
     monkeypatch.setattr(
         "backend.databento_streamer.time.time", lambda: cache_path.stat().st_mtime + 60.0
@@ -922,7 +934,13 @@ def test_current_day_cache_restores_hash_bound_provider_cutoffs(tmp_path, monkey
     cache_path = writer._save_cached_universe(
         frame,
         trading_date=trading_date,
+        provider_definition_start=datetime(
+            2026, 8, 26, tzinfo=timezone.utc
+        ),
         provider_definition_end=definition_end,
+        provider_statistics_start=datetime(
+            2026, 8, 26, tzinfo=timezone.utc
+        ),
         provider_statistics_end=statistics_end,
     )
     assert cache_path is not None
@@ -937,7 +955,9 @@ def test_current_day_cache_restores_hash_bound_provider_cutoffs(tmp_path, monkey
 
     provenance = reader.subscription_metadata["universe_provenance"]
     assert provenance["cache_metadata_status"] == "verified"
+    assert provenance["provider_definition_start"] == "2026-08-26T00:00:00+00:00"
     assert provenance["provider_definition_end"] == definition_end.isoformat()
+    assert provenance["provider_statistics_start"] == "2026-08-26T00:00:00+00:00"
     assert provenance["provider_statistics_end"] == statistics_end.isoformat()
 
 
@@ -961,7 +981,13 @@ def test_current_day_cache_does_not_trust_tampered_cutoff_sidecar(tmp_path, monk
     cache_path = writer._save_cached_universe(
         frame,
         trading_date=trading_date,
+        provider_definition_start=datetime(
+            2026, 8, 26, tzinfo=timezone.utc
+        ),
         provider_definition_end=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+        provider_statistics_start=datetime(
+            2026, 8, 26, tzinfo=timezone.utc
+        ),
         provider_statistics_end=datetime(2026, 8, 26, 11, 0, tzinfo=timezone.utc),
     )
     assert cache_path is not None
@@ -969,8 +995,50 @@ def test_current_day_cache_does_not_trust_tampered_cutoff_sidecar(tmp_path, monk
 
     reader = DatabentoGammaStreamer(["SPX"])
     reader.cache_dir = tmp_path
-    assert reader._load_cached_universe(trading_date) is True
+    assert reader._load_cached_universe(trading_date) is False
+    assert reader.live_symbols == []
 
-    provenance = reader.subscription_metadata["universe_provenance"]
-    assert provenance["cache_metadata_status"] == "missing_or_invalid"
-    assert provenance["provider_statistics_end"] is None
+
+def test_current_day_cache_hashes_the_exact_bytes_it_parses(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend.databento_streamer.MIN_PRIMARY_STRIKE_PAIRS", 1)
+    trading_date = date(2026, 8, 26)
+    frame = pd.DataFrame([
+        {
+            "market": "SPX", "symbol": "SPXW  260826C05000000",
+            "expiration_date": trading_date, "option_type": "C", "strike": 5000.0,
+            "open_interest": 100.0,
+        },
+        {
+            "market": "SPX", "symbol": "SPXW  260826P05000000",
+            "expiration_date": trading_date, "option_type": "P", "strike": 5000.0,
+            "open_interest": 100.0,
+        },
+    ])
+    source_start = datetime.combine(
+        trading_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    writer = DatabentoGammaStreamer(["SPX"])
+    writer.cache_dir = tmp_path
+    cache_path = writer._save_cached_universe(
+        frame,
+        trading_date=trading_date,
+        provider_definition_start=source_start,
+        provider_definition_end=source_start + timedelta(hours=12),
+        provider_statistics_start=source_start,
+        provider_statistics_end=source_start + timedelta(hours=11),
+    )
+    assert cache_path is not None
+    expected_sha256 = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+
+    reader = DatabentoGammaStreamer(["SPX"])
+    reader.cache_dir = tmp_path
+
+    def _reject_path_rehash(_path):
+        raise AssertionError("current-day cache path was re-read for hashing")
+
+    monkeypatch.setattr(reader, "_file_sha256", _reject_path_rehash)
+    assert reader._load_cached_universe(trading_date) is True
+    assert (
+        reader.subscription_metadata["universe_provenance"]["source_sha256"]
+        == expected_sha256
+    )

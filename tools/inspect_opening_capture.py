@@ -47,7 +47,10 @@ OPENING_SYMBOLS = ("SPX", "NDX", "VIX", "RUT")
 ACCEPTANCE_SCOPES = (
     "startup",
     "first_eligible_gamma_capture",
+    "first_opening_bucket",
     "complete_5m_orb",
+    "complete_15m_orb",
+    "complete_30m_orb",
     "complete_60m_orb",
 )
 OPTION_ROOT_ALIASES = {
@@ -740,6 +743,8 @@ def _orb_reference_evidence(
         list[tuple[datetime, datetime, datetime, str | None, bool | None]],
     ] = {}
     invalid_timestamp_rows: dict[str, int] = {}
+    timing_contracts: dict[str, set[str]] = {}
+    first_bucket_receipts: dict[str, list[dict]] = {}
     for row in rows:
         symbol = str(row["symbol"] or "").upper().strip()
         sample = _parse_utc(row["sample_timestamp_utc"])
@@ -752,6 +757,19 @@ def _orb_reference_evidence(
         provider = str(row["provider"] or "").lower().strip()
         validation_status = str(row["validation_status"] or "").lower().strip()
         row_keys = set(row.keys())
+        contract = str(row["timestamp_contract_version"]) if "timestamp_contract_version" in row_keys else "provider-event.v1"
+        if sample is not None and open_ct.astimezone(UTC) <= sample < opening_end_ct.astimezone(UTC):
+            timing_contracts.setdefault(symbol, set()).add(contract)
+        decision_time = _parse_utc(row["progress_decided_at_utc"]) if "progress_decided_at_utc" in row_keys else None
+        if (sample == open_ct.astimezone(UTC) and captured is not None and decision_time is not None
+                and sample <= captured <= decision_time < sample + timedelta(seconds=ORB_REFERENCE_CADENCE_SECONDS)
+                and "sample_id" in row_keys):
+            first_bucket_receipts.setdefault(symbol, []).append({
+                "sample_id": row["sample_id"], "sample_timestamp_utc": sample.isoformat(),
+                "captured_at_utc": captured.isoformat(), "progress_decided_at_utc": decision_time.isoformat(),
+                "subscription_epoch_id": epoch_id, "subscription_generation": generation,
+                "timestamp_contract_version": contract,
+            })
         primary_expiration = str(
             row["primary_expiration"] if "primary_expiration" in row_keys else ""
         ).strip() or None
@@ -996,6 +1014,9 @@ def _orb_reference_evidence(
         )
         evidence[symbol] = {
             "row_count": len(samples),
+            "timestamp_contracts": sorted(timing_contracts.get(symbol, ())),
+            "first_bucket_receipts": first_bucket_receipts.get(symbol, []),
+            "timestamp_contract_aligned": len(timing_contracts.get(symbol, ())) <= 1,
             "invalid_timestamp_row_count": invalid_timestamp_rows.get(symbol, 0),
             "cadence_seconds": ORB_REFERENCE_CADENCE_SECONDS,
             "expected_opening_sample_count": expected_samples,
@@ -1639,6 +1660,67 @@ $rows | ConvertTo-Json -Depth 6 -Compress
     }
 
 
+def _inspect_cbbo_reference_store(connection, trading_day):
+    """Read additive interval evidence without rewriting or projecting legacy rows."""
+    sample_table = "orb_cbbo_reference_samples"
+    decision_table = "orb_cbbo_reference_sample_decisions"
+    contracts = (
+        (sample_table, EXPECTED_ORB_REFERENCE_COLUMNS | {"timestamp_contract_version", "quote_schema", "trade_timestamp_count"},
+         EXPECTED_ORB_REFERENCE_TRIGGERS, EXPECTED_ORB_REFERENCE_INDEXES),
+        (decision_table, EXPECTED_ORB_REFERENCE_DECISION_COLUMNS,
+         EXPECTED_ORB_REFERENCE_DECISION_TRIGGERS, EXPECTED_ORB_REFERENCE_DECISION_INDEXES),
+    )
+    issues = []
+    for table, required, triggers, indexes in contracts:
+        columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+        if not required.issubset(columns):
+            issues.append(f"{table}:missing_columns")
+        for object_type, expected in (("trigger", triggers), ("index", indexes)):
+            actual = {str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type=? AND tbl_name=?", (object_type, table))}
+            if not {name.replace("orb_reference", "orb_cbbo_reference") for name in expected}.issubset(actual):
+                issues.append(f"{table}:missing_{object_type}")
+    if issues:
+        return {"ready": False, "issues": issues}, [], {}
+    decisions = {}
+    for row in connection.execute(
+        "SELECT sample.symbol, COUNT(*) AS raw_count, "
+        "SUM(decision.sample_id IS NULL) AS pending_count, "
+        "SUM(decision.progress_eligible=0) AS ineligible_count, "
+        "SUM(decision.progress_eligible=1) AS eligible_count "
+        f"FROM {sample_table} AS sample LEFT JOIN {decision_table} AS decision "
+        "ON decision.sample_id=sample.sample_id WHERE sample.trading_date=? GROUP BY sample.symbol",
+        (trading_day.isoformat(),)):
+        decisions[row["symbol"]] = {
+            "raw_row_count": int(row["raw_count"] or 0),
+            "pending_decision_count": int(row["pending_count"] or 0),
+            "ineligible_decision_count": int(row["ineligible_count"] or 0),
+            "eligible_decision_count": int(row["eligible_count"] or 0),
+        }
+    rows = list(connection.execute(
+        "SELECT sample.sample_id, sample.symbol, sample.sample_timestamp_utc, "
+        "sample.source_timestamp_utc, sample.captured_at_utc, sample.subscription_epoch_id, "
+        "sample.subscription_generation, sample.provider, sample.validation_status, "
+        "sample.primary_expiration, sample.same_day_profile_available, sample.timestamp_contract_version, "
+        "sample.quote_schema, decision.attempt_completed_at_utc AS progress_decided_at_utc "
+        f"FROM {sample_table} AS sample JOIN {decision_table} AS decision "
+        "ON decision.sample_id=sample.sample_id WHERE sample.trading_date=? "
+        "AND sample.timestamp_contract_version='databento-cbbo-interval.v1' "
+        "AND sample.quote_schema IN ('cbbo-1s','cbbo-1m') "
+        "AND decision.decision_status='final' AND decision.progress_eligible=1 "
+        "AND decision.sample_timestamp_utc=sample.sample_timestamp_utc "
+        "AND decision.intended_bucket_utc=sample.sample_timestamp_utc "
+        "AND CAST(strftime('%s',decision.intended_bucket_utc) AS INTEGER) % 5=0 "
+        "AND (instr(CAST(decision.intended_bucket_utc AS TEXT), '.')=0 OR "
+        "CAST(decision.intended_bucket_utc AS TEXT) NOT GLOB '*.[0-9]*[1-9]*') "
+        "AND julianday(decision.attempt_completed_at_utc)>=julianday(sample.captured_at_utc) "
+        "AND julianday(decision.attempt_completed_at_utc)>=julianday(decision.intended_bucket_utc) "
+        "AND julianday(decision.attempt_completed_at_utc)<julianday(decision.intended_bucket_utc,'+5 seconds') "
+        "ORDER BY sample.symbol,sample.sample_timestamp_utc,sample.captured_at_utc",
+        (trading_day.isoformat(),)))
+    return {"ready": True, "issues": [], "eligible_row_count": len(rows)}, rows, decisions
+
+
 def inspect_database(
     path: Path,
     trading_day: date,
@@ -2051,7 +2133,8 @@ def inspect_database(
                 }.issubset(orb_columns) and decision_contract_ready:
                     orb_rows = list(
                         connection.execute(
-                            "SELECT sample.symbol, sample.sample_timestamp_utc, "
+                            "SELECT sample.sample_id, decision.attempt_completed_at_utc AS progress_decided_at_utc, "
+                            "sample.symbol, sample.sample_timestamp_utc, "
                             "sample.source_timestamp_utc, sample.captured_at_utc, "
                             + (
                                 "sample.subscription_epoch_id "
@@ -2117,6 +2200,12 @@ def inspect_database(
                             (trading_day.isoformat(),),
                         )
                     )
+            cbbo_contract, cbbo_rows, cbbo_decisions = _inspect_cbbo_reference_store(connection, trading_day)
+            orb_rows.extend(cbbo_rows)
+            for symbol, counts in cbbo_decisions.items():
+                totals = orb_decision_rows.setdefault(symbol, {key: 0 for key in counts})
+                for key, count in counts.items():
+                    totals[key] += count
             observed = observed_at_ct or datetime.now(CT)
             return {
                 "present": True,
@@ -2142,6 +2231,7 @@ def inspect_database(
                     "orb_reference_samples" in table_names
                 ),
                 "orb_reference_evidence_role": "opening_ranges_only",
+                "cbbo_reference_store": cbbo_contract,
                 "orb_reference_columns": sorted(orb_columns),
                 "missing_orb_reference_columns": sorted(
                     EXPECTED_ORB_REFERENCE_COLUMNS.difference(orb_columns)
@@ -2390,6 +2480,9 @@ def evaluate(
             issues.append("MARKET_STRUCTURE_SCHEMA_INCOMPATIBLE")
         if database.get("missing_market_structure_triggers"):
             issues.append("MARKET_STRUCTURE_IMMUTABILITY_TRIGGERS_MISSING")
+        cbbo_contract = database.get("cbbo_reference_store")
+        if isinstance(cbbo_contract, dict) and cbbo_contract.get("ready") is not True:
+            issues.append("ORB_CBBO_REFERENCE_STORE_INCOMPATIBLE")
         if database.get("orb_reference_table_present") is not True:
             issues.append("ORB_REFERENCE_TABLE_MISSING")
         if database.get("missing_orb_reference_columns"):
@@ -2738,6 +2831,10 @@ def evaluate(
         reference_decisions = (
             database.get("orb_reference_progress_decisions") or {}
         )
+        if now_ct.time() >= time(8, 30, 5):
+            for symbol in set(CORE_SYMBOLS).union(configured):
+                if not (reference_rows.get(symbol) or {}).get("opening_bucket_present"):
+                    issues.append(f"ORB_FIRST_BUCKET_MISSING:{symbol}")
         reference_due = now_ct.time() >= time(8, 30, 15)
         if reference_due:
             runtime_context = orb_payload.get("active_runtime_context") or {}
@@ -2749,6 +2846,8 @@ def evaluate(
                 issues.append("ORB_RUNTIME_SUBSCRIPTION_EPOCH_MISMATCH")
             for symbol in set(CORE_SYMBOLS).union(configured):
                 evidence = reference_rows.get(symbol) or {}
+                if evidence.get("timestamp_contract_aligned") is False:
+                    issues.append(f"ORB_TIMESTAMP_CONTRACT_MIXED:{symbol}")
                 decision_evidence = reference_decisions.get(symbol) or {}
                 if int(decision_evidence.get("pending_decision_count") or 0) > 0:
                     issues.append(f"ORB_REFERENCE_DECISION_PENDING:{symbol}")
@@ -2981,7 +3080,7 @@ def scope_acceptance_evaluation(
     ordered_issues = list(dict.fromkeys(issues))
     if acceptance_scope == "first_eligible_gamma_capture":
         excluded_predicate = _is_gamma_scope_excluded_issue
-    elif acceptance_scope in {"complete_5m_orb", "complete_60m_orb"}:
+    elif acceptance_scope in {"first_opening_bucket", "complete_5m_orb", "complete_15m_orb", "complete_30m_orb", "complete_60m_orb"}:
         excluded_predicate = _is_orb_scope_excluded_issue
     else:
         return state, ordered_issues, []
@@ -3523,6 +3622,7 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
             "market_structure_rows",
             "orb_reference_table_present",
             "orb_reference_evidence_role",
+            "cbbo_reference_store",
             "missing_orb_reference_columns",
             "orb_reference_triggers",
             "missing_orb_reference_triggers",

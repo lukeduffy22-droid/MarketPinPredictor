@@ -61,7 +61,10 @@ foreach ($functionName in @(
     'Test-MarketAppCurrentDayUniversePreparationProof',
     'Invoke-BackendPreparedAutomaticListenerStop',
     'Assert-OpeningAcceptanceMutationPreflight',
-    'Invoke-MarketAppCurrentDayUniversePrestage'
+    'Invoke-MarketAppCurrentDayUniversePrestage',
+    'Test-ReadinessRecoveryAlreadyAttempted',
+    'Test-BackendReadinessRecoveryAlreadyAttempted',
+    'Test-DashboardReadinessRecoveryAlreadyAttempted'
 )) {
     $definition = @($ensureMarketAppAst.FindAll(
         {
@@ -161,6 +164,12 @@ function New-TestBackendUniversePreparation {
                 source_date = if ($UsesFallback) { '2026-09-08' } else { $TradingDate }
                 mode = if ($UsesFallback) { 'prior_cache_filtered' } else { 'current_day_cache' }
                 is_fallback = $UsesFallback
+                cache_metadata_status = if ($UsesFallback) { 'fallback' } else { 'verified' }
+                source_sha256 = ('b' * 64)
+                provider_definition_start = "${TradingDate}T00:00:00+00:00"
+                provider_definition_end = "${TradingDate}T23:59:59+00:00"
+                provider_statistics_start = "${TradingDate}T00:00:00+00:00"
+                provider_statistics_end = "${TradingDate}T23:59:59+00:00"
             }
         }
     }
@@ -1814,6 +1823,24 @@ Describe 'Pre-start universe cache preparation result handling' {
 }
 
 Describe 'Bounded pre-start universe cache preparation' {
+    It 'rejects late cache validation unless provider discovery is explicitly disabled' {
+        $rejection = $null
+        try {
+            Invoke-MarketAppUniverseCachePreparation `
+                -ProjectRoot $ProjectRoot `
+                -PythonExe 'python.exe' `
+                -Symbols 'SPX,NDX' `
+                -Deadline ([DateTime]::UtcNow.AddMinutes(-1)) `
+                -InvocationId 'unsafe-late-cache-only' `
+                -AllowCacheValidationAfterDeadline
+        }
+        catch {
+            $rejection = $_
+        }
+        $rejection | Should Not BeNullOrEmpty
+        $rejection.Exception.Message | Should Be '-AllowCacheValidationAfterDeadline requires -SkipProviderDiscovery.'
+    }
+
     It 'terminates the exact real Python process tree after a bounded timeout' {
         $root = Join-Path $TestDrive 'real-timeout-child'
         $toolDir = Join-Path $root 'tools'
@@ -2010,6 +2037,36 @@ Describe 'Bounded pre-start universe cache preparation' {
             $result.UsesFallback | Should Be $true
             Assert-MockCalled -CommandName Invoke-MarketAppUniversePreparationChild -ModuleName market_app_supervisor -Times 1 -ParameterFilter {
                 [bool]$CacheOnly
+            }
+        }
+
+        It 'permits bounded cache-only validation after an expired deadline only for explicit late salvage' {
+            Mock -CommandName Invoke-MarketAppUniversePreparationChild -ModuleName market_app_supervisor -MockWith {
+                [pscustomobject]@{
+                    Completed = $true
+                    TimedOut = $false
+                    ExitedAndQuiescent = $true
+                    ExitCode = 0
+                    Output = @('{"status":"fallback","preparation_mode":"cache_only","provenance_label":"PRIOR_SESSION_FALLBACK","current_day_cache_ready":false,"provenance":{"mode":"prior_cache_filtered","is_fallback":true,"trading_date":"2026-09-09"}}')
+                }
+            }
+
+            $result = Invoke-MarketAppUniverseCachePreparation `
+                -ProjectRoot $ProjectRoot `
+                -PythonExe 'python.exe' `
+                -Symbols 'SPX,NDX,VIX,RUT' `
+                -TradingDate '2026-09-09' `
+                -ProviderTimeoutSeconds 1 `
+                -CacheValidationTimeoutSeconds 1 `
+                -Deadline ([DateTime]::UtcNow.AddMinutes(-1)) `
+                -InvocationId 'late-cache-only' `
+                -SkipProviderDiscovery `
+                -AllowCacheValidationAfterDeadline
+
+            $result.StartupMayContinue | Should Be $true
+            $result.Outcome | Should Be 'provider_skipped_cache_only_validated'
+            Assert-MockCalled -CommandName Invoke-MarketAppUniversePreparationChild -ModuleName market_app_supervisor -Times 1 -ParameterFilter {
+                [bool]$CacheOnly -and $TimeoutMilliseconds -eq 1000 -and $DeadlineUtc -gt [DateTime]::UtcNow
             }
         }
 
@@ -2543,6 +2600,48 @@ Describe 'Verified backend cash-close boundary' {
 }
 
 Describe 'Bounded backend readiness recovery decision' {
+    It 'preserves an aged same-day handoff warming before open without spending recovery' {
+        $state = New-TestBackendReadinessState
+        $state.SubscriptionSessionState = 'preopen'
+        $state.HealthHandoffStatus = 'warming'
+        $state.LiveHandoffStatus = 'warming'
+        $decision = Resolve-MarketAppBackendReadinessAction `
+            -Now ([datetime]'2026-09-08T08:00:00') -ListenerCount 1 `
+            -OwnershipVerified $true -ListenerStartTime ([datetime]'2026-09-08T07:45:00') `
+            -RuntimeState $state
+        $decision.Action | Should Be 'preserve'
+        $decision.Reason | Should Be 'preopen_handoff_warming'
+        @($decision.FailureReasons).Count | Should Be 0
+    }
+
+    It 'still diagnoses a dead sampler while a preopen handoff warms' {
+        $state = New-TestBackendReadinessState
+        $state.SubscriptionSessionState = 'preopen'
+        $state.HealthHandoffStatus = 'warming'
+        $state.LiveHandoffStatus = 'warming'
+        $state.OrbSamplerAlive = $false
+        $decision = Resolve-MarketAppBackendReadinessAction `
+            -Now ([datetime]'2026-09-08T08:00:00') -ListenerCount 1 `
+            -OwnershipVerified $true -ListenerStartTime ([datetime]'2026-09-08T07:45:00') `
+            -RuntimeState $state
+        $decision.Action | Should Be 'restart'
+        (@($decision.FailureReasons) -contains 'orb_sampler_not_alive') | Should Be $true
+    }
+
+    It 'requires active handoff at the exact cash open' {
+        $state = New-TestBackendReadinessState
+        $state.SubscriptionSessionState = 'regular_session'
+        $state.HealthHandoffStatus = 'warming'
+        $state.LiveHandoffStatus = 'warming'
+        $decision = Resolve-MarketAppBackendReadinessAction `
+            -Now ([datetime]'2026-09-08T08:30:00') -ListenerCount 1 `
+            -OwnershipVerified $true -ListenerStartTime ([datetime]'2026-09-08T07:45:00') `
+            -RuntimeState $state
+        (@($decision.FailureReasons) -contains 'health_handoff_not_active') | Should Be $true
+        (@($decision.FailureReasons) -contains 'live_handoff_not_active') | Should Be $true
+        $decision.Reason | Should Be 'protected_opening_boundary_reached'
+    }
+
     It 'preserves a healthy pre-open backend' {
         $decision = Resolve-MarketAppBackendReadinessAction `
             -Now ([datetime]'2026-09-08T08:20:00') `
@@ -2994,6 +3093,9 @@ Describe 'Session recovery journal success latch' {
             -TradingDate '2026-09-08'
         $state.Requested | Should Be $true
         $state.Succeeded | Should Be $false
+        $state.CompletionPending | Should Be $true
+        $state.SuccessfulReplacementProcessId | Should BeNullOrEmpty
+        $state.SuccessfulReplacementIdentityToken | Should BeNullOrEmpty
 
         $retry = Resolve-MarketAppDashboardReadinessAction `
             -Now ([datetime]'2026-09-08T08:30:00') `
@@ -3022,6 +3124,9 @@ Describe 'Session recovery journal success latch' {
             -TradingDate '2026-09-08'
         $state.Requested | Should Be $true
         $state.Succeeded | Should Be $true
+        $state.CompletionPending | Should Be $false
+        $state.SuccessfulReplacementProcessId | Should Be 5252
+        $state.SuccessfulReplacementIdentityToken | Should BeNullOrEmpty
 
         $latched = Resolve-MarketAppDashboardReadinessAction `
             -Now ([datetime]'2026-09-08T08:30:00') `
@@ -3032,6 +3137,163 @@ Describe 'Session recovery journal success latch' {
             -RecoveryAlreadyAttempted $state.Succeeded
         $latched.Action | Should Be 'preserve'
         $latched.Reason | Should Be 'session_recovery_already_succeeded'
+    }
+
+    It 'does not let a readable success receipt without an exact PID suppress a different backend owner' {
+        $root = Join-Path $TestDrive 'backend-success-without-identity'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 action=request_exact_owner_stop',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 action=latched'
+        )
+
+        $state = Get-MarketAppSessionRecoveryJournalState `
+            -ProjectRoot $root `
+            -Component 'backend' `
+            -TradingDate '2026-09-08'
+        $state.Succeeded | Should Be $true
+        $state.SuccessfulReplacementProcessId | Should BeNullOrEmpty
+
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $differentListenerSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 6262
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+        }
+        $differentListenerSucceeded | Should Be $false
+    }
+
+    It 'binds a backend success receipt only to its exact replacement listener PID' {
+        $root = Join-Path $TestDrive 'backend-bound-success'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=4141 action=request_exact_owner_stop',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=5252 action=latched'
+        )
+
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $matchingListenerSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252
+            $differentListenerSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 6262
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+        }
+
+        $matchingListenerSucceeded | Should Be $true
+        $differentListenerSucceeded | Should Be $false
+    }
+
+    It 'rejects a reused backend PID when the process creation identity changed' {
+        $root = Join-Path $TestDrive 'backend-strong-identity'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=4141 action=launch_replacement',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=5252 replacement_listener_identity_token=5252|638929455050000000 action=latched'
+        )
+
+        $state = Get-MarketAppSessionRecoveryJournalState `
+            -ProjectRoot $root `
+            -Component 'backend' `
+            -TradingDate '2026-09-08'
+        $state.SuccessfulReplacementProcessId | Should Be 5252
+        $state.SuccessfulReplacementIdentityToken | Should Be '5252|638929455050000000'
+
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $exactIdentitySucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252 `
+                -CurrentListenerIdentityToken '5252|638929455050000000'
+            $reusedPidSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252 `
+                -CurrentListenerIdentityToken '5252|638929999990000000'
+            $unresolvedIdentitySucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+        }
+
+        $exactIdentitySucceeded | Should Be $true
+        $reusedPidSucceeded | Should Be $false
+        $unresolvedIdentitySucceeded | Should Be $false
+    }
+
+    It 'uses the latest backend success PID and leaves a later request pending' {
+        $root = Join-Path $TestDrive 'backend-latest-success-and-request'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=4141 action=request_exact_owner_stop',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=5252 action=latched',
+            '2026-09-08 09:00:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=5252 action=request_exact_owner_stop',
+            '2026-09-08 09:00:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=6262 action=latched',
+            '2026-09-08 09:30:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=6262 action=request_exact_owner_stop'
+        )
+
+        $state = Get-MarketAppSessionRecoveryJournalState `
+            -ProjectRoot $root `
+            -Component 'backend' `
+            -TradingDate '2026-09-08'
+        $state.Requested | Should Be $true
+        $state.Succeeded | Should Be $true
+        $state.CompletionPending | Should Be $true
+        $state.SuccessfulReplacementProcessId | Should Be 6262
+        $state.SuccessfulReplacementIdentityToken | Should BeNullOrEmpty
+    }
+
+    It 'keeps the backend latch fail closed when the recovery journal is unreadable' {
+        $root = Join-Path $TestDrive 'backend-unreadable-journal'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 action=request_exact_owner_stop'
+
+        $lock = [System.IO.File]::Open(
+            $journal,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $state = Get-MarketAppSessionRecoveryJournalState `
+                -ProjectRoot $root `
+                -Component 'backend' `
+                -TradingDate '2026-09-08'
+            $alreadyAttempted = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 6262
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+            $lock.Dispose()
+        }
+
+        $state.Readable | Should Be $false
+        $state.CompletionPending | Should Be $false
+        $alreadyAttempted | Should Be $true
     }
 }
 
@@ -3590,8 +3852,19 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $ensureScript | Should Match 'RecoveryReason \$readinessDecision\.Reason[\s\S]+-RuntimeState \$backendReadinessState'
         $ensureScript | Should Match 'backend_readiness_recovery_requested'
         $ensureScript | Should Match 'Test-BackendReadinessRecoveryAlreadyAttempted'
+        ([regex]::Matches(
+            $ensureScript,
+            'Test-BackendReadinessRecoveryAlreadyAttempted\s+`\r?\n\s+-TradingDate \$currentTradingDate\s+`\r?\n\s+-CurrentListenerProcessId \(\[int\]\$backendPids\[0\]\)\s+`\r?\n\s+-CurrentListenerIdentityToken \$backendListenerIdentityToken'
+        ).Count) | Should Be 3
+        ([regex]::Matches(
+            $ensureScript,
+            'if \(\$(?:preparedStop|automaticStop)\.Stopped\) \{[\s\S]{0,700}?-Event ''backend_session_recovery_requested'''
+        ).Count) | Should Be 3
         $ensureScript | Should Match "backend_session_recovery_requested[\s\S]+backend_session_recovery_succeeded"
         $ensureScript | Should Match 'backendLaunchResult\.ListenerProcessId[\s\S]+action=latched'
+        $ensureScript | Should Match 'replacement_listener_identity_token=\$\(\$backendLaunchResult\.ListenerIdentityToken\)'
+        $ensureScript | Should Match 'Start-VerifiedComponent[\s\S]+-RequireStrongListenerIdentity[\s\S]+backend_session_recovery_succeeded'
+        $ensureScript | Should Match "launch_identity_unverified[\s\S]+Stop-MarketAppAttemptedLaunch"
         $ensureScript | Should Match 'backend_prior_day_process_current_session_verified[\s\S]+reason=current_session_contract_progressing[\s\S]+action=preserve_listener'
         $ensureScript | Should Match "verified_prior_day_backend_preopen_refresh[\s\S]+Invoke-BackendPreparedAutomaticListenerStop[\s\S]+-RequireCurrentDay"
         $ensureScript | Should Match '\$preparedBackendUniverse = \$automaticStop\.Preparation'
@@ -3675,12 +3948,12 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
     It 'returns closing-tape status without terminating the parent supervisor runspace' {
         $startClosingScript | Should Not Match '(?m)^\s*exit\b'
         $startClosingScript | Should Match "Status = 'not_yet_due'[\s\S]+\r?\n\s*return"
-        $startClosingScript | Should Match "Status = 'recovery_replay_blocked'[\s\S]+\r?\n\s*return"
+        $startClosingScript | Should Match "Status = 'recovery_attempt_limit_reached'[\s\S]+\r?\n\s*return"
         $startClosingScript | Should Match "Status = 'outside_start_window'[\s\S]+\r?\n\s*return"
         $startClosingScript | Should Match "Status = 'already_running'[\s\S]+\r?\n\s*return"
     }
 
-    It 'defers the broad closing-tape stream until the opening ORB is complete' {
+    It 'defers the broad closing-tape stream until transport and primary subscriptions are safe' {
         $ensureScript | Should Match 'closing_tape_deferred_for_opening_capture'
         $ensureScript | Should Match "resultStatus -eq 'not_yet_due'"
         $ensureScript | Should Match 'protect_opening_gamma_and_orb'
@@ -3689,11 +3962,20 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startClosingScript | Should Match '--require-primary-ready'
     }
 
-    It 'preserves prior tape evidence instead of auto-replaying it during live hours' {
-        $ensureScript | Should Match "resultStatus -eq 'recovery_replay_blocked'"
-        $ensureScript | Should Match 'closing_tape_recovery_replay_blocked'
+    It 'preserves tape evidence after the bounded recovery attempt limit' {
+        $ensureScript | Should Match "resultStatus -eq 'recovery_attempt_limit_reached'"
+        $ensureScript | Should Match 'closing_tape_recovery_attempt_limit_reached'
         $ensureScript | Should Match 'action=preserve_primary_backend'
         $ensureScript | Should Match "resultStatus -eq 'outside_start_window'[\s\S]+Resolve-MarketAppPostCloseFinalizeResult"
+    }
+
+    It 'records catalog DBN status process and runtime-log launch evidence' {
+        $startClosingScript | Should Match '\$sqlitePath = .*data\\market_data\.db'
+        $startClosingScript | Should Match '\$env:DATABASE_URL = "sqlite:///\$sqlitePath"'
+        $startClosingScript | Should Match 'marketpin\.closing-tape-launch-receipt\.v1'
+        $startClosingScript | Should Match 'catalog_path[\s\S]+status_path[\s\S]+dbn_paths'
+        $startClosingScript | Should Match 'stdout_path[\s\S]+stderr_path'
+        $startClosingScript | Should Match "capture_mode[\s\S]+capture_only"
     }
 
     It 'limits explicit restart execution to the requested component' {
@@ -3771,13 +4053,14 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startMarketDayScript | Should Match 'Start-Service -Name W32Time'
         $startMarketDayScript | Should Match 'w32tm /resync /rediscover'
         $startMarketDayScript | Should Not Match '(?m)^\s*& w32tm /resync /nowait'
-        $startMarketDayScript | Should Match 'UtcNow\.AddSeconds\(30\)[\s\S]+w32tm /query /status[\s\S]+Start-Sleep -Milliseconds 500'
+        $startMarketDayScript | Should Match 'ConfirmationTimeoutSeconds = 30'
+        $startMarketDayScript | Should Match 'Stopwatch\]::StartNew\(\)[\s\S]+w32tm /query /status[\s\S]+Start-Sleep -Milliseconds 500'
         $startMarketDayScript | Should Match "Status='synchronized'"
         $startMarketDayScript | Should Match 'clock_sync\.log'
         $startMarketDayScript | Should Match 'PROCESSING_CLOCK_NOT_SYNCHRONIZED|fails closed'
         $startMarketDayScript | Should Match 'All-index ORB launch failed closed because RUT clock eligibility was not proven'
         $startMarketDayScript | Should Match 'No SPX/NDX/VIX-only downgrade will be launched'
-        $startMarketDayScript | Should Match '(?s)if \(-not \$rutCanaryEligible\) \{.*?Write-Error.*?exit 1\s*\}'
+        $startMarketDayScript | Should Match '(?s)if \(-not \$rutCanaryEligible -and -not \$clockPreflightOnly\) \{.*?Write-Error.*?exit 1\s*\}'
         $startMarketDayScript | Should Not Match 'core SPX/NDX/VIX launch will continue'
     }
 
@@ -3790,7 +4073,7 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startMarketDayScript | Should Match '\$Date -ge \$universePrestageCutoff -and[\s\S]+\$Date -lt \$launchWindowEndExclusive'
         $startMarketDayScript | Should Match '\$clockPreflightOnly = \$action -ceq ''clock_and_universe_prestage'''
         $startMarketDayScript | Should Match "'clock_and_universe_prestage'"
-        $startMarketDayScript | Should Match 'if \(\$clockPreflightOnly\)[\s\S]+-PrepareUniverseOnly[\s\S]+exit \$LASTEXITCODE'
+        $startMarketDayScript | Should Match 'if \(\$clockPreflightOnly\)[\s\S]+-PrepareUniverseOnly[\s\S]+if \(\$prestageExitCode -ne 0\) \{ exit \$prestageExitCode \}'
         $startMarketDayScript | Should Match '07:00 and 07:15 triggers repair/verify time and stage only the[\s\S]+07:40-through-18:00 guarded launch window[\s\S]+pre-stage stops[\s\S]+by 07:40'
         $startMarketDayScript | Should Match "'ScheduledTaskUniversePrestage'"
     }

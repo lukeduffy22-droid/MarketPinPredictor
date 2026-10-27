@@ -132,6 +132,77 @@ def _window_summary(value: Any, *, directional_allowed: bool) -> str:
     return status
 
 
+def _orb_status_detail(
+    envelope: Mapping[str, Any],
+    state: Mapping[str, Any],
+    *,
+    state_identity_current: bool,
+) -> str:
+    """Explain row availability without treating an empty canary as a process fault."""
+
+    capture_status = str(state.get("capture_status") or "unavailable")
+    if capture_status == "not_configured":
+        return "Not configured for live capture."
+
+    reasons: list[str] = []
+    context = _as_mapping(envelope.get("active_runtime_context"))
+    provenance = _as_mapping(state.get("provenance"))
+    evidence = _as_mapping(state.get("capture_evidence"))
+    latest = _as_mapping(state.get("last_known_reference"))
+    if not state_identity_current:
+        if (
+            envelope.get("schema_version") != ORB_COLLECTION_SCHEMA_V2
+            or envelope.get("runtime_binding_applied") is not True
+        ):
+            reasons.append("Live runtime binding is unavailable.")
+        elif envelope.get("runtime_context_stable") is not True:
+            reasons.append("Runtime identity changed or was not verified during this read.")
+        elif (
+            _canonical_subscription_epoch(context.get("subscription_epoch_id")) is None
+            or _positive_int(context.get("subscription_generation")) is None
+        ):
+            reasons.append("Active runtime identity is unavailable.")
+        elif context.get("handoff_status") != "active":
+            reasons.append("Feed handoff is not active; current signals are unavailable.")
+        elif (
+            latest.get("subscription_epoch_id") is not None
+            and latest.get("subscription_epoch_id") != context.get("subscription_epoch_id")
+        ):
+            reasons.append("Latest sample belongs to a different runtime process.")
+        elif (
+            latest.get("subscription_generation") is not None
+            and latest.get("subscription_generation") != context.get("subscription_generation")
+        ):
+            reasons.append("Latest sample belongs to a different subscription generation.")
+        else:
+            reasons.append("No eligible sample is bound to the current runtime.")
+
+    if capture_status == "partial":
+        if evidence.get("opening_bucket_present") is False:
+            reasons.append("The first opening bucket is missing.")
+        if provenance.get("range_provenance_aligned") is False:
+            reasons.append("Opening samples have mixed or incomplete provenance.")
+        reasons.append("Opening-range capture is partial; breakout signals are unavailable.")
+    elif capture_status in {"unavailable", "awaiting_first_sample"}:
+        reasons.append("No eligible opening-range samples are available.")
+    elif capture_status == "not_started":
+        reasons.append("Opening-range capture has not started.")
+    elif capture_status == "forming":
+        reasons.append("Opening ranges are forming; completed windows are evaluated separately.")
+    elif capture_status == "complete":
+        if provenance.get("current_vs_range_aligned") is not True:
+            reasons.append("Current sample and opening range are not aligned.")
+        if state.get("current_reference_fresh") is not True:
+            reasons.append("The current reference is stale or unavailable.")
+        if _as_mapping(state.get("reference_semantics")).get("directional_base_eligible") is not True:
+            reasons.append("This option-parity reference is context only.")
+        if not reasons and state.get("directional_evidence_eligible") is not True:
+            reasons.append("The captured range is context only; directional eligibility is unverified.")
+    else:
+        reasons.append("Opening-range capture state is unavailable.")
+    return " ".join(reasons) or "Opening range is complete and eligible for sampled-reference signals."
+
+
 def _orb_fetch_failure(reason: str, *, status_code: int | None = None) -> dict[str, Any]:
     """Return a non-signal UI diagnostic for a failed bounded ORB read."""
 
@@ -158,7 +229,7 @@ def _orb_http_failure(response: Any) -> dict[str, Any]:
     return _orb_fetch_failure(reason, status_code=int(response.status_code))
 
 
-def fetch_opening_ranges(timeout_seconds: float = 1.5) -> dict[str, Any]:
+def fetch_opening_ranges(timeout_seconds: float = 5.0) -> dict[str, Any]:
     """Read ORB state while preserving a safe reason when the read is unavailable."""
     try:
         response = requests.get(ORB_ENDPOINT, timeout=timeout_seconds)
@@ -237,12 +308,15 @@ def opening_range_rows(payload: Mapping[str, Any] | None) -> list[dict[str, Any]
         else:
             alignment = "reset/mixed"
         display_warnings = [str(item) for item in warnings]
-        if not state_identity_current:
+        if not state_identity_current and capture_status != "not_configured":
             display_warnings.append("ORB_V2_LIVE_CONTRACT_UNVERIFIED")
         rows.append(
             {
                 "Symbol": str(symbol),
                 "Capture": capture_status,
+                "Status detail": _orb_status_detail(
+                    envelope, state, state_identity_current=state_identity_current
+                ),
                 "Provenance": alignment,
                 "Reference": str(reference.get("kind") or "pending"),
                 "ORB eligible": bool(
@@ -262,9 +336,20 @@ def opening_range_rows(payload: Mapping[str, Any] | None) -> list[dict[str, Any]
                 "Coverage %": (
                     capture_ratio * 100.0 if capture_ratio is not None else None
                 ),
-                "Open": state.get("opening_price"),
-                "ORB high": state.get("orb_high"),
-                "ORB low": state.get("orb_low"),
+                "First opening bucket": (
+                    "captured" if evidence.get("opening_bucket_present") is True
+                    else "missing" if evidence.get("opening_bucket_present") is False
+                    else "unverified"
+                ),
+                "First sample lag (s)": _finite_float(
+                    evidence.get("first_sample_lag_seconds")
+                ),
+                "First sampled price": state.get("opening_price"),
+                "60m sampled high": state.get("orb_high"),
+                "60m sampled low": state.get("orb_low"),
+                "Invalid price samples excluded": _nonnegative_int(
+                    evidence.get("excluded_invalid_price_sample_count")
+                ),
                 "Current": (
                     state.get("current_price") if current_reference_visible else None
                 ),
@@ -373,33 +458,27 @@ def render_opening_range_panel() -> None:
         )
         return
 
-    states = {row["Capture"] for row in rows}
-    provenance_resets = any(row["Provenance"] == "reset/mixed" for row in rows)
-    all_live_v2 = all(row["Live contract"] == "v2 current" for row in rows)
-    if states == {"complete"} and not provenance_resets and all_live_v2:
-        st.success("Opening ranges are complete for every displayed market.")
-    elif not all_live_v2:
-        st.warning(
-            "Current ORB signals are withheld because at least one row lacks a stable, "
-            "runtime-bound v2 process identity. Retained ranges are context only."
-        )
-    elif (
-        "partial" in states
-        or "unavailable" in states
-        or "not_configured" in states
-        or provenance_resets
-    ):
-        st.warning(
-            "At least one opening range is partial, unavailable, not configured, or "
-            "provenance-reset; "
-            "those rows are not used as breakout signals."
-        )
-    elif "forming" in states or "awaiting_first_sample" in states:
-        st.info("Opening ranges are forming; breakout classification remains disabled.")
-    elif "not_started" in states:
-        st.info("Opening-range capture has not started yet.")
+    notices: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        if row["Capture"] == "not_configured":
+            level = "caption"
+        elif row["ORB eligible"]:
+            level = "success"
+        elif row["Capture"] in {"not_started", "forming"} and row["Live contract"] == "v2 current":
+            level = "info"
+        else:
+            level = "warning"
+        notices.setdefault((level, row["Status detail"]), []).append(row["Symbol"])
+    for (level, detail), symbols in notices.items():
+        getattr(st, level)(f"{', '.join(symbols)}: {detail}")
 
     frame = pd.DataFrame(rows)
+    if any(row["Invalid price samples excluded"] for row in rows):
+        st.warning(
+            "Invalid option-price samples were excluded from the displayed ranges. "
+            "Original records are preserved for audit; the remaining samples do not "
+            "establish official opening highs or lows."
+        )
     st.dataframe(
         frame,
         width="stretch",
@@ -411,9 +490,9 @@ def render_opening_range_panel() -> None:
                 max_value=100.0,
                 format="%.0f%%",
             ),
-            "Open": st.column_config.NumberColumn(format="%.2f"),
-            "ORB high": st.column_config.NumberColumn(format="%.2f"),
-            "ORB low": st.column_config.NumberColumn(format="%.2f"),
+            "First sampled price": st.column_config.NumberColumn(format="%.2f"),
+            "60m sampled high": st.column_config.NumberColumn(format="%.2f"),
+            "60m sampled low": st.column_config.NumberColumn(format="%.2f"),
             "Current": st.column_config.NumberColumn(format="%.2f"),
             "Gamma pin": st.column_config.NumberColumn(format="%.2f"),
             "Pin move from open": st.column_config.NumberColumn(format="%+.2f"),
@@ -422,8 +501,12 @@ def render_opening_range_panel() -> None:
         },
     )
     st.caption(
-        "RUT remains not configured unless its guarded canary is explicitly enabled and "
-        "passes live coverage checks; missing ranges are never reconstructed from later prices. "
+        "High and low columns cover the first 60 minutes of sampled option parity. "
+        "The first sampled price is not the official opening print. "
+        "Complete capture requires the first opening bucket as well as sufficient coverage; "
+        "a high coverage percentage cannot replace a missing opening bucket. "
+        "First sample lag is measured from 08:30 AM Central (09:30 AM Eastern). "
+        "Missing ranges are never reconstructed from later prices. "
         "ORB eligible applies only to the sampled range. ORB + structure eligible also "
         "requires gamma/max-pain provenance to align with that reference. The abbreviated "
         "epoch is for scanning; Epoch full retains the complete process identity for audit."

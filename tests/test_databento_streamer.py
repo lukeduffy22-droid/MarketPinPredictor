@@ -6,6 +6,7 @@ import logging
 import threading
 from datetime import date, datetime, timedelta, timezone
 
+import databento as db
 import pandas as pd
 import pytest
 
@@ -1062,23 +1063,27 @@ def test_reference_sampler_retries_same_bucket_for_new_generation(monkeypatch):
             "post_persist_context_current": True,
         }
 
-    class StopAfterTwoWaits:
-        waits = 0
+    class StopAfterTwoAttempts:
+        deadline = time.monotonic() + 2.0
 
         def wait(self, timeout):
             assert timeout <= 1.0
-            self.waits += 1
+            # A scheduler poll need not dispatch a new worker: its previous
+            # future may still be returning after it recorded the attempt.
+            # Allow that normal poll, rather than blocking the scheduler until
+            # an attempt that only the scheduler can dispatch has appeared.
             with attempt_condition:
-                assert attempt_condition.wait_for(
-                    lambda: len(attempts) >= self.waits,
-                    timeout=2.0,
+                finished = attempt_condition.wait_for(
+                    lambda: len(attempts) >= 2,
+                    timeout=0.01,
                 )
-            if self.waits >= 2:
+            assert finished or time.monotonic() < self.deadline
+            if finished:
                 streamer.is_running = False
             return False
 
     monkeypatch.setattr(streamer, "_capture_opening_reference_once", capture)
-    streamer._stop_event = StopAfterTwoWaits()
+    streamer._stop_event = StopAfterTwoAttempts()
 
     streamer._opening_reference_loop()
 
@@ -2262,6 +2267,121 @@ def test_core_cache_admission_rejects_weak_core_and_collects_all_family_diagnost
     assert rut_diagnostic["required_for_universe_admission"] is False
 
 
+@pytest.mark.parametrize("failure_stage", ["definition", "open_interest"])
+def test_provider_staging_keeps_current_day_core_when_optional_rut_provider_fails(
+    tmp_path,
+    monkeypatch,
+    failure_stage,
+):
+    monkeypatch.setattr(
+        "backend.databento_streamer.DATABENTO_REQUIRED_SYMBOLS", ["SPX", "NDX"]
+    )
+    monkeypatch.setattr("backend.databento_streamer.MIN_PRIMARY_STRIKE_PAIRS", 1)
+    trading_date = date(2026, 8, 26)
+    streamer = DatabentoGammaStreamer(["SPX", "NDX", "RUT"])
+    streamer.cache_dir = tmp_path
+    monkeypatch.setattr(
+        streamer,
+        "_load_staged_market_universe",
+        lambda **_kwargs: None,
+    )
+
+    core_by_market = {
+        market: pd.DataFrame(_primary_pair_rows(market, trading_date, 1)).drop(
+            columns=["open_interest"]
+        )
+        for market in ("SPX", "NDX")
+    }
+
+    def definitions(_historical, config, **_kwargs):
+        if config.label == "RUT" and failure_stage == "definition":
+            raise db.BentoServerError(504, message="fixture gateway timeout")
+        if config.label == "RUT":
+            frame = pd.DataFrame(
+                _primary_pair_rows("RUT", trading_date + timedelta(days=1), 1)
+            )
+            return frame.drop(columns=["open_interest"])
+        return core_by_market[config.label].copy()
+
+    def open_interest(_historical, config, candidates, **_kwargs):
+        if config.label == "RUT" and failure_stage == "open_interest":
+            raise db.BentoServerError(504, message="fixture gateway timeout")
+        return pd.DataFrame(
+            {"symbol": list(candidates), "open_interest": [1.0] * len(candidates)}
+        )
+
+    monkeypatch.setattr(streamer, "_fetch_definition_universe", definitions)
+    monkeypatch.setattr(streamer, "_fetch_parent_open_interest", open_interest)
+    definition_end = datetime(2026, 8, 26, 23, 0, tzinfo=timezone.utc)
+    statistics_end = datetime(2026, 8, 26, 23, 30, tzinfo=timezone.utc)
+
+    result = streamer._stage_provider_universe_cache(
+        historical=object(),
+        source_date=trading_date,
+        admission_date=trading_date,
+        definition_end=definition_end,
+        statistics_end=statistics_end,
+        is_fallback=False,
+    )
+
+    assert result["is_fallback"] is False
+    assert result["source_date"] == trading_date.isoformat()
+    assert result["trading_date"] == trading_date.isoformat()
+    assert result["optional_family_unavailable_reasons"] == {
+        "RUT": "OPTIONAL_FAMILY_PROVIDER_ERROR"
+    }
+    rut_discovery = result["definition_discovery"]["RUT"]
+    assert rut_discovery["status"] == "unavailable"
+    assert rut_discovery["unavailable_reason"] == "OPTIONAL_FAMILY_PROVIDER_ERROR"
+    assert rut_discovery["provider_error_stage"] == failure_stage
+    assert rut_discovery["provider_error_type"] == "BentoServerError"
+    cache_frame = pd.read_csv(result["source_path"])
+    assert set(cache_frame["market"]) == {"SPX", "NDX"}
+    assert streamer._load_cached_universe(
+        trading_date, ignore_refresh_flag=True
+    ) is True
+    assert set(streamer.universe["market"]) == {"SPX", "NDX"}
+    assert streamer.subscription_metadata["optional_family_unavailable_reasons"] == {
+        "RUT": "OPTIONAL_FAMILY_PROVIDER_ERROR"
+    }
+
+
+def test_provider_staging_fails_closed_when_required_core_provider_fails(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "backend.databento_streamer.DATABENTO_REQUIRED_SYMBOLS", ["SPX", "NDX"]
+    )
+    trading_date = date(2026, 8, 26)
+    streamer = DatabentoGammaStreamer(["SPX", "NDX", "RUT"])
+    streamer.cache_dir = tmp_path
+    monkeypatch.setattr(
+        streamer,
+        "_load_staged_market_universe",
+        lambda **_kwargs: None,
+    )
+
+    def definitions(_historical, config, **_kwargs):
+        if config.label == "SPX":
+            raise db.BentoServerError(504, message="fixture gateway timeout")
+        return pd.DataFrame()
+
+    monkeypatch.setattr(streamer, "_fetch_definition_universe", definitions)
+
+    with pytest.raises(db.BentoServerError):
+        streamer._stage_provider_universe_cache(
+            historical=object(),
+            source_date=trading_date,
+            admission_date=trading_date,
+            definition_end=datetime(2026, 8, 26, 23, 0, tzinfo=timezone.utc),
+            statistics_end=datetime(2026, 8, 26, 23, 30, tzinfo=timezone.utc),
+            is_fallback=False,
+        )
+
+    assert not list(tmp_path.glob("opra_universe_*.csv"))
+
+
 def test_current_cache_publishes_core_when_optional_families_are_unavailable(
     tmp_path,
     monkeypatch,
@@ -2290,7 +2410,17 @@ def test_current_cache_publishes_core_when_optional_families_are_unavailable(
             for option_type in ("C", "P")
         ]
     )
-    core_frame.to_csv(streamer._cache_path(trading_date), index=False)
+    source_start = datetime.combine(
+        trading_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    assert streamer._save_cached_universe(
+        core_frame,
+        trading_date=trading_date,
+        provider_definition_start=source_start,
+        provider_definition_end=source_start + timedelta(hours=12),
+        provider_statistics_start=source_start,
+        provider_statistics_end=source_start + timedelta(hours=11),
+    ) is not None
 
     assert streamer._load_cached_universe(trading_date) is True
     assert set(streamer.universe["market"]) == {"SPX", "NDX"}
@@ -3867,6 +3997,11 @@ def test_valid_snapshot_writes_canonical_export_without_using_invalid_throttle(
     streamer.snapshot_interval = 0
     streamer._last_invalid_snapshot_write["SPX"] = time.monotonic()
     payload = {
+        "universe_provenance": {
+            "is_fallback": False,
+            "trading_date": current_market_date().isoformat(),
+            "source_date": current_market_date().isoformat(),
+        },
         "generated_at_utc": "2026-09-01T14:30:00+00:00",
         "timestamp_utc": "2026-09-01T14:30:00+00:00",
         "symbol": "SPX",
@@ -4275,7 +4410,7 @@ def test_transport_reconnect_promotes_staged_current_day_cache_over_fallback(
         raw_option_symbol("SPXW", trading_date, option_type, 7605.0)
         for option_type in ("C", "P")
     ]
-    pd.DataFrame(
+    current_frame = pd.DataFrame(
         [
             {
                 "market": "SPX",
@@ -4287,7 +4422,18 @@ def test_transport_reconnect_promotes_staged_current_day_cache_over_fallback(
             }
             for symbol, option_type in zip(current_symbols, ("C", "P"))
         ]
-    ).to_csv(streamer._cache_path(trading_date), index=False)
+    )
+    source_start = datetime.combine(
+        trading_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    assert streamer._save_cached_universe(
+        current_frame,
+        trading_date=trading_date,
+        provider_definition_start=source_start,
+        provider_definition_end=source_start + timedelta(hours=12),
+        provider_statistics_start=source_start,
+        provider_statistics_end=source_start + timedelta(hours=11),
+    ) is not None
 
     class UnexpectedHistorical:
         def __init__(self, _api_key):

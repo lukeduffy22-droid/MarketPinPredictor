@@ -627,7 +627,20 @@ def ingest(
     allow_partial_correction: bool = False,
     bundle_profile: str = "full",
     score_prediction_ids_by_symbol: dict[str, list[int]] | None = None,
+    selection_evidence_sha256_by_symbol: dict[str, str] | None = None,
+    history_only: bool = False,
+    initialize_schema: bool = True,
 ) -> list[dict[str, object]]:
+    """Import verified closes; history-only mode never initializes or scores.
+
+    History-only imports require an already initialized close schema. Running
+    the general initializer here could reconcile unrelated interrupted capture
+    records, which is outside a historical-close import's scope.
+    """
+    if history_only and (
+        score_prediction_ids_by_symbol or selection_evidence_sha256_by_symbol
+    ):
+        raise ValueError("history-only import cannot include prediction scoring selections or evidence")
     validate_close_bundles(
         rows,
         allow_partial_correction=allow_partial_correction,
@@ -636,6 +649,10 @@ def ingest(
     selected = {
         str(symbol).strip().upper(): sorted({int(value) for value in values})
         for symbol, values in (score_prediction_ids_by_symbol or {}).items()
+    }
+    selection_hashes = {
+        str(symbol).strip().upper(): validate_source_artifact_sha256(value)
+        for symbol, value in (selection_evidence_sha256_by_symbol or {}).items()
     }
     row_symbols = {row.symbol for row in rows}
     unknown_symbols = sorted(set(selected) - row_symbols)
@@ -646,14 +663,49 @@ def ingest(
         )
     if any(value <= 0 for values in selected.values() for value in values):
         raise ValueError("selected prediction IDs must be positive integers")
+    unknown_hash_symbols = sorted(set(selection_hashes) - set(selected))
+    if unknown_hash_symbols:
+        raise ValueError(
+            "selection evidence has no matching prediction selection: "
+            + ",".join(unknown_hash_symbols)
+        )
+    missing_hash_symbols = sorted(
+        symbol for symbol, values in selected.items() if values and symbol not in selection_hashes
+    )
+    if missing_hash_symbols:
+        raise ValueError(
+            "prediction selections require selection evidence: "
+            + ",".join(missing_hash_symbols)
+        )
     root = Path(project_root).resolve()
-    market_database = configured_market_database_path(root)
+    market_database = configured_market_database_path(root, require_canonical=True)
+    require_existing = history_only or not initialize_schema
+    mode = "history-only import" if history_only else "settlement"
+    if require_existing and not market_database.is_file():
+        raise RuntimeError(f"{mode} requires an existing initialized market database")
     database_module = _require_configured_database_bindings(market_database)
+    if require_existing:
+        from sqlalchemy import inspect
+
+        inspector = inspect(database_module.engine)
+        models = [database_module.EODClose, database_module.EODCloseObservation]
+        if not history_only:
+            models.extend([database_module.PredictionSnapshot,
+                           database_module.PredictionAccuracyObservation,
+                           database_module.PredictionPassport])
+        for model in models:
+            table = model.__table__
+            if not inspector.has_table(table.name):
+                raise RuntimeError(f"{mode} requires initialized close schema: {table.name}")
+            columns = {column["name"] for column in inspector.get_columns(table.name)}
+            if set(table.columns.keys()) - columns:
+                raise RuntimeError(f"{mode} requires current close schema: {table.name}")
     init_db = database_module.init_db
     score_prediction_snapshots = database_module.score_prediction_snapshots
     upsert_verified_eod_close_bundle = database_module.upsert_verified_eod_close_bundle
     staged = stage_source_artifacts(rows, project_root=root)
-    init_db()
+    if not require_existing:
+        init_db()
     for row in rows:
         staged_path = staged[
             (row.trading_date, row.symbol, row.source_artifact_sha256)
@@ -678,22 +730,36 @@ def ingest(
         }
         for row in rows
     ])
-    governance_scores = reconcile_governed_prediction_outcomes(
-        root,
-        {row.trading_date for row in rows},
-        market_db_path=market_database,
+    trading_days = {row.trading_date for row in rows}
+    governance_scores = (
+        {day.isoformat(): {"scored": 0, "reason": "history_only"} for day in trading_days}
+        if history_only else reconcile_governed_prediction_outcomes(
+            root, trading_days, market_db_path=market_database,
+        )
     )
     results = []
     for row, close in zip(rows, closes, strict=True):
+        structural_comparison = {"recorded": 0, "reason": "history_only"}
+        if not history_only:
+            from backend.structural_regime_journal import StructuralRegimeJournal
+
+            # Only validated, committed official imports can label this separate
+            # research journal. Historical-only imports remain free of scoring.
+            structural_comparison = StructuralRegimeJournal(
+                root / "data" / "structural_regime.db"
+            ).record_verified_close(replace(
+                row, source_artifact_path=staged[(row.trading_date, row.symbol, row.source_artifact_sha256)]
+            ))
         prediction_ids = selected.get(row.symbol, [])
         score = (
             score_prediction_snapshots(
                 row.symbol,
                 row.trading_date,
                 prediction_ids=prediction_ids,
+                selection_evidence_sha256=selection_hashes[row.symbol],
             )
             if prediction_ids
-            else {"scored": 0, "reason": "no_explicit_prediction_selection"}
+            else {"scored": 0, "reason": "history_only" if history_only else "no_explicit_prediction_selection"}
         )
         results.append(
             {
@@ -701,10 +767,13 @@ def ingest(
                 "trading_date": row.trading_date.isoformat(),
                 "official_close": close.official_close,
                 "source": row.source,
+                "history_only": history_only,
                 "source_artifact_path": str(
                     staged[(row.trading_date, row.symbol, row.source_artifact_sha256)]
                 ),
                 "scored": int(score.get("scored") or 0),
+                "score": score,
+                "structural_regime_comparison": structural_comparison,
                 "governed_forecast_scoring": governance_scores[
                     row.trading_date.isoformat()
                 ],
@@ -720,6 +789,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("csv_path")
     parser.add_argument("--project-root", default=str(PROJECT_ROOT))
     parser.add_argument(
+        "--history-only",
+        action="store_true",
+        help="import into an initialized close schema without scoring forecasts or reconciling capture records",
+    )
+    parser.add_argument(
         "--bundle-profile",
         choices=sorted(BUNDLE_PROFILES),
         default="full",
@@ -733,11 +807,23 @@ def main(argv: list[str] | None = None) -> int:
         help="explicit prediction snapshot to score; repeat for additional rows",
     )
     parser.add_argument(
+        "--selection-evidence",
+        action="append",
+        default=[],
+        metavar="SYMBOL:SHA256",
+        help=(
+            "SHA-256 of the immutable selection receipt for one scored symbol; "
+            "required for every --score-prediction symbol"
+        ),
+    )
+    parser.add_argument(
         "--allow-partial-correction",
         action="store_true",
         help="allow a partial bundle only when every row has explicit correction lineage",
     )
     args = parser.parse_args(argv)
+    if args.history_only and (args.score_prediction or args.selection_evidence):
+        parser.error("--history-only cannot be combined with --score-prediction or --selection-evidence")
     selections: dict[str, list[int]] = {}
     for raw_selection in args.score_prediction:
         try:
@@ -749,12 +835,33 @@ def main(argv: list[str] | None = None) -> int:
         if not normalized_symbol or prediction_id <= 0:
             parser.error(f"invalid --score-prediction {raw_selection!r}; expected SYMBOL:positive-ID")
         selections.setdefault(normalized_symbol, []).append(prediction_id)
+    selection_hashes: dict[str, str] = {}
+    for raw_selection in args.selection_evidence:
+        try:
+            raw_symbol, raw_hash = raw_selection.rsplit(":", 1)
+            normalized_symbol = raw_symbol.strip().upper()
+            normalized_hash = validate_source_artifact_sha256(raw_hash)
+        except (ValueError, AttributeError) as exc:
+            parser.error(
+                f"invalid --selection-evidence {raw_selection!r}; "
+                "expected SYMBOL:SHA256"
+            )
+        if not normalized_symbol:
+            parser.error(
+                f"invalid --selection-evidence {raw_selection!r}; "
+                "expected SYMBOL:SHA256"
+            )
+        if normalized_symbol in selection_hashes:
+            parser.error(f"duplicate selection evidence for {normalized_symbol}")
+        selection_hashes[normalized_symbol] = normalized_hash
     results = ingest(
         read_verified_close_csv(args.csv_path),
         project_root=args.project_root,
         allow_partial_correction=args.allow_partial_correction,
         bundle_profile=args.bundle_profile,
         score_prediction_ids_by_symbol=selections,
+        selection_evidence_sha256_by_symbol=selection_hashes,
+        history_only=args.history_only,
     )
     for result in results:
         print(

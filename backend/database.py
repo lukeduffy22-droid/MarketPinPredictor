@@ -11,11 +11,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
+from databento_dbn import UNDEF_PRICE, FIXED_PRICE_SCALE
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, Boolean, Index, Date, Text, UniqueConstraint, CheckConstraint, inspect, text, LargeBinary, ForeignKey, event, func, select
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, Boolean, Index, Date, Text, UniqueConstraint, CheckConstraint, inspect, text, LargeBinary, ForeignKey, event, func, select, and_, or_
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
+from backend.quote_timing import CBBO_TIMING, LEGACY_TIMING, timing_contract, timestamp_bounds_valid, cbbo_formula_timing_valid, last_sale_identity
 from backend.config import DATABASE_URL
 from backend.closing_tape.close_evidence import (
     VERIFIED_CLOSE_SOURCES_BY_SYMBOL,
@@ -588,6 +590,190 @@ class OrbReferenceSampleDecision(Base):
     )
 
 
+class OrbCbboReferenceSample(Base):
+    """Append-only 5-second option-parity reference evidence for ORB ranges."""
+
+    __tablename__ = "orb_cbbo_reference_samples"
+
+    timestamp_contract_version = Column(String(48), nullable=False)
+    quote_schema = Column(String(16), nullable=False)
+    trade_timestamp_count = Column(Integer, nullable=False)
+    sample_id = Column(String(64), primary_key=True)
+    symbol = Column(String(16), nullable=False)
+    trading_date = Column(Date, nullable=False)
+    sample_timestamp_utc = Column(DateTime, nullable=False)
+    source_timestamp_utc = Column(DateTime, nullable=False)
+    captured_at_utc = Column(DateTime, nullable=False)
+    provider = Column(String(32), nullable=False)
+    # Legacy rows predate process-epoch identity and remain nullable historical
+    # evidence; new writes are rejected unless this is canonical 64-hex.
+    subscription_epoch_id = Column(String(64))
+    subscription_generation = Column(Integer, nullable=False)
+    reference_price = Column(Float, nullable=False)
+    spot_source = Column(String(80), nullable=False)
+    spot_formula_version = Column(String(80), nullable=False)
+    risk_free_rate = Column(Float, nullable=False)
+    time_to_expiration_years = Column(Float, nullable=False)
+    primary_expiration = Column(String(10), nullable=False)
+    same_day_profile_available = Column(Boolean, nullable=False)
+    universe_sha256 = Column(String(64), nullable=False)
+    universe_is_fallback = Column(Boolean, nullable=False)
+    paired_quote_count = Column(Integer, nullable=False)
+    minimum_paired_quote_count = Column(Integer, nullable=False)
+    contributing_pair_count = Column(Integer, nullable=False)
+    contributing_quote_count = Column(Integer, nullable=False)
+    earliest_ts_event_ns = Column(Integer, nullable=True)
+    latest_ts_event_ns = Column(Integer, nullable=True)
+    earliest_ts_recv_ns = Column(Integer, nullable=False)
+    latest_ts_recv_ns = Column(Integer, nullable=False)
+    observation_index_ns = Column(Integer, nullable=False)
+    source_quote_age_seconds = Column(Float, nullable=False)
+    maximum_source_quote_age_seconds = Column(Float, nullable=False)
+    source_timestamp_span_seconds = Column(Float, nullable=False)
+    quote_freshness_limit_seconds = Column(Float, nullable=False)
+    pair_identity_sha256 = Column(String(64), nullable=False)
+    symbol_mapping_version = Column(String(64), nullable=False)
+    formula_inputs_json = Column(Text, nullable=False)
+    processing_clock_status = Column(String(24), nullable=False)
+    timestamp_order_valid = Column(Boolean, nullable=False)
+    handoff_status = Column(String(24), nullable=False)
+    generation_state_unchanged = Column(Boolean, nullable=False)
+    universe_state_unchanged = Column(Boolean, nullable=False)
+    validation_status = Column(String(24), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("timestamp_contract_version = 'databento-cbbo-interval.v1' AND quote_schema IN ('cbbo-1s', 'cbbo-1m')", name="ck_orb_cbbo_reference_timing_contract"),
+        CheckConstraint("provider = 'databento'", name="ck_orb_cbbo_reference_databento_provider"),
+        CheckConstraint("subscription_generation > 0", name="ck_orb_cbbo_reference_positive_generation"),
+        CheckConstraint(
+            "subscription_epoch_id IS NULL OR length(subscription_epoch_id) = 64",
+            name="ck_orb_cbbo_reference_epoch_hash_length",
+        ),
+        CheckConstraint("reference_price > 0", name="ck_orb_cbbo_reference_positive_price"),
+        CheckConstraint("spot_source = 'databento_opra_put_call_parity'", name="ck_orb_cbbo_reference_spot_source"),
+        CheckConstraint("length(spot_formula_version) > 0", name="ck_orb_cbbo_reference_formula_version"),
+        CheckConstraint("time_to_expiration_years > 0", name="ck_orb_cbbo_reference_positive_tte"),
+        CheckConstraint("length(primary_expiration) = 10", name="ck_orb_cbbo_reference_primary_expiration"),
+        CheckConstraint("length(universe_sha256) = 64", name="ck_orb_cbbo_reference_universe_hash_length"),
+        CheckConstraint("universe_is_fallback = 0", name="ck_orb_cbbo_reference_nonfallback"),
+        CheckConstraint(
+            "minimum_paired_quote_count > 0 AND paired_quote_count >= minimum_paired_quote_count",
+            name="ck_orb_cbbo_reference_complete_pairs",
+        ),
+        CheckConstraint(
+            "contributing_pair_count > 0 "
+            "AND contributing_pair_count <= paired_quote_count "
+            "AND contributing_quote_count = contributing_pair_count * 2",
+            name="ck_orb_cbbo_reference_contributing_pairs",
+        ),
+        CheckConstraint(
+            "earliest_ts_recv_ns > 0 AND latest_ts_recv_ns >= earliest_ts_recv_ns "
+            "AND observation_index_ns = latest_ts_recv_ns "
+            "AND trade_timestamp_count BETWEEN 0 AND contributing_quote_count "
+            "AND ((trade_timestamp_count = 0 AND earliest_ts_event_ns IS NULL "
+            "AND latest_ts_event_ns IS NULL) OR (trade_timestamp_count > 0 "
+            "AND earliest_ts_event_ns IS NOT NULL AND latest_ts_event_ns IS NOT NULL "
+            "AND earliest_ts_event_ns > 0 AND latest_ts_event_ns >= earliest_ts_event_ns "
+            "AND latest_ts_event_ns <= latest_ts_recv_ns))",
+            name="ck_orb_cbbo_reference_timestamp_order",
+        ),
+        CheckConstraint(
+            "source_quote_age_seconds >= -0.05 "
+            "AND maximum_source_quote_age_seconds >= source_quote_age_seconds "
+            "AND source_timestamp_span_seconds >= 0 "
+            "AND quote_freshness_limit_seconds > 0 "
+            "AND maximum_source_quote_age_seconds <= quote_freshness_limit_seconds",
+            name="ck_orb_cbbo_reference_timestamp_evidence",
+        ),
+        CheckConstraint("length(pair_identity_sha256) = 64", name="ck_orb_cbbo_reference_pair_hash"),
+        CheckConstraint("length(symbol_mapping_version) = 64", name="ck_orb_cbbo_reference_mapping_hash"),
+        CheckConstraint("processing_clock_status = 'synchronized'", name="ck_orb_cbbo_reference_clock_sync"),
+        CheckConstraint("timestamp_order_valid = 1", name="ck_orb_cbbo_reference_order_valid"),
+        CheckConstraint("handoff_status = 'active'", name="ck_orb_cbbo_reference_active_handoff"),
+        CheckConstraint("generation_state_unchanged = 1", name="ck_orb_cbbo_reference_generation_stable"),
+        CheckConstraint("universe_state_unchanged = 1", name="ck_orb_cbbo_reference_universe_stable"),
+        CheckConstraint("validation_status = 'valid'", name="ck_orb_cbbo_reference_valid_only"),
+        Index(
+            "idx_orb_cbbo_reference_symbol_date_sample_time",
+            "symbol",
+            "trading_date",
+            "sample_timestamp_utc",
+        ),
+        Index("idx_orb_cbbo_reference_trading_date", "trading_date"),
+        # Keep the live metadata scan out of the large formula-input records.
+        # Existing databases use tools/install_orb_read_index.py; create_all
+        # only installs this automatically when creating a new table.
+        Index(
+            "idx_orb_cbbo_reference_snapshot_metadata",
+            "symbol", "trading_date", "sample_timestamp_utc", "sample_id",
+            "captured_at_utc", "provider", "subscription_epoch_id",
+            "subscription_generation", "universe_sha256",
+        ),
+        Index(
+            "uix_orb_cbbo_reference_logical_sample",
+            "symbol",
+            "sample_timestamp_utc",
+            "subscription_epoch_id",
+            "subscription_generation",
+            "universe_sha256",
+            "primary_expiration",
+            "spot_formula_version",
+            "risk_free_rate",
+            "symbol_mapping_version",
+            unique=True,
+        ),
+    )
+
+
+class OrbCbboReferenceSampleDecision(Base):
+    """Immutable final progress decision for one retained ORB sample.
+
+    Reference rows are written before the sampler can finish its post-persist
+    bucket/context checks.  Keeping that final decision in a 1:1 sidecar
+    preserves the raw evidence while making pending and rejected rows
+    ineligible for every live/read-side projection.
+    """
+
+    __tablename__ = "orb_cbbo_reference_sample_decisions"
+
+    sample_id = Column(
+        String(64),
+        ForeignKey("orb_cbbo_reference_samples.sample_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    sample_timestamp_utc = Column(DateTime, nullable=False)
+    intended_bucket_utc = Column(DateTime, nullable=False)
+    attempt_completed_at_utc = Column(DateTime, nullable=False)
+    progress_eligible = Column(Boolean, nullable=False)
+    reason = Column(String(96))
+    decision_status = Column(String(16), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "decision_status = 'final'",
+            name="ck_orb_cbbo_reference_decision_final",
+        ),
+        CheckConstraint(
+            "(progress_eligible = 1 AND reason IS NULL) OR "
+            "(progress_eligible = 0 AND reason IS NOT NULL AND length(reason) > 0)",
+            name="ck_orb_cbbo_reference_decision_reason",
+        ),
+        CheckConstraint(
+            "attempt_completed_at_utc >= intended_bucket_utc",
+            name="ck_orb_cbbo_reference_decision_completion_order",
+        ),
+        CheckConstraint(
+            "progress_eligible = 0 OR sample_timestamp_utc = intended_bucket_utc",
+            name="ck_orb_cbbo_reference_decision_eligible_bucket_identity",
+        ),
+        Index(
+            "uix_orb_cbbo_reference_decision_sample_id",
+            "sample_id",
+            unique=True,
+        ),
+    )
+
+
 class PredictionPassport(Base):
     """Immutable, provenance-complete sidecar for a forecast or abstention."""
     __tablename__ = "prediction_passports"
@@ -713,6 +899,10 @@ def init_db():
     _ensure_orb_reference_immutability()
     _ensure_orb_reference_decision_schema()
     _ensure_orb_reference_decision_immutability()
+    _ensure_orb_cbbo_reference_schema()
+    _ensure_orb_cbbo_reference_immutability()
+    _ensure_orb_cbbo_reference_decision_schema()
+    _ensure_orb_cbbo_reference_decision_immutability()
     reconciliation = reconcile_orb_reference_sample_decisions()
     if reconciliation["reconciled_count"]:
         logger.warning(
@@ -1417,6 +1607,247 @@ def _ensure_orb_reference_decision_immutability() -> None:
         """))
 
 
+def _ensure_orb_cbbo_reference_immutability() -> None:
+    """Protect retained ORB reference samples and their provenance."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    with engine.begin() as connection:
+        # The pre-epoch index and duplicate guard cannot distinguish two
+        # backend processes that both start at subscription generation 1.
+        connection.execute(text("DROP INDEX IF EXISTS uix_orb_cbbo_reference_logical_sample"))
+        connection.execute(text("""
+            CREATE UNIQUE INDEX uix_orb_cbbo_reference_logical_sample
+            ON orb_cbbo_reference_samples (
+                symbol,
+                sample_timestamp_utc,
+                subscription_epoch_id,
+                subscription_generation,
+                universe_sha256,
+                primary_expiration,
+                spot_formula_version,
+                risk_free_rate,
+                symbol_mapping_version
+            )
+        """))
+        connection.execute(
+            text("DROP TRIGGER IF EXISTS orb_cbbo_reference_samples_existing_guard")
+        )
+        connection.execute(text("""
+            CREATE TRIGGER orb_cbbo_reference_samples_existing_guard
+            BEFORE INSERT ON orb_cbbo_reference_samples
+            WHEN EXISTS (
+                SELECT 1 FROM orb_cbbo_reference_samples AS existing
+                WHERE existing.sample_id = NEW.sample_id
+                   OR (
+                       existing.symbol = NEW.symbol
+                       AND existing.sample_timestamp_utc = NEW.sample_timestamp_utc
+                       AND existing.subscription_epoch_id = NEW.subscription_epoch_id
+                       AND existing.subscription_generation = NEW.subscription_generation
+                       AND existing.universe_sha256 = NEW.universe_sha256
+                       AND existing.primary_expiration = NEW.primary_expiration
+                       AND existing.spot_formula_version = NEW.spot_formula_version
+                       AND existing.risk_free_rate = NEW.risk_free_rate
+                       AND existing.symbol_mapping_version = NEW.symbol_mapping_version
+                   )
+            )
+            BEGIN SELECT RAISE(ABORT, 'ORB reference sample identity already exists'); END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_samples_epoch_guard
+            BEFORE INSERT ON orb_cbbo_reference_samples
+            WHEN NEW.subscription_epoch_id IS NULL
+              OR length(NEW.subscription_epoch_id) != 64
+              OR NEW.subscription_epoch_id != lower(NEW.subscription_epoch_id)
+              OR NEW.subscription_epoch_id GLOB '*[^0-9a-f]*'
+            BEGIN SELECT RAISE(ABORT, 'invalid ORB reference process epoch'); END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_samples_no_update
+            BEFORE UPDATE ON orb_cbbo_reference_samples
+            BEGIN SELECT RAISE(ABORT, 'ORB reference samples are immutable'); END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_samples_no_delete
+            BEFORE DELETE ON orb_cbbo_reference_samples
+            BEGIN SELECT RAISE(ABORT, 'ORB reference samples are immutable'); END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_samples_insert_guard
+            BEFORE INSERT ON orb_cbbo_reference_samples
+            WHEN NEW.provider != 'databento'
+              OR NEW.subscription_generation IS NULL
+              OR NEW.subscription_generation <= 0
+              OR NEW.reference_price IS NULL
+              OR NEW.reference_price <= 0
+              OR NEW.spot_source != 'databento_opra_put_call_parity'
+              OR NEW.spot_formula_version IS NULL
+              OR length(NEW.spot_formula_version) = 0
+              OR NEW.time_to_expiration_years IS NULL
+              OR NEW.time_to_expiration_years <= 0
+              OR NEW.primary_expiration IS NULL
+              OR length(NEW.primary_expiration) != 10
+              OR NEW.universe_sha256 IS NULL
+              OR length(NEW.universe_sha256) != 64
+              OR NEW.universe_is_fallback != 0
+              OR NEW.minimum_paired_quote_count IS NULL
+              OR NEW.minimum_paired_quote_count <= 0
+              OR NEW.paired_quote_count < NEW.minimum_paired_quote_count
+              OR NEW.contributing_pair_count IS NULL
+              OR NEW.contributing_pair_count <= 0
+              OR NEW.contributing_pair_count > NEW.paired_quote_count
+              OR NEW.contributing_quote_count != NEW.contributing_pair_count * 2
+              OR NEW.timestamp_contract_version != 'databento-cbbo-interval.v1'
+              OR NEW.quote_schema NOT IN ('cbbo-1s', 'cbbo-1m')
+              OR NEW.trade_timestamp_count IS NULL
+              OR NEW.trade_timestamp_count < 0
+              OR NEW.trade_timestamp_count > NEW.contributing_quote_count
+              OR (NEW.trade_timestamp_count = 0 AND
+                  (NEW.earliest_ts_event_ns IS NOT NULL OR NEW.latest_ts_event_ns IS NOT NULL))
+              OR (NEW.trade_timestamp_count > 0 AND
+                  (NEW.earliest_ts_event_ns IS NULL OR NEW.latest_ts_event_ns IS NULL
+                   OR NEW.earliest_ts_event_ns <= 0
+                   OR NEW.latest_ts_event_ns < NEW.earliest_ts_event_ns
+                   OR NEW.latest_ts_event_ns > NEW.latest_ts_recv_ns))
+              OR NEW.earliest_ts_recv_ns IS NULL OR NEW.earliest_ts_recv_ns <= 0
+              OR NEW.latest_ts_recv_ns IS NULL
+              OR NEW.latest_ts_recv_ns < NEW.earliest_ts_recv_ns
+              OR NEW.observation_index_ns IS NULL
+              OR NEW.observation_index_ns != NEW.latest_ts_recv_ns
+              OR NEW.source_quote_age_seconds < -0.05
+              OR NEW.maximum_source_quote_age_seconds < NEW.source_quote_age_seconds
+              OR NEW.source_timestamp_span_seconds < 0
+              OR NEW.quote_freshness_limit_seconds <= 0
+              OR NEW.maximum_source_quote_age_seconds > NEW.quote_freshness_limit_seconds
+              OR NEW.pair_identity_sha256 IS NULL
+              OR length(NEW.pair_identity_sha256) != 64
+              OR NEW.symbol_mapping_version IS NULL
+              OR length(NEW.symbol_mapping_version) != 64
+              OR NEW.formula_inputs_json IS NULL
+              OR length(NEW.formula_inputs_json) = 0
+              OR NEW.processing_clock_status != 'synchronized'
+              OR NEW.timestamp_order_valid != 1
+              OR NEW.handoff_status != 'active'
+              OR NEW.generation_state_unchanged != 1
+              OR NEW.universe_state_unchanged != 1
+              OR NEW.validation_status != 'valid'
+            BEGIN SELECT RAISE(ABORT, 'invalid ORB reference provenance'); END
+        """))
+
+
+def _ensure_orb_cbbo_reference_schema() -> None:
+    """Fail fast if a legacy/partial table cannot honor the sampler contract."""
+    inspector = inspect(engine)
+    if not inspector.has_table("orb_cbbo_reference_samples"):
+        raise RuntimeError("orb_cbbo_reference_samples was not created")
+    actual = {
+        column["name"]
+        for column in inspector.get_columns("orb_cbbo_reference_samples")
+    }
+    required = {column.name for column in OrbCbboReferenceSample.__table__.columns}
+    missing = sorted(required - actual)
+    if missing:
+        raise RuntimeError(
+            "orb_cbbo_reference_samples schema is incompatible; missing columns: "
+            + ", ".join(missing)
+        )
+
+
+def _ensure_orb_cbbo_reference_decision_schema() -> None:
+    """Fail fast unless final ORB progress decisions can be retained."""
+    inspector = inspect(engine)
+    table_name = "orb_cbbo_reference_sample_decisions"
+    if not inspector.has_table(table_name):
+        raise RuntimeError(f"{table_name} was not created")
+    actual = {
+        column["name"]
+        for column in inspector.get_columns(table_name)
+    }
+    required = {
+        column.name
+        for column in OrbCbboReferenceSampleDecision.__table__.columns
+    }
+    missing = sorted(required - actual)
+    if missing:
+        raise RuntimeError(
+            f"{table_name} schema is incompatible; missing columns: "
+            + ", ".join(missing)
+        )
+
+
+def _ensure_orb_cbbo_reference_decision_immutability() -> None:
+    """Protect the one final progress decision attached to each raw sample."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    cadence_seconds = max(
+        1,
+        int(os.getenv("DATABENTO_ORB_REFERENCE_INTERVAL_SECONDS", "5")),
+    )
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uix_orb_cbbo_reference_decision_sample_id
+            ON orb_cbbo_reference_sample_decisions (sample_id)
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_sample_decisions_existing_guard
+            BEFORE INSERT ON orb_cbbo_reference_sample_decisions
+            WHEN EXISTS (
+                SELECT 1 FROM orb_cbbo_reference_sample_decisions AS existing
+                WHERE existing.sample_id = NEW.sample_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'ORB reference sample decision already exists'); END
+        """))
+        connection.execute(
+            text("DROP TRIGGER IF EXISTS orb_cbbo_reference_sample_decisions_insert_guard")
+        )
+        connection.execute(text(f"""
+            CREATE TRIGGER orb_cbbo_reference_sample_decisions_insert_guard
+            BEFORE INSERT ON orb_cbbo_reference_sample_decisions
+            WHEN NEW.decision_status != 'final'
+              OR NEW.progress_eligible NOT IN (0, 1)
+              OR (
+                  NEW.progress_eligible = 1
+                  AND NEW.reason IS NOT NULL
+              )
+              OR (
+                  NEW.progress_eligible = 0
+                  AND (NEW.reason IS NULL OR length(NEW.reason) = 0)
+              )
+              OR NOT EXISTS (
+                  SELECT 1 FROM orb_cbbo_reference_samples AS sample
+                  WHERE sample.sample_id = NEW.sample_id
+                    AND sample.sample_timestamp_utc = NEW.sample_timestamp_utc
+                    AND julianday(NEW.attempt_completed_at_utc)
+                        >= julianday(sample.captured_at_utc)
+              )
+              OR (
+                  NEW.progress_eligible = 1
+                  AND (
+                      NEW.intended_bucket_utc != NEW.sample_timestamp_utc
+                      OR CAST(strftime('%s', NEW.intended_bucket_utc) AS INTEGER)
+                          % {cadence_seconds} != 0
+                      OR julianday(NEW.attempt_completed_at_utc)
+                          < julianday(NEW.intended_bucket_utc)
+                      OR julianday(NEW.attempt_completed_at_utc)
+                          >= julianday(
+                              NEW.intended_bucket_utc,
+                              '+{cadence_seconds} seconds'
+                          )
+                  )
+              )
+            BEGIN SELECT RAISE(ABORT, 'invalid ORB reference sample decision'); END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_sample_decisions_no_update
+            BEFORE UPDATE ON orb_cbbo_reference_sample_decisions
+            BEGIN SELECT RAISE(ABORT, 'ORB reference sample decisions are immutable'); END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS orb_cbbo_reference_sample_decisions_no_delete
+            BEFORE DELETE ON orb_cbbo_reference_sample_decisions
+            BEGIN SELECT RAISE(ABORT, 'ORB reference sample decisions are immutable'); END
+        """))
+
+
 def get_db():
     """Dependency for FastAPI endpoints"""
     db = SessionLocal()
@@ -1791,6 +2222,12 @@ def save_orb_reference_sample(
     A reused sample id is accepted only when every persisted value is identical.
     Conflicting content fails closed instead of silently returning the old row.
     """
+    contract = timing_contract(sample)
+    if contract is None:
+        return None
+    sample_model = OrbCbboReferenceSample if contract == CBBO_TIMING else OrbReferenceSample
+    timing_identity = ({"timestamp_contract_version": contract, "quote_schema": sample["quote_schema"]}
+                       if contract == CBBO_TIMING else {})
     sample_id = str(sample.get("sample_id") or "").lower().strip()
     symbol = str(sample.get("symbol") or "").upper().strip()
     sample_timestamp_utc = _coerce_timestamp(sample.get("sample_timestamp_utc"))
@@ -1902,19 +2339,7 @@ def save_orb_reference_sample(
         or contributing_pair_count <= 0
         or contributing_pair_count > paired_quote_count
         or contributing_quote_count != contributing_pair_count * 2
-        or earliest_ts_event_ns is None
-        or earliest_ts_event_ns <= 0
-        or latest_ts_event_ns is None
-        or latest_ts_event_ns <= 0
-        or latest_ts_event_ns < earliest_ts_event_ns
-        or earliest_ts_recv_ns is None
-        or earliest_ts_recv_ns <= 0
-        or latest_ts_recv_ns is None
-        or latest_ts_recv_ns <= 0
-        or latest_ts_recv_ns < earliest_ts_recv_ns
-        or observation_index_ns is None
-        or observation_index_ns <= 0
-        or latest_ts_event_ns > latest_ts_recv_ns
+        or not timestamp_bounds_valid(sample)
         or source_quote_age_seconds is None
         or source_quote_age_seconds < -0.05
         or maximum_source_quote_age_seconds is None
@@ -1933,6 +2358,8 @@ def save_orb_reference_sample(
         or re.fullmatch(r"[0-9a-f]{64}", pair_identity_sha256) is None
         or re.fullmatch(r"[0-9a-f]{64}", symbol_mapping_version) is None
         or formula_inputs_json is None
+        or not orb_reference_price_inputs_valid(formula_inputs)
+        or (contract == CBBO_TIMING and not cbbo_formula_timing_valid(sample, formula_inputs.get("pairs")))
         or formula_inputs.get("formula_version") != spot_formula_version
         or str(sample.get("processing_clock_status") or "") != "synchronized"
         or str(sample.get("handoff_status") or "") != "active"
@@ -2015,6 +2442,8 @@ def save_orb_reference_sample(
 
     canonical_identity = json.dumps(
         {
+            **timing_identity,
+            **last_sale_identity(sample),
             "symbol": symbol,
             "sample_timestamp_utc": sample_aware.isoformat().replace("+00:00", "Z"),
             "subscription_epoch_id": subscription_epoch_id,
@@ -2032,6 +2461,8 @@ def save_orb_reference_sample(
         return None
 
     payload = {
+        **timing_identity,
+        **({"trade_timestamp_count": sample["trade_timestamp_count"]} if contract == CBBO_TIMING else {}),
         "sample_id": sample_id,
         "symbol": symbol,
         "trading_date": trading_date,
@@ -2076,20 +2507,20 @@ def save_orb_reference_sample(
 
     session = SessionLocal()
     try:
-        existing = session.get(OrbReferenceSample, sample_id)
+        existing = session.get(sample_model, sample_id)
         if existing is not None:
             if _orb_reference_row_matches(existing, payload):
                 return existing
             logger.warning("Rejected conflicting ORB reference sample id %s", sample_id)
             return None
-        row = OrbReferenceSample(**payload)
+        row = sample_model(**payload)
         session.add(row)
         session.commit()
         session.refresh(row)
         return row
     except IntegrityError:
         session.rollback()
-        existing = session.get(OrbReferenceSample, sample_id)
+        existing = session.get(sample_model, sample_id)
         if _orb_reference_row_matches(existing, payload):
             return existing
         logger.warning("Rejected conflicting concurrent ORB reference sample id %s", sample_id)
@@ -2171,16 +2602,23 @@ def save_orb_reference_sample_decision(
         "reason": reason,
         "decision_status": "final",
     }
+    decision_model = OrbReferenceSampleDecision
     session = SessionLocal()
     try:
         raw_sample = session.get(OrbReferenceSample, sample_id)
+        cbbo_sample = session.get(OrbCbboReferenceSample, sample_id)
+        if raw_sample is not None and cbbo_sample is not None:
+            return None
+        if cbbo_sample is not None:
+            raw_sample = cbbo_sample
+            decision_model = OrbCbboReferenceSampleDecision
         if (
             raw_sample is None
             or raw_sample.sample_timestamp_utc != sample_timestamp
             or completed < raw_sample.captured_at_utc
         ):
             return None
-        existing = session.get(OrbReferenceSampleDecision, sample_id)
+        existing = session.get(decision_model, sample_id)
         if existing is not None:
             if _orb_reference_decision_row_matches(existing, payload):
                 return existing
@@ -2189,14 +2627,14 @@ def save_orb_reference_sample_decision(
                 sample_id,
             )
             return None
-        row = OrbReferenceSampleDecision(**payload)
+        row = decision_model(**payload)
         session.add(row)
         session.commit()
         session.refresh(row)
         return row
     except IntegrityError:
         session.rollback()
-        existing = session.get(OrbReferenceSampleDecision, sample_id)
+        existing = session.get(decision_model, sample_id)
         if _orb_reference_decision_row_matches(existing, payload):
             return existing
         logger.warning(
@@ -2216,10 +2654,21 @@ def save_orb_reference_sample_decision(
         session.close()
 
 
-def reconcile_orb_reference_sample_decisions(
+def reconcile_orb_reference_sample_decisions(*, as_of_utc: Any = None, maximum_rows: int | None = None) -> dict[str, int]:
+    old = _reconcile_orb_reference_sample_decisions_store(as_of_utc=as_of_utc, maximum_rows=maximum_rows)
+    new = _reconcile_orb_reference_sample_decisions_store(
+        as_of_utc=as_of_utc, maximum_rows=maximum_rows,
+        sample_model=OrbCbboReferenceSample, decision_model=OrbCbboReferenceSampleDecision,
+    )
+    return {key: old[key] + new[key] for key in old}
+
+
+def _reconcile_orb_reference_sample_decisions_store(
     *,
     as_of_utc: Any = None,
     maximum_rows: int | None = None,
+    sample_model=OrbReferenceSample,
+    decision_model=OrbReferenceSampleDecision,
 ) -> dict[str, int]:
     """Fail closed on expired raw ORB samples left without a final decision.
 
@@ -2251,16 +2700,16 @@ def reconcile_orb_reference_sample_decisions(
 
     def pending_query(session):
         return (
-            session.query(OrbReferenceSample)
+            session.query(sample_model)
             .outerjoin(
-                OrbReferenceSampleDecision,
-                OrbReferenceSampleDecision.sample_id
-                == OrbReferenceSample.sample_id,
+                decision_model,
+                decision_model.sample_id
+                == sample_model.sample_id,
             )
             .filter(
-                OrbReferenceSampleDecision.sample_id.is_(None),
-                OrbReferenceSample.sample_timestamp_utc <= expired_cutoff,
-                OrbReferenceSample.captured_at_utc <= observed_at,
+                decision_model.sample_id.is_(None),
+                sample_model.sample_timestamp_utc <= expired_cutoff,
+                sample_model.captured_at_utc <= observed_at,
             )
         )
 
@@ -2274,8 +2723,8 @@ def reconcile_orb_reference_sample_decisions(
             pending_rows = (
                 pending_query(session)
                 .order_by(
-                    OrbReferenceSample.sample_timestamp_utc.asc(),
-                    OrbReferenceSample.sample_id.asc(),
+                    sample_model.sample_timestamp_utc.asc(),
+                    sample_model.sample_id.asc(),
                 )
                 .limit(row_limit)
                 .all()
@@ -2289,7 +2738,7 @@ def reconcile_orb_reference_sample_decisions(
                     intended + timedelta(seconds=cadence_seconds),
                 )
                 session.add(
-                    OrbReferenceSampleDecision(
+                    decision_model(
                         sample_id=sample.sample_id,
                         sample_timestamp_utc=sample.sample_timestamp_utc,
                         intended_bucket_utc=intended,
@@ -2375,11 +2824,59 @@ def _orb_reference_decision_is_read_eligible(
     )
 
 
-def load_orb_reference_samples(
+def orb_reference_price_inputs_valid(formula_inputs: Any) -> bool:
+    """Validate retained option prices without changing their recorded evidence."""
+    if isinstance(formula_inputs, str):
+        try:
+            formula_inputs = json.loads(formula_inputs)
+        except (TypeError, ValueError):
+            return False
+    pairs = formula_inputs.get("pairs") if isinstance(formula_inputs, Mapping) else None
+    if not isinstance(pairs, list) or not pairs:
+        return False
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            return False
+        for side in ("call_mid", "put_mid"):
+            value = pair.get(side)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+            if not math.isfinite(value) or not 0 < value < UNDEF_PRICE / FIXED_PRICE_SCALE:
+                return False
+    return True
+
+
+def _orb_reference_price_inputs_valid_sql(sample_model):
+    # Check selected detail rows in SQLite without hydrating every retained
+    # pair payload into Python on the bounded live endpoint.
+    pairs = func.json_each(sample_model.formula_inputs_json, "$.pairs").table_valued("key", "value").alias("orb_price_pair")
+    invalid = []
+    for side in ("call_mid", "put_mid"):
+        kind = func.json_type(pairs.c.value, f"$.{side}")
+        price = func.json_extract(pairs.c.value, f"$.{side}")
+        invalid.append(or_(kind.is_(None), kind.notin_(("integer", "real")), price <= 0, price >= UNDEF_PRICE / FIXED_PRICE_SCALE))
+    bad_pair = select(1).select_from(pairs).where(or_(*invalid)).correlate(sample_model).exists()
+    return and_(func.json_type(sample_model.formula_inputs_json, "$.pairs") == "array",
+                func.json_array_length(sample_model.formula_inputs_json, "$.pairs") > 0,
+                ~bad_pair).label("reference_price_inputs_valid")
+
+
+def load_orb_reference_samples(symbol: str, trading_date: date, *, as_of_utc: Any = None) -> list[dict[str, Any]]:
+    rows = _load_orb_reference_samples_store(symbol, trading_date, as_of_utc=as_of_utc)
+    rows += _load_orb_reference_samples_store(
+        symbol, trading_date, as_of_utc=as_of_utc,
+        sample_model=OrbCbboReferenceSample, decision_model=OrbCbboReferenceSampleDecision,
+    )
+    return sorted(rows, key=lambda row: (row["sample_timestamp_utc"], row["sample_id"]))
+
+
+def _load_orb_reference_samples_store(
     symbol: str,
     trading_date: date,
     *,
     as_of_utc: Any = None,
+    sample_model=OrbReferenceSample,
+    decision_model=OrbReferenceSampleDecision,
 ) -> list[dict[str, Any]]:
     """Load immutable 5-second reference samples for one market session."""
     normalized = str(symbol or "").upper().strip()
@@ -2389,25 +2886,25 @@ def load_orb_reference_samples(
     session = SessionLocal()
     try:
         query = session.query(
-            OrbReferenceSample,
-            OrbReferenceSampleDecision,
+            sample_model,
+            decision_model,
         ).join(
-            OrbReferenceSampleDecision,
-            OrbReferenceSampleDecision.sample_id == OrbReferenceSample.sample_id,
+            decision_model,
+            decision_model.sample_id == sample_model.sample_id,
         ).filter(
-            OrbReferenceSample.symbol == normalized,
-            OrbReferenceSample.trading_date == trading_date,
-            OrbReferenceSampleDecision.decision_status == "final",
-            OrbReferenceSampleDecision.progress_eligible.is_(True),
+            sample_model.symbol == normalized,
+            sample_model.trading_date == trading_date,
+            decision_model.decision_status == "final",
+            decision_model.progress_eligible.is_(True),
         )
         if cutoff is not None:
             query = query.filter(
-                OrbReferenceSample.sample_timestamp_utc <= cutoff,
-                OrbReferenceSample.captured_at_utc <= cutoff,
+                sample_model.sample_timestamp_utc <= cutoff,
+                sample_model.captured_at_utc <= cutoff,
             )
         rows = query.order_by(
-            OrbReferenceSample.sample_timestamp_utc.asc(),
-            OrbReferenceSample.sample_id.asc(),
+            sample_model.sample_timestamp_utc.asc(),
+            sample_model.sample_id.asc(),
         ).all()
         fields = (
             "sample_id",
@@ -2451,9 +2948,12 @@ def load_orb_reference_samples(
             "universe_state_unchanged",
             "validation_status",
         )
+        if sample_model is OrbCbboReferenceSample:
+            fields += ("quote_schema", "timestamp_contract_version", "trade_timestamp_count")
         return [
             {
                 **{field: getattr(sample, field) for field in fields},
+                "reference_price_inputs_valid": orb_reference_price_inputs_valid(sample.formula_inputs_json),
                 "progress_eligible": True,
                 "progress_decision_status": decision.decision_status,
                 "progress_decision_reason": decision.reason,
@@ -2477,11 +2977,22 @@ def load_orb_reference_samples(
         session.close()
 
 
-def load_orb_reference_snapshot_samples(
+def load_orb_reference_snapshot_samples(symbol: str, trading_date: date, *, as_of_utc: Any = None) -> list[dict[str, Any]]:
+    rows = _load_orb_reference_snapshot_samples_store(symbol, trading_date, as_of_utc=as_of_utc)
+    rows += _load_orb_reference_snapshot_samples_store(
+        symbol, trading_date, as_of_utc=as_of_utc,
+        sample_model=OrbCbboReferenceSample, decision_model=OrbCbboReferenceSampleDecision,
+    )
+    return sorted(rows, key=lambda row: (row["sample_timestamp_utc"], row["sample_id"]))
+
+
+def _load_orb_reference_snapshot_samples_store(
     symbol: str,
     trading_date: date,
     *,
     as_of_utc: Any = None,
+    sample_model=OrbReferenceSample,
+    decision_model=OrbReferenceSampleDecision,
 ) -> list[dict[str, Any]]:
     """Load only the immutable fields needed to project an ORB snapshot.
 
@@ -2501,6 +3012,10 @@ def load_orb_reference_snapshot_samples(
         "sample_id",
         "sample_timestamp_utc",
         "captured_at_utc",
+        "earliest_ts_recv_ns",
+        "latest_ts_recv_ns",
+        "processing_clock_status",
+        "paired_quote_count",
         "provider",
         "subscription_epoch_id",
         "subscription_generation",
@@ -2513,34 +3028,43 @@ def load_orb_reference_snapshot_samples(
         "universe_sha256",
         "symbol_mapping_version",
     )
+    if sample_model is OrbCbboReferenceSample:
+        fields += ("quote_schema", "timestamp_contract_version")
+    policy_columns = (
+        [func.json_extract(sample_model.formula_inputs_json,
+                           "$.last_sale_validation_version").label("last_sale_validation_version")]
+        if sample_model is OrbCbboReferenceSample else []
+    )
     session = SessionLocal()
     try:
         detail_query = session.query(
-            *(getattr(OrbReferenceSample, field) for field in fields),
-            OrbReferenceSampleDecision.decision_status,
-            OrbReferenceSampleDecision.reason,
-            OrbReferenceSampleDecision.attempt_completed_at_utc,
-            OrbReferenceSampleDecision.sample_timestamp_utc.label(
+            *(getattr(sample_model, field) for field in fields),
+            _orb_reference_price_inputs_valid_sql(sample_model),
+            *policy_columns,
+            decision_model.decision_status,
+            decision_model.reason,
+            decision_model.attempt_completed_at_utc,
+            decision_model.sample_timestamp_utc.label(
                 "decision_sample_timestamp_utc"
             ),
-            OrbReferenceSampleDecision.intended_bucket_utc,
-            OrbReferenceSampleDecision.progress_eligible.label(
+            decision_model.intended_bucket_utc,
+            decision_model.progress_eligible.label(
                 "decision_progress_eligible"
             ),
         ).join(
-            OrbReferenceSampleDecision,
-            OrbReferenceSampleDecision.sample_id == OrbReferenceSample.sample_id,
+            decision_model,
+            decision_model.sample_id == sample_model.sample_id,
         )
         query = detail_query.filter(
-            OrbReferenceSample.symbol == normalized,
-            OrbReferenceSample.trading_date == trading_date,
-            OrbReferenceSampleDecision.decision_status == "final",
-            OrbReferenceSampleDecision.progress_eligible.is_(True),
+            sample_model.symbol == normalized,
+            sample_model.trading_date == trading_date,
+            decision_model.decision_status == "final",
+            decision_model.progress_eligible.is_(True),
         )
         if cutoff is not None:
             query = query.filter(
-                OrbReferenceSample.sample_timestamp_utc <= cutoff,
-                OrbReferenceSample.captured_at_utc <= cutoff,
+                sample_model.sample_timestamp_utc <= cutoff,
+                sample_model.captured_at_utc <= cutoff,
             )
         opening_start_utc = datetime(
             trading_date.year,
@@ -2551,17 +3075,20 @@ def load_orb_reference_snapshot_samples(
             tzinfo=ZoneInfo("America/New_York"),
         ).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
         opening_end_utc = opening_start_utc + timedelta(hours=1)
-        ordered_rows = query.with_entities(
-            OrbReferenceSample.sample_id,
-            OrbReferenceSample.sample_timestamp_utc,
-            OrbReferenceSample.provider,
-            OrbReferenceSample.subscription_epoch_id,
-            OrbReferenceSample.subscription_generation,
-            OrbReferenceSample.universe_sha256,
+        ordered_statement = query.with_entities(
+            sample_model.sample_id,
+            sample_model.sample_timestamp_utc,
+            sample_model.provider,
+            sample_model.subscription_epoch_id,
+            sample_model.subscription_generation,
+            sample_model.universe_sha256,
         ).order_by(
-            OrbReferenceSample.sample_timestamp_utc.asc(),
-            OrbReferenceSample.sample_id.asc(),
-        ).yield_per(256)
+            sample_model.sample_timestamp_utc.asc(),
+            sample_model.sample_id.asc(),
+        ).statement
+        # These are scalar projections. Core execution avoids ORM row
+        # adaptation on every post-opening record while preserving selection.
+        ordered_rows = session.connection().execute(ordered_statement).yield_per(256)
         retained_ids = set()
         seen_identities = set()
         latest_row = None
@@ -2577,12 +3104,16 @@ def load_orb_reference_snapshot_samples(
             latest_row = row
         if latest_row is not None:
             retained_ids.add(latest_row.sample_id)
-        rows = detail_query.filter(
-            OrbReferenceSample.sample_id.in_(retained_ids)
+        # Keep the symbol/date/time predicates for the detail read too. Without
+        # them SQLite walks random sample IDs and sorts the result, instead of
+        # using the ordered session index; combined live reads can time out.
+        detail_statement = query.filter(
+            sample_model.sample_id.in_(retained_ids)
         ).order_by(
-            OrbReferenceSample.sample_timestamp_utc.asc(),
-            OrbReferenceSample.sample_id.asc(),
-        ).all() if retained_ids else []
+            sample_model.sample_timestamp_utc.asc(),
+            sample_model.sample_id.asc(),
+        ).statement
+        rows = session.connection().execute(detail_statement).all() if retained_ids else []
         return [
             {
                 **{
@@ -2593,6 +3124,9 @@ def load_orb_reference_snapshot_samples(
                 "progress_decision_status": row.decision_status,
                 "progress_decision_reason": row.reason,
                 "progress_decided_at_utc": row.attempt_completed_at_utc,
+                "reference_price_inputs_valid": bool(row.reference_price_inputs_valid),
+                **({"last_sale_validation_version": row.last_sale_validation_version}
+                   if sample_model is OrbCbboReferenceSample else {}),
             }
             for row in rows
             if _orb_reference_decision_is_read_eligible(

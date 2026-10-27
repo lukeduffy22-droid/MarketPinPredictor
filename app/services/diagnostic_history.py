@@ -40,7 +40,7 @@ def observation_time(value):
         return None
 
 
-def session_context(observed_at, day, now):
+def session_context(observed_at, day, now, *, collection=None):
     from backend.forecast_calendar import session_bounds
     observed = observation_time(observed_at)
     result = {'selected_session_date_ct': day, 'runtime_observed_at_utc': observed_at,
@@ -57,7 +57,19 @@ def session_context(observed_at, day, now):
                                        'REGULAR_SESSION' if observed < closing else 'POST_CLOSE')
     except ValueError as exc:
         result['calendar_status'] = str(exc)
-    result['meaning'] = ('Runtime is a timestamped retained observation, not a fresh poll. '
+    collection = collection or {}
+    start = observation_time(collection.get('started_at_utc'))
+    end = observation_time(collection.get('completed_at_utc'))
+    request_time = (collection.get('mode') == 'REQUEST_TIME' and start and end and observed
+                    and start <= observed <= end <= now)
+    result.update(collection_mode='REQUEST_TIME' if request_time else 'RETAINED_OR_UNKNOWN',
+                  collection_started_at_utc=start.isoformat() if request_time else None,
+                  collection_completed_at_utc=end.isoformat() if request_time else None,
+                  backend_sampled_at_utc=collection.get('backend_sampled_at_utc'),
+                  report_created_at_utc=now.isoformat())
+    result['meaning'] = (('Evidence was collected for this request; the saved report does not update afterward. '
+                          if request_time else 'Runtime is a retained observation; request-time collection is not established. ') +
+                         'Polling time and underlying quote time are different; a new poll cannot refresh old quotes. '
                          'Post-close inactivity alone is not a regular-session outage. '
                          'Different-session runtime must not characterize the selected session.')
     return result
@@ -93,7 +105,7 @@ def summarize_attempts(rows, timing):
 
 def save_review(review, root):
     """Create an exclusive content-addressed file; retries never overwrite evidence."""
-    if review.get('schema_version') != 'diagnostic-review-v1' or review.get('research_only') is not True:
+    if review.get('schema_version') not in ('diagnostic-review-v1', 'diagnostic-review-v2', 'diagnostic-review-v3') or review.get('research_only') is not True:
         raise ValueError('Unsupported diagnostic review')
     day = review.get('packet', {}).get('session_date_ct')
     day = date.fromisoformat(day).isoformat()
@@ -125,3 +137,15 @@ def load_reviews(root, day):
             raise ValueError('Saved review session mismatch')
         results.append(value)
     return sorted(results, key=lambda item: item['generated_at_utc'])
+
+
+def review_status_lines(job, reviews):
+    """An automatic attempt and a later saved review are independent outcomes."""
+    automatic = (f"Automatic post-close job: {job['status']} at {job.get('updated_at_utc', 'unknown')} "
+                 f"· API attempts: {job['attempts']}. This status describes that job only."
+                 if job else 'Automatic post-close job: no job recorded for this date.')
+    latest = max(reviews, key=lambda r: r['generated_at_utc']) if reviews else None
+    saved = (f"Latest saved AI review: {latest['generated_at_utc']} · Model: {latest.get('model', 'unknown')}. "
+             'This saved result does not change the automatic job outcome.' if latest else
+             'Latest saved AI review: none for this session.')
+    return automatic, saved

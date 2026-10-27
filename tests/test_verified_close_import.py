@@ -568,7 +568,10 @@ def test_ingest_fails_before_writes_when_database_was_preimported_for_another_pa
         ),
     )
 
-    with pytest.raises(RuntimeError, match="database target mismatch"):
+    with pytest.raises(
+        RuntimeError,
+        match="canonical MarketPin database|database target mismatch",
+    ):
         ingest(rows, project_root=tmp_path, bundle_profile="core")
 
     assert not database_a.exists()
@@ -661,6 +664,9 @@ def test_source_artifact_vault_is_content_addressed_and_idempotent(tmp_path: Pat
 def test_ingest_revalidates_the_hash_bound_staged_artifact_before_close_commit(
     tmp_path: Path, monkeypatch
 ):
+    project_root = tmp_path / "project"
+    canonical_database = project_root / "data" / "market_data.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{canonical_database.as_posix()}")
     valid_spx, _valid_spx_hash = _spx_artifact(tmp_path)
     valid_spx_bytes = valid_spx.read_bytes()
     invalid_spx = tmp_path / "spx-invalid.html"
@@ -710,6 +716,6 @@ def test_ingest_revalidates_the_hash_bound_staged_artifact_before_close_commit(
     )
 
     with pytest.raises(ValueError, match="SPX official artifact"):
-        ingest(rows, project_root=tmp_path / "project", bundle_profile="core")
+        ingest(rows, project_root=project_root, bundle_profile="core")
 
     assert swapped_once

@@ -415,6 +415,54 @@ class TapeCatalog:
         finally:
             connection.close()
 
+    def checkpoint_wal_for_immutable_read(self) -> tuple[int, int, int]:
+        """Flush and truncate the WAL before publishing a finalized catalog.
+
+        An immutable SQLite reader deliberately ignores WAL sidecars. Use a
+        fresh writable connection so this checkpoint cannot be hidden inside
+        one of the catalog write transactions it is intended to publish.
+        """
+        connection = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
+        try:
+            connection.execute("PRAGMA busy_timeout=10000")
+            rows = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        finally:
+            connection.close()
+
+        if len(rows) != 1 or len(rows[0]) != 3:
+            raise RuntimeError(
+                "closing-tape WAL checkpoint returned an invalid result row"
+            )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in rows[0]
+        ):
+            raise RuntimeError(
+                "closing-tape WAL checkpoint returned non-integer counters"
+            )
+        busy, log_frames, checkpointed_frames = tuple(rows[0])
+        if min(busy, log_frames, checkpointed_frames) < 0:
+            raise RuntimeError(
+                "closing-tape catalog is not in checkpointable WAL mode"
+            )
+        if busy != 0:
+            raise RuntimeError(
+                "closing-tape WAL checkpoint was busy "
+                f"(log_frames={log_frames}, checkpointed_frames={checkpointed_frames})"
+            )
+        if log_frames != checkpointed_frames:
+            raise RuntimeError(
+                "closing-tape WAL checkpoint was incomplete "
+                f"(log_frames={log_frames}, checkpointed_frames={checkpointed_frames})"
+            )
+
+        wal_path = Path(f"{self.path}-wal")
+        if wal_path.is_file() and wal_path.stat().st_size != 0:
+            raise RuntimeError(
+                "closing-tape WAL checkpoint left a nonempty WAL sidecar"
+            )
+        return busy, log_frames, checkpointed_frames
+
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA_SQL)

@@ -50,9 +50,9 @@ $AppDir = [System.IO.Path]::GetFullPath($ProjectRoot)
 $PythonExe = Join-Path $AppDir '.venv\Scripts\python.exe'
 $OpeningAcceptancePreflightScript = Join-Path $AppDir 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 67
-$OpeningAcceptancePreflightRequiredModuleCount = 50
-$OpeningAcceptancePreflightTimeoutSeconds = 150
+$OpeningAcceptancePreflightRequiredFileCount = 74
+$OpeningAcceptancePreflightRequiredModuleCount = 56
+$OpeningAcceptancePreflightTimeoutSeconds = 300
 $InvocationId = 'manual-launcher-pester'
 
 function Write-StartupSupervisorLog {
@@ -86,8 +86,8 @@ function New-ValidStrictPreflightJson {
         schema_bootstrap_performed = $BootstrapPerformed
         bootstrap_attempt_count = $BootstrapAttemptCount
         source_fingerprint_sha256 = ('a' * 64)
-        required_file_count = 67
-        required_module_count = 50
+        required_file_count = 74
+        required_module_count = 56
         database_issues = $DatabaseIssues
         issues = @()
     } | ConvertTo-Json -Compress -Depth 8
@@ -117,8 +117,21 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
         $LauncherSource | Should Match '"--server\.fileWatcherType"\s*,\s*\r?\n\s*"none"'
     }
 
+    It 'starts both background services with hidden console windows' {
+        $calls = @($LauncherAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Start-Process' -and
+            $node.Extent.Text -match '-FilePath \$(PythonExe|StreamlitExe)'
+        }, $true))
+        $calls.Count | Should Be 2
+        foreach ($call in $calls) {
+            $call.Extent.Text | Should Match '-WindowStyle Hidden'
+        }
+    }
+
     It 'uses the bounded opening-acceptance preflight and fails closed on incomplete proof' {
-        $LauncherSource | Should Match '\$OpeningAcceptancePreflightTimeoutSeconds = 150'
+        $LauncherSource | Should Match '\$OpeningAcceptancePreflightTimeoutSeconds = 300'
         $preflight = Get-LauncherFunctionSource -Name 'Invoke-OpeningAcceptancePreflight'
         $preflight | Should Match "ValidateSet\('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint'\)"
         $preflight | Should Match 'Invoke-MarketAppBoundedChildProcess'
@@ -159,6 +172,23 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
         ($invokeIndex -ge 0) | Should Be $true
         ($cacheIndex -gt $invokeIndex) | Should Be $true
         ([regex]::Matches($assertion, "-Phase 'bootstrap'" )).Count | Should Be 1
+    }
+
+    It 'keeps backend and dashboard startup budgets component-specific' {
+        $wait = Get-LauncherFunctionSource -Name 'Wait-ForHttpEndpoint'
+        $wait | Should Match '\[ValidateRange\(1, 300\)\]\[int\]\$TimeoutSeconds = 90'
+        $wait | Should Match '-TimeoutSeconds \$TimeoutSeconds'
+
+        $backendLabel = $LauncherSource.IndexOf('-Label "Backend"')
+        $dashboardLabel = $LauncherSource.IndexOf('-Label "Dashboard"', $backendLabel)
+        $backendStart = $LauncherSource.LastIndexOf('if (-not (Wait-ForHttpEndpoint', $backendLabel)
+        $dashboardStart = $LauncherSource.LastIndexOf('if (-not (Wait-ForHttpEndpoint', $dashboardLabel)
+        $dashboardEnd = $LauncherSource.IndexOf('$backendListenerPid =', $dashboardStart)
+        $backendWait = $LauncherSource.Substring($backendStart, $dashboardStart - $backendStart)
+        $dashboardWait = $LauncherSource.Substring($dashboardStart, $dashboardEnd - $dashboardStart)
+        $backendWait | Should Match '-TimeoutSeconds 180'
+        $dashboardWait | Should Match '-TimeoutSeconds 90'
+        $dashboardWait | Should Not Match '-TimeoutSeconds 180'
     }
 
     It 'keeps the stop helper locally guarded and re-verifies every selected process' {
@@ -232,7 +262,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             -PythonPath $PythonExe `
             -PreflightScript $OpeningAcceptancePreflightScript `
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
-            -Phase 'strict' } | Should Throw
+            -Phase 'strict' } | Should Throw 'Opening-acceptance source/schema preflight failed'
         Assert-MockCalled Invoke-MarketAppBoundedChildProcess -Times 1 -Scope It
     }
 
@@ -288,7 +318,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             -PythonPath $PythonExe `
             -PreflightScript $OpeningAcceptancePreflightScript `
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
-            -Phase 'strict' } | Should Throw
+            -Phase 'strict' } | Should Throw 'Opening-acceptance source/schema preflight failed'
     }
 
     It 'rejects duplicate raw timestamp fields even when JSON parsing succeeds' {
@@ -314,7 +344,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             -PythonPath $PythonExe `
             -PreflightScript $OpeningAcceptancePreflightScript `
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
-            -Phase 'strict' } | Should Throw
+            -Phase 'strict' } | Should Throw 'Opening-acceptance source/schema preflight failed'
     }
 
     It 'rejects timeout behavior before accepting any proof' {
@@ -335,7 +365,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             -PythonPath $PythonExe `
             -PreflightScript $OpeningAcceptancePreflightScript `
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
-            -Phase 'strict' } | Should Throw
+            -Phase 'strict' } | Should Throw 'Opening-acceptance source/schema preflight timed out'
         Assert-MockCalled Invoke-MarketAppBoundedChildProcess -Times 1 -Scope It
     }
 
@@ -357,7 +387,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             -PythonPath $PythonExe `
             -PreflightScript $OpeningAcceptancePreflightScript `
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
-            -Phase 'strict' } | Should Throw
+            -Phase 'strict' } | Should Throw 'Opening-acceptance source/schema preflight failed'
 
         $script:PreflightChildResult = [pscustomobject]@{
             TimedOut = $false
@@ -372,7 +402,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             -PythonPath $PythonExe `
             -PreflightScript $OpeningAcceptancePreflightScript `
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
-            -Phase 'strict' } | Should Throw
+            -Phase 'strict' } | Should Throw 'Opening-acceptance source/schema preflight failed'
         Assert-MockCalled Invoke-MarketAppBoundedChildProcess -Times 2 -Scope It
     }
 
@@ -432,7 +462,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
         Mock Get-CimInstance { throw 'process enumeration must not occur' }
         Mock Stop-Process { throw 'process stop must not occur' }
 
-        { Stop-MarketPinProcesses -Root $AppDir } | Should Throw
+        { Stop-MarketPinProcesses -Root $AppDir } | Should Throw 'mock preflight failure'
 
         Assert-MockCalled Get-CimInstance -Times 0 -Scope It
         Assert-MockCalled Stop-Process -Times 0 -Scope It
@@ -447,7 +477,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
         Mock Get-CimInstance { throw 'process enumeration must not occur' }
         Mock Stop-Process { throw 'process stop must not occur' }
 
-        { Stop-MarketPinProcesses -Root $AppDir } | Should Throw
+        { Stop-MarketPinProcesses -Root $AppDir } | Should Throw 'mock source fingerprint mismatch'
 
         Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 1 -Scope It `
             -ParameterFilter {

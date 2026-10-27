@@ -2,6 +2,8 @@
 param(
     [datetime]$Date = (Get-Date),
     [switch]$CheckOnly,
+    # Skip routine resynchronization; an unsafe all-index clock still gets
+    # one bounded repair attempt before startup is allowed to proceed.
     [switch]$SkipClockSync,
     [switch]$EnableRutCanary
 )
@@ -11,6 +13,7 @@ $ProjectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $EnsureScript = Join-Path $ProjectRoot 'ensure_market_app.ps1'
 $RuntimeLogDir = Join-Path $ProjectRoot 'logs\runtime'
 $ClockLogPath = Join-Path $RuntimeLogDir 'clock_sync.log'
+$ClockRecoveryStatePath = Join-Path $ProjectRoot 'output\clock_recovery\retry-state.json'
 $StartupTaskName = 'MarketPinPredictor_AutoStart'
 $StartupTaskPath = '\'
 $WatchdogTaskName = 'MarketPinPredictor_Watchdog'
@@ -23,8 +26,63 @@ if (-not (Test-Path -LiteralPath $MarketCalendarModule -PathType Leaf)) {
 }
 Import-Module -Name $MarketCalendarModule -Force -ErrorAction Stop
 
+function Test-MarketClockStatusSynchronized {
+    param(
+        [string]$StatusText,
+        [double]$MaximumSyncAgeSeconds = [double]::PositiveInfinity
+    )
+    # Leap/stratum can retain a previous success after a failed resync.
+    # Require verbose status and a successful sample within two polling periods.
+    if (-not (
+        $StatusText -match '(?m)^\s*Leap Indicator:\s*[012]\b' -and
+        $StatusText -match '(?m)^\s*Stratum:\s*(?:[1-9]|1[0-5])\b' -and
+        $StatusText -match '(?m)^\s*Last Sync Error:\s*0\b'
+    )) { return $false }
+    $ageMatch = [regex]::Match($StatusText,
+        '(?m)^\s*Time since Last Good Sync Time:\s*(\d+(?:\.\d+)?)s\s*$')
+    $pollMatch = [regex]::Match($StatusText,
+        '(?m)^\s*Poll Interval:\s*\d+\s*\((\d+)s\)\s*$')
+    if (-not $ageMatch.Success -or -not $pollMatch.Success) { return $false }
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    $age = [double]::Parse($ageMatch.Groups[1].Value, $culture)
+    $poll = [double]::Parse($pollMatch.Groups[1].Value, $culture)
+    return [bool]($poll -gt 0 -and $age -le (2 * $poll) -and
+        $age -le $MaximumSyncAgeSeconds)
+}
+
 function Sync-MarketSystemClock {
+    param([ValidateRange(1, 60)][int]$ConfirmationTimeoutSeconds = 30,
+          [string]$RecoveryStatePath)
     try {
+        if ($RecoveryStatePath) {
+            Import-Module (Join-Path $ProjectRoot 'tools\clock_recovery.psm1') -Force -ErrorAction Stop
+            $recovery = Get-MarketClockRecoveryDecision -Path $RecoveryStatePath
+            if (-not $recovery.Allowed) {
+                # Natural W32Time recovery may end the cooldown early, but an
+                # accepted request or old success flags cannot do so.
+                $recovered = $true
+                $attemptAge = ([datetime]::UtcNow - ([datetime]$recovery.AttemptedAtUtc).ToUniversalTime()).TotalSeconds
+                $recoveryTimer = [Diagnostics.Stopwatch]::StartNew()
+                for ($check = 0; $check -lt 2; $check++) {
+                    $currentStatus = @(& w32tm /query /status /verbose 2>&1) -join "`n"
+                    if ($LASTEXITCODE -ne 0 -or -not (Test-MarketClockStatusSynchronized -StatusText $currentStatus `
+                            -MaximumSyncAgeSeconds ($attemptAge + $recoveryTimer.Elapsed.TotalSeconds))) {
+                        $recovered = $false
+                        break
+                    }
+                    if ($check -eq 0) { Start-Sleep -Milliseconds 500 }
+                }
+                if ($recovered) {
+                    Set-MarketClockRecoveryState -Path $RecoveryStatePath -Synchronized
+                    return [pscustomobject]@{Status='synchronized'; Service='observed'; Error=$null}
+                }
+                return [pscustomobject]@{Status='warning'; Service='not_checked';
+                    Error="CLOCK_RECOVERY_BACKOFF: next bounded attempt in $($recovery.RetryAfterSeconds)s"}
+            }
+            # Persist the attempt before any mutation, so a terminated launcher
+            # cannot make the next watchdog immediately repeat the same repair.
+            Set-MarketClockRecoveryState -Path $RecoveryStatePath -PreviousFailures $recovery.Failures
+        }
         $service = Get-Service -Name W32Time -ErrorAction Stop
         if ($service.StartType -ne 'Automatic') {
             Set-Service -Name W32Time -StartupType Automatic -ErrorAction Stop
@@ -32,26 +90,35 @@ function Sync-MarketSystemClock {
         if ($service.Status -ne 'Running') {
             Start-Service -Name W32Time -ErrorAction Stop
         }
-        # Rediscover the configured source and wait for the request to finish.
-        # `/nowait` returned before Windows applied Friday's correction, which
-        # left the opening calculations five seconds behind provider time.
-        & w32tm /resync /rediscover *> $null
+        # Queue the request, then require observed synchronization below.
+        # An accepted /nowait request alone must never authorize startup.
+        $confirmationTimer = [Diagnostics.Stopwatch]::StartNew()
+        & w32tm /resync /rediscover /nowait *> $null
         if ($LASTEXITCODE -ne 0) {
             throw "w32tm /resync /rediscover returned exit code $LASTEXITCODE"
         }
 
-        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        # A clock correction must not extend or truncate its own timeout.
+        $consecutiveGood = 0
         do {
-            $timeStatus = @(& w32tm /query /status 2>&1)
+            $requestAgeSeconds = $confirmationTimer.Elapsed.TotalSeconds
+            $timeStatus = @(& w32tm /query /status /verbose 2>&1)
             $queryExitCode = $LASTEXITCODE
             $statusText = $timeStatus -join "`n"
-            if ($queryExitCode -eq 0 -and $statusText -notmatch 'Leap Indicator:\s*3') {
-                return [pscustomobject]@{Status='synchronized';Service='running';Error=$null}
-            }
+            if ($queryExitCode -eq 0 -and (Test-MarketClockStatusSynchronized `
+                    -StatusText $statusText -MaximumSyncAgeSeconds $requestAgeSeconds)) {
+                $consecutiveGood += 1
+                if ($consecutiveGood -ge 2) {
+                    if ($RecoveryStatePath) {
+                        Set-MarketClockRecoveryState -Path $RecoveryStatePath -Synchronized
+                    }
+                    return [pscustomobject]@{Status='synchronized';Service='running';Error=$null}
+                }
+            } else { $consecutiveGood = 0 }
             Start-Sleep -Milliseconds 500
-        } while ([DateTime]::UtcNow -lt $deadline)
+        } while ($confirmationTimer.Elapsed.TotalSeconds -lt $ConfirmationTimeoutSeconds)
 
-        throw 'Windows Time did not report synchronized status within 30 seconds'
+        throw "Windows Time did not report synchronized status within $ConfirmationTimeoutSeconds seconds"
     }
     catch {
         # Clock repair is best-effort. The live formula still fails closed when
@@ -678,7 +745,7 @@ function Repair-MarketWatchdogRecoveryAuthority {
 function Get-RutCanaryClockEligibility {
     try {
         $service = Get-Service -Name W32Time -ErrorAction Stop
-        $timeStatus = @(& w32tm /query /status 2>&1)
+        $timeStatus = @(& w32tm /query /status /verbose 2>&1)
         $statusText = $timeStatus -join "`n"
         if ($LASTEXITCODE -ne 0) {
             throw "w32tm /query /status returned exit code $LASTEXITCODE"
@@ -688,6 +755,9 @@ function Get-RutCanaryClockEligibility {
         }
         if ($statusText -match 'Leap Indicator:\s*3') {
             throw 'Windows reports Leap Indicator 3 (not synchronized)'
+        }
+        if (-not (Test-MarketClockStatusSynchronized -StatusText $statusText)) {
+            throw 'Windows Time requires recent successful verbose sync evidence; retained leap/stratum flags alone are insufficient'
         }
         return [pscustomobject]@{Eligible=$true;Status='rut_canary_eligible';Service=$service.Status;Error=$null}
     }
@@ -761,6 +831,7 @@ if (-not $bootstrapLock.Acquired) {
 }
 
 $prestageArguments = $null
+$prestageClockFailed = $false
 $rutCanaryEligible = $false
 try {
     # These repairs intentionally precede the holiday exit. An elevated 07:00
@@ -792,15 +863,28 @@ try {
     if (-not (Test-Path -LiteralPath $EnsureScript -PathType Leaf)) { throw "Guarded app launcher was not found: $EnsureScript" }
     $clockResult = $null
     if (-not $SkipClockSync) {
-        $clockResult = Sync-MarketSystemClock
+        $clockResult = Sync-MarketSystemClock -RecoveryStatePath $ClockRecoveryStatePath
         $clockResult | Format-List
         Write-MarketClockLog -Result $clockResult
     }
     if ($EnableRutCanary) {
         $rutClock = Get-RutCanaryClockEligibility
         Write-MarketClockLog -Result $rutClock
+        if ($SkipClockSync -and -not $rutClock.Eligible) {
+            # The five-minute watchdog used to stop here without trying to
+            # repair time. Retry only an unsafe clock, once per invocation;
+            # a healthy running session receives no routine clock correction.
+            Write-MarketClockLog -Result ([pscustomobject]@{
+                Status='watchdog_clock_recovery_attempt';Service='W32Time';Error=$rutClock.Error
+            })
+            $clockResult = Sync-MarketSystemClock -RecoveryStatePath $ClockRecoveryStatePath
+            $clockResult | Format-List
+            Write-MarketClockLog -Result $clockResult
+            $rutClock = Get-RutCanaryClockEligibility
+            Write-MarketClockLog -Result $rutClock
+        }
         $rutCanaryEligible = [bool]$rutClock.Eligible
-        if (-not $rutCanaryEligible) {
+        if (-not $rutCanaryEligible -and -not $clockPreflightOnly) {
             Write-Error "All-index ORB launch failed closed because RUT clock eligibility was not proven. No SPX/NDX/VIX-only downgrade will be launched. $($rutClock.Error)"
             exit 1
         }
@@ -811,9 +895,13 @@ try {
         # the 07:40-through-18:00 guarded launch window, including the
         # 07:45/08:15 triggers and in-window logon recovery. The pre-stage stops
         # by 07:40.
-        if ($clockResult -and $clockResult.Status -ne 'synchronized') {
-            exit 1
-        }
+        # Provider-dated contract metadata is not a live market observation.
+        # Finish this independent preparation even if clock repair failed;
+        # retain a failed task result and all live-start/capture clock gates.
+        $prestageClockFailed = (
+            ($clockResult -and $clockResult.Status -ne 'synchronized') -or
+            ($EnableRutCanary -and -not $rutCanaryEligible)
+        )
 
         $prestageArguments = @(
             '-NoProfile',
@@ -826,7 +914,7 @@ try {
             'ScheduledTaskUniversePrestage',
             '-PrepareUniverseOnly'
         )
-        if ($rutCanaryEligible) {
+        if ($EnableRutCanary) {
             $prestageArguments += '-EnableRutCanary'
         }
     }
@@ -839,7 +927,18 @@ finally {
 
 if ($null -ne $prestageArguments) {
     & powershell.exe @prestageArguments
-    exit $LASTEXITCODE
+    $prestageExitCode = $LASTEXITCODE
+    if ($prestageExitCode -ne 0) { exit $prestageExitCode }
+    if ($prestageClockFailed) {
+        Write-MarketClockLog -Result ([pscustomobject]@{
+            Status = 'universe_prestage_complete_clock_unready'
+            Service = 'W32Time'
+            Error = 'live_start_still_requires_synchronized_clock'
+        })
+        Write-Warning 'Universe preparation completed, but clock readiness still failed. No application component was launched.'
+        exit 1
+    }
+    exit 0
 }
 if ($rutCanaryEligible) {
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $EnsureScript -Caller ScheduledTask -EnableRutCanary

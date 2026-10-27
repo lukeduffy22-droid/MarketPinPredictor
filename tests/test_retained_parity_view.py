@@ -67,7 +67,7 @@ def test_renderer_labels_latest_segment_envelope_as_non_predictive(monkeypatch):
     assert rendered is True
     assert "NON-PREDICTIVE RETAINED CONTEXT ONLY" in ui.errors[0]
     assert "not an end-of-day close estimate" in ui.errors[0]
-    assert "$101.00 to $103.00" in ui.markdowns[0]
+    assert r"\$101.00 to \$103.00" in ui.markdowns[0]
     lineage = next(value for value in ui.captions if "N=2" in value)
     assert "first UTC=2026-09-09T13:31:00+00:00" in lineage
     assert "last UTC=2026-09-09T13:32:00+00:00" in lineage

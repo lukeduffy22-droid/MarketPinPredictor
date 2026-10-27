@@ -19,7 +19,11 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from backend.quote_timing import (CBBO_TIMING, LEGACY_TIMING, timing_contract,
+                                 last_sale_policy, last_sale_identity,
+                                 timestamp_bounds_valid, cbbo_formula_timing_valid)
 from backend.database import (
+    orb_reference_price_inputs_valid,
     load_orb_reference_snapshot_samples,
     load_market_structure_observations,
     save_orb_reference_sample,
@@ -234,6 +238,9 @@ def _orb_reference_provenance_identity(
     str | None,
     float | None,
     str | None,
+    str | None,
+    str | None,
+    str | None,
 ]:
     (
         provider,
@@ -254,6 +261,9 @@ def _orb_reference_provenance_identity(
         formula_version,
         risk_free_rate,
         mapping_version,
+        timing_contract(row),
+        row.get("quote_schema") or "legacy",
+        last_sale_policy(row),
     )
 
 
@@ -499,6 +509,23 @@ def _opening_window_projection(
             "expected_cadence_seconds": expected_cadence_seconds,
             "first_sample_utc": _utc_iso(first_sample_utc),
             "opening_bucket_present": opening_bucket_present,
+            "first_bucket_receipts": [
+                {
+                    "sample_id": row.get("sample_id"),
+                    "sample_timestamp_utc": _utc_iso(row["_source_time"]),
+                    "captured_at_utc": _utc_iso(_parse_utc(row.get("captured_at_utc"))),
+                    "decision_timestamp_utc": _utc_iso(_parse_utc(row.get("progress_decided_at_utc"))),
+                    "subscription_epoch_id": row.get("subscription_epoch_id"),
+                    "subscription_generation": row.get("subscription_generation"),
+                    "timestamp_contract_version": timing_contract(row),
+                    "quote_schema": row.get("quote_schema"),
+                    "earliest_ts_recv_ns": row.get("earliest_ts_recv_ns"),
+                    "latest_ts_recv_ns": row.get("latest_ts_recv_ns"),
+                    "processing_clock_status": row.get("processing_clock_status"),
+                    "paired_quote_count": row.get("paired_quote_count"),
+                }
+                for row in raw_rows if row["_source_time"] == start_utc
+            ],
             "last_range_sample_utc": _utc_iso(last_sample_utc),
             "first_sample_lag_seconds": first_sample_lag_seconds,
             "end_gap_seconds": end_gap_seconds,
@@ -653,6 +680,11 @@ class MarketStructureJournal:
 
     def record_reference(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Persist one independently sampled, provenance-complete ORB reference."""
+        contract = timing_contract(payload)
+        if contract is None:
+            return {"recorded": False, "reason": "TIMESTAMP_CONTRACT_UNSUPPORTED"}
+        timing_identity = ({"timestamp_contract_version": contract, "quote_schema": payload["quote_schema"]}
+                           if contract == CBBO_TIMING else {})
         defer_progress_decision = payload.get("_defer_progress_decision") is True
         symbol = str(payload.get("symbol") or "").upper().strip()
         if not symbol:
@@ -742,6 +774,8 @@ class MarketStructureJournal:
         formula_pairs = formula_inputs.get("pairs")
         if not isinstance(formula_pairs, list) or len(formula_pairs) != contributing_pair_count:
             return {"recorded": False, "reason": "REFERENCE_FORMULA_INPUTS_INVALID"}
+        if not orb_reference_price_inputs_valid(formula_inputs):
+            return {"recorded": False, "reason": "REFERENCE_OPTION_PRICE_INVALID"}
         canonical_pairs = json.dumps(
             formula_pairs,
             sort_keys=True,
@@ -842,25 +876,10 @@ class MarketStructureJournal:
         earliest_ts_recv_ns = _integer(payload.get("earliest_ts_recv_ns"))
         latest_ts_recv_ns = _integer(payload.get("latest_ts_recv_ns"))
         observation_index_ns = _integer(payload.get("observation_index_ns"))
-        if (
-            earliest_ts_event_ns is None
-            or latest_ts_event_ns is None
-            or earliest_ts_recv_ns is None
-            or latest_ts_recv_ns is None
-            or observation_index_ns is None
-            or min(
-                earliest_ts_event_ns,
-                latest_ts_event_ns,
-                earliest_ts_recv_ns,
-                latest_ts_recv_ns,
-                observation_index_ns,
-            )
-            <= 0
-            or earliest_ts_event_ns > latest_ts_event_ns
-            or earliest_ts_recv_ns > latest_ts_recv_ns
-            or latest_ts_event_ns > latest_ts_recv_ns
-        ):
+        if not timestamp_bounds_valid(payload):
             return {"recorded": False, "reason": "PROVIDER_TIMESTAMP_ORDER_INVALID"}
+        if contract == CBBO_TIMING and not cbbo_formula_timing_valid(payload, formula_pairs):
+            return {"recorded": False, "reason": "PROVIDER_INTERVAL_EVIDENCE_INVALID"}
         recv_time = datetime.fromtimestamp(latest_ts_recv_ns / 1_000_000_000, tz=UTC)
         if abs((recv_time - source_time).total_seconds()) > 0.000002:
             return {"recorded": False, "reason": "SOURCE_TIMESTAMP_MISMATCH"}
@@ -902,6 +921,8 @@ class MarketStructureJournal:
 
         identity = json.dumps(
             {
+                **timing_identity,
+                **last_sale_identity(payload),
                 "symbol": symbol,
                 "sample_timestamp_utc": _utc_iso(sample_time),
                 "subscription_epoch_id": subscription_epoch_id,
@@ -917,6 +938,8 @@ class MarketStructureJournal:
         ).encode("utf-8")
         sample_id = hashlib.sha256(identity).hexdigest()
         sample = {
+            **timing_identity,
+            **({"trade_timestamp_count": payload["trade_timestamp_count"]} if contract == CBBO_TIMING else {}),
             "sample_id": sample_id,
             "symbol": symbol,
             "trading_date": sample_et.date(),
@@ -1053,15 +1076,21 @@ class MarketStructureJournal:
 
         rows = self.reference_loader(normalized, target_date, as_of_utc=as_of)
         normalized_rows: list[dict[str, Any]] = []
+        invalid_price_rows: list[dict[str, Any]] = []
         for row in rows:
             # Production loaders always project the immutable decision sidecar.
             # Requiring the marker here also prevents a custom/legacy loader
             # from accidentally promoting a pending raw row.
-            if row.get("progress_eligible") is not True:
+            if row.get("progress_eligible") is not True or timing_contract(row) is None:
                 continue
             source_time = _parse_utc(row.get("sample_timestamp_utc"))
             price = _finite(row.get("reference_price"))
             if source_time is None or price is None or price <= 0.0:
+                continue
+            if (row.get("reference_price_inputs_valid") is False
+                    or ("formula_inputs_json" in row
+                        and not orb_reference_price_inputs_valid(row["formula_inputs_json"]))):
+                invalid_price_rows.append({**row, "_source_time": source_time})
                 continue
             normalized_rows.append({**row, "_source_time": source_time, "_price": price})
         normalized_rows.sort(
@@ -1082,6 +1111,9 @@ class MarketStructureJournal:
         raw_range_rows = [
             row for row in normalized_rows if start_utc <= row["_source_time"] < end_utc
         ]
+        invalid_range_rows = [
+            row for row in invalid_price_rows if start_utc <= row["_source_time"] < end_utc
+        ]
         # One sampler bucket is one price sample. Provider timestamps remain
         # retained separately, so an unchanged but still-fresh quote does not
         # make the 5-second cadence appear missing.
@@ -1090,6 +1122,12 @@ class MarketStructureJournal:
             range_by_source_time[row["_source_time"]] = row
         range_rows = [range_by_source_time[key] for key in sorted(range_by_source_time)]
         latest = normalized_rows[-1] if normalized_rows else None
+        latest_price_invalid = bool(invalid_price_rows and (
+            latest is None or max(row["_source_time"] for row in invalid_price_rows)
+            >= latest["_source_time"]
+        ))
+        if latest_price_invalid:
+            latest = None  # Never promote the preceding sample as current.
 
         if as_of < start_utc:
             clock_status = "not_started"
@@ -1252,6 +1290,13 @@ class MarketStructureJournal:
         latest_structure_identity = (
             _provenance_identity(latest_structure) if latest_structure else None
         )
+        latest_structure_identity_complete = bool(
+            latest_structure_identity is not None
+            and all(value is not None for value in latest_structure_identity)
+        )
+        # Request-local identities avoid repeatedly normalizing every day's
+        # row. Never cache runtime authority or reuse a completed projection.
+        structure_identities = [_provenance_identity(row) for row in structure_rows]
         structure_vs_reference_aligned = bool(
             latest_structure_identity is not None
             and latest is not None
@@ -1301,11 +1346,9 @@ class MarketStructureJournal:
 
         calculation_bound_rows = [
             row
-            for row in structure_rows
-            if latest_structure_identity is not None
-            and _complete_provenance_identity(latest_structure)
-            and _complete_provenance_identity(row)
-            and _provenance_identity(row) == latest_structure_identity
+            for row, identity in zip(structure_rows, structure_identities)
+            if latest_structure_identity_complete
+            and identity == latest_structure_identity
             and row.get("same_day_profile_available")
             is latest_structure.get("same_day_profile_available")
             and str(row.get("validation_status") or "").lower().strip() == "valid"
@@ -1420,11 +1463,10 @@ class MarketStructureJournal:
         comparison_rows = (
             [
                 row
-                for row in structure_rows
-                if _provenance_identity(row) == latest_structure_identity
+                for row, identity in zip(structure_rows, structure_identities)
+                if identity == latest_structure_identity
             ]
-            if latest_structure_identity is not None
-            and _complete_provenance_identity(latest_structure)
+            if latest_structure_identity_complete
             else []
         )
         opening_structure_rows = [
@@ -1503,8 +1545,8 @@ class MarketStructureJournal:
         comparison_reset = bool(
             latest_structure_identity is not None
             and any(
-                _provenance_identity(row) != latest_structure_identity
-                for row in structure_rows
+                identity != latest_structure_identity
+                for identity in structure_identities
             )
         )
         if current_gamma is not None and current_pain is not None:
@@ -1515,6 +1557,10 @@ class MarketStructureJournal:
             current_pin_level_availability = "unavailable"
         current_pin_levels_available = current_pin_level_availability == "available"
         warnings: list[str] = []
+        if invalid_range_rows:
+            warnings.append("INVALID_OPTION_PRICE_SAMPLES_EXCLUDED")
+        if latest_price_invalid:
+            warnings.append("LATEST_REFERENCE_OPTION_PRICE_INVALID")
         if capture_status == "partial":
             warnings.append("OPENING_RANGE_CAPTURE_PARTIAL")
         elif capture_status == "unavailable":
@@ -1560,6 +1606,12 @@ class MarketStructureJournal:
             for minutes in ORB_WINDOWS_MINUTES
         }
         for window in opening_ranges.values():
+            excluded = [row for row in invalid_range_rows
+                        if row["_source_time"] < start_utc + timedelta(minutes=window["duration_minutes"])]
+            window["capture_evidence"]["excluded_invalid_price_sample_count"] = len(excluded)
+            window["capture_evidence"]["raw_observation_count"] += len(excluded)
+            if excluded:
+                window["warnings"].append("INVALID_OPTION_PRICE_SAMPLES_EXCLUDED")
             window["reference_semantics"] = dict(reference_semantics)
             window["directional_evidence_eligible"] = bool(
                 reference_semantics["directional_base_eligible"]
@@ -1686,7 +1738,9 @@ class MarketStructureJournal:
             "opening_ranges": opening_ranges,
             "capture_evidence": {
                 "sample_count": sample_count,
-                "raw_observation_count": len(raw_range_rows),
+                "raw_observation_count": len(raw_range_rows) + len(invalid_range_rows),
+                "excluded_invalid_price_sample_count": len(invalid_range_rows),
+                "excluded_invalid_price_sample_ids": [row.get("sample_id") for row in invalid_range_rows],
                 "duplicate_source_timestamp_count": len(raw_range_rows) - sample_count,
                 "expected_sample_count": expected_samples,
                 "capture_ratio": capture_ratio,

@@ -116,24 +116,67 @@ function Get-MarketAppSessionRecoveryJournalState {
             Readable = $true
             Requested = $false
             Succeeded = $false
+            CompletionPending = $false
+            SuccessfulReplacementProcessId = $null
+            SuccessfulReplacementIdentityToken = $null
         }
     }
 
     $requested = $false
     $succeeded = $false
+    $latestRequestOrdinal = -1
+    $latestSuccessOrdinal = -1
+    $successfulReplacementProcessId = $null
+    $successfulReplacementIdentityToken = $null
     try {
         # Scan lazily from the append-only journal so an unusually noisy day
         # cannot evict the success latch from a fixed tail window.
+        $lineOrdinal = 0
         foreach ($line in [System.IO.File]::ReadLines($journalPath)) {
+            $lineOrdinal += 1
             $text = [string]$line
             if (-not $text.Contains("trading_date=$TradingDate")) {
                 continue
             }
             if ($text.Contains("event=${Component}_session_recovery_requested")) {
                 $requested = $true
+                $latestRequestOrdinal = $lineOrdinal
             }
             if ($text.Contains("event=${Component}_session_recovery_succeeded")) {
                 $succeeded = $true
+                $latestSuccessOrdinal = $lineOrdinal
+                # Only the most recent success receipt is authoritative. A
+                # readable legacy/malformed receipt without an exact positive
+                # PID must not suppress recovery for an unrelated listener.
+                $successfulReplacementProcessId = $null
+                $successfulReplacementIdentityToken = $null
+                $pidMatch = [regex]::Match(
+                    $text,
+                    '(?:^|\s)replacement_listener_pid=(?<pid>[1-9][0-9]*)(?:\s|$)'
+                )
+                $parsedPid = 0
+                if (
+                    $pidMatch.Success -and
+                    [int]::TryParse($pidMatch.Groups['pid'].Value, [ref]$parsedPid) -and
+                    $parsedPid -gt 0
+                ) {
+                    $successfulReplacementProcessId = [int]$parsedPid
+                    $identityMatch = [regex]::Match(
+                        $text,
+                        '(?:^|\s)replacement_listener_identity_token=(?<identity>[1-9][0-9]*\|[1-9][0-9]*)(?:\s|$)'
+                    )
+                    if ($identityMatch.Success) {
+                        $identityParts = $identityMatch.Groups['identity'].Value.Split('|')
+                        $identityPid = 0
+                        if (
+                            $identityParts.Count -eq 2 -and
+                            [int]::TryParse($identityParts[0], [ref]$identityPid) -and
+                            $identityPid -eq $parsedPid
+                        ) {
+                            $successfulReplacementIdentityToken = [string]$identityMatch.Groups['identity'].Value
+                        }
+                    }
+                }
             }
         }
     }
@@ -144,12 +187,21 @@ function Get-MarketAppSessionRecoveryJournalState {
             Readable = $false
             Requested = $false
             Succeeded = $true
+            CompletionPending = $false
+            SuccessfulReplacementProcessId = $null
+            SuccessfulReplacementIdentityToken = $null
         }
     }
     return [pscustomobject]@{
         Readable = $true
         Requested = [bool]$requested
         Succeeded = [bool]$succeeded
+        CompletionPending = [bool](
+            $requested -and
+            (-not $succeeded -or $latestRequestOrdinal -gt $latestSuccessOrdinal)
+        )
+        SuccessfulReplacementProcessId = $successfulReplacementProcessId
+        SuccessfulReplacementIdentityToken = $successfulReplacementIdentityToken
     }
 }
 
@@ -675,6 +727,22 @@ function Test-MarketAppUniversePreparationQuiescent {
     }
 }
 
+function Test-MarketAppChildCompletedBeforeDeadline {
+    param(
+        [Parameter(Mandatory = $true)][bool]$Completed,
+        [Parameter(Mandatory = $true)][datetime]$ObservedUtc,
+        [Parameter(Mandatory = $true)][datetime]$DeadlineUtc,
+        [Parameter(Mandatory = $true)][double]$ObservedElapsedMilliseconds,
+        [Parameter(Mandatory = $true)][double]$TimeoutMilliseconds
+    )
+
+    return [bool](
+        $Completed -and
+        $ObservedUtc -lt $DeadlineUtc -and
+        $ObservedElapsedMilliseconds -lt $TimeoutMilliseconds
+    )
+}
+
 function Invoke-MarketAppBoundedChildProcess {
     [CmdletBinding()]
     param(
@@ -697,6 +765,11 @@ function Invoke-MarketAppBoundedChildProcess {
         -ProjectRoot $root `
         -Component $LogComponent `
         -InvocationId $InvocationId
+    # Enforce the earlier of an absolute UTC deadline and Stopwatch's monotonic
+    # duration. UTC catches suspend/resume lateness; Stopwatch prevents a
+    # backward wall-clock correction from extending the child budget.
+    $timeoutMilliseconds = [double]$TimeoutSeconds * 1000.0
+    $deadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $exitCode = $null
     try {
@@ -713,10 +786,37 @@ function Invoke-MarketAppBoundedChildProcess {
         # child is alive so ExitCode remains available after a fast exit.
         $null = $process.Handle
 
-        $completed = $process.WaitForExit($TimeoutSeconds * 1000)
-        $timedOut = -not $completed
+        $completed = $false
+        $completionObservedUtc = [DateTime]::UtcNow
+        $completionObservedElapsedMilliseconds = $stopwatch.Elapsed.TotalMilliseconds
+        do {
+            $remainingUtcMilliseconds = (
+                ($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+            )
+            $remainingMonotonicMilliseconds = (
+                $timeoutMilliseconds - $stopwatch.Elapsed.TotalMilliseconds
+            )
+            $remainingMilliseconds = [Math]::Floor(
+                [Math]::Min($remainingUtcMilliseconds, $remainingMonotonicMilliseconds)
+            )
+            if ($remainingMilliseconds -le 0) {
+                break
+            }
+            # Re-check both clocks at least once per second.
+            $waitMilliseconds = [int][Math]::Min(1000, $remainingMilliseconds)
+            $completed = $process.WaitForExit($waitMilliseconds)
+            $completionObservedUtc = [DateTime]::UtcNow
+            $completionObservedElapsedMilliseconds = $stopwatch.Elapsed.TotalMilliseconds
+        } while (-not $completed)
+        $completedWithinDeadline = Test-MarketAppChildCompletedBeforeDeadline `
+            -Completed ([bool]$completed) `
+            -ObservedUtc $completionObservedUtc `
+            -DeadlineUtc $deadlineUtc `
+            -ObservedElapsedMilliseconds $completionObservedElapsedMilliseconds `
+            -TimeoutMilliseconds $timeoutMilliseconds
+        $timedOut = -not $completedWithinDeadline
         $terminationAttempted = $false
-        $terminationConfirmed = [bool]$completed
+        $terminationConfirmed = [bool]$completedWithinDeadline
         if ($timedOut) {
             $terminationAttempted = $true
             try {
@@ -736,7 +836,7 @@ function Invoke-MarketAppBoundedChildProcess {
                 $terminationConfirmed = $false
             }
         }
-        elseif ($completed) {
+        elseif ($completedWithinDeadline) {
             # The parameterless wait flushes redirected output before it is
             # read from the retained launch files.
             $process.WaitForExit()
@@ -749,7 +849,7 @@ function Invoke-MarketAppBoundedChildProcess {
     }
 
     return [pscustomobject]@{
-        Completed = [bool]$completed
+        Completed = [bool]$completedWithinDeadline
         TimedOut = [bool]$timedOut
         TerminationAttempted = [bool]$terminationAttempted
         TerminationConfirmed = [bool]$terminationConfirmed
@@ -759,12 +859,12 @@ function Invoke-MarketAppBoundedChildProcess {
         ExitCode = $exitCode
         ElapsedMilliseconds = [int64]$stopwatch.ElapsedMilliseconds
         Output = @(
-            if ($terminationConfirmed -and (Test-Path -LiteralPath $logs.RetainedStandardOutputPath)) {
+            if (-not $timedOut -and $terminationConfirmed -and (Test-Path -LiteralPath $logs.RetainedStandardOutputPath)) {
                 Get-Content -LiteralPath $logs.RetainedStandardOutputPath -ErrorAction SilentlyContinue
             }
         )
         StandardError = @(
-            if ($terminationConfirmed -and (Test-Path -LiteralPath $logs.RetainedStandardErrorPath)) {
+            if (-not $timedOut -and $terminationConfirmed -and (Test-Path -LiteralPath $logs.RetainedStandardErrorPath)) {
                 Get-Content -LiteralPath $logs.RetainedStandardErrorPath -ErrorAction SilentlyContinue
             }
         )
@@ -900,8 +1000,16 @@ function Invoke-MarketAppUniverseCachePreparation {
         [ValidateRange(1, 60)][int]$CacheValidationTimeoutSeconds = 30,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [string]$InvocationId = ([guid]::NewGuid().ToString('N')),
-        [switch]$SkipProviderDiscovery
+        [switch]$SkipProviderDiscovery,
+        [switch]$AllowCacheValidationAfterDeadline
     )
+
+    if (
+        $AllowCacheValidationAfterDeadline.IsPresent -and
+        -not $SkipProviderDiscovery.IsPresent
+    ) {
+        throw '-AllowCacheValidationAfterDeadline requires -SkipProviderDiscovery.'
+    }
 
     $toolPath = Join-Path ([System.IO.Path]::GetFullPath($ProjectRoot)) `
         'tools\prepare_databento_universe_cache.py'
@@ -949,9 +1057,26 @@ function Invoke-MarketAppUniverseCachePreparation {
         }
     }
 
+    $cacheValidationDeadlineUtc = $deadlineUtc
     $remainingMilliseconds = [Math]::Floor(
-        ($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+        ($cacheValidationDeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
     )
+    # A late-session recovery must never reopen provider discovery, but it may
+    # validate an already-published cache under a fresh, tightly bounded child
+    # deadline. Without this branch, an expired pre-open discovery deadline
+    # prevents the cache-only proof that late salvage requires.
+    if (
+        $AllowCacheValidationAfterDeadline -and
+        $SkipProviderDiscovery -and
+        $remainingMilliseconds -lt (($CacheValidationTimeoutSeconds + 3) * 1000)
+    ) {
+        $cacheValidationDeadlineUtc = [DateTime]::UtcNow.AddSeconds(
+            $CacheValidationTimeoutSeconds + 6
+        )
+        $remainingMilliseconds = [Math]::Floor(
+            ($cacheValidationDeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+        )
+    }
     $validationBudget = [Math]::Min(
         $CacheValidationTimeoutSeconds * 1000,
         [Math]::Max(0, $remainingMilliseconds - 3000)
@@ -976,7 +1101,7 @@ function Invoke-MarketAppUniverseCachePreparation {
         Symbols = $Symbols
         InvocationId = "$InvocationId-cache-only"
         TimeoutMilliseconds = [int]$validationBudget
-        DeadlineUtc = $deadlineUtc
+        DeadlineUtc = $cacheValidationDeadlineUtc
         LogComponent = 'universe-cache-validation'
         CacheOnly = $true
     }
@@ -1032,7 +1157,7 @@ function Invoke-MarketAppUniverseCachePreparation {
             CacheValidation = $validation
         }
     }
-    if ([DateTime]::UtcNow -ge $deadlineUtc) {
+    if ([DateTime]::UtcNow -ge $cacheValidationDeadlineUtc) {
         return [pscustomobject]@{
             Outcome = 'deadline_elapsed_after_cache_only_validation'
             TimedOut = [bool]($primary -and $primary.TimedOut)
@@ -1428,10 +1553,24 @@ function Resolve-MarketAppBackendReadinessAction {
     if ($healthGeneration -gt 0 -and $liveGeneration -gt 0 -and $healthGeneration -ne $liveGeneration) {
         $failures += 'subscription_generation_mismatch'
     }
-    if (([string]$RuntimeState.HealthHandoffStatus).ToLowerInvariant() -ne 'active') {
+    # A same-day provider can legitimately await the first quote before cash
+    # open. Do not consume its recovery attempt for this state alone. Missing
+    # endpoints, a dead sampler, invalid identity and degraded transport still
+    # fail the independent checks; prior-day source refresh remains mandatory.
+    $healthHandoff = ([string]$RuntimeState.HealthHandoffStatus).ToLowerInvariant()
+    $liveHandoff = ([string]$RuntimeState.LiveHandoffStatus).ToLowerInvariant()
+    $preopenWarming = [bool](
+        $Now -ge $Now.Date.AddHours(7).AddMinutes(45) -and
+        $Now -lt $Now.Date.AddHours(8).AddMinutes(30) -and
+        ([string]$RuntimeState.SubscriptionSessionState).ToLowerInvariant() -eq 'preopen' -and
+        $healthHandoff -in @('active', 'warming') -and
+        $liveHandoff -in @('active', 'warming') -and
+        ($healthHandoff -eq 'warming' -or $liveHandoff -eq 'warming')
+    )
+    if ($healthHandoff -ne 'active' -and -not $preopenWarming) {
         $failures += 'health_handoff_not_active'
     }
-    if (([string]$RuntimeState.LiveHandoffStatus).ToLowerInvariant() -ne 'active') {
+    if ($liveHandoff -ne 'active' -and -not $preopenWarming) {
         $failures += 'live_handoff_not_active'
     }
 
@@ -1570,7 +1709,7 @@ function Resolve-MarketAppBackendReadinessAction {
         else {
             return [pscustomobject]@{
                 Action = 'preserve'
-                Reason = 'healthy'
+                Reason = if ($preopenWarming) { 'preopen_handoff_warming' } else { 'healthy' }
                 FailureReasons = @()
                 StartAgeSeconds = if ($ListenerStartTime -eq [datetime]::MinValue) { $null } else { [math]::Max(0.0, ($Now - $ListenerStartTime).TotalSeconds) }
             }
@@ -1730,7 +1869,80 @@ function Get-MarketAppListenerProcessIds {
             [int]$Matches[1]
         }
     }
-    return @($processIds | Sort-Object -Unique)
+    $owners = @($processIds | Sort-Object -Unique)
+    if ($owners.Count -gt 0 -and -not ($owners.Count -eq 1 -and $owners[0] -eq 0)) {
+        return $owners
+    }
+    # Some Windows inventories omit the listener (or report PID zero) while
+    # retaining connected socket ownership. Prove the process serving our exact
+    # loopback endpoint with a held connection; never infer ownership from a
+    # successful connect, executable name, or an arbitrary established socket.
+    return @(Get-MarketAppLoopbackServerProcessIds -Port $Port)
+}
+
+function Resolve-MarketAppLoopbackServerOwners {
+    param(
+        [AllowEmptyCollection()][string[]]$Lines,
+        [int]$ServerPort,
+        [int]$ClientPort
+    )
+    $pattern = '^\s*TCP\s+127\.0\.0\.1:' + [regex]::Escape([string]$ServerPort) +
+        '\s+127\.0\.0\.1:' + [regex]::Escape([string]$ClientPort) + '\s+ESTABLISHED\s+(\d+)\s*$'
+    $owners = @(foreach ($line in $Lines) {
+        if ($line -match $pattern) { [int]$Matches[1] }
+    })
+    return @($owners | Sort-Object -Unique)
+}
+
+function Get-MarketAppLoopbackServerProcessIds {
+    param([ValidateRange(1, 65535)][int]$Port)
+
+    $client = [Net.Sockets.TcpClient]::new()
+    $pending = $null
+    try {
+        $pending = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $pending.AsyncWaitHandle.WaitOne(250)) { return @() }
+        $client.EndConnect($pending)
+        if (-not $client.Connected) { return @() }
+        $clientPort = [int]$client.Client.LocalEndPoint.Port
+        $netstatExe = Join-Path ([Environment]::SystemDirectory) 'netstat.exe'
+        $confirmed = $null
+        # Keep the same socket alive for both snapshots. Reused ports, client-
+        # side rows, old connections, PID zero and conflicting owners cannot pass.
+        foreach ($sample in @(1, 2)) {
+            $lines = @(& $netstatExe -ano -p tcp 2>$null)
+            if ($LASTEXITCODE -ne 0) { return @() }
+            $owners = @(Resolve-MarketAppLoopbackServerOwners -Lines $lines `
+                -ServerPort $Port -ClientPort $clientPort)
+            if ($owners.Count -ne 1 -or $owners[0] -le 0) { return @() }
+            if ($null -ne $confirmed -and $confirmed -ne $owners[0]) { return @() }
+            $confirmed = [int]$owners[0]
+        }
+        return @($confirmed)
+    }
+    catch { return @() }
+    finally {
+        $client.Close()
+        if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
+    }
+}
+
+function Test-MarketAppTcpPortReachable {
+    param([Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port)
+
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $pending = $null
+    try {
+        $pending = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $pending.AsyncWaitHandle.WaitOne(250)) { return $false }
+        $client.EndConnect($pending)
+        return $client.Connected
+    }
+    catch { return $false }
+    finally {
+        $client.Close()
+        if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
+    }
 }
 
 function Test-MarketAppPortListener {
@@ -1739,7 +1951,13 @@ function Test-MarketAppPortListener {
         [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port
     )
 
-    return @(Get-MarketAppListenerProcessIds -Port $Port).Count -gt 0
+    if (@(Get-MarketAppListenerProcessIds -Port $Port).Count -gt 0) {
+        return $true
+    }
+    # An incomplete OS ownership inventory must not authorize a duplicate
+    # launch. A bounded loopback connection proves only port occupancy; every
+    # ownership, readiness and stop check still requires its original proof.
+    return Test-MarketAppTcpPortReachable -Port $Port
 }
 
 function Assert-MarketAppExpectedListenerPid {
@@ -1835,6 +2053,21 @@ function Get-MarketAppProcessIdentityToken {
     catch {
         return $null
     }
+}
+
+function Get-MarketAppProcessIdentityTokenById {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$ProcessId
+    )
+
+    $record = Get-MarketAppProcessRecord -ProcessId $ProcessId
+    if (-not $record) {
+        return $null
+    }
+    return Get-MarketAppProcessIdentityToken -ProcessRecord $record
 }
 
 function Test-MarketAppCommandLineMarker {
@@ -1968,6 +2201,25 @@ function Get-MarketAppDirectBackendProcessIdentities {
     return @($identities | Sort-Object ProcessId -Unique)
 }
 
+function Test-MarketAppVerifiedRecorderProviderOwner {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    $recorderRoot = Get-MarketAppVerifiedRecorderProcessId `
+        -ProjectRoot $ProjectRoot -TradingDate (Get-Date).ToString('yyyy-MM-dd')
+    if (-not $recorderRoot) { return $false }
+    if (-not (Test-MarketAppVerifiedProcess `
+        -ProcessId $ProcessId -ProjectRoot $ProjectRoot `
+        -RequiredCommandMarkers @('backend.closing_tape.live_recorder'))) {
+        return $false
+    }
+    return [bool](Test-MarketAppProcessDescendsFrom `
+        -ProcessId $ProcessId -AncestorProcessId ([int]$recorderRoot))
+}
+
 function Invoke-MarketAppVerifiedOrphanBackendCleanup {
     [CmdletBinding()]
     param(
@@ -1989,11 +2241,18 @@ function Invoke-MarketAppVerifiedOrphanBackendCleanup {
         -RequiredCommandMarkers $RequiredCommandMarkers)
     $providerOwnerIds = @(Get-MarketAppRemoteTcpOwnerProcessIds `
         -RemotePort $ProviderRemotePort)
+    # The independently owned raw-tape recorder shares the provider endpoint.
+    # Exempt only its verified current-day process tree, never an arbitrary PID.
+    $preservedRecorderIds = @($providerOwnerIds | Where-Object {
+        Test-MarketAppVerifiedRecorderProviderOwner -ProjectRoot $ProjectRoot -ProcessId ([int]$_)
+    })
+    $providerOwnerIds = @($providerOwnerIds | Where-Object { $_ -notin $preservedRecorderIds })
     if ($directIdentities.Count -eq 0 -and $providerOwnerIds.Count -eq 0) {
         return [pscustomobject]@{
             Cleaned = $false
             ProcessIds = @()
             ProviderOwnerProcessIds = @()
+            PreservedRecorderProcessIds = @($preservedRecorderIds)
         }
     }
 
@@ -2051,6 +2310,9 @@ function Invoke-MarketAppVerifiedOrphanBackendCleanup {
         }
     }
 
+    if (@($preservedRecorderIds | Where-Object { $stopOrder.Contains([int]$_) }).Count -ne 0) {
+        throw 'A verified recorder overlaps the backend cleanup tree; no process was changed.'
+    }
     $identityTokens = @{}
     foreach ($candidateId in $stopOrder) {
         $record = Get-MarketAppProcessRecord -ProcessId $candidateId
@@ -2112,6 +2374,9 @@ function Invoke-MarketAppVerifiedOrphanBackendCleanup {
     $remainingListeners = @(Get-MarketAppListenerProcessIds -Port $Port)
     $remainingProviderOwners = @(Get-MarketAppRemoteTcpOwnerProcessIds `
         -RemotePort $ProviderRemotePort)
+    $remainingProviderOwners = @($remainingProviderOwners | Where-Object {
+        -not (Test-MarketAppVerifiedRecorderProviderOwner -ProjectRoot $ProjectRoot -ProcessId ([int]$_))
+    })
     $remainingBackendProcesses = @(Get-MarketAppDirectBackendProcessIdentities `
         -ProjectRoot $ProjectRoot `
         -RequiredCommandMarkers $RequiredCommandMarkers)
@@ -2133,6 +2398,7 @@ function Invoke-MarketAppVerifiedOrphanBackendCleanup {
         Cleaned = $true
         ProcessIds = @($stopOrder)
         ProviderOwnerProcessIds = @($providerOwnerIds)
+        PreservedRecorderProcessIds = @($preservedRecorderIds)
     }
 }
 
@@ -2341,12 +2607,18 @@ function Test-MarketAppProcessDescendsFrom {
 function Test-MarketAppVerifiedProcess {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][ValidateRange(0, [int]::MaxValue)][int]$ProcessId,
         [Parameter(Mandatory = $true)][string]$ProjectRoot,
         [Parameter(Mandatory = $true)][string[]]$RequiredCommandMarkers,
         [ValidateRange(1, 32)][int]$MaximumDepth = 12
     )
 
+    # Windows can expose a listening socket with PID 0 when its owner cannot
+    # be resolved. Preserve the occupied port, but never grant stop authority
+    # or abort unrelated supervision merely because ownership is unknown.
+    if ($ProcessId -eq 0) {
+        return $false
+    }
     $normalizedRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
     $currentId = $ProcessId
     $seen = @{}
@@ -2679,6 +2951,9 @@ function Get-MarketAppOwnedListenerPid {
         return $null
     }
     $listenerPid = [int]$currentPids[0]
+    if ($listenerPid -le 0) {
+        return $null
+    }
     if (Test-MarketAppProcessDescendsFrom -ProcessId $listenerPid -AncestorProcessId $LaunchProcessId) {
         return $listenerPid
     }
@@ -2918,6 +3193,7 @@ Export-ModuleMember -Function @(
     'Test-MarketAppDeadHandoffCacheProof',
     'Resolve-MarketAppDashboardReadinessAction',
     'Get-MarketAppListenerProcessIds',
+    'Get-MarketAppProcessIdentityTokenById',
     'Test-MarketAppPortListener',
     'Assert-MarketAppExpectedListenerPid',
     'Wait-MarketAppProcessNetworkQuiescence',

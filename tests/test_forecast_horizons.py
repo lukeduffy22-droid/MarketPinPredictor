@@ -97,6 +97,77 @@ def test_eod_candidates_are_pure_research_and_deterministic():
     json.dumps(result, allow_nan=False)
 
 
+def test_robust_trend_is_separate_and_does_not_change_existing_selection():
+    result = evaluate_forecast("SPY", series(), as_of_utc=AS_OF)
+    robust = candidate(result, "eod_robust_trend_v1")
+    blend = candidate(result, "eod_equal_candidate_blend_v1")
+    assert robust["status"] == "RESEARCH_ONLY" and robust["predicted_close"] > 100
+    assert robust["default_selection_eligible"] is False and robust["prospective_only"] is True
+    assert robust["accuracy_improvement_verified"] is False
+    assert robust["comparison_status"] == "PROSPECTIVE_RESEARCH_COMPARISON_NOT_SELECTED"
+    assert "did not beat baseline" in robust["limitation"]
+    assert robust["method_id"] not in blend["components"]
+    expected = sum(candidate(result, m)["predicted_close"] for m in blend["components"]) / len(blend["components"])
+    assert result["predicted_close"] == pytest.approx(expected)
+    assert result["selected_method"] == blend["method_id"]
+
+
+def test_robust_trend_resists_one_bad_lookback_endpoint():
+    clean = evaluate_forecast("SPY", series(), as_of_utc=AS_OF)
+    noisy = series()
+    noisy[0]["spot"] = 150
+    result = evaluate_forecast("SPY", noisy, as_of_utc=AS_OF)
+    assert candidate(result, "eod_robust_trend_v1")["predicted_close"] == pytest.approx(
+        candidate(clean, "eod_robust_trend_v1")["predicted_close"])
+    assert candidate(result, "eod_damped_momentum_v1")["predicted_close"] < 100
+
+
+def test_robust_trend_weights_completed_minutes_not_sample_bursts():
+    rows = series()
+    clean = evaluate_forecast("SPY", rows, as_of_utc=AS_OF)
+    # Extra observations in one minute cannot create extra trend-bin weight.
+    burst = [spot(AS_OF - timedelta(minutes=10) + timedelta(seconds=s), rows[20]["spot"])
+             for s in range(1, 59)]
+    result = evaluate_forecast("SPY", rows + burst, as_of_utc=AS_OF)
+    before, after = [candidate(r, "eod_robust_trend_v1") for r in (clean, result)]
+    assert before["predicted_close"] == pytest.approx(after["predicted_close"])
+    assert before["observed_minute_count"] == after["observed_minute_count"] == 30
+
+
+def test_robust_trend_excludes_future_available_and_unfinished_minute_samples():
+    as_of = AS_OF + timedelta(seconds=30)
+    rows = series(as_of)
+    clean = evaluate_forecast("SPY", rows, as_of_utc=as_of)
+    extra = [spot(as_of - timedelta(seconds=10), 150),
+             spot(as_of - timedelta(minutes=5, seconds=10), 150,
+                  available_at_utc=(as_of + timedelta(seconds=1)).isoformat())]
+    result = evaluate_forecast("SPY", rows + extra, as_of_utc=as_of)
+    assert candidate(result, "eod_robust_trend_v1")["predicted_close"] == pytest.approx(
+        candidate(clean, "eod_robust_trend_v1")["predicted_close"])
+    assert result["evidence"]["excluded_rows"]["future_observation"] == 1
+
+
+@pytest.mark.parametrize("mode", ["gap", "generation", "short"])
+def test_robust_trend_abstains_for_insufficient_contiguous_evidence(mode):
+    rows = series()
+    if mode == "gap":
+        rows = rows[:5] + rows[20:]
+    elif mode == "generation":
+        rows[-1]["subscription_generation"] += 1
+    else:
+        rows = rows[-10:]
+    result = evaluate_forecast("SPY", rows, as_of_utc=AS_OF)
+    assert candidate(result, "eod_robust_trend_v1")["status"] == "ABSTAIN"
+    assert candidate(result, "eod_robust_trend_v1")["predicted_close"] is None
+
+
+def test_robust_trend_damps_toward_current_reference_near_close():
+    closed = session_bounds(AS_OF.date())[1]
+    as_of = closed - timedelta(seconds=1)
+    result = evaluate_forecast("SPY", series(as_of), as_of_utc=as_of)
+    assert 100 < candidate(result, "eod_robust_trend_v1")["predicted_close"] < 100.001
+
+
 @pytest.mark.parametrize("changes,reason", [
     ({"source_verified": False}, "unverified_source"),
     ({"source_verified": "true"}, "unverified_source"),

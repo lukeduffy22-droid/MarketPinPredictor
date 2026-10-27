@@ -174,6 +174,7 @@ def test_status_reads_close_evidence_from_the_explicit_configured_database(tmp_p
     )
     assert unavailable["close_evidence"]["available"] is False
     assert "artifact" in unavailable["close_evidence"]["reason"]
+    assert "2026-08-25/SPX, observation 1:" in unavailable["close_evidence"]["reason"]
 
 
 def test_status_fails_closed_for_forked_verified_close_lineage(tmp_path):

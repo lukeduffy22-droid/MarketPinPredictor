@@ -131,7 +131,7 @@ def render_closing_prices(symbols):
     import streamlit as st
     from zoneinfo import ZoneInfo
     with st.expander('Official closing prices — save and review'):
-        st.caption('Fetches official-source artifacts for every selected tracked symbol. No AI is needed. The existing publication gate allows requests from 5:00 PM Central; unavailable sources remain pending. Nothing is scored or trained here.')
+        st.caption('Fetches official-source artifacts for every selected tracked symbol. No AI is needed. The publication gate allows requests from 5:00 PM Central; unavailable sources remain pending. The scheduled settlement path scores only a precommitted research selection and never trains a model.')
         day = st.date_input('Closing-price session', datetime.now(ZoneInfo('America/Chicago')).date(), key='official_close_day')
         st.write('Selected symbols: '+', '.join(symbols))
         st.caption('Collection also includes every symbol reported as tracked by the backend. If that inventory cannot be read, collection fails rather than silently omitting symbols.')
@@ -155,3 +155,35 @@ def render_closing_prices(symbols):
                                file_name=f'closing-prices-{day}.json',mime='application/json')
         else:
             st.info('No saved collection report for this session yet.')
+        try:
+            from tools.run_verified_close_postclose import latest_pipeline_status
+            pipeline = latest_pipeline_status(ROOT, day)
+        except Exception as exc:
+            st.warning('Post-close evidence chain could not be validated: '+type(exc).__name__)
+        else:
+            st.markdown('**Post-close evidence chain**')
+            selection = pipeline['selection']
+            settlement = pipeline['settlement']
+            st.write({
+                'prediction selection': selection['status'],
+                'verified bundle / ingestion / scoring': settlement['status'],
+                'DJI verified-close scoring': pipeline['dji_close_scoring']['status'],
+            })
+            if selection.get('symbols'):
+                st.dataframe(selection['symbols'], hide_index=True)
+            if settlement['status'] == 'COMPLETE':
+                rows = []
+                for item in settlement.get('ingest_results', []):
+                    score = item.get('score') or {}
+                    rows.append({
+                        'symbol': item.get('symbol'),
+                        'artifact saved': True,
+                        'ledger ingested': True,
+                        'prediction scored': int(score.get('scored') or 0) > 0,
+                        'score reason': score.get('reason') or '',
+                    })
+                st.dataframe(rows, hide_index=True)
+            st.caption(
+                'DJI remains explicit and unsupported here because no approved official-close '
+                'adapter is configured; DIA is not substituted for the cash-index close.'
+            )

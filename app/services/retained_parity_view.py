@@ -47,6 +47,9 @@ def build_retained_opra_parity_figure(
                 point.subscription_epoch_id,
                 point.subscription_generation,
                 point.calculation_id or "N/A",
+                point.timestamp_utc.astimezone(display_timezone.tzinfo).strftime(
+                    "%b %d, %Y at %I:%M:%S %p %Z"
+                ),
             ]
             for point in segment.points
         ]
@@ -64,6 +67,7 @@ def build_retained_opra_parity_figure(
                 customdata=identity,
                 hovertemplate=(
                     "Parity spot %{y:,.2f}<br>"
+                    "Recorded %{customdata[3]}<br>"
                     "Epoch %{customdata[0]} · generation %{customdata[1]}<br>"
                     "Calculation %{customdata[2]}<extra></extra>"
                 ),
@@ -83,6 +87,7 @@ def build_retained_opra_parity_figure(
                 customdata=identity,
                 hovertemplate=(
                     "Gamma pin %{y:,.2f}<br>"
+                    "Recorded %{customdata[3]}<br>"
                     "Epoch %{customdata[0]} · generation %{customdata[1]}<br>"
                     "Calculation %{customdata[2]}<extra></extra>"
                 ),
@@ -90,7 +95,9 @@ def build_retained_opra_parity_figure(
         )
     figure.update_layout(
         height=360,
-        hovermode="x unified",
+        # Unified hover can combine nearest points from different epochs under
+        # one timestamp. Show only the point actually being inspected.
+        hovermode="closest",
         margin={"l": 20, "r": 20, "t": 25, "b": 20},
         legend={
             "orientation": "h",
@@ -100,6 +107,7 @@ def build_retained_opra_parity_figure(
             "x": 0,
         },
         xaxis_title=f"Time ({display_timezone_label(display_timezone)})",
+        xaxis_tickformat="%I:%M %p",
         yaxis_title="Index level / strike",
     )
     return figure
@@ -140,7 +148,7 @@ def render_retained_opra_parity_history(
                 st.markdown(
                     "**Latest contiguous OPRA parity observation envelope "
                     "(not a forecast):** "
-                    f"${reference.range_low:,.2f} to ${reference.range_high:,.2f}"
+                    f"\\${reference.range_low:,.2f} to \\${reference.range_high:,.2f}"
                 )
             else:
                 st.markdown(

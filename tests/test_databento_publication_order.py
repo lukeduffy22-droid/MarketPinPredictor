@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 import backend.database as backend_database
 import database as root_database
-from backend.databento_streamer import DatabentoGammaStreamer
+from backend.databento_streamer import DatabentoGammaStreamer, current_market_date
 
 
 @pytest.fixture
@@ -46,6 +46,13 @@ def publication_case(tmp_path, monkeypatch):
         "validation_failure_reasons": [],
         "subscription_epoch_id": streamer.subscription_epoch_id,
         "subscription_generation": 1,
+        # Reach the persistence boundary under the current-session universe
+        # prerequisite. Missing provenance is independently tested elsewhere.
+        "universe_provenance": {
+            "is_fallback": False,
+            "trading_date": current_market_date().isoformat(),
+            "source_date": current_market_date().isoformat(),
+        },
         "calculation_id": "11111111-1111-1111-1111-111111111111",
     }
     result["_calculation_inputs"] = {
@@ -135,6 +142,42 @@ def test_failed_input_persistence_publishes_only_unusable_diagnostics(
         assert audit["gamma_excluded_from_model"] is True
         assert audit["usable_for_prediction"] is False
         assert "CALCULATION_INPUT_PERSISTENCE_FAILED" in audit["validation_failure_reasons"]
+
+
+def test_fallback_provenance_is_not_mislabeled_as_persistence_failure(
+    publication_case, monkeypatch
+):
+    streamer, result = publication_case
+    result["universe_provenance"] = {
+        "is_fallback": True,
+        "mode": "prior_cache_filtered",
+        "trading_date": current_market_date().isoformat(),
+        "source_date": "2026-10-19",
+    }
+    streamer.subscription_metadata["universe_provenance"] = dict(
+        result["universe_provenance"]
+    )
+    audits = []
+    monkeypatch.setattr(root_database, "save_audit_snapshot_to_db", audits.append)
+    monkeypatch.setattr(
+        backend_database,
+        "save_gamma_calculation_inputs",
+        lambda *_args: pytest.fail("fallback provenance reached persistence"),
+    )
+
+    streamer._compute_and_publish()
+
+    payload = streamer.get_all_latest()["SPX"]
+    assert payload["validation_is_valid"] is False
+    assert payload["usable_for_prediction"] is False
+    assert payload["validation_failure_reasons"] == ["FALLBACK_PROVENANCE"]
+    assert "CALCULATION_INPUT_PERSISTENCE_FAILED" not in payload[
+        "validation_failure_reasons"
+    ]
+    assert not payload.get("calculation_id")
+    assert len(audits) == 1
+    assert audits[0]["capture_block_reason"] == "UNIVERSE_CAPTURE_NOT_CURRENT_SESSION"
+    assert audits[0]["validation_failure_reasons"] == ["FALLBACK_PROVENANCE"]
 
 
 def test_failed_due_capture_retries_before_success_throttle_and_stays_abstained(

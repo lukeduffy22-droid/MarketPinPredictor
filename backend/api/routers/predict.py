@@ -126,6 +126,7 @@ def get_close_overlay(symbol: str):
         "prediction_mode": prediction_authority["prediction_mode"],
         "is_estimate": bool(prediction_authority["is_estimate"]),
         "prediction_authority": prediction_authority,
+        "structural_regime_prediction": prediction.get("structural_regime_prediction"),
     }
 
 
@@ -270,6 +271,7 @@ def _predict_close_impl(
         prediction_mode=str(prediction_authority["prediction_mode"]),
         is_estimate=bool(prediction_authority["is_estimate"]),
         prediction_authority=prediction_authority,
+        structural_regime_prediction=prediction.get("structural_regime_prediction"),
     )
 
 

@@ -59,7 +59,7 @@ def render_advisor(symbols, preferences_path=PREFERENCES):
         except (OSError, ValueError) as exc:
             st.warning(f'Could not restore selections: {exc}')
             st.session_state.advisor_saved = None
-    if st.button('Analyze Live State', type='primary'):
+    if st.button('Analyze Live State'):
         st.session_state.live_advisor_context = fetch_advisor_context(symbols)
         previous = st.session_state.get('live_advisor_report', {}).get('capabilities')
         if previous is None and st.session_state.advisor_saved:
@@ -110,12 +110,12 @@ def render_advisor(symbols, preferences_path=PREFERENCES):
         st.caption('Select Analyze Live State to collect diagnostics. No live requests run automatically.')
     from app.services.diagnostic_agent import render_diagnostic_agent
     render_diagnostic_agent(st.session_state.get('live_advisor_context') or
-                            {'requested_symbols': list(symbols)}, capabilities)
+                            {'requested_symbols': list(symbols)}, capabilities, requested_symbols=list(symbols))
     saved = st.session_state.advisor_saved
     if saved:
-        if saved.get('source_fingerprint') != capabilities['fingerprint']:
-            st.warning('Saved selections refer to an older source version. They remain available for download but are not automatically approved for this version.')
         with st.expander('Approved Proposals (Recorded)'):
+            if saved.get('source_fingerprint') != capabilities['fingerprint']:
+                st.warning('Previously selected change proposals were saved against different source code. Review them again before implementation. This does not invalidate saved AI reviews.')
             st.json(saved)
         st.download_button('Download saved proposals (JSON)', json.dumps(saved, indent=2),
                            file_name='advisor-proposals.json', mime='application/json')

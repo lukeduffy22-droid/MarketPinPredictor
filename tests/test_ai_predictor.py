@@ -1,6 +1,8 @@
 import pandas as pd
 import pytest
+import torch
 
+from backend import ai_predictor
 from backend.ai_predictor import build_ai_prediction
 from backend.api.helpers import pin_payload_for_symbol, with_gex_level_semantics
 from backend.api.routers import gex as gex_router
@@ -59,6 +61,99 @@ def test_ai_prediction_is_usable_with_live_payload():
     assert result["confidence_calibrated"] is False
     assert result["signals"]
     assert result["pin_payload"]["symbol"] == "SPX"
+
+
+def test_successful_requested_device_is_reported_without_fallback(monkeypatch):
+    cpu_target = ai_predictor._weighted_average(
+        [
+            ("live_gex_target", 7510.0, 0.42),
+            ("gamma_pin", 7505.0, 0.28),
+            ("zero_gamma", 7495.0, 0.18),
+            ("max_pain", 7520.0, 0.12),
+        ],
+        torch.device("cpu"),
+    )
+    observed = []
+
+    def successful_cuda(_anchors, device):
+        observed.append(device.type)
+        return cpu_target
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(ai_predictor, "_weighted_average", successful_cuda)
+    monkeypatch.setattr(ai_predictor, "_cuda_disabled_after_failure", False)
+
+    result = build_ai_prediction("SPX", base_payload())
+
+    assert observed == ["cuda"]
+    assert result["predicted_close"] == pytest.approx(cpu_target)
+    assert result["inference_device"] == "cuda:0"
+
+
+def test_cuda_calculation_failure_retries_identically_on_cpu_and_reports_cpu(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(ai_predictor, "_cuda_disabled_after_failure", False)
+    expected = build_ai_prediction("SPX", base_payload())
+    original = ai_predictor._weighted_average
+    observed = []
+
+    def fail_cuda_then_calculate(anchors, device):
+        observed.append(device.type)
+        if device.type == "cuda":
+            raise RuntimeError("simulated CUDA kernel failure")
+        return original(anchors, device)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(ai_predictor, "_weighted_average", fail_cuda_then_calculate)
+    monkeypatch.setattr(ai_predictor, "_cuda_disabled_after_failure", False)
+    monkeypatch.setattr(ai_predictor, "_cuda_fallback_warning_emitted", False)
+    caplog.set_level("WARNING", logger="backend.ai_predictor")
+
+    result = build_ai_prediction("SPX", base_payload())
+    second = build_ai_prediction("SPX", base_payload())
+
+    assert observed == ["cuda", "cpu", "cpu"]
+    assert result["predicted_close"] == expected["predicted_close"]
+    assert result["feature_hash"] == expected["feature_hash"]
+    assert result["inference_device"] == "cpu"
+    assert second["inference_device"] == "cpu"
+    assert ai_predictor._cuda_disabled_after_failure is True
+    warnings = [
+        record for record in caplog.records
+        if "deterministic prediction is retrying on CPU" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+def test_cuda_discovery_failure_latches_subsequent_predictions_to_cpu(
+    monkeypatch, caplog
+):
+    discovery_calls = 0
+
+    def fail_cuda_discovery():
+        nonlocal discovery_calls
+        discovery_calls += 1
+        raise RuntimeError("simulated CUDA discovery failure")
+
+    monkeypatch.setattr(torch.cuda, "is_available", fail_cuda_discovery)
+    monkeypatch.setattr(ai_predictor, "_cuda_disabled_after_failure", False)
+    monkeypatch.setattr(ai_predictor, "_cuda_fallback_warning_emitted", False)
+    caplog.set_level("WARNING", logger="backend.ai_predictor")
+
+    first = build_ai_prediction("SPX", base_payload())
+    second = build_ai_prediction("SPX", base_payload())
+
+    assert discovery_calls == 1
+    assert first["inference_device"] == "cpu"
+    assert second["inference_device"] == "cpu"
+    assert ai_predictor._cuda_disabled_after_failure is True
+    warnings = [
+        record for record in caplog.records
+        if "CUDA device_discovery failed" in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def test_invalid_payload_is_not_usable():
