@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -541,6 +542,68 @@ def _opening_window_projection(
         },
         "warnings": warnings,
     }
+
+
+@dataclass(frozen=True)
+class _SnapshotEvidence:
+    """Validated request-local inputs, before ORB classification/presentation."""
+
+    references: list[dict[str, Any]]
+    structures: list[dict[str, Any]]
+    raw_range: list[dict[str, Any]]
+    invalid_range: list[dict[str, Any]]
+    range_rows: list[dict[str, Any]]
+    latest: dict[str, Any] | None
+    latest_price_invalid: bool
+
+
+def _normalize_snapshot_evidence(
+    references: Sequence[Mapping[str, Any]],
+    structures: Sequence[Mapping[str, Any]],
+    start_utc: datetime,
+    end_utc: datetime,
+) -> _SnapshotEvidence:
+    """Keep rejected/latest-invalid evidence explicit; never mutate raw records."""
+    normalized_rows: list[dict[str, Any]] = []
+    invalid_price_rows: list[dict[str, Any]] = []
+    for row in references:
+        # Legacy/custom loaders cannot promote a pending raw row.
+        if row.get("progress_eligible") is not True or timing_contract(row) is None:
+            continue
+        source_time = _parse_utc(row.get("sample_timestamp_utc"))
+        price = _finite(row.get("reference_price"))
+        if source_time is None or price is None or price <= 0.0:
+            continue
+        if (row.get("reference_price_inputs_valid") is False
+                or ("formula_inputs_json" in row
+                    and not orb_reference_price_inputs_valid(row["formula_inputs_json"]))):
+            invalid_price_rows.append({**row, "_source_time": source_time})
+            continue
+        normalized_rows.append({**row, "_source_time": source_time, "_price": price})
+    normalized_rows.sort(key=lambda row: (
+        row["_source_time"],
+        _parse_utc(row.get("captured_at_utc")) or row["_source_time"],
+        str(row.get("sample_id") or ""),
+    ))
+    structure_rows = []
+    for row in structures:
+        source_time = _parse_utc(row.get("source_timestamp_utc"))
+        if source_time is not None:
+            structure_rows.append({**row, "_source_time": source_time})
+    structure_rows.sort(key=lambda row: (row["_source_time"], str(row.get("observation_id") or "")))
+    raw_range_rows = [row for row in normalized_rows if start_utc <= row["_source_time"] < end_utc]
+    invalid_range_rows = [row for row in invalid_price_rows if start_utc <= row["_source_time"] < end_utc]
+    # One sampler bucket is one price sample, including unchanged fresh quotes.
+    range_by_source_time = {row["_source_time"]: row for row in raw_range_rows}
+    range_rows = [range_by_source_time[key] for key in sorted(range_by_source_time)]
+    latest = normalized_rows[-1] if normalized_rows else None
+    latest_price_invalid = bool(invalid_price_rows and (
+        latest is None or max(row["_source_time"] for row in invalid_price_rows) >= latest["_source_time"]
+    ))
+    return _SnapshotEvidence(
+        normalized_rows, structure_rows, raw_range_rows, invalid_range_rows,
+        range_rows, None if latest_price_invalid else latest, latest_price_invalid,
+    )
 
 
 class MarketStructureJournal:
@@ -1074,60 +1137,18 @@ class MarketStructureJournal:
             )
         )
 
-        rows = self.reference_loader(normalized, target_date, as_of_utc=as_of)
-        normalized_rows: list[dict[str, Any]] = []
-        invalid_price_rows: list[dict[str, Any]] = []
-        for row in rows:
-            # Production loaders always project the immutable decision sidecar.
-            # Requiring the marker here also prevents a custom/legacy loader
-            # from accidentally promoting a pending raw row.
-            if row.get("progress_eligible") is not True or timing_contract(row) is None:
-                continue
-            source_time = _parse_utc(row.get("sample_timestamp_utc"))
-            price = _finite(row.get("reference_price"))
-            if source_time is None or price is None or price <= 0.0:
-                continue
-            if (row.get("reference_price_inputs_valid") is False
-                    or ("formula_inputs_json" in row
-                        and not orb_reference_price_inputs_valid(row["formula_inputs_json"]))):
-                invalid_price_rows.append({**row, "_source_time": source_time})
-                continue
-            normalized_rows.append({**row, "_source_time": source_time, "_price": price})
-        normalized_rows.sort(
-            key=lambda row: (
-                row["_source_time"],
-                _parse_utc(row.get("captured_at_utc")) or row["_source_time"],
-                str(row.get("sample_id") or ""),
-            )
+        evidence = _normalize_snapshot_evidence(
+            self.reference_loader(normalized, target_date, as_of_utc=as_of),
+            self.loader(normalized, target_date, as_of_utc=as_of),
+            start_utc, end_utc,
         )
-        structure_rows: list[dict[str, Any]] = []
-        for row in self.loader(normalized, target_date, as_of_utc=as_of):
-            source_time = _parse_utc(row.get("source_timestamp_utc"))
-            if source_time is not None:
-                structure_rows.append({**row, "_source_time": source_time})
-        structure_rows.sort(
-            key=lambda row: (row["_source_time"], str(row.get("observation_id") or ""))
-        )
-        raw_range_rows = [
-            row for row in normalized_rows if start_utc <= row["_source_time"] < end_utc
-        ]
-        invalid_range_rows = [
-            row for row in invalid_price_rows if start_utc <= row["_source_time"] < end_utc
-        ]
-        # One sampler bucket is one price sample. Provider timestamps remain
-        # retained separately, so an unchanged but still-fresh quote does not
-        # make the 5-second cadence appear missing.
-        range_by_source_time: dict[datetime, dict[str, Any]] = {}
-        for row in raw_range_rows:
-            range_by_source_time[row["_source_time"]] = row
-        range_rows = [range_by_source_time[key] for key in sorted(range_by_source_time)]
-        latest = normalized_rows[-1] if normalized_rows else None
-        latest_price_invalid = bool(invalid_price_rows and (
-            latest is None or max(row["_source_time"] for row in invalid_price_rows)
-            >= latest["_source_time"]
-        ))
-        if latest_price_invalid:
-            latest = None  # Never promote the preceding sample as current.
+        normalized_rows = evidence.references
+        structure_rows = evidence.structures
+        raw_range_rows = evidence.raw_range
+        invalid_range_rows = evidence.invalid_range
+        range_rows = evidence.range_rows
+        latest = evidence.latest
+        latest_price_invalid = evidence.latest_price_invalid
 
         if as_of < start_utc:
             clock_status = "not_started"

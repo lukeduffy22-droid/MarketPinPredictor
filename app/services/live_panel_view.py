@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from app.services.retained_forecasts import render_retained_forecasts
+from app.services.evidence_stages import capture_evidence_stages, evidence_cache_context
 
 import pandas as pd
 import requests
@@ -364,21 +365,21 @@ def _promoted_prediction_view(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_closing_tape_readiness() -> dict[str, Any]:
+def _cached_closing_tape_readiness(evidence_context=()) -> dict[str, Any]:
     return fetch_closing_tape_readiness()
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def _cached_closing_tape_status() -> dict[str, Any]:
+def _cached_closing_tape_status(evidence_context=()) -> dict[str, Any]:
     return fetch_closing_tape_status()
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def _cached_promoted_closing_tape_predictions() -> dict[str, Any]:
+def _cached_promoted_closing_tape_predictions(evidence_context=()) -> dict[str, Any]:
     return fetch_promoted_closing_tape_predictions()
 
 
-def render_closing_tape_evidence() -> None:
+def render_closing_tape_evidence(*, runtime_context=None) -> None:
     """Render the full-width observed/inferred evidence and promotion surface."""
     with st.expander("Observed OPRA Tape and Inferred Flow", expanded=False):
         load_evidence = st.toggle(
@@ -405,15 +406,19 @@ def render_closing_tape_evidence() -> None:
             _cached_closing_tape_readiness.clear()
             _cached_promoted_closing_tape_predictions.clear()
 
-        payload = _cached_closing_tape_status()
-        readiness = _cached_closing_tape_readiness()
+        from zoneinfo import ZoneInfo
+        cache_context = evidence_cache_context(runtime_context, datetime.now(ZoneInfo("America/New_York")).date())
+        payload = _cached_closing_tape_status(cache_context)
+        readiness = _cached_closing_tape_readiness(cache_context)
         promoted = _promoted_prediction_view(
-            _cached_promoted_closing_tape_predictions()
+            _cached_promoted_closing_tape_predictions(cache_context)
         )
         level, message = _closing_tape_status_message(payload)
         getattr(st, level)(message)
         analysis_level, analysis_message = _closing_tape_analysis_message(payload)
         getattr(st, analysis_level)(analysis_message)
+        st.dataframe(capture_evidence_stages(payload, readiness), hide_index=True, width="stretch")
+        st.caption("Each stage needs its own evidence. Capture completion does not establish a scored forecast or model accuracy.")
         observed = payload.get("observed") or {}
         inferred = payload.get("inferred") or {}
         model_gate = payload.get("model_gate") or {}

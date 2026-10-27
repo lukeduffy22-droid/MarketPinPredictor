@@ -27,6 +27,7 @@ def _database(root: Path) -> Path:
             id INTEGER PRIMARY KEY,
             symbol TEXT,
             timestamp_utc TEXT,
+            created_at_utc TEXT,
             trading_date TEXT,
             is_valid INTEGER,
             current_price REAL,
@@ -56,10 +57,11 @@ def _database(root: Path) -> Path:
     ]
     for prediction_id, symbol, timestamp, calculation_id, predicted in rows:
         connection.execute(
-            "INSERT INTO prediction_snapshots VALUES (?,?,?,?,1,?,?,?,?,?)",
+            "INSERT INTO prediction_snapshots VALUES (?,?,?,?,?,1,?,?,?,?,?)",
             (
                 prediction_id,
                 symbol,
+                timestamp,
                 timestamp,
                 "2026-09-18",
                 predicted - 5,
@@ -256,3 +258,13 @@ def test_settlement_binds_scoring_to_selection_receipt(monkeypatch, tmp_path):
     status = latest_pipeline_status(tmp_path, date(2026, 9, 18))
     assert status["selection"]["status"] == "RECEIPT_VALID"
     assert status["settlement"]["status"] == "COMPLETE"
+
+
+def test_backdated_snapshot_inserted_after_close_is_not_selected(monkeypatch, tmp_path):
+    database = _database(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database.as_posix()}")
+    with sqlite3.connect(database) as conn:
+        conn.execute("UPDATE prediction_snapshots SET created_at_utc='2026-09-18 20:00:00' WHERE id=2")
+    result = prepare_prediction_score_selection(tmp_path, date(2026, 9, 18),
+        observed_at_utc=datetime(2026, 9, 18, 21, tzinfo=UTC))
+    assert {r["symbol"]: r["prediction_id"] for r in result["receipt"]["selections"]}["SPX"] == 1

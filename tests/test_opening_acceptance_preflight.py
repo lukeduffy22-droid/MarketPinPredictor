@@ -175,34 +175,121 @@ def test_database_contract_accepts_complete_schema_without_writing(tmp_path):
     assert database_path.read_bytes() == before
 
 
-def test_database_contract_quick_checks_only_required_opening_tables(
+def test_database_contract_runs_one_full_integrity_pass_before_schema_checks(
     tmp_path,
     monkeypatch,
 ):
     database_path = tmp_path / "opening.db"
     _create_contract_database(database_path)
-    statements: list[str] = []
-    real_connect = preflight_module.sqlite3.connect
-
-    def traced_connect(*args, **kwargs):
-        connection = real_connect(*args, **kwargs)
-        connection.set_trace_callback(statements.append)
-        return connection
-
-    monkeypatch.setattr(preflight_module.sqlite3, "connect", traced_connect)
-
-    assert inspect_database_contract(database_path) == []
+    timings = []
+    assert inspect_database_contract(database_path, timings=timings) == []
 
     quick_checks = {
-        statement for statement in statements if statement.startswith("PRAGMA quick_check")
+        row["query"] for row in timings if row["query"].startswith("PRAGMA quick_check")
     }
-    assert quick_checks == {
-        'PRAGMA quick_check("market_structure_observations")',
-        'PRAGMA quick_check("orb_reference_samples")',
-        'PRAGMA quick_check("orb_reference_sample_decisions")',
-        'PRAGMA quick_check("orb_cbbo_reference_samples")',
-        'PRAGMA quick_check("orb_cbbo_reference_sample_decisions")',
-    }
+    assert quick_checks == {"PRAGMA quick_check"}
+    assert sum(row["query"] == "PRAGMA quick_check" for row in timings) == 1
+
+
+def test_database_scan_budget_fails_closed_with_stage_and_preserves_bytes(tmp_path):
+    path = tmp_path / "opening.db"
+    _create_contract_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO market_structure_observations(observation_id) VALUES (?)",
+            [(str(i),) for i in range(2000)],
+        )
+    before = path.read_bytes()
+    timings = []
+    issues = inspect_database_contract(path, total_seconds=0, query_seconds=0, timings=timings)
+    assert any(issue["code"] == "RUNTIME_DATABASE_BUDGET_EXCEEDED" for issue in issues)
+    assert any("quick_check" in issue.get("stage", "") for issue in issues)
+    assert timings and all(row["elapsed_ms"] >= 0 for row in timings)
+    assert path.read_bytes() == before
+    assert not database_issues_allow_additive_bootstrap(issues)
+
+
+def test_main_integrity_budget_allows_retained_201_second_scan(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(preflight_module.time, "monotonic", lambda: now[0])
+    connection = sqlite3.connect(":memory:")
+    try:
+        budget = preflight_module.DatabaseReadBudget(connection)
+        budget._begin('PRAGMA quick_check("orb_cbbo_reference_samples")')
+        now[0] = 201.25
+        assert not budget.expired()
+        now[0] = 279.0
+        assert not budget.expired()
+        now[0] = 280.0
+        assert budget.expired()
+    finally:
+        connection.close()
+
+
+def test_capture_preflight_does_not_scan_or_bootstrap_main_opening_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight_module, "inspect_required_files", lambda root: [])
+    monkeypatch.setattr(preflight_module, "capture_source_fingerprint", lambda root: "a" * 64)
+    monkeypatch.setattr(preflight_module, "inspect_import_contract", lambda root: [])
+    def forbidden(*args, **kwargs):
+        raise AssertionError("independent capture must not use the main database gate")
+    monkeypatch.setattr(preflight_module, "inspect_database_contract", forbidden)
+    monkeypatch.setattr(preflight_module, "inspect_configured_database_target", forbidden)
+    path = tmp_path / "data/closing_tape/2026-10-28/closing_tape.sqlite"
+    report = preflight_module.run_preflight(tmp_path, path, phase="capture")
+    assert report["ready"]
+    assert report["database_contract"] == "independent_capture_catalog"
+    assert not report["schema_bootstrap_required"]
+    assert report["stage_timings_ms"]["database_contract"] >= 0
+    assert not path.exists()
+
+
+def test_capture_catalog_rejects_wrong_target_corruption_and_missing_tables(tmp_path):
+    assert preflight_module.inspect_capture_catalog(tmp_path, tmp_path / "market_data.db") == [
+        {"code": "CAPTURE_CATALOG_TARGET_INVALID"}
+    ]
+    path = tmp_path / "data/closing_tape/2026-10-28/closing_tape.sqlite"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"corrupted sqlite evidence")
+    before = path.read_bytes()
+    assert preflight_module.inspect_capture_catalog(tmp_path, path)[0]["code"] == "CAPTURE_CATALOG_READ_FAILED"
+    assert path.read_bytes() == before
+    path.unlink()
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated(value)")
+    assert preflight_module.inspect_capture_catalog(tmp_path, path)[0]["code"] == "CAPTURE_CATALOG_SCHEMA_INVALID"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE tape_sessions(session_id)")
+        connection.execute("CREATE TABLE tape_feed_status(session_id)")
+    before = path.read_bytes()
+    assert preflight_module.inspect_capture_catalog(tmp_path, path) == []
+    assert path.read_bytes() == before
+
+
+def test_invocation_reuse_binds_database_identity_and_schema_not_later_rows(tmp_path, monkeypatch):
+    path = tmp_path / "opening.db"
+    _create_contract_database(path)
+    monkeypatch.setattr(preflight_module, "inspect_required_files", lambda root: [])
+    monkeypatch.setattr(preflight_module, "capture_source_fingerprint", lambda root: "a" * 64)
+    fingerprint = preflight_module.capture_database_fingerprint(path)
+    def recheck(**extra):
+        return preflight_module.run_fingerprint_preflight(
+            tmp_path, path, expected_source_fingerprint="a" * 64,
+            expected_database_fingerprint=fingerprint, **extra,
+        )
+    assert recheck()["ready"]
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO market_structure_observations(observation_id) VALUES ('new')")
+    connection.close()
+    assert recheck()["ready"]
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER orb_reference_samples_no_update")
+    connection.close()
+    assert "DATABASE_FINGERPRINT_MISMATCH" in {x["code"] for x in recheck()["issues"]}
+    replacement = tmp_path / "replacement.db"
+    _create_contract_database(replacement)
+    path.unlink()
+    replacement.replace(path)
+    assert "DATABASE_FINGERPRINT_MISMATCH" in {x["code"] for x in recheck()["issues"]}
 
 
 def test_database_contract_rejects_missing_append_only_trigger(tmp_path):

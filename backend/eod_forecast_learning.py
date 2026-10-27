@@ -6,7 +6,8 @@ Repeated intraday forecasts cannot masquerade as independent trading sessions.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
+from copy import deepcopy
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
@@ -16,8 +17,9 @@ from pathlib import Path
 import sqlite3
 from statistics import fmean, stdev
 import time
+import sys
 
-from backend.forecast_calendar import resolve_target_session
+from backend.forecast_calendar import resolve_target_session, session_bounds
 from backend.forecast_horizons import SCHEMA_VERSION, _forecast_digest, _normalize, _positive, _utc
 
 SCHEMA = "marketpin-eod-learning.v1"
@@ -33,67 +35,198 @@ MAX_TRAIN_SESSIONS = 120
 BUCKET_MINUTES = 15
 
 
-def read_frozen_eod(journal_path, symbols, *, as_of_utc, limit=50000, include_current_session=False):
-    """Bounded, query-only scan with outer receipt and column binding checks."""
+# Only journals with enforced append-only source/receipt tables may reuse verified
+# content. Cache entries bind row identity, receipt, projection hash and schema.
+_READ_CACHES = OrderedDict()
+MAX_CACHE_ENTRIES = 50000
+MAX_CACHE_BYTES = 32 * 1024 * 1024
+MAX_FORECAST_BYTES = 256 * 1024
+READ_BUDGET_SECONDS = 3.0
+
+
+def _cache_cost(value):
+    """Count nested Python objects, including metadata, rather than raw payload size."""
+    seen = set()
+    def size(item):
+        if id(item) in seen:
+            return 0
+        seen.add(id(item))
+        total = sys.getsizeof(item)
+        if isinstance(item, dict):
+            total += sum(size(k) + size(v) for k, v in item.items())
+        elif isinstance(item, (tuple, list)):
+            total += sum(map(size, item))
+        return total
+    return size(value) + 256  # OrderedDict bookkeeping allowance per entry.
+
+
+class _VerifiedCache(OrderedDict):
+    def __init__(self):
+        super().__init__()
+        self.costs = {}
+        self.byte_size = 0
+
+    def remember(self, key, value):
+        cost = _cache_cost((key, value))
+        if cost > MAX_CACHE_BYTES:
+            return cost
+        while self and (self.byte_size + cost > MAX_CACHE_BYTES or len(self) >= MAX_CACHE_ENTRIES):
+            old, _ = self.popitem(last=False)
+            self.byte_size -= self.costs.pop(old)
+        self[key] = deepcopy(value)
+        self.costs[key] = cost
+        self.byte_size += cost
+        return cost
+
+
+class _CohortCapacityError(Exception):
+    pass
+
+
+def read_frozen_eod(journal_path, symbols, *, as_of_utc, limit=50000, include_current_session=False, lead_bucket=None):
+    """Bounded metadata-first read; cold-cache work resumes after a timeout.
+
+    Partial cohorts are never returned. A read-only legacy/comparison database
+    lacking append-only guards is verified afresh on every call.
+    """
+    from backend.eod_journal_index import binding, validate_selection, guards_verified
+    if lead_bucket is not None and (type(lead_bucket) is not int or not 1 <= lead_bucket <= 26):
+        raise ValueError("lead bucket must be 1..26")
     path = Path(journal_path).resolve()
     if not path.is_file():
         return [], {"status": "EMPTY", "reasons": ["NO_FROZEN_JOURNAL"]}
     started = time.monotonic()
     forecasts, rejected = [], Counter()
+    cached_count = 0
+    cohort_bytes = 0
+    def budget():
+        if time.monotonic() - started > READ_BUDGET_SECONDS:
+            raise TimeoutError("evaluation budget exceeded")
     try:
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.25)) as conn:
             conn.execute("PRAGMA query_only=ON")
-            conn.set_progress_handler(lambda: int(time.monotonic() - started > 3), 2000)
-            receipts = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_forecast_receipts'").fetchone()
+            conn.set_progress_handler(lambda: int(time.monotonic() - started > READ_BUDGET_SECONDS), 2000)
+            objects = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','trigger')")}
+            receipts = "research_forecast_receipts" in objects
+            compact = "research_eod_index" in objects
+            selection = "research_eod_fixed_lead_selections" in objects
+            guarded = guards_verified(conn)
+            stat = path.stat()
+            identity = (str(path), stat.st_dev, stat.st_ino, conn.execute("PRAGMA schema_version").fetchone()[0])
+            if guarded:
+                if identity not in _READ_CACHES:
+                    if len(_READ_CACHES) >= 4:
+                        _READ_CACHES.popitem(last=False)
+                    _READ_CACHES[identity] = _VerifiedCache()
+                _READ_CACHES.move_to_end(identity)
+                cache = _READ_CACHES[identity]
+            else:
+                cache = {}
             receipt_columns = ",r.committed_at_utc,r.receipt_sha256" if receipts else ",NULL,NULL"
             receipt_join = " LEFT JOIN research_forecast_receipts r ON r.forecast_id=f.forecast_id" if receipts else ""
+            compact_columns = ",c.forecast_sha256,c.binding_sha256" if compact else ",NULL,NULL"
+            compact_join = " LEFT JOIN research_eod_index c ON c.forecast_id=f.forecast_id" if compact else ""
             placeholders = ",".join("?" for _ in symbols)
             date_operator = "<=" if include_current_session else "<"
             rows = conn.execute(
-                "SELECT f.forecast_id,f.symbol,f.as_of_utc,f.target_session_date,f.payload_json" + receipt_columns +
-                " FROM research_forecasts f" + receipt_join + " WHERE f.horizon_sessions=0 AND f.symbol IN (" + placeholders + ") "
+                "SELECT f.rowid,f.forecast_id,f.symbol,f.as_of_utc,f.target_session_date" + receipt_columns + compact_columns +
+                " FROM research_forecasts f" + receipt_join + compact_join +
+                " WHERE f.horizon_sessions=0 AND f.symbol IN (" + placeholders + ") "
                 "AND f.target_session_date" + date_operator + "? LIMIT ?",
                 (*symbols, _utc(as_of_utc).date().isoformat(), limit + 1)).fetchall()
-        if len(rows) > limit:
-            return [], {"status": "UNAVAILABLE", "reasons": ["EVALUATION_SCAN_LIMIT_REACHED"]}
-        # Every matching row is required or the read fails closed above. Sort
-        # references only after that check: SQLite otherwise copies the large
-        # receipt payloads into a temporary sort, consuming the read budget.
-        rows.sort(key=lambda row: row[2] if isinstance(row[2], str) else "", reverse=True)
-        for key, symbol, origin, target_day, raw, committed, receipt_hash in rows:
-            try:
-                origin_utc = _utc(origin)
-                if origin_utc is None:
-                    raise ValueError("invalid receipt origin")
-                payload = json.loads(raw)
-                canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                forecast = payload["forecast"]
-                if (hashlib.sha256(canonical.encode()).hexdigest() != key
-                        or forecast["symbol"] != symbol or forecast["horizon_sessions"] != 0
-                        or _utc(forecast["as_of_utc"]) != origin_utc
-                        or forecast["target_session_date"] != target_day
-                        or _utc(payload["captured_at_utc"]) != origin_utc):
-                    raise ValueError("receipt mismatch")
-                forecast = dict(forecast)
-                # Older receipts only recorded a declared analysis time. They
-                # can be compared, but cannot prove pre-close issuance for fitting.
-                verified = bool(committed and receipt_hash == hashlib.sha256((key + "\n" + committed).encode()).hexdigest())
-                forecast["journal_receipt"] = {"receipt_sha256": receipt_hash, "binding_verified": verified,
-                    "persisted_at_utc": committed if verified else None}
-                forecasts.append(forecast)
-            except (ValueError, TypeError, KeyError, AttributeError):
-                rejected["JOURNAL_RECEIPT_INVALID"] += 1
-    except (sqlite3.Error, OSError) as exc:
-        # Keep the original failure code for clients, with a bounded cause
-        # instead of swallowing timeouts/locks or exposing SQL and file paths.
+            budget()
+            if len(rows) > limit:
+                return [], {"status": "UNAVAILABLE", "reasons": ["EVALUATION_SCAN_LIMIT_REACHED"]}
+            if lead_bucket is not None:
+                scoped = []
+                closes = {}
+                for row in rows:
+                    budget()
+                    try:
+                        if row[4] not in closes:
+                            closes[row[4]] = session_bounds(datetime.fromisoformat(row[4]).date())[1]
+                        bucket = math.ceil((closes[row[4]] - _utc(row[3])).total_seconds() / (60 * BUCKET_MINUTES))
+                        if bucket == lead_bucket:
+                            scoped.append(row)
+                    except (TypeError, ValueError, OverflowError):
+                        rejected["JOURNAL_RECEIPT_INVALID"] += 1
+                rows = scoped
+            # Only small metadata is sorted; large retained payloads never enter
+            # a SQLite temporary sort or an unbounded fetchall.
+            rows.sort(key=lambda r: r[3] if isinstance(r[3], str) else "", reverse=True)
+            for metadata in rows:
+                budget()
+                rowid, key, symbol, origin, target_day, committed, receipt_hash, compact_sha, compact_binding = metadata
+                try:
+                    if metadata in cache:
+                        forecast = deepcopy(cache[metadata])
+                        cache.move_to_end(metadata)
+                        cohort_bytes += cache.costs[metadata]
+                        cached_count += 1
+                    else:
+                        origin_utc = _utc(origin)
+                        if origin_utc is None:
+                            raise ValueError("invalid receipt origin")
+                        # A compact projection is not an authenticated Merkle proof.
+                        # Verify its original content-addressed envelope once before
+                        # cache reuse; a copied/tampered index cannot invent lineage.
+                        raw = conn.execute("SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=? "
+                            "THEN payload_json END FROM research_forecasts WHERE rowid=?",
+                            (4 * 1024 * 1024, rowid)).fetchone()[0]
+                        if not isinstance(raw, str):
+                            raise ValueError("oversize or missing receipt")
+                        payload = json.loads(raw)
+                        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                        if hashlib.sha256(canonical.encode()).hexdigest() != key or _utc(payload["captured_at_utc"]) != origin_utc:
+                            raise ValueError("outer receipt mismatch")
+                        forecast = payload["forecast"]
+                        if compact_sha:
+                            projection = conn.execute("SELECT CASE WHEN length(CAST(forecast_json AS BLOB))<=? "
+                                "THEN forecast_json END FROM research_eod_index WHERE forecast_id=?",
+                                (MAX_FORECAST_BYTES, key)).fetchone()[0]
+                            expected = json.dumps(forecast, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                            if (projection != expected or hashlib.sha256(expected.encode()).hexdigest() != compact_sha
+                                    or binding(key, compact_sha, committed) != compact_binding):
+                                raise ValueError("compact receipt mismatch")
+                        budget()
+                        if (forecast["symbol"] != symbol or forecast["horizon_sessions"] != 0
+                                or _utc(forecast["as_of_utc"]) != origin_utc or forecast["target_session_date"] != target_day):
+                            raise ValueError("receipt column mismatch")
+                        forecast = dict(forecast)
+                        verified = bool(committed and receipt_hash == hashlib.sha256((key + "\n" + committed).encode()).hexdigest())
+                        forecast["journal_receipt"] = {"receipt_sha256": receipt_hash, "binding_verified": verified,
+                            "persisted_at_utc": committed if verified else None}
+                        if guarded:
+                            cohort_bytes += cache.remember(metadata, forecast)
+                        else:
+                            cohort_bytes += _cache_cost((metadata, forecast))
+                    if cohort_bytes > MAX_CACHE_BYTES:
+                        raise _CohortCapacityError()
+                    # Selection is checked on every read, even when payload parsing
+                    # was cached; a newly appended receipt must be visible.
+                    selected = conn.execute("SELECT protocol_id,lead_minutes,selected_at_utc,receipt_sha256 "
+                        "FROM research_eod_fixed_lead_selections WHERE forecast_id=?", (key,)).fetchone() if selection else None
+                    forecast = dict(forecast)
+                    forecast["prospective_selection"] = validate_selection(selected, key=key, symbol=symbol,
+                        day=target_day, origin=_utc(origin), target=_utc(forecast.get("target_close_utc")), committed=committed)
+                    forecasts.append(forecast)
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    rejected["JOURNAL_RECEIPT_INVALID"] += 1
+            budget()
+    except _CohortCapacityError:
+        return [], {"status": "UNAVAILABLE", "reasons": ["EVALUATION_COHORT_MEMORY_LIMIT"],
+                    "maximum_bytes": MAX_CACHE_BYTES, "complete_cohort": False}
+    except (sqlite3.Error, OSError, TimeoutError) as exc:
         code = getattr(exc, "sqlite_errorcode", None)
         primary_code = code & 0xff if isinstance(code, int) else None
-        cause = ("EVALUATION_JOURNAL_READ_TIMEOUT" if primary_code == sqlite3.SQLITE_INTERRUPT else
+        cause = ("EVALUATION_JOURNAL_READ_TIMEOUT" if isinstance(exc, TimeoutError) or primary_code == sqlite3.SQLITE_INTERRUPT else
                  "EVALUATION_JOURNAL_LOCKED" if primary_code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) else
-                 "EVALUATION_JOURNAL_IO_ERROR" if isinstance(exc, OSError) else
-                 "EVALUATION_JOURNAL_SQLITE_ERROR")
-        return [], {"status": "UNAVAILABLE", "reasons": ["EVALUATION_JOURNAL_READ_FAILED", cause]}
-    return forecasts, {"status": "READ_ONLY", "frozen_forecasts": len(forecasts), "rejected": dict(rejected)}
+                 "EVALUATION_JOURNAL_IO_ERROR" if isinstance(exc, OSError) else "EVALUATION_JOURNAL_SQLITE_ERROR")
+        return [], {"status": "UNAVAILABLE", "reasons": ["EVALUATION_JOURNAL_READ_FAILED", cause],
+                    "verified_cache_entries": len(cache) if "cache" in locals() else 0}
+    return forecasts, {"status": "READ_ONLY", "frozen_forecasts": len(forecasts), "rejected": dict(rejected),
+                       "verified_cache_hits": cached_count, "complete_cohort": True,
+                       "lead_bucket_minutes": lead_bucket * BUCKET_MINUTES if lead_bucket else None}
 
 
 def _issued(forecast):
@@ -132,10 +265,13 @@ def _issued(forecast):
         receipt = forecast.get("journal_receipt") or {}
         persisted = _utc(receipt.get("persisted_at_utc"))
         issuance_verified = receipt.get("binding_verified") is True and persisted is not None and origin <= persisted < target
+        prospective = forecast.get("prospective_selection")
+        prospective = prospective if issuance_verified and isinstance(prospective, dict) and prospective.get("binding_verified") is True else None
         return {"origin": origin, "target": target, "spot": spot, "predictions": candidates,
                 "signatures": signatures, "session": forecast["target_session_date"],
                 "forecast_id": forecast["forecast_id"], "symbol": forecast["symbol"],
                 "issuance_verified": issuance_verified,
+                "prospective_selection": prospective,
                 "bucket": math.ceil((target - origin).total_seconds() / (BUCKET_MINUTES * 60))}
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
         return None
@@ -246,6 +382,8 @@ def analyze_eod_forecast(current, frozen_forecasts, official_outcomes, *, as_of_
     result["independent_sessions"] = len(selected)
     verified_issued = [r for r in selected if r["issuance_verified"]]
     result["verified_issuance_sessions"] = len(verified_issued)
+    result["prospective_fixed_lead_sessions"] = sum(bool(r["prospective_selection"]) for r in selected)
+    result["selection_scope"] = "diagnostic earliest-in-bucket; prospective fixed-lead cohort reported separately after completion"
     pool = tuple(m for m in COMPONENTS if m in methods)
     tests = []
     for row in verified_issued:

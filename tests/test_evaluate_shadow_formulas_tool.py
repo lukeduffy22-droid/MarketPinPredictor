@@ -65,7 +65,7 @@ def _observation(*, day_offset: int = 0, symbol: str = "NDX") -> PointInTimeObse
 
 def test_shadow_evaluation_is_read_only_auditable_and_never_promotes(tmp_path):
     journal_path = tmp_path / "shadow.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
     engine = ShadowFormulaEngine()
     predictions = [
         engine.evaluate(_observation(), NAIVE_LAST_PRICE_V1),
@@ -99,7 +99,7 @@ def test_shadow_evaluation_is_read_only_auditable_and_never_promotes(tmp_path):
 
 def test_shadow_evaluation_cli_writes_rerunnable_json_and_markdown(tmp_path, capsys):
     journal_path = tmp_path / "shadow.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
     prediction = ShadowFormulaEngine().evaluate(_observation(), NAIVE_LAST_PRICE_V1)
     journal.save(prediction)
     journal.score_outcome(
@@ -123,7 +123,7 @@ def test_shadow_evaluation_cli_writes_rerunnable_json_and_markdown(tmp_path, cap
 
 def test_shadow_walk_forward_status_uses_actual_multi_session_counts(tmp_path):
     journal_path = tmp_path / "shadow.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
     engine = ShadowFormulaEngine()
     for day_offset in range(2):
         for formula in (NAIVE_LAST_PRICE_V1, PIN_CONTEXT_LINEAR_V1):
@@ -150,7 +150,7 @@ def test_shadow_walk_forward_status_uses_actual_multi_session_counts(tmp_path):
 
 def test_shadow_walk_forward_status_reports_ready_without_fitting_or_promotion(tmp_path):
     journal_path = tmp_path / "shadow.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
     engine = ShadowFormulaEngine()
     for day_offset in range(10):
         for symbol in ("SPX", "NDX"):
@@ -180,7 +180,7 @@ def test_shadow_walk_forward_status_reports_ready_without_fitting_or_promotion(t
 
 def test_shadow_evaluator_never_pairs_different_process_epochs(tmp_path):
     journal_path = tmp_path / "shadow.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
     engine = ShadowFormulaEngine()
     baseline = engine.evaluate(_observation(), NAIVE_LAST_PRICE_V1)
     candidate = engine.evaluate(
@@ -209,7 +209,7 @@ def test_shadow_evaluator_never_pairs_different_process_epochs(tmp_path):
 
 def test_shadow_evaluator_excludes_legacy_epochless_rows_from_evidence(tmp_path):
     journal_path = tmp_path / "shadow.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
     engine = ShadowFormulaEngine()
     for formula in (NAIVE_LAST_PRICE_V1, PIN_CONTEXT_LINEAR_V1):
         prediction = engine.evaluate(_observation(), formula)

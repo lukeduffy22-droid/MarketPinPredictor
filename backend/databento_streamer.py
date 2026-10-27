@@ -2154,6 +2154,17 @@ class DatabentoGammaStreamer:
             "minimum_samples": CLOCK_SYNC_MIN_SAMPLES,
             "minimum_lag_seconds": min(samples) if samples else None,
             "maximum_lag_seconds": max(samples) if samples else None,
+            # Pre-open diagnostics must expose the unsatisfied provider gate.
+            # Host clock health and replayed quotes cannot supply live samples.
+            "readiness_stage": (
+                "awaiting_replay_completion" if replay_pending else
+                "awaiting_live_provider_samples" if status == "unknown" else
+                "provider_clock_unsafe" if status == "unsynchronized" else
+                "provider_timing_ready"
+            ),
+            "samples_remaining": max(0, CLOCK_SYNC_MIN_SAMPLES - len(samples)),
+            "establishes_opening_reference": False,
+            "readiness_scope": "provider_timing_only_opening_requires_current_bucket_and_primary_admission",
         }
         observer = getattr(self, "_host_clock_shadow", None)
         if observer is not None:

@@ -17,18 +17,18 @@ def journal(tmp_path):
             prediction_timestamp_utc TEXT, target_timestamp_utc TEXT, horizon_seconds INTEGER,
             spot REAL, predicted_price REAL, abstained INTEGER, abstention_reasons_json TEXT,
             realized_price REAL, realized_timestamp_utc TEXT, absolute_error_points REAL,
-            direction_hit INTEGER)""")
+            direction_hit INTEGER, created_at_utc TEXT)""")
         for i in range(125):
             abstained, scored = i % 3 == 0, i % 3 == 1
             day = "2026-09-16" if i < 5 else "2026-09-17"
-            connection.execute("INSERT INTO shadow_prediction_journal VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            connection.execute("INSERT INTO shadow_prediction_journal VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 f"forecast-{i:03}", "SPX" if i % 2 == 0 else "NDX",
                 "baseline" if i % 2 == 0 else "candidate", "v1",
                 day + "T14:00:00+00:00", day + "T14:05:00+00:00", 300,
                 100, None if abstained else 101, int(abstained),
                 json.dumps(["MISSING_100%_QUOTE"] if abstained else []),
                 102 if scored else None, day + "T14:05:01+00:00" if scored else None,
-                1 if scored else None, 1 if scored else None,
+                1 if scored else None, 1 if scored else None, day + "T14:00:01+00:00",
             ))
     return path
 
@@ -86,6 +86,9 @@ def test_frontend_search_pagination_and_filter_reset(journal):
         "from app.services.shadow_research_view import render_shadow_history\n"
         f"render_shadow_history({str(journal)!r}, symbols=['SPX', 'NDX'], formulas=['baseline', 'candidate'])"
     ).run()
+    assert not app.exception
+    assert not app.dataframe
+    app.toggle(key="load_shadow_history").set_value(True).run()
     assert not app.exception
     assert len(app.dataframe[0].value) == 50
     app.number_input(key="shadow_history_page").set_value(3).run()

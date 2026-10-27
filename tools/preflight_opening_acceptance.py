@@ -17,6 +17,7 @@ import json
 import logging
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ PREFLIGHT_PHASES = (
     "bootstrap-eligibility",
     "bootstrap",
     "fingerprint",
+    "capture",
 )
 REQUIRED_FILES = (
     "market_app_supervisor.psm1",
@@ -69,6 +71,7 @@ REQUIRED_FILES = (
     "backend/closing_tape/config.py",
     "backend/closing_tape/live_recorder.py",
     "backend/closing_tape/recovery.py",
+    "backend/closing_tape/postclose.py",
     "backend/closing_tape/start_gate.py",
     "backend/database.py",
     "backend/quote_timing.py",
@@ -92,6 +95,7 @@ REQUIRED_FILES = (
     "backend/prediction_passport.py",
     "backend/research/live_shadow.py",
     "backend/research/shadow_formula.py",
+    "backend/research/outcome_protocol.py",
     "backend/runtime_controls.py",
     "backend/snapshot_export.py",
     "backend/streamer.py",
@@ -102,6 +106,7 @@ REQUIRED_FILES = (
     "tools/commit_market_monitor_opening_acceptance.py",
     "tools/inspect_opening_capture.py",
     "tools/preflight_opening_acceptance.py",
+    "tools/finalize_closing_tape_if_due.py",
     "tools/prepare_databento_universe_cache.py",
     "tools/prepare_market_monitor_session.py",
 )
@@ -119,6 +124,7 @@ REQUIRED_MODULES = (
     "backend.closing_tape.config",
     "backend.closing_tape.live_recorder",
     "backend.closing_tape.recovery",
+    "backend.closing_tape.postclose",
     "backend.closing_tape.start_gate",
     "backend.api.helpers",
     "backend.api.bounded_runtime_read",
@@ -150,6 +156,7 @@ REQUIRED_MODULES = (
     "backend.prediction_passport",
     "backend.research.live_shadow",
     "backend.research.shadow_formula",
+    "backend.research.outcome_protocol",
     "backend.runtime_controls",
     "backend.snapshot_export",
     "backend.streamer",
@@ -160,6 +167,7 @@ REQUIRED_MODULES = (
     "tools.commit_market_monitor_opening_acceptance",
     "tools.inspect_opening_capture",
     "tools.preflight_opening_acceptance",
+    "tools.finalize_closing_tape_if_due",
     "tools.prepare_databento_universe_cache",
     "tools.prepare_market_monitor_session",
 )
@@ -560,8 +568,107 @@ def _database_names(
     }
 
 
-def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
-    """Inspect the deployed SQLite schema through a read-only connection."""
+class DatabaseReadBudget:
+    """Bound SQLite VM work and retain the stage that exhausted its budget."""
+
+    def __init__(self, connection, *, total_seconds=280.0, query_seconds=280.0):
+        self.started = time.monotonic()
+        self.deadline = self.started + total_seconds
+        self.query_seconds = query_seconds
+        self.query_deadline = self.deadline
+        self.query = "connect"
+        self.query_started = self.started
+        self.timings: list[dict[str, Any]] = []
+        connection.set_trace_callback(self._begin)
+        connection.set_progress_handler(self.expired, 1000)
+
+    def _begin(self, statement):
+        now = time.monotonic()
+        self.finish(now)
+        self.query = statement.split("\n", 1)[0][:100]
+        self.query_started = now
+        self.query_deadline = min(self.deadline, now + self.query_seconds)
+
+    def expired(self):
+        return time.monotonic() >= self.query_deadline
+
+    def finish(self, now=None):
+        now = time.monotonic() if now is None else now
+        self.timings.append({"query": self.query, "elapsed_ms": round((now - self.query_started) * 1000, 3)})
+
+
+def capture_database_fingerprint(database_path: Path) -> str:
+    """Bind invocation-local reuse to file identity and schema, not row contents.
+
+    This never upgrades an earlier integrity check to a claim about later rows.
+    Replacements, DDL changes and changed database targets invalidate reuse.
+    """
+    path = database_path.resolve()
+    before = path.stat()
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2)
+    try:
+        DatabaseReadBudget(connection, total_seconds=5, query_seconds=2)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        objects = connection.execute(
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name LIMIT 10001"
+        ).fetchall()
+        if len(objects) > 10000:
+            raise ValueError("database schema exceeds bounded fingerprint limit")
+        after = path.stat()
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("database identity changed during fingerprint")
+        payload = [str(path), before.st_dev, before.st_ino, schema_version, objects]
+        return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+    finally:
+        connection.close()
+
+
+def inspect_capture_catalog(project_root: Path, database_path: Path) -> list[dict[str, Any]]:
+    """Check only the independent recorder catalog, never main historical tables."""
+    path = database_path.resolve()
+    try:
+        relative = path.relative_to((project_root / "data" / "closing_tape").resolve())
+        if len(relative.parts) != 2 or relative.name != "closing_tape.sqlite":
+            raise ValueError("unexpected catalog target")
+        datetime.strptime(relative.parts[0], "%Y-%m-%d")
+    except ValueError:
+        return [_issue("CAPTURE_CATALOG_TARGET_INVALID")]
+    if not path.exists():
+        # First launch creates this day's catalog under the recorder's lock.
+        return []
+    connection = None
+    budget = None
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2)
+        budget = DatabaseReadBudget(connection, total_seconds=20, query_seconds=15)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        integrity = [row[0] for row in connection.execute("PRAGMA quick_check")]
+        if integrity != ["ok"]:
+            return [_issue("CAPTURE_CATALOG_INTEGRITY_FAILED")]
+        for table in ("tape_sessions", "tape_feed_status"):
+            columns = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
+            if "session_id" not in columns:
+                return [_issue("CAPTURE_CATALOG_SCHEMA_INVALID", table=table)]
+    except (OSError, sqlite3.Error) as exc:
+        return [_issue("CAPTURE_CATALOG_BUDGET_EXCEEDED" if budget and budget.expired()
+                       else "CAPTURE_CATALOG_READ_FAILED", error_type=type(exc).__name__)]
+    finally:
+        if connection is not None:
+            connection.close()
+    return []
+
+
+def inspect_database_contract(database_path: Path, *, total_seconds=280.0,
+                              query_seconds=280.0, timings=None) -> list[dict[str, Any]]:
+    """Inspect the deployed schema/integrity without weakening the main gate.
+
+    Retained 10 GB integrity scans take over 200 seconds. Keep that work within
+    the launcher's existing 300-second limit, with room to emit a failed report.
+    Independent recorder work uses its own small catalog contract instead.
+    """
 
     path = database_path.resolve()
     if path.exists() and not path.is_file():
@@ -579,7 +686,7 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
 
     issues: list[dict[str, Any]] = []
     try:
-        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2)
     except sqlite3.Error as exc:
         return [
             _issue(
@@ -588,8 +695,16 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
                 error=_safe_error_message(exc),
             )
         ]
+    budget = DatabaseReadBudget(connection, total_seconds=total_seconds, query_seconds=query_seconds)
     try:
         connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        # One full pass covers every table/index in this snapshot. Repeating
+        # table-scoped scans paged through the large opening stores five times
+        # and exhausted the watchdog's budget. Schema checks below stay cheap.
+        quick_check = [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
+        if quick_check != ["ok"]:
+            return [_issue("RUNTIME_DATABASE_QUICK_CHECK_FAILED", results=quick_check[:1] or ["no_result"])]
         table_contracts = (
             ("market_structure_observations", REQUIRED_MARKET_STRUCTURE_COLUMNS),
             ("orb_reference_samples", REQUIRED_ORB_REFERENCE_COLUMNS),
@@ -612,25 +727,6 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
             if not table_exists:
                 issues.append(_issue("RUNTIME_TABLE_MISSING", table=table_name))
                 continue
-            # This preflight protects the opening-capture contract, not every
-            # unrelated historical table sharing the live database.  A
-            # table-scoped quick check retains b-tree/index integrity coverage
-            # for each required opening table without rescanning the complete
-            # multi-gigabyte database on every watchdog invocation.
-            quick_check = [
-                str(row[0])
-                for row in connection.execute(
-                    f'PRAGMA quick_check("{table_name}")'
-                )
-            ]
-            if quick_check != ["ok"]:
-                return [
-                    _issue(
-                        "RUNTIME_DATABASE_QUICK_CHECK_FAILED",
-                        table=table_name,
-                        results=quick_check[:1] or ["no_result"],
-                    )
-                ]
             columns = {
                 str(row[1])
                 for row in connection.execute(f'PRAGMA table_info("{table_name}")')
@@ -735,12 +831,17 @@ def inspect_database_contract(database_path: Path) -> list[dict[str, Any]]:
     except sqlite3.Error as exc:
         issues.append(
             _issue(
-                "RUNTIME_DATABASE_SCHEMA_READ_FAILED",
+                "RUNTIME_DATABASE_BUDGET_EXCEEDED" if budget.expired()
+                else "RUNTIME_DATABASE_SCHEMA_READ_FAILED",
+                stage=budget.query,
                 error_type=type(exc).__name__,
                 error=_safe_error_message(exc),
             )
         )
     finally:
+        budget.finish()
+        if timings is not None:
+            timings.extend(budget.timings)
         connection.close()
     return issues
 
@@ -836,29 +937,37 @@ def run_preflight(
     phase: str = "strict",
     expected_source_fingerprint: str | None = None,
 ) -> dict[str, Any]:
-    if phase not in {"strict", "bootstrap-eligibility"}:
+    if phase not in {"strict", "bootstrap-eligibility", "capture"}:
         raise ValueError(f"Unsupported read-only preflight phase: {phase}")
 
+    stage_timings: dict[str, float] = {}
+    def measured(name, operation):
+        started = time.monotonic()
+        try:
+            return operation()
+        finally:
+            stage_timings[name] = round((time.monotonic() - started) * 1000, 3)
+
     root = project_root.resolve()
-    file_issues = inspect_required_files(root)
+    file_issues = measured("required_files", lambda: inspect_required_files(root))
     source_fingerprint, fingerprint_issues = (None, [])
     if not file_issues:
-        source_fingerprint, fingerprint_issues = _fingerprint_issue(
+        source_fingerprint, fingerprint_issues = measured("source_before", lambda: _fingerprint_issue(
             root,
             stage="before_import",
-        )
-    import_issues = [] if file_issues else inspect_import_contract(root)
+        ))
+    import_issues = [] if file_issues else measured("imports", lambda: inspect_import_contract(root))
     target_issues = (
         []
-        if file_issues or import_issues
-        else inspect_configured_database_target(database_path)
+        if file_issues or import_issues or phase == "capture"
+        else measured("configured_target", lambda: inspect_configured_database_target(database_path))
     )
     after_fingerprint, after_fingerprint_issues = (None, [])
     if not file_issues:
-        after_fingerprint, after_fingerprint_issues = _fingerprint_issue(
+        after_fingerprint, after_fingerprint_issues = measured("source_after", lambda: _fingerprint_issue(
             root,
             stage="after_import",
-        )
+        ))
     fingerprint_issues.extend(after_fingerprint_issues)
     if source_fingerprint and after_fingerprint:
         if source_fingerprint != after_fingerprint:
@@ -874,12 +983,32 @@ def run_preflight(
             _issue("SOURCE_FINGERPRINT_MISMATCH")
         )
 
-    database_issues = inspect_database_contract(database_path)
+    database_timings: list[dict[str, Any]] = []
+    database_fingerprint = None
+    binding_issues = []
+    before_database_fingerprint = None
+    if phase != "capture" and database_path.is_file():
+        try:
+            before_database_fingerprint = measured("database_identity_before", lambda: capture_database_fingerprint(database_path))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            binding_issues.append(_issue("DATABASE_IDENTITY_UNVERIFIED", error_type=type(exc).__name__))
+    database_issues = measured("database_contract", lambda: (
+        inspect_capture_catalog(root, database_path) if phase == "capture"
+        else inspect_database_contract(database_path, timings=database_timings)
+    ))
+    if phase != "capture" and not database_issues and not binding_issues:
+        try:
+            database_fingerprint = measured("database_identity_after", lambda: capture_database_fingerprint(database_path))
+            if database_fingerprint != before_database_fingerprint:
+                binding_issues.append(_issue("DATABASE_IDENTITY_CHANGED_DURING_PREFLIGHT"))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            binding_issues.append(_issue("DATABASE_IDENTITY_UNVERIFIED", error_type=type(exc).__name__))
     source_issues = [
         *file_issues,
         *fingerprint_issues,
         *import_issues,
         *target_issues,
+        *binding_issues,
     ]
     additive_bootstrap_allowed = database_issues_allow_additive_bootstrap(
         database_issues
@@ -887,7 +1016,7 @@ def run_preflight(
     bootstrap_scope = additive_bootstrap_scope(database_issues)
     schema_bootstrap_required = bool(database_issues) and additive_bootstrap_allowed
     database_contract = (
-        "strict"
+        ("independent_capture_catalog" if phase == "capture" else "strict")
         if not database_issues
         else (
             "additive_bootstrap_required"
@@ -896,7 +1025,7 @@ def run_preflight(
         )
     )
     issues = list(source_issues)
-    if phase == "strict" or not additive_bootstrap_allowed:
+    if phase in {"strict", "capture"} or not additive_bootstrap_allowed:
         issues.extend(database_issues)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -911,6 +1040,10 @@ def run_preflight(
         "schema_bootstrap_performed": False,
         "bootstrap_attempt_count": 0,
         "source_fingerprint_sha256": source_fingerprint,
+        "database_fingerprint_sha256": database_fingerprint,
+        "database_fingerprint_scope": "file_identity_and_schema_not_row_contents",
+        "stage_timings_ms": stage_timings,
+        "database_query_timings": database_timings,
         "required_file_count": len(REQUIRED_FILES),
         "required_module_count": len(REQUIRED_MODULES),
         "database_issues": database_issues,
@@ -923,8 +1056,9 @@ def run_fingerprint_preflight(
     database_path: Path,
     *,
     expected_source_fingerprint: str | None,
+    expected_database_fingerprint: str | None = None,
 ) -> dict[str, Any]:
-    """Re-bind a cached full proof to unchanged on-disk source only."""
+    """Re-bind invocation-local proof to source, database identity and schema."""
 
     root = project_root.resolve()
     file_issues = inspect_required_files(root)
@@ -948,6 +1082,13 @@ def run_fingerprint_preflight(
         or source_fingerprint != expected_source_fingerprint
     ):
         fingerprint_issues.append(_issue("SOURCE_FINGERPRINT_MISMATCH"))
+    database_fingerprint = None
+    try:
+        database_fingerprint = capture_database_fingerprint(database_path)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        fingerprint_issues.append(_issue("DATABASE_IDENTITY_UNVERIFIED", error_type=type(exc).__name__))
+    if not expected_database_fingerprint or database_fingerprint != expected_database_fingerprint:
+        fingerprint_issues.append(_issue("DATABASE_FINGERPRINT_MISMATCH"))
     issues = [*file_issues, *fingerprint_issues]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -962,6 +1103,10 @@ def run_fingerprint_preflight(
         "schema_bootstrap_performed": False,
         "bootstrap_attempt_count": 0,
         "source_fingerprint_sha256": source_fingerprint,
+        "database_fingerprint_sha256": database_fingerprint,
+        "database_fingerprint_scope": "file_identity_and_schema_not_row_contents",
+        "stage_timings_ms": {},
+        "database_query_timings": [],
         "required_file_count": len(REQUIRED_FILES),
         "required_module_count": len(REQUIRED_MODULES),
         "database_issues": [],
@@ -1077,6 +1222,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--phase", choices=PREFLIGHT_PHASES, default="strict")
     parser.add_argument("--expected-source-fingerprint")
+    parser.add_argument("--expected-database-fingerprint")
     parser.add_argument(
         "--bootstrap-scope",
         choices=("canonical_init_db", "orb_reference_decision_sidecar"),
@@ -1098,6 +1244,7 @@ def main(argv: list[str] | None = None) -> int:
             args.project_root,
             args.database,
             expected_source_fingerprint=args.expected_source_fingerprint,
+            expected_database_fingerprint=args.expected_database_fingerprint,
         )
     else:
         report = run_preflight(

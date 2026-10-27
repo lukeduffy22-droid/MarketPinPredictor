@@ -45,6 +45,31 @@ def test_generation_transition_invalidates_clock_evidence():
     assert streamer._processing_clock_telemetry()['sample_count'] == 1
 
 
+def test_preopen_readiness_exposes_missing_provider_proof_without_bypassing_gates():
+    streamer = DatabentoGammaStreamer(['SPX', 'NDX'])
+    streamer.active_generation = 7
+    recv = 1790775001000000000
+    initial = streamer._processing_clock_telemetry()
+    assert initial['readiness_stage'] == 'awaiting_live_provider_samples'
+    assert initial['samples_remaining'] == 50
+    assert initial['establishes_opening_reference'] is False
+    streamer._clock_replay_pending = True
+    assert streamer._processing_clock_telemetry()['readiness_stage'] == 'awaiting_replay_completion'
+    for i in range(50):
+        assert not streamer._record_processing_clock_sample(_record(i + 1, recv), processed_at_ns=recv + 1, generation=7)
+    assert streamer._processing_clock_telemetry()['status'] == 'unknown'
+    streamer._clock_replay_pending = False
+    for i in range(49):
+        assert streamer._record_processing_clock_sample(_record(i + 1, recv), processed_at_ns=recv + 1, generation=7)
+    assert streamer._processing_clock_telemetry()['samples_remaining'] == 1
+    assert streamer._processing_clock_telemetry()['status'] == 'unknown'
+    assert streamer._record_processing_clock_sample(_record(50, recv), processed_at_ns=recv + 1, generation=7)
+    ready = streamer._processing_clock_telemetry()
+    assert ready['readiness_stage'] == 'provider_timing_ready'
+    assert ready['status'] == 'synchronized'
+    assert ready['establishes_opening_reference'] is False
+
+
 def test_actual_cbbo_reader_keeps_metadata_and_progresses_during_publication(monkeypatch):
     import tests.test_databento_reader_publication_lock as reader_cases
     recv = 1790775001000000000

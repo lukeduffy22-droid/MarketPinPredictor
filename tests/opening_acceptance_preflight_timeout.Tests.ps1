@@ -19,7 +19,8 @@ if (@($ensureParseErrors).Count -ne 0) {
 }
 foreach ($functionName in @(
     'Invoke-OpeningAcceptancePreflight',
-    'Assert-OpeningAcceptanceMutationPreflight'
+    'Assert-OpeningAcceptanceMutationPreflight',
+    'Assert-ClosingTapeMutationPreflight'
 )) {
     $definition = @($ensureAst.FindAll(
         {
@@ -93,8 +94,12 @@ function New-TestPreflightPayload {
         schema_bootstrap_performed = $SchemaBootstrapPerformed
         bootstrap_attempt_count = $BootstrapAttemptCount
         source_fingerprint_sha256 = ('a' * 64)
-        required_file_count = 74
-        required_module_count = 56
+        database_fingerprint_sha256 = ('b' * 64)
+        database_fingerprint_scope = 'file_identity_and_schema_not_row_contents'
+        stage_timings_ms = @{}
+        database_query_timings = @()
+        required_file_count = 77
+        required_module_count = 59
         database_issues = @($DatabaseIssues)
         issues = @($Issues)
     }
@@ -120,8 +125,8 @@ Describe 'Bounded opening-acceptance preflight' {
         $script:InvocationId = [guid]::NewGuid().ToString('N')
         $script:OpeningAcceptancePreflightTimeoutSeconds = 300
         $script:OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-        $script:OpeningAcceptancePreflightRequiredFileCount = 74
-        $script:OpeningAcceptancePreflightRequiredModuleCount = 56
+        $script:OpeningAcceptancePreflightRequiredFileCount = 77
+        $script:OpeningAcceptancePreflightRequiredModuleCount = 59
         $script:OpeningAcceptancePreflightResult = $null
         $script:PythonExe = $PythonPath
         $script:OpeningAcceptancePreflightScript = Join-Path $TestDrive 'preflight.py'
@@ -347,12 +352,22 @@ time.sleep(30)
         }
     }
 
+    It 'rejects a mismatched database binding on cached proof reuse' {
+        $payload = New-TestPreflightPayload -Phase 'fingerprint' -DatabaseContract 'cached_full_proof_not_rechecked'
+        $tool = New-TestPreflightScript -Name 'wrong-database.py' -Body (New-TestJsonPrinterBody -Payload $payload)
+        { Invoke-OpeningAcceptancePreflight -PythonPath $PythonPath -PreflightScript $tool `
+            -DatabasePath (Join-Path $TestDrive 'market.db') -Phase 'fingerprint' `
+            -ExpectedSourceFingerprint ('a' * 64) -ExpectedDatabaseFingerprint ('c' * 64) `
+            -TimeoutSeconds 5 } | Should Throw 'Opening-acceptance source/schema preflight failed (phase=fingerprint issues=PREFLIGHT_PAYLOAD_CONTRACT_INVALID).'
+    }
+
     It 'memoizes one full proof and revalidates its fingerprint before reuse' {
         $script:successfulProof = [pscustomobject]@{
             schema_version = 'marketpin-opening-acceptance-preflight.v2'
             ready = $true
             schema_bootstrap_required = $false
             source_fingerprint_sha256 = ('a' * 64)
+            database_fingerprint_sha256 = ('b' * 64)
         }
         Mock Invoke-OpeningAcceptancePreflight { $script:successfulProof }
 
@@ -363,7 +378,18 @@ time.sleep(30)
         [object]::ReferenceEquals($second, $script:successfulProof) | Should Be $true
         Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 2 -Scope It
         Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 1 -Scope It -ParameterFilter {
-            $Phase -eq 'fingerprint' -and $ExpectedSourceFingerprint -eq ('a' * 64)
+            $Phase -eq 'fingerprint' -and $ExpectedSourceFingerprint -eq ('a' * 64) -and
+                $ExpectedDatabaseFingerprint -eq ('b' * 64)
+        }
+    }
+
+    It 'uses a separate bounded catalog gate for independent recorder work' {
+        Mock Invoke-OpeningAcceptancePreflight { [pscustomobject]@{ready=$true} }
+        $result = Assert-ClosingTapeMutationPreflight -TradingDate '2026-10-28'
+        $result.ready | Should Be $true
+        Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 1 -Scope It -ParameterFilter {
+            $Phase -eq 'capture' -and $TimeoutSeconds -eq 90 -and
+                $DatabasePath -eq (Join-Path $TestDrive 'data\closing_tape\2026-10-28\closing_tape.sqlite')
         }
     }
 
@@ -379,6 +405,7 @@ time.sleep(30)
                 ready = $true
                 schema_bootstrap_required = $false
                 source_fingerprint_sha256 = ('a' * 64)
+                database_fingerprint_sha256 = ('b' * 64)
             }
         }
 

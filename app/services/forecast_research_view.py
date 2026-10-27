@@ -335,7 +335,8 @@ def _render_forecast_research():
     with st.expander("EOD, multi-day forecasts and directional shifts", expanded=False):
         st.caption("Select a horizon for each symbol. 0 = today's close; 1–10 = trading sessions ahead. "
                    "On weekends/holidays the calendar anchors to the next session; forecasts still abstain outside regular hours. "
-                   "These are retained research estimates. Accuracy improvement has not been established.")
+                    "These are retained research estimates. Accuracy improvement has not been established. "
+                    "Quality scores are uncalibrated unless a matched out-of-sample calibration artifact is explicitly shown; they are not win probabilities.")
         symbols = st.multiselect("Research markets", list(DEFAULT_TRACKED_SYMBOLS),
                                 default=["SPX", "NDX", "SPY", "QQQ"],
                                 format_func=lambda s: f"{s} · {MARKET_UNIVERSE[s].name}")

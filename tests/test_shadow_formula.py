@@ -242,7 +242,7 @@ def test_payload_adapter_never_guesses_timing_mapping_momentum_or_freshness():
 def test_research_journal_is_idempotent_and_scores_only_after_horizon(tmp_path):
     prediction = ShadowFormulaEngine().evaluate(_observation())
     journal_path = tmp_path / "shadow_research.db"
-    journal = ShadowPredictionJournal(journal_path)
+    journal = ShadowPredictionJournal(journal_path, clock=lambda: prediction.processed_at_utc)
 
     assert not journal_path.exists()  # construction is side-effect free
     assert journal.save(prediction) is True
@@ -275,3 +275,44 @@ def test_research_journal_is_idempotent_and_scores_only_after_horizon(tmp_path):
         )
     with sqlite3.connect(journal_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM shadow_prediction_journal").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("late_seconds,expected", [(30, "ELIGIBLE"), (31, "QUARANTINED")])
+def test_outcome_protocol_quarantines_late_references_without_rewriting_prediction(tmp_path, late_seconds, expected):
+    prediction = ShadowFormulaEngine().evaluate(_observation())
+    journal = ShadowPredictionJournal(tmp_path / "shadow.db", clock=lambda: prediction.processed_at_utc)
+    journal.save(prediction)
+    result = journal.score_outcome(prediction.prediction_id, realized_price=6502.,
+        realized_timestamp_utc=prediction.target_timestamp_utc + timedelta(seconds=late_seconds))
+    assert result["outcome_eligibility"]["status"] == expected
+    assert result["outcome_eligibility"]["actual_horizon_seconds"] == 300 + late_seconds
+    assert (journal.fetch(prediction.prediction_id)["realized_price"] is None) == (expected == "QUARANTINED")
+    assert not journal.fetch_due_unscored("SPX", prediction.target_timestamp_utc + timedelta(seconds=60),
+        subscription_epoch_id="e" * 64, subscription_generation=7)
+    with sqlite3.connect(journal.path) as conn:
+        row = conn.execute("SELECT * FROM shadow_outcome_observations").fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT OR REPLACE INTO shadow_outcome_observations VALUES (?,?,?,?,?,?,?,?,?,?)", row)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE shadow_prediction_journal SET created_at_utc='2026-01-01T00:00:00Z'")
+
+
+def test_backdated_shadow_prediction_cannot_earn_accuracy(tmp_path):
+    prediction = ShadowFormulaEngine().evaluate(_observation())
+    journal = ShadowPredictionJournal(tmp_path / "shadow.db", clock=lambda: prediction.target_timestamp_utc)
+    journal.save(prediction)
+    result = journal.score_outcome(prediction.prediction_id, realized_price=6502.,
+        realized_timestamp_utc=prediction.target_timestamp_utc)
+    assert result["scored"] is False
+    assert result["outcome_eligibility"]["reasons"] == ["PREDICTION_NOT_PERSISTED_BEFORE_TARGET"]
+
+
+def test_sql_and_python_outcome_boundary_are_identical():
+    from backend.research.outcome_protocol import register_outcome_sql, assess_outcome
+    row = {"prediction_timestamp_utc": "2026-10-27T19:50:00Z", "created_at_utc": "2026-10-27T19:50:01Z",
+           "target_timestamp_utc": "2026-10-27T19:55:00Z", "realized_timestamp_utc": "2026-10-27T19:55:30Z"}
+    with sqlite3.connect(":memory:") as conn:
+        register_outcome_sql(conn)
+        assert conn.execute("SELECT outcome_eligible(?,?,?,?)", tuple(row[k] for k in (
+            "prediction_timestamp_utc", "target_timestamp_utc", "created_at_utc", "realized_timestamp_utc"))).fetchone()[0] == 1
+    assert assess_outcome(row)["status"] == "ELIGIBLE"

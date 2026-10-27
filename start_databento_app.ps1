@@ -16,8 +16,8 @@ $BackendEntrypoint = [System.IO.Path]::GetFullPath((Join-Path $AppDir 'server.py
 $DashboardEntrypoint = [System.IO.Path]::GetFullPath((Join-Path $AppDir 'app.py'))
 $OpeningAcceptancePreflightScript = Join-Path $AppDir 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 74
-$OpeningAcceptancePreflightRequiredModuleCount = 56
+$OpeningAcceptancePreflightRequiredFileCount = 77
+$OpeningAcceptancePreflightRequiredModuleCount = 59
 # Keep the manual full-stack launcher aligned with the scheduled recovery's
 # bounded live-I/O headroom.
 $OpeningAcceptancePreflightTimeoutSeconds = 300
@@ -99,10 +99,12 @@ function Invoke-OpeningAcceptancePreflight {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$PreflightScript,
         [Parameter(Mandatory = $true)][string]$DatabasePath,
-        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint')]
+        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint', 'capture')]
         [string]$Phase = 'strict',
         [ValidatePattern('^[0-9a-f]{64}$')]
         [string]$ExpectedSourceFingerprint,
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$ExpectedDatabaseFingerprint,
         [ValidateSet('canonical_init_db', 'orb_reference_decision_sidecar')]
         [string]$BootstrapScope,
         [ValidateRange(1, 300)][int]$TimeoutSeconds = $OpeningAcceptancePreflightTimeoutSeconds
@@ -130,6 +132,9 @@ function Invoke-OpeningAcceptancePreflight {
             '--expected-source-fingerprint',
             $ExpectedSourceFingerprint
         )
+    }
+    if ($ExpectedDatabaseFingerprint) {
+        $preflightArguments += @('--expected-database-fingerprint', $ExpectedDatabaseFingerprint)
     }
     if ($BootstrapScope) {
         $preflightArguments += @('--bootstrap-scope', $BootstrapScope)
@@ -243,6 +248,10 @@ function Invoke-OpeningAcceptancePreflight {
             'schema_bootstrap_performed',
             'bootstrap_attempt_count',
             'source_fingerprint_sha256',
+            'database_fingerprint_sha256',
+            'database_fingerprint_scope',
+            'stage_timings_ms',
+            'database_query_timings',
             'required_file_count',
             'required_module_count',
             'database_issues',
@@ -352,6 +361,17 @@ function Invoke-OpeningAcceptancePreflight {
             )
         }
 
+        # Invocation-local reuse is valid only for the same database file/schema.
+        # It does not assert that rows written after the full check were rescanned.
+        if ($Phase -ne 'capture' -and $payload.schema_bootstrap_required -ne $true) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -cmatch '^[0-9a-f]{64}$')
+        }
+        if ($ExpectedDatabaseFingerprint) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -ceq $ExpectedDatabaseFingerprint)
+        }
+
         $phaseContractValid = switch ($Phase) {
             'strict' {
                 $payload.database_contract -ceq 'strict' -and
@@ -402,6 +422,16 @@ function Invoke-OpeningAcceptancePreflight {
                 $prebootstrapIssuesAreArray -and
                 @($payload.prebootstrap_database_issues).Count -gt 0
             }
+            'capture' {
+                $payload.database_contract -ceq 'independent_capture_catalog' -and
+                $payload.schema_bootstrap_required -is [bool] -and
+                $payload.schema_bootstrap_required -eq $false -and
+                $payload.schema_bootstrap_performed -is [bool] -and
+                $payload.schema_bootstrap_performed -eq $false -and
+                [int]$payload.bootstrap_attempt_count -eq 0 -and
+                $null -eq $payload.schema_bootstrap_scope -and
+                $payloadDatabaseIssues.Count -eq 0
+            }
             'fingerprint' {
                 $payload.database_contract -ceq 'cached_full_proof_not_rechecked' -and
                 $payload.schema_bootstrap_required -is [bool] -and
@@ -450,6 +480,7 @@ function Assert-OpeningAcceptanceMutationPreflight {
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
             -Phase 'fingerprint' `
             -ExpectedSourceFingerprint $cachedFingerprint `
+            -ExpectedDatabaseFingerprint ([string]$script:OpeningAcceptancePreflightResult.database_fingerprint_sha256) `
             -TimeoutSeconds $OpeningAcceptancePreflightTimeoutSeconds | Out-Null
         return $script:OpeningAcceptancePreflightResult
     }

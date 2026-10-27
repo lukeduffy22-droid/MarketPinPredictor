@@ -46,6 +46,8 @@ def research_code_fingerprint():
         "backend/market_universe.py", "tools/run_forecast_research.py",
         "backend/indicator_bars.py", "backend/equity_context.py", "backend/indicator_capture.py",
         "backend/eod_forecast_learning.py",
+        "backend/eod_journal_index.py",
+        "backend/research/evaluation_statistics.py",
         "backend/forecast_publication_gate.py", "backend/forecast_attempt_journal.py",
     ))).hexdigest()
 
@@ -90,6 +92,7 @@ class MarketResearchService:
         self._lock = threading.Lock()
         self._thread = None
         self._eod_frozen_cache = None
+        self._eod_calendar_cache = None
         self._worker = {"attempt_count": 0, "completed_capture_count": 0,
                         "last_attempt_at_utc": None, "last_completed_at_utc": None,
                         "collecting": False, "last_error_code": None}
@@ -97,6 +100,7 @@ class MarketResearchService:
 
     def initialize_journal(self):
         from backend.forecast_attempt_journal import initialize_attempt_journal
+        from backend.eod_journal_index import initialize_eod_index
         self.journal_database.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.journal_database, timeout=0.5)) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -109,6 +113,7 @@ class MarketResearchService:
             conn.execute("CREATE TABLE IF NOT EXISTS research_forecast_receipts ("
                          "forecast_id TEXT PRIMARY KEY, committed_at_utc TEXT NOT NULL, receipt_sha256 TEXT NOT NULL)")
             initialize_attempt_journal(conn)
+            initialize_eod_index(conn)
             conn.commit()
 
     def _persist(self, state):
@@ -135,9 +140,13 @@ class MarketResearchService:
                 # Record completion AFTER the forecast transaction commits.
                 # A crash before this second append leaves issuance unverified.
                 committed = datetime.now(timezone.utc).isoformat()
+                pending = [row for row in rows if conn.execute(
+                    "SELECT 1 FROM research_forecast_receipts WHERE forecast_id=?", (row[0],)).fetchone() is None]
                 receipts = [(row[0], committed, hashlib.sha256(
-                    (row[0] + "\n" + committed).encode()).hexdigest()) for row in rows]
+                    (row[0] + "\n" + committed).encode()).hexdigest()) for row in pending]
                 conn.executemany("INSERT OR IGNORE INTO research_forecast_receipts VALUES (?,?,?)", receipts)
+                from backend.eod_journal_index import append_eod_index
+                append_eod_index(conn, pending, committed)
                 conn.commit()
 
     def collect_once(self, *, now=None):
@@ -171,6 +180,7 @@ class MarketResearchService:
         from backend.forecast_horizons import inventory_daily_history
         from backend.directional_shift import evaluate_directional_shift
         from backend.eod_forecast_learning import analyze_eod_forecast, read_frozen_eod
+        from backend.forecast_calendar import resolve_target_session, ET
 
         reasons = []
         try:
@@ -252,17 +262,29 @@ class MarketResearchService:
         # minutes to notice separately appended receipts; current quotes and
         # verified close availability are rechecked every capture cycle.
         cache = self._eod_frozen_cache
+        try:
+            calendar_day = as_of.astimezone(ET).date()
+            if self._eod_calendar_cache is None or self._eod_calendar_cache[0] != calendar_day:
+                self._eod_calendar_cache = (calendar_day, resolve_target_session(as_of, 0))
+            calendar = self._eod_calendar_cache[1]
+            lead_bucket = math.ceil((utc(calendar["target_close_utc"]) - as_of).total_seconds() / 900)
+        except (ValueError, TypeError, KeyError):
+            lead_bucket = 0
+        cache_scope = (as_of.date(), lead_bucket)
         # A transient lock/timeout is not immutable history. Retry it at the
         # next regular collection; successful reads retain the ten-minute cache.
-        if (cache is None or cache[0] != as_of.date() or cache[3]["status"] == "UNAVAILABLE"
+        if (cache is None or cache[0] != cache_scope or cache[3]["status"] == "UNAVAILABLE"
                 or time.monotonic() - cache[1] >= 600):
-            frozen, audit = read_frozen_eod(self.journal_database, self.symbols, as_of_utc=as_of)
-            if self.comparison_journal and self.comparison_journal != self.journal_database:
-                reference, reference_audit = read_frozen_eod(self.comparison_journal, self.symbols, as_of_utc=as_of)
+            if 1 <= lead_bucket <= 26:
+                frozen, audit = read_frozen_eod(self.journal_database, self.symbols, as_of_utc=as_of, lead_bucket=lead_bucket)
+            else:
+                frozen, audit = [], {"status": "READ_ONLY", "frozen_forecasts": 0, "scope": "outside_current_session"}
+            if self.comparison_journal and self.comparison_journal != self.journal_database and 1 <= lead_bucket <= 26:
+                reference, reference_audit = read_frozen_eod(self.comparison_journal, self.symbols, as_of_utc=as_of, lead_bucket=lead_bucket)
                 frozen += reference
                 audit = {"status": "UNAVAILABLE" if "UNAVAILABLE" in (audit["status"], reference_audit["status"]) else "READ_ONLY",
                          "current_journal": audit, "comparison_journal": reference_audit}
-            self._eod_frozen_cache = (as_of.date(), time.monotonic(), frozen, audit)
+            self._eod_frozen_cache = (cache_scope, time.monotonic(), frozen, audit)
         _, _, frozen, evaluation_audit = self._eod_frozen_cache
         for symbol, rows in histories.items():
             current = intraday[symbol][-1] if intraday[symbol] else None

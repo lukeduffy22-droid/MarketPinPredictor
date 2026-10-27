@@ -62,6 +62,7 @@ OPENING_CRITICAL_SOURCE_PATHS = (
     "backend/closing_tape/config.py",
     "backend/closing_tape/live_recorder.py",
     "backend/closing_tape/recovery.py",
+    "backend/closing_tape/postclose.py",
     "backend/closing_tape/start_gate.py",
     "backend/historical_context.py",
     "backend/inference.py",
@@ -77,6 +78,7 @@ OPENING_CRITICAL_SOURCE_PATHS = (
     "backend/prediction_passport.py",
     "backend/research/live_shadow.py",
     "backend/research/shadow_formula.py",
+    "backend/research/outcome_protocol.py",
     "backend/runtime_controls.py",
     "backend/snapshot_export.py",
     "backend/streamer.py",
@@ -96,6 +98,7 @@ OPENING_CRITICAL_SOURCE_PATHS = (
     "tools/commit_market_monitor_opening_acceptance.py",
     "tools/inspect_opening_capture.py",
     "tools/preflight_opening_acceptance.py",
+    "tools/finalize_closing_tape_if_due.py",
     "tools/prepare_databento_universe_cache.py",
     "tools/prepare_market_monitor_session.py",
 )

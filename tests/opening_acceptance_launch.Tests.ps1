@@ -168,7 +168,7 @@ Describe 'Opening acceptance launch preflight' {
             $gateCall
         )
         $preflight = $EnsureSource.IndexOf(
-            'Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null',
+            'Assert-ClosingTapeMutationPreflight -TradingDate $tradingDate | Out-Null',
             $readyBranch
         )
         $launchCall = $EnsureSource.IndexOf(

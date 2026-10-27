@@ -37,7 +37,8 @@ def score_completed_eod(forecasts, outcomes, *, symbols, as_of_utc=None):
             excluded["missing_or_conflicting_verified_close"] += 1
             continue
         # Keep legacy comparisons separate from proven pre-close issuance.
-        cohort = "verified_preclose" if row["issuance_verified"] else "unverified_issuance_diagnostic"
+        cohort = ("prospective_fixed_lead" if row["prospective_selection"] else
+                  "verified_preclose" if row["issuance_verified"] else "unverified_issuance_diagnostic")
         grouped[(row["symbol"], row["session"], row["bucket"], cohort)].append(row)
     scored, comparisons = [], defaultdict(list)
     for (symbol, session, bucket, cohort), rows in sorted(grouped.items()):
@@ -51,6 +52,7 @@ def score_completed_eod(forecasts, outcomes, *, symbols, as_of_utc=None):
         errors = {m: v - label.price for m, v in row["predictions"].items()}
         scored.append({"symbol": symbol, "session": session, "lead_bucket_minutes": bucket * BUCKET_MINUTES,
             "cohort": cohort, "forecast_id": row["forecast_id"], "forecast_at_utc": earliest.isoformat(),
+            "prospective_selection": row["prospective_selection"],
             "official_close": label.price, "close_available_at_utc": label.available.isoformat(),
             "source_sha256": label.source_sha256, "predictions": row["predictions"],
             "error_points": errors, "absolute_error_points": {m: abs(e) for m, e in errors.items()}})
@@ -61,7 +63,7 @@ def score_completed_eod(forecasts, outcomes, *, symbols, as_of_utc=None):
     return {"schema_version": "marketpin-completed-eod-scores.v1", "as_of_utc": now.isoformat(),
         "status": "RESEARCH_COMPARISON_ONLY", "decision_grade": False,
         "accuracy_improvement_verified": False, "production_promotion_allowed": False,
-        "selection_rule": "earliest eligible frozen forecast per symbol/session/15-minute lead bucket/issuance cohort",
+        "selection_rule": "prospective fixed-lead receipts kept separate; legacy earliest eligible per symbol/session/15-minute bucket/issuance cohort",
         "excluded": dict(excluded), "scored_forecasts": scored,
         "independent_sessions": {s: len({r["session"] for r in scored if r["symbol"] == s}) for s in symbols},
         "comparisons": [{"symbol": s, "lead_bucket_minutes": b * BUCKET_MINUTES,

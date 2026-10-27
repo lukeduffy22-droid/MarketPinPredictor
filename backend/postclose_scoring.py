@@ -74,7 +74,7 @@ def _eligible_snapshot(
 ) -> dict[str, Any] | None:
     rows = connection.execute(
         """
-        SELECT id, symbol, timestamp_utc, current_price, predicted_close,
+        SELECT id, symbol, timestamp_utc, created_at_utc, current_price, predicted_close,
                prediction_mode, model_version, source_payload_json
         FROM prediction_snapshots
         WHERE symbol=? AND trading_date=? AND is_valid=1
@@ -85,7 +85,11 @@ def _eligible_snapshot(
     )
     for row in rows:
         timestamp = _parse_utc(row["timestamp_utc"])
-        if timestamp > cash_close_utc:
+        try:
+            persisted_at = _parse_utc(row["created_at_utc"])
+        except (TypeError, ValueError):
+            continue
+        if not timestamp <= persisted_at < cash_close_utc:
             continue
         try:
             current_price = float(row["current_price"])

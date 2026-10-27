@@ -22,8 +22,8 @@ $ClosingTapeScript = Join-Path $ProjectRoot 'start_closing_tape.ps1'
 $ClosingTapeFinalizeScript = Join-Path $ProjectRoot 'tools\finalize_closing_tape_if_due.py'
 $OpeningAcceptancePreflightScript = Join-Path $ProjectRoot 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 74
-$OpeningAcceptancePreflightRequiredModuleCount = 56
+$OpeningAcceptancePreflightRequiredFileCount = 77
+$OpeningAcceptancePreflightRequiredModuleCount = 59
 # September 9 retained live full phases needed 111.716 and 113.151 seconds near
 # the open; later peers needed 101.906 and 107.919 seconds, while thirteen
 # same-day attempts hit the former 120-second cutoff under session I/O pressure.
@@ -121,6 +121,10 @@ function Get-BackendReadinessState {
         LiveActiveGeneration = if ($null -ne $live.active_generation) { $live.active_generation } else { $live.subscription_generation }
         HealthHandoffStatus = [string]$health.handoff_status
         LiveHandoffStatus = [string]$live.handoff_status
+        ProviderClockStatus = [string]$health.processing_clock_telemetry.status
+        ProviderClockReadinessStage = [string]$health.processing_clock_telemetry.readiness_stage
+        ProviderClockSampleCount = $health.processing_clock_telemetry.sample_count
+        ProviderClockMinimumSamples = $health.processing_clock_telemetry.minimum_samples
         IsFallback = [bool]$health.universe_provenance.is_fallback
         ProvenanceMode = [string]$health.universe_provenance.mode
         SourceDate = [string]$health.universe_provenance.source_date
@@ -791,10 +795,12 @@ function Invoke-OpeningAcceptancePreflight {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$PreflightScript,
         [Parameter(Mandatory = $true)][string]$DatabasePath,
-        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint')]
+        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint', 'capture')]
         [string]$Phase = 'strict',
         [ValidatePattern('^[0-9a-f]{64}$')]
         [string]$ExpectedSourceFingerprint,
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$ExpectedDatabaseFingerprint,
         [ValidateSet('canonical_init_db', 'orb_reference_decision_sidecar')]
         [string]$BootstrapScope,
         [ValidateRange(1, 300)][int]$TimeoutSeconds = $OpeningAcceptancePreflightTimeoutSeconds
@@ -822,6 +828,9 @@ function Invoke-OpeningAcceptancePreflight {
             '--expected-source-fingerprint',
             $ExpectedSourceFingerprint
         )
+    }
+    if ($ExpectedDatabaseFingerprint) {
+        $preflightArguments += @('--expected-database-fingerprint', $ExpectedDatabaseFingerprint)
     }
     if ($BootstrapScope) {
         $preflightArguments += @('--bootstrap-scope', $BootstrapScope)
@@ -935,6 +944,10 @@ function Invoke-OpeningAcceptancePreflight {
             'schema_bootstrap_performed',
             'bootstrap_attempt_count',
             'source_fingerprint_sha256',
+            'database_fingerprint_sha256',
+            'database_fingerprint_scope',
+            'stage_timings_ms',
+            'database_query_timings',
             'required_file_count',
             'required_module_count',
             'database_issues',
@@ -1044,6 +1057,17 @@ function Invoke-OpeningAcceptancePreflight {
             )
         }
 
+        # Invocation-local reuse is valid only for the same database file/schema.
+        # It does not assert that rows written after the full check were rescanned.
+        if ($Phase -ne 'capture' -and $payload.schema_bootstrap_required -ne $true) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -cmatch '^[0-9a-f]{64}$')
+        }
+        if ($ExpectedDatabaseFingerprint) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -ceq $ExpectedDatabaseFingerprint)
+        }
+
         $phaseContractValid = switch ($Phase) {
             'strict' {
                 $payload.database_contract -ceq 'strict' -and
@@ -1094,6 +1118,16 @@ function Invoke-OpeningAcceptancePreflight {
                 $prebootstrapIssuesAreArray -and
                 @($payload.prebootstrap_database_issues).Count -gt 0
             }
+            'capture' {
+                $payload.database_contract -ceq 'independent_capture_catalog' -and
+                $payload.schema_bootstrap_required -is [bool] -and
+                $payload.schema_bootstrap_required -eq $false -and
+                $payload.schema_bootstrap_performed -is [bool] -and
+                $payload.schema_bootstrap_performed -eq $false -and
+                [int]$payload.bootstrap_attempt_count -eq 0 -and
+                $null -eq $payload.schema_bootstrap_scope -and
+                $payloadDatabaseIssues.Count -eq 0
+            }
             'fingerprint' {
                 $payload.database_contract -ceq 'cached_full_proof_not_rechecked' -and
                 $payload.schema_bootstrap_required -is [bool] -and
@@ -1142,6 +1176,7 @@ function Assert-OpeningAcceptanceMutationPreflight {
             -DatabasePath (Join-Path $ProjectRoot 'data\market_data.db') `
             -Phase 'fingerprint' `
             -ExpectedSourceFingerprint $cachedFingerprint `
+            -ExpectedDatabaseFingerprint ([string]$script:OpeningAcceptancePreflightResult.database_fingerprint_sha256) `
             -TimeoutSeconds $OpeningAcceptancePreflightTimeoutSeconds | Out-Null
         return $script:OpeningAcceptancePreflightResult
     }
@@ -1239,6 +1274,21 @@ function Assert-OpeningAcceptanceMutationPreflight {
     }
     $script:OpeningAcceptancePreflightResult = $preflight
     return $script:OpeningAcceptancePreflightResult
+}
+
+function Assert-ClosingTapeMutationPreflight {
+    param([Parameter(Mandatory = $true)][ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$TradingDate)
+
+    # Independent capture/finalization owns its catalog. Main-app historical
+    # opening-table scans cannot hold this component behind a 300-second gate.
+    # The launcher still repeats its primary-family/time/ownership gate, and
+    # post-close finalization still requires a stopped writer and raw integrity.
+    Invoke-OpeningAcceptancePreflight `
+        -PythonPath $PythonExe `
+        -PreflightScript $OpeningAcceptancePreflightScript `
+        -DatabasePath (Join-Path $ProjectRoot "data\closing_tape\$TradingDate\closing_tape.sqlite") `
+        -Phase 'capture' `
+        -TimeoutSeconds 90
 }
 
 function Invoke-MarketAppCurrentDayUniversePrestage {
@@ -1520,6 +1570,14 @@ try {
         if ($backendListenerPresent -and -not $backendWasStopped) {
             $expectedTradingDate = $now.ToString('yyyy-MM-dd')
             $backendReadinessState = Get-BackendReadinessState
+            if ($backendReadinessState.SubscriptionSessionState -eq 'preopen') {
+                Write-WatchdogLog -Event 'opening_readiness_observed' -Message (
+                    "component=backend provider_clock=$($backendReadinessState.ProviderClockStatus) " +
+                    "stage=$($backendReadinessState.ProviderClockReadinessStage) " +
+                    "samples=$($backendReadinessState.ProviderClockSampleCount) " +
+                    "minimum_samples=$($backendReadinessState.ProviderClockMinimumSamples) " +
+                    "handoff=$($backendReadinessState.HealthHandoffStatus) opening_reference_authority=none action=observe_existing_gates")
+            }
             $backendUniverseState = Get-BackendUniverseState -RuntimeState $backendReadinessState
             $evaluateBackendReadiness = $false
             $observedTradingDate = if ($backendUniverseState) {
@@ -2158,7 +2216,7 @@ try {
                 Write-WatchdogLog `
                     -Event 'launch_requested' `
                     -Message "component=closing_tape trading_date=$tradingDate action=start"
-                Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
+                Assert-ClosingTapeMutationPreflight -TradingDate $tradingDate | Out-Null
                 $result = & $ClosingTapeScript -TradingDate $tradingDate -NoParquet
             }
             $resultStatus = [string]$result.Status
@@ -2185,7 +2243,7 @@ try {
                     -Message "component=closing_tape prior_nonempty_dbn_count=$($result.PriorNonemptyDbnCount) action=preserve_primary_backend"
             }
             elseif ($resultStatus -eq 'outside_start_window') {
-                Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
+                Assert-ClosingTapeMutationPreflight -TradingDate $tradingDate | Out-Null
                 $finalizeOutput = @(& $PythonExe $ClosingTapeFinalizeScript `
                     --project-root $ProjectRoot `
                     --trading-date $tradingDate)

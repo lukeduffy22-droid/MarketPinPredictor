@@ -28,6 +28,8 @@ env/
 .codex-tmp/
 .playwright-cli/
 .snapshots/
+.audit-tests/
+.audit-test-state/
 
 # Streamlit runtime safety is repository-owned; .streamlit/config.toml is
 # intentionally tracked so a direct local launch cannot re-enable hot reload.

@@ -50,8 +50,8 @@ $AppDir = [System.IO.Path]::GetFullPath($ProjectRoot)
 $PythonExe = Join-Path $AppDir '.venv\Scripts\python.exe'
 $OpeningAcceptancePreflightScript = Join-Path $AppDir 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 74
-$OpeningAcceptancePreflightRequiredModuleCount = 56
+$OpeningAcceptancePreflightRequiredFileCount = 77
+$OpeningAcceptancePreflightRequiredModuleCount = 59
 $OpeningAcceptancePreflightTimeoutSeconds = 300
 $InvocationId = 'manual-launcher-pester'
 
@@ -86,8 +86,12 @@ function New-ValidStrictPreflightJson {
         schema_bootstrap_performed = $BootstrapPerformed
         bootstrap_attempt_count = $BootstrapAttemptCount
         source_fingerprint_sha256 = ('a' * 64)
-        required_file_count = 74
-        required_module_count = 56
+        database_fingerprint_sha256 = ('b' * 64)
+        database_fingerprint_scope = 'file_identity_and_schema_not_row_contents'
+        stage_timings_ms = @{}
+        database_query_timings = @()
+        required_file_count = 77
+        required_module_count = 59
         database_issues = $DatabaseIssues
         issues = @()
     } | ConvertTo-Json -Compress -Depth 8
@@ -133,7 +137,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
     It 'uses the bounded opening-acceptance preflight and fails closed on incomplete proof' {
         $LauncherSource | Should Match '\$OpeningAcceptancePreflightTimeoutSeconds = 300'
         $preflight = Get-LauncherFunctionSource -Name 'Invoke-OpeningAcceptancePreflight'
-        $preflight | Should Match "ValidateSet\('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint'\)"
+        $preflight | Should Match "ValidateSet\('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint', 'capture'\)"
         $preflight | Should Match 'Invoke-MarketAppBoundedChildProcess'
         $preflight | Should Match '-FilePath \$PythonPath'
         $preflight | Should Match '\$child\.TimedOut'
@@ -412,6 +416,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
             [pscustomobject]@{
                 schema_bootstrap_required = $false
                 source_fingerprint_sha256 = ('a' * 64)
+                database_fingerprint_sha256 = ('b' * 64)
             }
         }
 
@@ -435,6 +440,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
                     database_contract = 'additive_bootstrap_required'
                     database_issues = @([pscustomobject]@{ code = 'RUNTIME_TABLE_MISSING' })
                     source_fingerprint_sha256 = ('a' * 64)
+                    database_fingerprint_sha256 = ('b' * 64)
                 }
             }
             if ($Phase -eq 'bootstrap') {
@@ -444,6 +450,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
                     schema_bootstrap_performed = $true
                     bootstrap_attempt_count = 1
                     source_fingerprint_sha256 = ('a' * 64)
+                    database_fingerprint_sha256 = ('b' * 64)
                 }
             }
             throw "Unexpected phase: $Phase"
@@ -471,6 +478,7 @@ Describe 'Manual Databento full-stack launcher mutation guard' {
     It 'revalidates a cached fingerprint and refuses to stop when it changed' {
         $script:OpeningAcceptancePreflightResult = [pscustomobject]@{
             source_fingerprint_sha256 = ('a' * 64)
+            database_fingerprint_sha256 = ('b' * 64)
         }
         Mock Invoke-OpeningAcceptancePreflight { throw 'mock source fingerprint mismatch' } `
             -ParameterFilter { $Phase -eq 'fingerprint' }

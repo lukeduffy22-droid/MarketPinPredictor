@@ -1981,11 +1981,13 @@ with st.sidebar:
     else:
         st.warning("Market Status: 🟠 UNAVAILABLE (backend session authority not verified)")
 
-    # Create tabs for Live Streaming, Advisor, Frozen Gamma, and Debug Snapshot Viewer
-    streaming_tab, advisor_tab, frozen_gamma_tab, debug_snapshot_tab = st.tabs(["📡 Live Streaming", "🧠 Advisor", "🧊 Frozen Gamma (Audit)", "🔍 Debug Snapshot"])
+    # Streamlit tabs execute every body. Select one body so inactive panels do
+    # not issue backend/database reads on every interaction.
+    from app.services.market_view_navigation import select_market_view
+    market_view = select_market_view()
 
     # === FROZEN GAMMA TAB ===
-    with frozen_gamma_tab:
+    if market_view == "Frozen Gamma (Audit)":
         st.markdown("Read-only research view — Shows the last calculation-valid stored gamma state; current authority is not established.")
 
         # Check freeze status
@@ -2201,7 +2203,7 @@ with st.sidebar:
     # === LIVE STREAMING TAB ===
     # NOTE: WebSocket connections are managed by the FastAPI backend ONLY
     # Streamlit reads cached data via REST endpoints (no direct WebSocket creation)
-    with streaming_tab:
+    if market_view == "Live Streaming":
         st.info("📡 **Live data is streamed via the backend service**")
         st.caption("The FastAPI backend manages all WebSocket connections to prevent duplicate connections.")
 
@@ -2211,8 +2213,9 @@ with st.sidebar:
             "Automatic refresh is off. Values and eligibility reflect the last page "
             "update; use Refresh live status now to check the latest data."
         )
-        if st.button("Refresh live status now", type="secondary"):
-            st.rerun()
+        # A button click already reruns the script, including the shared status
+        # observation above. A second rerun would duplicate that network read.
+        st.button("Refresh live status now", type="secondary")
 
         if market_session_state == "closed":
             st.warning("ℹ️ Market closed - showing cached data from last session")
@@ -2223,7 +2226,6 @@ with st.sidebar:
         render_backend_streaming_status(live_snapshot=live_status_snapshot)
         if st.session_state.data_provider == 'databento':
             render_opening_range_panel()
-        render_shadow_research_panel()
 
         def _render_sidebar_state_context(state: Any) -> None:
             observed = format_display_timestamp(
@@ -2660,8 +2662,11 @@ with st.sidebar:
             3. Streamlit polls the backend cache for latest values
             """)
 
+    if market_view == "Shadow Research":
+        render_shadow_research_panel(runtime_context=live_status_snapshot.get("pipeline") or {})
+
     # === DEBUG SNAPSHOT VIEWER TAB ===
-    with debug_snapshot_tab:
+    if market_view == "Debug Snapshot":
         st.markdown("**Raw Audit Snapshot Viewer** — Shows exact values from the latest audit JSON for debugging.")
         st.caption("When UI looks wrong, use this to prove whether backend stored wrong values or UI displayed wrong values.")
 
@@ -2802,7 +2807,7 @@ with st.sidebar:
             st.info("Select indexes in the sidebar to view debug snapshot data.")
 
     # === LIVE ADVISOR TAB ===
-    with advisor_tab:
+    if market_view == "Advisor":
         from app.services.advisor_view import render_advisor
         advisor_symbols = [INDEXES[idx] for idx in selected_indexes] if selected_indexes else ["SPX", "NDX", "VIX"]
         render_advisor(advisor_symbols)
@@ -2878,7 +2883,7 @@ if st.session_state.data_provider == 'databento':
     render_live_api_demo()
     render_forecast_research()
     render_indicator_panel()
-    render_closing_tape_evidence()
+    render_closing_tape_evidence(runtime_context=live_status_snapshot.get("pipeline") or {})
 
 if st.session_state.data_provider == 'polygon' and not st.session_state.api_key:
     st.info("👈 Please enter your Polygon API key in the sidebar to get started, or switch Market Data Provider to Databento OPRA")

@@ -21,6 +21,7 @@ from backend.optional_family_canary import CORE_PRIMARY_PAIR_COVERAGE_RATIO
 from backend.research.shadow_formula import (
     NAIVE_LAST_PRICE_V1,
     PIN_CONTEXT_LINEAR_V1,
+    PIN_CONTEXT_NO_ZERO_GAMMA_V2,
     FormulaDefinition,
     ShadowFormulaEngine,
     ShadowGuardrails,
@@ -75,9 +76,20 @@ def _optional_int(value: Any) -> int | None:
 
 def _process_identity(payload: Mapping[str, Any]) -> tuple[str, int] | None:
     epoch_id = str(payload.get("subscription_epoch_id") or "").strip()
-    generation = _optional_int(payload.get("subscription_generation"))
+    raw_generation = payload.get("subscription_generation")
+    if isinstance(raw_generation, bool):
+        generation = None
+    elif isinstance(raw_generation, int):
+        generation = raw_generation
+    elif isinstance(raw_generation, str) and raw_generation.strip().isdigit():
+        generation = int(raw_generation.strip())
+    else:
+        generation = None
+    calculation_id = payload.get("calculation_id")
     if (
-        len(epoch_id) != 64
+        not isinstance(calculation_id, str)
+        or not calculation_id.strip()
+        or len(epoch_id) != 64
         or any(character not in "0123456789abcdef" for character in epoch_id)
         or generation is None
         or generation <= 0
@@ -103,19 +115,21 @@ class LiveShadowResearchRecorder:
         *,
         journal_path: str | Path | None = None,
         enabled: bool | None = None,
-        formulas: Sequence[FormulaDefinition] = (
-            NAIVE_LAST_PRICE_V1,
-            PIN_CONTEXT_LINEAR_V1,
-        ),
+        formulas: Sequence[FormulaDefinition] | None = None,
         max_quote_age_seconds: float = 30.0,
+        persistence_clock=None,
     ) -> None:
         configured_path = journal_path or os.getenv("SHADOW_RESEARCH_DB_PATH") or DEFAULT_JOURNAL_PATH
         self.enabled = _env_enabled("SHADOW_RESEARCH_ENABLED", True) if enabled is None else bool(enabled)
-        self.formulas = tuple(formulas)
+        # V1 stays frozen. V2 is a separate, explicitly enabled research arm.
+        self.formulas = tuple(formulas) if formulas is not None else (
+            NAIVE_LAST_PRICE_V1, PIN_CONTEXT_LINEAR_V1,
+            *((PIN_CONTEXT_NO_ZERO_GAMMA_V2,) if _env_enabled("SHADOW_RESEARCH_V2_ENABLED", False) else ()),
+        )
         self.engine = ShadowFormulaEngine(
             ShadowGuardrails(max_quote_age_seconds=float(max_quote_age_seconds))
         )
-        self.journal = ShadowPredictionJournal(configured_path)
+        self.journal = ShadowPredictionJournal(configured_path, clock=persistence_clock)
         self._history: dict[
             tuple[str, str, int], deque[tuple[datetime, float]]
         ] = defaultdict(
@@ -160,6 +174,10 @@ class LiveShadowResearchRecorder:
             payload.get("price") if payload.get("price") is not None else payload.get("spot_last")
         )
         process_identity = _process_identity(payload)
+        if process_identity is None:
+            return LiveShadowRecordResult(
+                skipped_reason="MISSING_COMMITTED_PROVENANCE_IDENTITY"
+            )
 
         momentum = self._spot_return(symbol, process_identity, index_at, spot)
         required_features = {
@@ -234,12 +252,12 @@ class LiveShadowResearchRecorder:
         ):
             reasons.append("DUPLICATE_SYMBOL_INDEX_TIMESTAMP")
 
-        scored_count = self._score_due(
-            symbol,
-            index_at,
-            spot,
-            process_identity=process_identity,
-        )
+        # A subsequent reference must pass the same observation-quality gates
+        # as the baseline; invalid quotes cannot settle an earlier forecast.
+        reference_validation = self.engine.evaluate(observation, NAIVE_LAST_PRICE_V1,
+            forced_abstention_reasons=tuple(reasons))
+        scored_count = 0 if reference_validation.abstained else self._score_due(
+            symbol, index_at, spot, process_identity=process_identity)
         predictions_list: list[ShadowPrediction] = []
         for formula in self.formulas:
             formula_reasons = list(reasons)
@@ -303,13 +321,13 @@ class LiveShadowResearchRecorder:
             subscription_generation=process_identity[1],
         ):
             try:
-                self.journal.score_outcome(
+                outcome = self.journal.score_outcome(
                     str(row["prediction_id"]),
                     realized_price=realized_price,
                     realized_timestamp_utc=realized_at,
                     scored_at_utc=datetime.now(UTC),
                 )
-                scored += 1
+                scored += int(outcome.get("scored") is True)
             except (KeyError, ValueError) as exc:
                 logger.warning("Shadow outcome scoring skipped for %s: %s", row.get("prediction_id"), exc)
         return scored
