@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 import zlib
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -3297,6 +3298,168 @@ def _append_prediction_jsonl(payload: dict[str, Any]) -> None:
         handle.write(_json_dumps(payload) + "\n")
 
 
+def verify_prediction_calculation_lineage(
+    source: Mapping[str, Any],
+    *,
+    symbol: str | None = None,
+    predicted_at_utc: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Verify exact retained inputs before admitting a new numeric forecast.
+
+    This reads existing rows only. A claimed id or producer success flag is not
+    a receipt, and missing historical identities are never inferred or repaired.
+    """
+    reasons: list[str] = []
+    source = source if isinstance(source, Mapping) else {}
+    calculation_id = str(source.get("calculation_id") or "").strip()
+    result = {"valid": False, "reasons": reasons,
+              "calculation_id": calculation_id or None, "payload_sha256": None}
+    if not calculation_id:
+        reasons.append("CALCULATION_ID_MISSING")
+        return result
+    if source.get("validation_is_valid") is not True or source.get("gamma_excluded_from_model") is not False:
+        reasons.append("CALCULATION_SOURCE_NOT_USABLE")
+    from backend.workstation import payload_has_fallback_provenance
+    if source.get("usable_for_prediction", True) is not True or payload_has_fallback_provenance(source):
+        reasons.append("CALCULATION_SOURCE_NOT_USABLE")
+    expected_symbol = str(symbol or source.get("symbol") or "").strip().upper()
+    epoch = _canonical_subscription_epoch(source.get("subscription_epoch_id"))
+    generation = source.get("subscription_generation")
+    if not expected_symbol or source.get("symbol", expected_symbol) != expected_symbol:
+        reasons.append("CALCULATION_SYMBOL_MISMATCH")
+    if epoch is None or type(generation) is not int or generation < 1:
+        reasons.append("CALCULATION_PROCESS_IDENTITY_INVALID")
+    predicted_at = _coerce_timestamp(predicted_at_utc) if predicted_at_utc is not None else _naive_utc()
+    if predicted_at is None:
+        reasons.append("PREDICTION_TIMESTAMP_INVALID")
+    if reasons:
+        return result
+    session = SessionLocal()
+    try:
+        pair = session.query(GammaCalculationRun, GammaCalculationInputBlob).join(
+            GammaCalculationInputBlob,
+            GammaCalculationInputBlob.calculation_run_id == GammaCalculationRun.id,
+        ).filter(GammaCalculationRun.calculation_id == calculation_id).first()
+        if pair is None:
+            reasons.append("CALCULATION_INPUTS_NOT_RETAINED")
+            return result
+        run, blob = pair
+        if run.symbol != expected_symbol or run.trading_date != _trading_date(predicted_at):
+            reasons.append("CALCULATION_SYMBOL_OR_SESSION_MISMATCH")
+        if run.subscription_epoch_id != epoch or run.subscription_generation != generation:
+            reasons.append("CALCULATION_PROCESS_IDENTITY_MISMATCH")
+        if run.status != "valid":
+            reasons.append("CALCULATION_NOT_VALID")
+        if source.get("provider") is not None and run.provider != str(source["provider"]).lower().strip():
+            reasons.append("CALCULATION_PROVIDER_MISMATCH")
+        if run.calculated_at_utc > predicted_at:
+            reasons.append("CALCULATION_AFTER_PREDICTION")
+        source_time = _coerce_timestamp(
+            source.get("calculated_at_utc") or source.get("timestamp_utc") or source.get("timestamp")
+        )
+        if source_time is None or source_time != run.calculated_at_utc:
+            reasons.append("CALCULATION_TIMESTAMP_MISMATCH")
+        reference = _first_finite_float(source.get("price"), source.get("spot_last"))
+        if reference is None or reference <= 0 or run.spot_price is None or not math.isclose(
+            reference, run.spot_price, rel_tol=1e-12, abs_tol=1e-8,
+        ):
+            reasons.append("CALCULATION_REFERENCE_MISMATCH")
+        material_fields = {
+            "gamma_pin": "gamma_pin", "likely_close": "selected_target",
+            "net_gex": "net_gex", "gross_gex": "gross_gex",
+            "zero_gamma": "zero_gamma", "max_pain": "max_pain",
+            "call_gex_total": "call_gex", "put_gex_total": "put_gex",
+        }
+        for source_key, run_key in material_fields.items():
+            if source_key not in source:
+                continue
+            source_value, retained_value = source[source_key], getattr(run, run_key)
+            if source_value is None and retained_value is None:
+                continue
+            number = _first_finite_float(source_value)
+            if number is None or retained_value is None or not math.isclose(
+                number, retained_value, rel_tol=1e-12, abs_tol=1e-8,
+            ):
+                reasons.append("CALCULATION_OUTPUT_MISMATCH:" + source_key)
+        quote_value = source.get("latest_ts_recv_utc") or source.get("observation_index_utc")
+        quote_at = _coerce_timestamp(quote_value)
+        if quote_value is not None and quote_at is None:
+            reasons.append("SOURCE_TIMESTAMP_INVALID")
+        if quote_at is not None and quote_at > predicted_at:
+            reasons.append("SOURCE_TIMESTAMP_AFTER_PREDICTION")
+        if reasons:
+            return result
+        # Bound decompression even when metadata or stored bytes are corrupt.
+        maximum_bytes = 32 * 1024 * 1024
+        if (blob.encoding != "canonical-json+zlib-v1"
+                or not 0 < blob.uncompressed_bytes <= maximum_bytes
+                or not 0 < blob.compressed_bytes <= maximum_bytes
+                or len(blob.payload) != blob.compressed_bytes):
+            reasons.append("CALCULATION_INPUT_ENCODING_OR_SIZE_INVALID")
+            return result
+        decoder = zlib.decompressobj()
+        canonical = decoder.decompress(blob.payload, maximum_bytes + 1)
+        if (not decoder.eof or decoder.unused_data or decoder.unconsumed_tail
+                or len(canonical) != blob.uncompressed_bytes
+                or hashlib.sha256(canonical).hexdigest() != blob.payload_sha256):
+            reasons.append("CALCULATION_INPUT_INTEGRITY_FAILED")
+            return result
+        payload = json.loads(canonical.decode("utf-8"))
+        if (not isinstance(payload, dict)
+                or payload.get("calculation_id") != calculation_id
+                or payload.get("symbol") != expected_symbol
+                or payload.get("subscription_epoch_id") != epoch
+                or type(payload.get("subscription_generation")) is not int
+                or payload.get("subscription_generation") != generation
+                or _coerce_timestamp(payload.get("calculated_at_utc")) != run.calculated_at_utc):
+            reasons.append("CALCULATION_INPUT_IDENTITY_MISMATCH")
+        if isinstance(payload, dict) and payload.get("input_schema_version") != run.input_schema_version:
+            reasons.append("CALCULATION_INPUT_SCHEMA_MISMATCH")
+        if run.provider == "databento":
+            required = {"parameters": dict, "output_summary": dict,
+                        "raw_fresh_chain_rows": list, "calculated_gex_rows": list,
+                        "rejection_counts": dict}
+            if (not isinstance(payload, dict)
+                    or payload.get("input_schema_version") != "gamma-inputs-v2-point-in-time"
+                    or any(not isinstance(payload.get(k), kind) for k, kind in required.items())
+                    or not payload.get("raw_fresh_chain_rows") or not payload.get("calculated_gex_rows")):
+                reasons.append("CALCULATION_REPLAY_INPUTS_INCOMPLETE")
+            else:
+                summary = payload["output_summary"]
+                if (summary.get("calculation_id") != calculation_id
+                        or summary.get("symbol") != expected_symbol
+                        or summary.get("subscription_epoch_id") != epoch
+                        or type(summary.get("subscription_generation")) is not int
+                        or summary.get("subscription_generation") != generation
+                        or summary.get("validation_is_valid") is not True
+                        or summary.get("gamma_excluded_from_model") is not False
+                        or _first_finite_float(summary.get("price")) != run.spot_price
+                        or len(payload["raw_fresh_chain_rows"]) != run.chain_row_count
+                        or len(payload["calculated_gex_rows"]) != run.gex_row_count):
+                    reasons.append("CALCULATION_INPUT_SUMMARY_MISMATCH")
+                for source_key, run_key in material_fields.items():
+                    if source_key not in summary:
+                        continue
+                    value, expected = summary[source_key], getattr(run, run_key)
+                    if value is None and expected is None:
+                        continue
+                    number = _first_finite_float(value)
+                    if number is None or expected is None or not math.isclose(number, expected, rel_tol=1e-12, abs_tol=1e-8):
+                        reasons.append("CALCULATION_INPUT_SUMMARY_MISMATCH:" + source_key)
+        claimed_hash = source.get("calculation_input_sha256")
+        if claimed_hash is not None and claimed_hash != blob.payload_sha256:
+            reasons.append("CALCULATION_INPUT_HASH_MISMATCH")
+        result["payload_sha256"] = blob.payload_sha256
+        result["valid"] = not reasons
+        return result
+    except Exception:
+        logger.warning("Calculation lineage verification failed for %s", calculation_id, exc_info=True)
+        reasons.append("CALCULATION_LINEAGE_UNAVAILABLE")
+        return result
+    finally:
+        session.close()
+
+
 def save_prediction_snapshot(
     prediction: dict[str, Any],
     prediction_mode: str = "balanced",
@@ -3315,8 +3478,13 @@ def save_prediction_snapshot(
 
     if not publication_allowed():
         return None
+    commit_started = commit_acknowledged = False
     try:
-        timestamp_utc = _coerce_timestamp(prediction.get("timestamp")) or _naive_utc()
+        # Caller-owned/live dictionaries may change while guards or DB reads run.
+        # The verified revision and the bytes inserted/exported must be identical.
+        prediction = deepcopy(prediction)
+        supplied_timestamp = _coerce_timestamp(prediction.get("timestamp"))
+        timestamp_utc = supplied_timestamp or _naive_utc()
 
         symbol = str(prediction.get("symbol", "")).upper()
         current_price = _first_finite_float(prediction.get("current_price")) or 0.0
@@ -3399,6 +3567,52 @@ def save_prediction_snapshot(
             prediction.get("validation_status")
             or ("valid" if is_valid else "invalid")
         )
+        needs_lineage = is_valid and (
+            provider == "databento"
+            or str(source_payload.get("provider") or "").lower().strip() == "databento"
+            or str(prediction.get("model_version") or "").startswith("databento_")
+        )
+        if needs_lineage:
+            from backend.workstation import payload_has_fallback_provenance
+            if payload_has_fallback_provenance(prediction) or prediction.get("usable_for_prediction", True) is not True:
+                return None
+            if supplied_timestamp is None:
+                logger.warning("Rejected prediction without a valid issuance timestamp for %s", symbol)
+                return None
+            if validation_status != "valid":
+                logger.warning("Rejected prediction with invalid validation status for %s", symbol)
+                return None
+            raw_generation = prediction.get("subscription_generation", source_payload.get("subscription_generation"))
+            if type(raw_generation) is not int or raw_generation < 1:
+                return None
+            if provider != str(source_payload.get("provider") or "").lower().strip():
+                return None
+            lineage = verify_prediction_calculation_lineage(
+                source_payload, symbol=symbol, predicted_at_utc=timestamp_utc,
+            )
+            if lineage["valid"] is not True:
+                logger.warning("Rejected unbound prediction for %s: %s", symbol, lineage["reasons"])
+                return None
+            if subscription_generation != source_payload.get("subscription_generation"):
+                logger.warning("Rejected prediction with conflicting source generation for %s", symbol)
+                return None
+            source_quote = _coerce_timestamp(source_payload.get("latest_ts_recv_utc") or source_payload.get("observation_index_utc") or source_payload.get("timestamp"))
+            if quote_timestamp is None or quote_timestamp != source_quote or quote_timestamp > timestamp_utc:
+                logger.warning("Rejected prediction with an unbound quote timestamp for %s", symbol)
+                return None
+            overrides = {"gamma_pin": "gamma_pin", "max_pain": "max_pain", "zero_gamma": "zero_gamma",
+                         "gross_gex": "gross_gex", "net_gex": "net_gex",
+                         "call_gex": "call_gex_total", "put_gex": "put_gex_total"}
+            for key, source_key in overrides.items():
+                if key in prediction and prediction[key] is not None:
+                    value, expected = _first_finite_float(prediction[key]), _first_finite_float(source_payload.get(source_key))
+                    if value is None or expected is None or not math.isclose(value, expected, rel_tol=1e-12, abs_tol=1e-8):
+                        logger.warning("Rejected unbound prediction override %s for %s", key, symbol)
+                        return None
+            # A top-level reference cannot diverge from the verified source.
+            if not math.isclose(current_price, float(source_payload.get("price", source_payload.get("spot_last"))), rel_tol=1e-12, abs_tol=1e-8):
+                logger.warning("Rejected prediction with conflicting source reference for %s", symbol)
+                return None
         existing = None
         if (
             quote_timestamp is not None
@@ -3419,6 +3633,21 @@ def save_prediction_snapshot(
             finally:
                 db.close()
         if existing is not None:
+            if needs_lineage:
+                existing_source = json.loads(existing.source_payload_json or "{}")
+                if (existing_source.get("calculation_id") != source_payload.get("calculation_id")
+                        or existing.model_version != prediction.get("model_version")
+                        or existing.feature_hash != prediction.get("feature_hash")
+                        or not math.isclose(existing.predicted_close, predicted_close, rel_tol=1e-12, abs_tol=1e-8)):
+                    # Same provider quote is not permission to relabel an old
+                    # forecast as a newly computed model/feature revision.
+                    return None
+                if verify_prediction_calculation_lineage(
+                    existing_source, symbol=existing.symbol,
+                    predicted_at_utc=existing.timestamp_utc,
+                )["valid"] is not True:
+                    # Do not overwrite or return an old unbound row as success.
+                    return None
             return existing if publication_allowed() else None
 
         row_payload = {
@@ -3457,9 +3686,17 @@ def save_prediction_snapshot(
             "put_gex": put_gex,
             "inference_device": prediction.get("inference_device"),
             "validation_status": validation_status,
+            "persistence_status": "committed",
         }
 
         db = SessionLocal()
+        if needs_lineage:
+            # Recheck admission immediately before the insert, after any guard
+            # or duplicate lookup. Calculation inputs themselves are immutable.
+            if verify_prediction_calculation_lineage(
+                source_payload, symbol=symbol, predicted_at_utc=timestamp_utc,
+            )["valid"] is not True:
+                return None
         snapshot = PredictionSnapshot(
             symbol=symbol,
             timestamp_utc=timestamp_utc,
@@ -3505,7 +3742,9 @@ def save_prediction_snapshot(
         if not publication_allowed():
             db.rollback()
             return None
+        commit_started = True
         db.commit()
+        commit_acknowledged = True
         db.refresh(snapshot)
         try:
             _append_prediction_jsonl(row_payload)
@@ -3520,7 +3759,18 @@ def save_prediction_snapshot(
         logger.warning("Failed to save prediction snapshot: %s", exc)
         try:
             if "row_payload" in locals():
-                _append_prediction_jsonl(row_payload)
+                # Preserve an attempted prediction without representing an
+                # uncommitted SQLite row as an issued/accepted forecast.
+                _append_prediction_jsonl({
+                    **row_payload, "is_valid": False,
+                    "validation_status": "persistence_failed",
+                    "persistence_status": (
+                        "committed_publication_unavailable" if commit_acknowledged
+                        else "commit_unverified" if commit_started else "uncommitted"
+                    ),
+                    "evidence_role": "unissued_prediction_attempt",
+                    "usable_for_prediction": False,
+                })
         except Exception as export_exc:
             logger.error("Prediction snapshot SQLite and NDJSON persistence both failed: %s", export_exc)
         return None

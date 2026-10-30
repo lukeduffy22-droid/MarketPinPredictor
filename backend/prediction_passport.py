@@ -322,6 +322,7 @@ def _gamma_lineage(session, calculation_id: str | None) -> dict[str, Any]:
         "errors": [],
     }
     if not calculation_id:
+        evidence["errors"].append("CALCULATION_ID_MISSING")
         return evidence
     run = session.query(database.GammaCalculationRun).filter(
         database.GammaCalculationRun.calculation_id == calculation_id,
@@ -341,10 +342,19 @@ def _gamma_lineage(session, calculation_id: str | None) -> dict[str, Any]:
     try:
         if blob.encoding != "canonical-json+zlib-v1":
             raise ValueError("unsupported input encoding")
-        if int(blob.compressed_bytes) != len(blob.payload):
+        maximum_bytes = 32 * 1024 * 1024
+        if (
+            not 0 < int(blob.compressed_bytes) <= maximum_bytes
+            or not 0 < int(blob.uncompressed_bytes) <= maximum_bytes
+            or int(blob.compressed_bytes) != len(blob.payload)
+        ):
             raise ValueError("compressed input size mismatch")
-        canonical = zlib.decompress(blob.payload)
-        if int(blob.uncompressed_bytes) != len(canonical):
+        decoder = zlib.decompressobj()
+        canonical = decoder.decompress(blob.payload, maximum_bytes + 1)
+        if (
+            not decoder.eof or decoder.unused_data or decoder.unconsumed_tail
+            or int(blob.uncompressed_bytes) != len(canonical)
+        ):
             raise ValueError("uncompressed input size mismatch")
         if hashlib.sha256(canonical).hexdigest() != str(blob.payload_sha256).lower():
             raise ValueError("input payload hash mismatch")
@@ -382,7 +392,7 @@ def _lineage_validation_errors(
     errors = [str(item) for item in lineage.get("errors") or []]
     run = lineage.get("run")
     if run is None:
-        return errors
+        return errors or ["CALCULATION_RUN_NOT_FOUND"]
     if str(run.status or "").lower() != "valid":
         errors.append("CALCULATION_RUN_NOT_VALID")
     if str(run.symbol or "").upper() != symbol:
@@ -403,6 +413,24 @@ def _lineage_validation_errors(
         errors.append("CALCULATION_TIMESTAMP_MISSING")
     elif calculated_at > predicted_at:
         errors.append("CALCULATION_AFTER_PREDICTION")
+    source_calculated_at = _timestamp(
+        source.get("calculated_at_utc") or source.get("timestamp_utc") or source.get("timestamp")
+    )
+    if source_calculated_at is None or source_calculated_at != calculated_at:
+        errors.append("CALCULATION_SOURCE_TIMESTAMP_MISMATCH")
+    # Hash integrity establishes byte identity; it does not establish that the
+    # blob belongs to this calculation. Bind the canonical payload's own
+    # identity to the run as well, so a valid but unrelated blob cannot satisfy
+    # a numeric research passport.
+    inputs = lineage.get("input_payload")
+    if not isinstance(inputs, Mapping) or (
+        inputs.get("calculation_id") != run.calculation_id
+        or inputs.get("symbol") != symbol
+        or inputs.get("subscription_epoch_id") != subscription_epoch_id
+        or inputs.get("subscription_generation") != generation
+        or _timestamp(inputs.get("calculated_at_utc")) != calculated_at
+    ):
+        errors.append("CALCULATION_INPUT_IDENTITY_MISMATCH")
     if int(run.chain_row_count or 0) <= 0 or int(run.gex_row_count or 0) <= 0:
         errors.append("CALCULATION_CHAIN_EVIDENCE_EMPTY")
     if reference_price is not None and not _same_number(run.spot_price, reference_price):
@@ -929,6 +957,18 @@ def issue_prediction_passport(
             source=source,
             reference_price=reference_price,
         )
+        if str(provider or "").lower() == "databento":
+            # Direct issuance must obey the same actual-input contract as the
+            # lifecycle and snapshot saver. A hash-valid blob with incomplete
+            # replay shapes is not sufficient for a new numeric passport.
+            shared_lineage = database.verify_prediction_calculation_lineage(
+                source, symbol=symbol, predicted_at_utc=predicted_at,
+            )
+            if shared_lineage.get("valid") is not True:
+                lineage_errors.extend(
+                    shared_lineage.get("reasons") or ["CALCULATION_LINEAGE_NOT_VERIFIED"]
+                )
+                lineage_errors = list(dict.fromkeys(lineage_errors))
         reasons.extend(lineage_errors)
         if universe_hash_invalid:
             reasons.append("INVALID_EVIDENCE_SHA256:universe_sha256")
@@ -1053,6 +1093,13 @@ def issue_prediction_passport(
         if predicted_at >= target_at:
             missing.append("pre_target_issue_time")
         missing = list(dict.fromkeys(missing))
+        # Research classification relaxes promotion/calibration requirements,
+        # not the requirement that a numeric forecast bind to real retained
+        # inputs.  Apply this only when issuing new passports: historical
+        # immutable records remain readable without being rewritten/upgraded.
+        if state == "research" and lineage_errors:
+            state = "abstain"
+            reasons.append("MISSING_EVIDENCE:verified_calculation_lineage")
         if state == "valid" and missing:
             state = "abstain"
             reasons.extend(f"MISSING_EVIDENCE:{name}" for name in missing)

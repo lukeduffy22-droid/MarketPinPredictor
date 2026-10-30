@@ -436,7 +436,7 @@ def test_handoff_during_commit_does_not_publish_previous_generation(
     assert backend_database.load_gamma_calculation_inputs(result["calculation_id"]) is not None
 
 
-def test_noncapture_cycle_keeps_existing_publication_without_claiming_lineage(
+def test_noncapture_cycle_without_acknowledged_publication_abstains(
     publication_case, monkeypatch
 ):
     streamer, result = publication_case
@@ -450,6 +450,109 @@ def test_noncapture_cycle_keeps_existing_publication_without_claiming_lineage(
     )
     streamer._compute_and_publish()
 
-    payload = streamer.latest_pins["SPX"]
-    assert "calculation_id" not in payload
-    assert payload["validation_is_valid"] is True
+    assert "SPX" not in streamer.latest_pins
+    payload = streamer.get_all_latest()["SPX"]
+    assert not payload.get("calculation_id")
+    assert payload["validation_is_valid"] is False
+    assert payload["usable_for_prediction"] is False
+    assert payload["validation_failure_reasons"] == ["CALCULATION_CAPTURE_THROTTLED"]
+    assert not list(streamer.exports_dir.rglob("*.ndjson"))
+
+
+def test_noncapture_refresh_preserves_exact_committed_publication_until_next_capture(
+    publication_case, monkeypatch
+):
+    streamer, template = publication_case
+    clock = [100.0]
+    monkeypatch.setattr("backend.databento_streamer.time.monotonic", lambda: clock[0])
+    callbacks = []
+    streamer.callbacks.append(lambda value: callbacks.append(dict(value)))
+    original_save = backend_database.save_gamma_calculation_inputs
+    commits = []
+
+    def save(run, inputs):
+        commits.append(run["calculation_id"])
+        return original_save(run, inputs)
+
+    monkeypatch.setattr(backend_database, "save_gamma_calculation_inputs", save)
+    streamer._compute_and_publish()
+    acknowledged = dict(streamer.latest_pins["SPX"])
+    acknowledged_message_time = streamer.last_message_time["SPX"]
+    assert acknowledged["calculation_inputs_persisted"] is True
+    assert len(acknowledged["calculation_input_sha256"]) == 64
+
+    clock[0] = 105.0
+    newer = {
+        key: value for key, value in template.items()
+        if key not in {"calculation_id", "_calculation_inputs", "calculation_input_sha256"}
+    }
+    newer.update(timestamp=datetime.now(timezone.utc), price=7525.0)
+    monkeypatch.setattr(streamer, "_calculate_pin", lambda *_args, **_kwargs: newer)
+    streamer._compute_and_publish()
+
+    # No copied identity, restamped price, extra callback or hidden extra commit.
+    assert streamer.latest_pins["SPX"] == acknowledged
+    assert streamer.get_all_latest()["SPX"] == acknowledged
+    assert streamer.last_message_time["SPX"] == acknowledged_message_time
+    assert len(callbacks) == 1
+    assert commits == [acknowledged["calculation_id"]]
+    assert streamer._last_snapshot_write["SPX"] == 100.0
+    diagnostic = streamer.latest_invalid["SPX"]
+    assert diagnostic["price"] == 7525.0
+    assert diagnostic["usable_for_prediction"] is False
+    assert not diagnostic.get("calculation_id")
+    assert not diagnostic.get("calculation_input_sha256")
+    assert diagnostic["validation_failure_reasons"] == ["CALCULATION_CAPTURE_THROTTLED"]
+
+    clock[0] = 161.0
+    next_result = dict(template)
+    next_result["calculation_id"] = "51111111-1111-1111-1111-111111111111"
+    next_result["_calculation_inputs"] = {
+        **template["_calculation_inputs"],
+        "calculation_id": next_result["calculation_id"],
+    }
+    next_result["timestamp"] = datetime.now(timezone.utc)
+    monkeypatch.setattr(streamer, "_calculate_pin", lambda *_args, **_kwargs: next_result)
+    streamer._compute_and_publish()
+    assert streamer.latest_pins["SPX"]["calculation_id"] == next_result["calculation_id"]
+    assert len(commits) == len(callbacks) == 2
+    assert "SPX" not in streamer.latest_invalid
+
+
+def test_direct_usable_snapshot_without_input_identity_is_only_diagnostic(
+    publication_case, monkeypatch
+):
+    streamer, result = publication_case
+    result = {key: value for key, value in result.items() if key not in {"calculation_id", "_calculation_inputs"}}
+    audits = []
+    monkeypatch.setattr(root_database, "save_audit_snapshot_to_db", audits.append)
+    monkeypatch.setattr(backend_database, "save_market_snapshot", lambda *_args, **_kwargs: pytest.fail("unbound market row"))
+    assert streamer._write_snapshot(result) is False
+    assert len(audits) == 1
+    assert audits[0]["validation_is_valid"] is False
+    assert audits[0]["usable_for_prediction"] is False
+    assert "CALCULATION_INPUT_CAPTURE_MISSING" in audits[0]["validation_failure_reasons"]
+    assert not list(streamer.exports_dir.rglob("*.ndjson"))
+
+
+def test_underlying_market_snapshot_does_not_receive_option_chain_medians(
+    publication_case, monkeypatch
+):
+    streamer, result = publication_case
+    result.update(
+        market_bid=None, market_ask=None,
+        option_chain_median_bid=20.3, option_chain_median_ask=20.5,
+        option_chain_quote_units="option_premium_points",
+    )
+    persisted = []
+    monkeypatch.setattr(backend_database, "save_market_snapshot", lambda *args, **kwargs: persisted.append((args, kwargs)))
+    streamer._compute_and_publish()
+    assert len(persisted) == 1
+    args, kwargs = persisted[0]
+    assert args[2] == 7500.0
+    assert kwargs["bid"] is None and kwargs["ask"] is None
+    path = next(streamer.exports_dir.rglob("*.ndjson"))
+    exported = json.loads(path.read_text().strip())
+    assert exported["market_bid"] is None and exported["market_ask"] is None
+    assert exported["option_chain_median_bid"] == 20.3
+    assert exported["option_chain_median_ask"] == 20.5

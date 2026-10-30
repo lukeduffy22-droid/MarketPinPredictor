@@ -33,6 +33,7 @@ from backend.databento_streamer import (
     parse_raw_option_symbol,
     raw_option_symbol,
     zero_gamma_level,
+    years_to_expiration,
 )
 
 
@@ -3356,6 +3357,51 @@ def test_point_in_time_lineage_is_retained_in_calculation_inputs(monkeypatch):
     row = inputs["raw_fresh_chain_rows"][0]
     assert row["ts_event_ns"] <= row["ts_recv_ns"]
     assert row["mapping_version"] == "test-mapping-SPX"
+    parameters = inputs["parameters"]
+    solver_time = datetime.fromisoformat(parameters["calculation_now_utc"])
+    assert solver_time.tzinfo is not None
+    assert parameters["year_fractions_by_expiration"] == {
+        current_market_date().isoformat(): years_to_expiration(
+            current_market_date(), now=solver_time
+        )
+    }
+    assert parameters["minimum_time_to_expiration_years"] > 0
+    assert parameters["expiration_cutoff_hour_et"] == 16
+    assert parameters["expiration_cutoff_minute_et"] == 0
+
+
+def test_option_chain_medians_are_not_underlying_bid_ask(monkeypatch):
+    monkeypatch.setattr("backend.databento_streamer.validate_underlying", lambda *_args: {})
+    streamer = _synthetic_gex_streamer(call_oi=2_000, put_oi=100)
+    result = streamer._calculate_pin("SPX", capture_inputs=True)
+    assert result is not None
+    assert result["price"] == pytest.approx(100.0)
+    assert result["market_bid"] is None
+    assert result["market_ask"] is None
+    assert result["option_chain_median_bid"] > 0
+    assert result["option_chain_median_ask"] > result["option_chain_median_bid"]
+    assert result["option_chain_quote_units"] == "option_premium_points"
+    payload = streamer._snapshot_payload(result)
+    assert payload["market_bid"] is None
+    assert payload["market_ask"] is None
+    assert payload["option_chain_median_bid"] == result["option_chain_median_bid"]
+    assert payload["option_chain_median_ask"] == result["option_chain_median_ask"]
+    assert result["_calculation_inputs"]["output_summary"]["market_bid"] is None
+
+
+def test_fractional_solver_expiry_is_saved_separately_from_calendar_dte(monkeypatch):
+    monkeypatch.setattr("backend.databento_streamer.validate_underlying", lambda *_args: {})
+    streamer = _synthetic_gex_streamer(call_oi=2_000, put_oi=100)
+    later = current_market_date() + timedelta(days=7)
+    _add_synthetic_expiration(streamer, "SPX", later, 2_000, 100, time.monotonic())
+    result = streamer._calculate_pin("SPX", capture_inputs=True)
+    assert result is not None
+    parameters = result["_calculation_inputs"]["parameters"]
+    solver_time = datetime.fromisoformat(parameters["calculation_now_utc"])
+    assert parameters["year_fractions_by_expiration"][later.isoformat()] == years_to_expiration(
+        later, now=solver_time
+    )
+    assert parameters["year_fractions_by_expiration"][later.isoformat()] > parameters["minimum_time_to_expiration_years"]
 
 
 def test_health_reports_backend_authoritative_market_subscription_status():
@@ -3995,6 +4041,8 @@ def test_valid_snapshot_writes_canonical_export_without_using_invalid_throttle(
     streamer.exports_dir = tmp_path / "exports"
     streamer.audit_dir = tmp_path / "audit"
     streamer.snapshot_interval = 0
+    streamer.active_generation = 1
+    streamer.handoff_status = "active"
     streamer._last_invalid_snapshot_write["SPX"] = time.monotonic()
     payload = {
         "universe_provenance": {
@@ -4011,10 +4059,26 @@ def test_valid_snapshot_writes_canonical_export_without_using_invalid_throttle(
         "spot_last": 6498.0,
         "gross_gex": 10.0,
         "net_gex": 2.0,
+        "likely_close": 6500.0,
+        "usable_for_prediction": True,
+        "calculation_id": "snapshot-test-calculation",
+        "subscription_epoch_id": streamer.subscription_epoch_id,
+        "subscription_generation": 1,
     }
     monkeypatch.setattr(streamer, "_snapshot_payload", lambda _result: payload)
+    monkeypatch.setattr(
+        backend_database,
+        "save_gamma_calculation_inputs",
+        lambda run, _inputs: {"calculation_id": run["calculation_id"], "payload_sha256": "a" * 64},
+    )
 
-    streamer._write_snapshot({"symbol": "SPX", "price": 6498.0})
+    streamer._write_snapshot({
+        "symbol": "SPX", "price": 6498.0,
+        "calculation_id": payload["calculation_id"],
+        "subscription_epoch_id": streamer.subscription_epoch_id,
+        "subscription_generation": 1,
+        "_calculation_inputs": {"parameters": {"quote_freshness_seconds": 30}},
+    })
 
     export_files = list((tmp_path / "exports").rglob("*.ndjson"))
     assert len(export_files) == 1

@@ -23,7 +23,11 @@ from backend.config import (
     SYMBOLS,
 )
 from backend.ai_predictor import build_ai_prediction
-from backend.database import init_db, save_prediction_snapshot
+from backend.database import (
+    init_db,
+    save_prediction_snapshot,
+    verify_prediction_calculation_lineage,
+)
 from backend.historical_context import get_historical_context, historical_adjustment
 from backend.inference import (
     GEX_INFERENCE_FEATURE_SCHEMA_VERSION,
@@ -97,6 +101,7 @@ class WorkstationPredictionCoordinator:
         passport_writer: Callable[..., dict[str, Any]] | None = None,
         snapshot_passport_writer: Callable[..., dict[str, Any]] | None = None,
         structural_journal: StructuralRegimeJournal | None = None,
+        lineage_verifier: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.streamer = streamer
         self.shadow_research = shadow_research
@@ -109,6 +114,7 @@ class WorkstationPredictionCoordinator:
         self.passport_writer = passport_writer
         self.snapshot_passport_writer = snapshot_passport_writer
         self.structural_journal = structural_journal
+        self.lineage_verifier = lineage_verifier or verify_prediction_calculation_lineage
         self.last_prediction_capture: dict[str, float] = {}
         self.publication_retry_symbols: set[str] = set()
         # Only committed input captures carry calculation_id. Their cadence is
@@ -323,7 +329,12 @@ class WorkstationPredictionCoordinator:
             subscription_generation=int(data.get("subscription_generation") or 0),
         )
 
-    def _guard_snapshot(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _guard_snapshot(
+        self,
+        data: dict[str, Any],
+        *,
+        expected_revision: tuple[Any, ...] | None = None,
+    ) -> dict[str, Any]:
         """Classify whether one payload may proceed to inference and publication."""
 
         provider = str(data.get("provider") or MARKET_DATA_PROVIDER)
@@ -397,6 +408,9 @@ class WorkstationPredictionCoordinator:
             validation_reasons.append("SUBSCRIPTION_EPOCH_MISMATCH")
         if handoff_unready:
             validation_reasons.append(f"HANDOFF_NOT_ACTIVE:{handoff_status}")
+        if expected_revision is not None and payload_revision_key(data) != expected_revision:
+            requested_state = "abstain"
+            validation_reasons.append("CALCULATION_INPUT_REVISION_CHANGED")
         return {
             "provider": provider,
             "is_fallback": is_fallback,
@@ -466,6 +480,10 @@ class WorkstationPredictionCoordinator:
     def process_payload(self, data: dict[str, Any]) -> dict[str, Any] | None:
         """Publish one backend-produced market revision and capture it when due."""
 
+        # The stream may continue publishing while inference runs.  A local
+        # immutable observation prevents that activity from changing the
+        # calculation whose retained inputs were verified below.
+        data = copy.deepcopy(data)
         symbol = str(data.get("symbol") or "").upper()
         if not symbol:
             return None
@@ -475,6 +493,39 @@ class WorkstationPredictionCoordinator:
         guard = self._guard_snapshot(data)
         if guard["requested_state"] is not None:
             return self._publish_guarded_state(symbol=symbol, data=data, guard=guard)
+
+        # A nonempty ID (or a caller's persisted=True flag) is not a receipt.
+        # Resolve the exact committed run/blob before context loading, model
+        # work or numeric publication.  This verification is once per process
+        # call; the repeated live lease checks below stay cheap. Persistence
+        # and passport issuance revalidate lineage at their own boundaries.
+        try:
+            lineage = self.lineage_verifier(
+                data,
+                symbol=symbol,
+                predicted_at_utc=datetime.now(timezone.utc),
+            )
+        except Exception:
+            logger.exception("Calculation lineage verification failed for %s", symbol)
+            lineage = {"valid": False, "reasons": ["CALCULATION_LINEAGE_UNAVAILABLE"]}
+        if not isinstance(lineage, dict) or lineage.get("valid") is not True:
+            lineage_reasons = (
+                list(lineage.get("reasons") or []) if isinstance(lineage, dict) else []
+            )
+            return self._publish_guarded_state(
+                symbol=symbol,
+                data=data,
+                guard={
+                    **guard,
+                    "requested_state": "abstain",
+                    "validation_failure_reasons": list(dict.fromkeys([
+                        *guard["validation_failure_reasons"],
+                        *lineage_reasons,
+                        "CALCULATION_LINEAGE_NOT_VERIFIED",
+                    ])),
+                },
+            )
+        verified_revision = payload_revision_key(data)
 
         provider = str(guard["provider"])
         spot = float(guard["spot"])
@@ -583,7 +634,7 @@ class WorkstationPredictionCoordinator:
 
         # Recheck after inference so a generation change or handoff that began
         # during model work cannot persist or publish the obsolete forecast.
-        guard = self._guard_snapshot(data)
+        guard = self._guard_snapshot(data, expected_revision=verified_revision)
         if guard["requested_state"] is not None:
             return self._publish_guarded_state(symbol=symbol, data=data, guard=guard)
 
@@ -591,9 +642,11 @@ class WorkstationPredictionCoordinator:
         passport = None
         now = self.monotonic_clock()
         deferred_guard = None
-        publication_guard = lambda: self._publication_allowed(data)
+        publication_guard = lambda: self._guard_snapshot(
+            data, expected_revision=verified_revision
+        )["requested_state"] is None
         with self._publication_context(data) as publication_lease:
-            guard = self._guard_snapshot(data)
+            guard = self._guard_snapshot(data, expected_revision=verified_revision)
             if not publication_lease or guard["requested_state"] is not None:
                 if guard["requested_state"] is None:
                     guard = {
@@ -619,7 +672,7 @@ class WorkstationPredictionCoordinator:
                             symbol,
                         )
 
-                guard = self._guard_snapshot(data)
+                guard = self._guard_snapshot(data, expected_revision=verified_revision)
                 if guard["requested_state"] is not None:
                     deferred_guard = guard
                     saved = None
@@ -639,7 +692,7 @@ class WorkstationPredictionCoordinator:
                             data=data,
                             publication_guard=publication_guard,
                         )
-                    guard = self._guard_snapshot(data)
+                    guard = self._guard_snapshot(data, expected_revision=verified_revision)
                     if guard["requested_state"] is not None:
                         deferred_guard = guard
                         saved = None
@@ -676,11 +729,11 @@ class WorkstationPredictionCoordinator:
         # decision-valid state to readers.
         final_guard = None
         with self._publication_context(data) as publication_lease:
-            guard = self._guard_snapshot(data)
+            guard = self._guard_snapshot(data, expected_revision=verified_revision)
             if publication_lease and guard["requested_state"] is None:
                 self._record_committed_shadow(symbol, data)
                 # Journal latency must not make the final published state stale.
-                guard = self._guard_snapshot(data)
+                guard = self._guard_snapshot(data, expected_revision=verified_revision)
             if not publication_lease or guard["requested_state"] is not None:
                 if guard["requested_state"] is None:
                     guard = {
@@ -712,7 +765,7 @@ class WorkstationPredictionCoordinator:
                             structural["journal_status"] = "FAILED"
                             logger.exception("Structural regime journal failed for %s", symbol)
                     # Persistence must not expose a forecast after its live lease expires.
-                    guard = self._guard_snapshot(data)
+                    guard = self._guard_snapshot(data, expected_revision=verified_revision)
                     if guard["requested_state"] is not None:
                         return self._publish_guarded_state(symbol=symbol, data=data, guard=guard)
                     if is_current_committed_revision and structural.get("journal_status") == "RECORDED":

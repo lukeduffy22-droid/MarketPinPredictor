@@ -42,6 +42,7 @@ def published(monkeypatch, tmp_path):
         context_loader=lambda symbol: {}, adjustment_builder=lambda *a: (0, []),
         passport_writer=lambda *a, **kw: _passport(point_estimate=7719.55, interval_lower=7700, interval_upper=7750),
         structural_journal=recorder,
+        lineage_verifier=lambda *a, **kw: {"valid": True, "reasons": []},
     )
     state = coordinator.process_payload(payload())
     yield state, stream, journal, coordinator

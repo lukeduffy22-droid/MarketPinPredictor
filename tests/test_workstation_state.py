@@ -22,6 +22,18 @@ from backend.workstation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _verified_calculation_adapter(monkeypatch):
+    # These coordinator unit tests supply synthetic stream/model/passport
+    # adapters, not real retained input rows. Database cryptographic admission
+    # has separate integration tests. Rejection tests inject an explicit
+    # verifier below; production defaults always resolve the actual DB blob.
+    monkeypatch.setattr(
+        "backend.api.lifecycle.verify_prediction_calculation_lineage",
+        lambda *_args, **_kwargs: {"valid": True, "reasons": []},
+    )
+
+
 def _payload(symbol: str = "SPX", **overrides):
     payload = {
         "symbol": symbol,
@@ -891,15 +903,17 @@ def test_stale_payload_issues_numeric_free_stale_passport():
         passport_writer=_passport_writer,
     )
 
-    state = coordinator.process_payload(
-        _payload(timestamp=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
-    )
+    committed_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    payload = _payload(timestamp=committed_timestamp, calculation_id="old-committed")
+    state = coordinator.process_payload(payload)
 
     assert passport_calls[0][1]["requested_state"] == "stale"
     assert state["status"] == "stale"
     assert state["forecast_state"] == "STALE"
     assert state["prediction"]["usable"] is False
     assert state["prediction"]["predicted_close"] is None
+    assert payload["timestamp"] == committed_timestamp
+    assert datetime.fromisoformat(state["source_as_of_utc"].replace("Z", "+00:00")) == datetime.fromisoformat(committed_timestamp)
 
 
 def test_missing_price_takes_unavailable_precedence_over_staleness():
@@ -1574,3 +1588,75 @@ def test_shadow_journal_delay_cannot_publish_a_stale_revision_as_live(monkeypatc
     assert state["status"] == "stale"
     assert state["prediction"]["predicted_close"] is None
     assert state["health"]["usable_for_prediction"] is False
+
+
+@pytest.mark.parametrize("calculation_id", [None, "nonempty-but-not-committed"])
+def test_unverified_lineage_blocks_context_model_and_forecast_save(calculation_id):
+    workstation_state_store.reset()
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unverified input must be rejected before context, model or save")
+
+    def verify(source, **kwargs):
+        calls.append((source["calculation_id"], kwargs["symbol"]))
+        return {"valid": False, "reasons": ["CALCULATION_RUN_NOT_FOUND"]}
+
+    coordinator = WorkstationPredictionCoordinator(
+        streamer=_ActiveStreamer(), shadow_research=object(), capture_seconds=60,
+        prediction_builder=forbidden, snapshot_saver=forbidden,
+        context_loader=forbidden, adjustment_builder=forbidden,
+        lineage_verifier=verify,
+    )
+    state = coordinator.process_payload(_payload(
+        calculation_id=calculation_id, calculation_inputs_persisted=True,
+    ))
+
+    assert calls == [(calculation_id, "SPX")]
+    assert state["prediction"]["predicted_close"] is None
+    assert state["health"]["usable_for_prediction"] is False
+    assert "CALCULATION_LINEAGE_NOT_VERIFIED" in state["health"]["validation_failure_reasons"]
+
+
+def test_lineage_verifier_error_abstains_before_model():
+    workstation_state_store.reset()
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("temporary input reader failure")
+
+    coordinator = WorkstationPredictionCoordinator(
+        streamer=_ActiveStreamer(), shadow_research=object(), capture_seconds=60,
+        prediction_builder=lambda *_a, **_k: pytest.fail("must not infer"),
+        lineage_verifier=unavailable,
+    )
+    state = coordinator.process_payload(_payload(calculation_id="committed"))
+
+    assert state["prediction"]["predicted_close"] is None
+    assert "CALCULATION_LINEAGE_UNAVAILABLE" in state["health"]["validation_failure_reasons"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("price", 7501.0),
+    ("net_gex", 6.0),
+    ("calculation_input_sha256", "a" * 64),
+])
+def test_model_cannot_change_verified_revision_before_persistence(field, value):
+    workstation_state_store.reset()
+    original = _payload(calculation_id="committed")
+
+    def model(symbol, source, **_kwargs):
+        source[field] = value
+        return _prediction(symbol)
+
+    coordinator = WorkstationPredictionCoordinator(
+        streamer=_ActiveStreamer(), shadow_research=object(), capture_seconds=60,
+        prediction_builder=model,
+        snapshot_saver=lambda *_a, **_k: pytest.fail("changed input must not save"),
+        context_loader=lambda _s: {}, adjustment_builder=lambda *_a: (0.0, []),
+        lineage_verifier=lambda *_a, **_k: {"valid": True, "reasons": []},
+    )
+    state = coordinator.process_payload(original)
+
+    assert original["price"] == 7500.0
+    assert state["prediction"]["predicted_close"] is None
+    assert "CALCULATION_INPUT_REVISION_CHANGED" in state["health"]["validation_failure_reasons"]

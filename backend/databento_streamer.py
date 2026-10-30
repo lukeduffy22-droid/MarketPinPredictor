@@ -5772,8 +5772,14 @@ class DatabentoGammaStreamer:
             "subscription_epoch_id": self.subscription_epoch_id,
             "timestamp": _utcnow_naive(),
             "price": spot,
-            "market_bid": chain_mid_bid,
-            "market_ask": chain_mid_ask,
+            # These are medians across option contracts, not quotes for the
+            # underlying reference price. Keep their instrument/unit boundary
+            # explicit; no independent underlying bid/ask is available here.
+            "option_chain_median_bid": chain_mid_bid,
+            "option_chain_median_ask": chain_mid_ask,
+            "option_chain_quote_units": "option_premium_points",
+            "market_bid": None,
+            "market_ask": None,
             "market_volume": None,
             "market_vwap": None,
             "provider": self.provider_name,
@@ -5968,6 +5974,17 @@ class DatabentoGammaStreamer:
                     "moneyness_upper": MONEYNESS_UPPER,
                     "risk_free_rate": _configured_risk_free_rate(),
                     "contract_multiplier": CONTRACT_MULTIPLIER,
+                    # Calendar DTE in calculated rows is a reporting bucket.
+                    # Retain the exact fractional solver inputs separately so
+                    # replay never samples another wall clock for expiry.
+                    "calculation_now_utc": calculation_now.isoformat(),
+                    "year_fractions_by_expiration": {
+                        expiration_date.isoformat(): float(years)
+                        for expiration_date, years in expiration_years.items()
+                    },
+                    "minimum_time_to_expiration_years": MIN_TTE_DAYS,
+                    "expiration_cutoff_hour_et": DATABENTO_EXPIRY_HOUR_ET,
+                    "expiration_cutoff_minute_et": DATABENTO_EXPIRY_MINUTE_ET,
                     "gex_formula_version": GEX_FORMULA_VERSION,
                     "spot_formula_version": SPOT_FORMULA_VERSION,
                     "target_formula_version": TARGET_FORMULA_VERSION,
@@ -6081,6 +6098,8 @@ class DatabentoGammaStreamer:
             "symbol": result.get("symbol"),
             "subscription_epoch_id": result.get("subscription_epoch_id"),
             "calculation_id": result.get("calculation_id"),
+            "calculation_input_sha256": result.get("calculation_input_sha256"),
+            "calculation_inputs_persisted": result.get("calculation_inputs_persisted") is True,
             "universe_sha256": result.get("universe_sha256"),
             "selected_universe_sha256": result.get("selected_universe_sha256"),
             "spot_last": spot,
@@ -6131,6 +6150,9 @@ class DatabentoGammaStreamer:
             "total_gex_net": net_gex,
             "market_bid": result.get("market_bid"),
             "market_ask": result.get("market_ask"),
+            "option_chain_median_bid": result.get("option_chain_median_bid"),
+            "option_chain_median_ask": result.get("option_chain_median_ask"),
+            "option_chain_quote_units": result.get("option_chain_quote_units"),
             "market_vwap": result.get("market_vwap"),
             "contracts_count": int(result.get("contracts") or 0),
             "expirations_min_days": int(float(result.get("expirations_min_days") or 0)),
@@ -6293,6 +6315,7 @@ class DatabentoGammaStreamer:
         is_usable = (
             payload.get("validation_is_valid") is True
             and payload.get("gamma_excluded_from_model") is False
+            and payload.get("usable_for_prediction") is True
             and current_session_universe
         )
         write_times = (
@@ -6367,6 +6390,12 @@ class DatabentoGammaStreamer:
                     and persistence_result.get("calculation_id") == result.get("calculation_id")
                     and persistence_result.get("payload_sha256")
                 )
+                if calculation_persisted:
+                    # Bind the public calculation to the actual commit receipt,
+                    # never to a later calculation or a reconstructed timestamp.
+                    result["calculation_input_sha256"] = persistence_result["payload_sha256"]
+                    result["calculation_inputs_persisted"] = True
+                    payload["calculation_input_sha256"] = persistence_result["payload_sha256"]
                 if not calculation_persisted:
                     logger.warning("Gamma input capture was not persisted for %s calculation %s", symbol, result.get("calculation_id"))
             except Exception as exc:
@@ -6375,19 +6404,23 @@ class DatabentoGammaStreamer:
         if is_usable and calculation_id and calculation_persisted:
             self._last_snapshot_write[symbol] = now
 
-        if calculation_id and not calculation_persisted:
+        if not calculation_persisted and (calculation_id or is_usable):
             # Every sink must agree that an uncommitted capture is diagnostic.
             # Retain its observations without claiming persisted lineage.
             payload.pop("calculation_id", None)
+            payload.pop("calculation_input_sha256", None)
             payload["validation_is_valid"] = False
             payload["validation_status"] = "invalid"
             payload["gamma_excluded_from_model"] = True
             payload["usable_for_prediction"] = False
-            if calculation_persistence_attempted:
-                payload["validation_failure_reasons"] = list(dict.fromkeys([
-                    *list(payload.get("validation_failure_reasons") or []),
-                    "CALCULATION_INPUT_PERSISTENCE_FAILED",
-                ]))
+            payload["validation_failure_reasons"] = list(dict.fromkeys([
+                *list(payload.get("validation_failure_reasons") or []),
+                (
+                    "CALCULATION_INPUT_PERSISTENCE_FAILED"
+                    if calculation_persistence_attempted
+                    else "CALCULATION_INPUT_CAPTURE_MISSING"
+                ),
+            ]))
             is_usable = False
 
         payload = finalize_snapshot_export_payload(
@@ -6396,6 +6429,7 @@ class DatabentoGammaStreamer:
             calculation_persisted=calculation_persisted,
             subscription_context=self.get_subscription_context(),
         )
+        is_usable = is_usable and payload.get("usable_for_prediction") is True
 
         if is_usable:
             try:
@@ -6905,6 +6939,7 @@ class DatabentoGammaStreamer:
             result_was_usable = bool(
                 result.get("validation_is_valid") is True
                 and result.get("gamma_excluded_from_model") is False
+                and result.get("usable_for_prediction", True) is True
             )
             calculation_id_claimed = bool(
                 str(result.get("calculation_id") or "").strip()
@@ -6912,6 +6947,35 @@ class DatabentoGammaStreamer:
             calculation_inputs_captured = isinstance(
                 result.get("_calculation_inputs"), dict
             )
+            if result_was_usable and not capture_valid_inputs:
+                # Numerical refreshes between retained-input captures are not
+                # issued forecasts. Keep the last acknowledged publication's
+                # original identity and timestamp; normal age gates still
+                # expire it. Never lend its ID to this newer calculation.
+                result = dict(result)
+                result.pop("calculation_id", None)
+                result.pop("calculation_input_sha256", None)
+                result.pop("_calculation_inputs", None)
+                result["calculation_inputs_persisted"] = False
+                result["validation_is_valid"] = False
+                result["gamma_excluded_from_model"] = True
+                result["usable_for_prediction"] = False
+                result["validation_failure_reasons"] = list(dict.fromkeys([
+                    *list(result.get("validation_failure_reasons") or []),
+                    "CALCULATION_CAPTURE_THROTTLED",
+                ]))
+                self._write_snapshot(result)
+                if (
+                    calculation_generation != self.active_generation
+                    or self.handoff_status != "active"
+                ):
+                    return
+                payload = self._snapshot_payload(result)
+                self.latest_invalid[market] = payload
+                if market not in self.latest_pins:
+                    self.buffers[market].append(payload)
+                self.last_diagnostic_time[market] = _utcnow_naive()
+                continue
             capture_lineage_missing = bool(
                 capture_valid_inputs
                 and result_was_usable
@@ -6940,6 +7004,10 @@ class DatabentoGammaStreamer:
                 or self.handoff_status != "active"
             ):
                 return
+            if calculation_persisted is not True:
+                result = dict(result)
+                result.pop("calculation_input_sha256", None)
+                result["calculation_inputs_persisted"] = False
             if calculation_persisted is not True and (
                 calculation_id_claimed or calculation_inputs_captured
             ):
@@ -6978,6 +7046,7 @@ class DatabentoGammaStreamer:
             if (
                 result.get("validation_is_valid") is not True
                 or result.get("gamma_excluded_from_model") is not False
+                or result.get("usable_for_prediction", True) is not True
             ):
                 payload = self._snapshot_payload(result)
                 self.latest_pins.pop(market, None)
