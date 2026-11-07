@@ -75,11 +75,13 @@ def _live_snapshots(journal, streamer, symbols, *, configured):
 
     context = _runtime_context(streamer)
     as_of_utc = datetime.now(timezone.utc)
+    reader_factory = getattr(journal, "snapshot_reader", None)
+    read_snapshot = reader_factory() if callable(reader_factory) else journal.snapshot
 
     def build(binding):
         kwargs = _live_snapshot_kwargs(binding)
         def snapshot(symbol):
-            return symbol, journal.snapshot(
+            return symbol, read_snapshot(
                 symbol,
                 as_of_utc=as_of_utc,
                 configured=symbol in configured,

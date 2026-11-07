@@ -398,8 +398,16 @@ function Test-MarketWatchdogTaskContract {
     else {
         $trigger = $triggers[0]
         $startTime = $null
-        try { $startTime = ([datetime]$trigger.StartBoundary).ToString('HH:mm') }
-        catch { $startTime = $null }
+        $startBoundary = [datetime]::MinValue
+        # An explicit offset pins UTC across DST. Require a floating local
+        # boundary; converting an old offset-bearing date can hide that drift.
+        if ([datetime]::TryParseExact(
+            [string]$trigger.StartBoundary, "yyyy-MM-dd'T'HH:mm:ss",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$startBoundary
+        ) -and $startBoundary.Second -eq 0) {
+            $startTime = $startBoundary.ToString('HH:mm')
+        }
         if (
             -not $trigger.Enabled -or
             $startTime -cne '07:50' -or
@@ -508,8 +516,15 @@ function Test-MarketStartupTaskContract {
     $times = [System.Collections.Generic.List[string]]::new()
     $weeklyShapeValid = $true
     foreach ($trigger in $weekly) {
-        try { $times.Add(([datetime]$trigger.StartBoundary).ToString('HH:mm')) }
-        catch { $weeklyShapeValid = $false }
+        $startBoundary = [datetime]::MinValue
+        if ([datetime]::TryParseExact(
+            [string]$trigger.StartBoundary, "yyyy-MM-dd'T'HH:mm:ss",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$startBoundary
+        ) -and $startBoundary.Second -eq 0) {
+            $times.Add($startBoundary.ToString('HH:mm'))
+        }
+        else { $weeklyShapeValid = $false }
         if (
             -not $trigger.Enabled -or
             [int]$trigger.DaysOfWeek -ne 62 -or
@@ -622,6 +637,9 @@ function Repair-MarketStartupBootRecovery {
                 -WeeksInterval 1 `
                 -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday `
                 -At '07:15'
+            $repairTrigger.StartBoundary = (Get-Date).ToString(
+                'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture
+            ) + 'T07:15:00'
             $repairedStatus = 'startup_universe_prestage_retry_repaired'
         }
         else {

@@ -197,7 +197,7 @@ def test_cbbo_late_commit_is_retained_without_opening_authority(cbbo_store, monk
     result = streamer._capture_opening_reference_for_bucket(
         'SPX', OPEN_UTC, now_utc=lambda: clock['now'], journal=journal)
     assert result['recorded'] and not result['progress_eligible']
-    assert result['reason'] == 'REFERENCE_CAPTURE_COMPLETED_OUTSIDE_INTENDED_BUCKET'
+    assert result['reason'] == 'REFERENCE_ATTEMPT_DEADLINE_EXCEEDED'
     with engine.connect() as connection:
         assert connection.execute(text('SELECT count(*) FROM orb_cbbo_reference_samples')).scalar() == 1
         assert connection.execute(text('SELECT progress_eligible FROM orb_cbbo_reference_sample_decisions')).scalar() == 0

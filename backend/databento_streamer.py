@@ -144,6 +144,10 @@ ORB_REFERENCE_SHUTDOWN_BARRIER_TIMEOUT_SECONDS = max(
         )
     ),
 )
+# Audit-only rejection finalization is separate from capture admission. It may
+# append a negative sidecar after a committed raw sample times out, never a new
+# raw sample or an eligible decision after the capture budget expires.
+ORB_REFERENCE_DECISION_CLEANUP_TIMEOUT_SECONDS = 0.25
 ORB_REFERENCE_FAILED_ATTEMPT_LIMIT = 64
 ORB_REFERENCE_FAILURE_WARNING_INTERVAL_SECONDS = 60.0
 ORB_STAGED_SUBSCRIPTION_FAMILIES = ("SPX", "NDX", "VIX", "RUT")
@@ -1900,6 +1904,8 @@ class DatabentoGammaStreamer:
         self._optional_family_canary_generation = 0
         self._optional_family_canary_active_since_monotonic = 0.0
         self._optional_family_canary_lock = threading.Lock()
+        self._optional_family_canary_population_identity: tuple[str, int] | None = None
+        self._optional_family_canary_established_core_families: set[str] = set()
         self.optional_family_rollback_evidence: dict[str, object] | None = None
         self.optional_family_canary_evaluation_evidence: dict[str, object] = {
             "evaluation_deferred": False,
@@ -1968,6 +1974,7 @@ class DatabentoGammaStreamer:
         # with shutdown. Expensive quote copying/parity work stays concurrent,
         # while stop can establish that no reference commit remains in flight.
         self._orb_reference_persist_barrier = threading.Lock()
+        self._orb_reference_capture_context = threading.local()
         self._orb_reference_recent_buckets_by_market: dict[
             str, deque[tuple[datetime, int, str]]
         ] = {symbol: deque(maxlen=4) for symbol in self.symbols}
@@ -2128,7 +2135,7 @@ class DatabentoGammaStreamer:
         return True
 
     def _processing_clock_telemetry(self) -> dict[str, object]:
-        with self._clock_evidence_lock:
+        with self._opening_reference_lock(self._clock_evidence_lock):
             samples = tuple(self._receive_lag_window)
             replay_pending = self._clock_replay_pending
         material_negative = sum(
@@ -2167,7 +2174,8 @@ class DatabentoGammaStreamer:
             "readiness_scope": "provider_timing_only_opening_requires_current_bucket_and_primary_admission",
         }
         observer = getattr(self, "_host_clock_shadow", None)
-        if observer is not None:
+        capture_budget = getattr(getattr(self, "_orb_reference_capture_context", None), "budget", None)
+        if observer is not None and capture_budget is None:
             evidence["host_clock_shadow"] = observer.snapshot(evidence)
         return evidence
 
@@ -7144,13 +7152,16 @@ class DatabentoGammaStreamer:
         # Index rebuilds are serialized, and each worker snapshots the complete
         # immutable per-market tuple while that index remains stable. The
         # expensive parity calculation happens after the snapshot locks are released.
-        # Publication must precede universe/quote locks. Waiting for a forecast
-        # save while holding the quote lock would also stall the live reader.
-        with self._prediction_publication_lock, self._universe_index_lock:
+        # Forecast persistence owns the publication barrier, not quote capture.
+        # Universe metadata is stable under its own lock. Copy runtime scalars
+        # briefly, then release runtime before taking the quote lock: existing
+        # lifecycle readers can acquire quote -> runtime in that order.
+        with self._opening_reference_lock(self._universe_index_lock):
             self._ensure_universe_index()
-            subscription_epoch_id = self.subscription_epoch_id
-            generation = int(self.active_generation)
-            handoff_status = str(self.handoff_status)
+            with self._opening_reference_lock(self._runtime_context_lock):
+                subscription_epoch_id = self.subscription_epoch_id
+                generation = int(self._active_generation)
+                handoff_status = str(self._handoff_status)
             selected_hash = str(
                 self.subscription_metadata.get("selected_universe_sha256") or ""
             ).lower().strip()
@@ -7204,7 +7215,7 @@ class DatabentoGammaStreamer:
             # never mutated in place; filtering, hashing, and dict copies can
             # therefore happen after release without widening the reader's
             # critical section during the opening burst.
-            with self._fresh_quote_lock:
+            with self._opening_reference_lock(self._fresh_quote_lock):
                 mapping_snapshot = tuple(self.symbol_mappings.values())
                 quote_snapshot = {
                     raw_symbol: self.quotes.get(raw_symbol)
@@ -7695,16 +7706,79 @@ class DatabentoGammaStreamer:
             "universe_state_unchanged": True,
         }, None
 
+    def _opening_reference_stage(self, name: str | None) -> None:
+        """Time fixed capture stages in memory; never query gates or do IO."""
+        context = getattr(self, "_orb_reference_capture_context", None)
+        diagnostics = getattr(context, "diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            return
+        now = time.monotonic()
+        previous = getattr(context, "stage", None)
+        started = getattr(context, "stage_started", None)
+        if previous is not None and started is not None:
+            elapsed = diagnostics.setdefault("capture_stage_elapsed_seconds", {})
+            elapsed[previous] = elapsed.get(previous, 0.0) + max(0.0, now - started)
+            diagnostics["capture_completed_stage"] = previous
+        context.stage, context.stage_started = name, now if name is not None else None
+
+    def _opening_reference_rejection_stage(self, name: str | None = None) -> None:
+        context = getattr(self, "_orb_reference_capture_context", None)
+        diagnostics = getattr(context, "diagnostics", None)
+        stage = name or getattr(context, "stage", None)
+        if isinstance(diagnostics, dict) and stage is not None:
+            diagnostics.setdefault("capture_rejection_stage", stage)
+
+    @contextmanager
+    def _opening_reference_lock(self, lock):
+        """Bound sampler lock waits without changing other callers' locks."""
+        budget = getattr(getattr(self, "_orb_reference_capture_context", None), "budget", None)
+        if budget is None:
+            with lock:
+                yield
+            return
+        acquired = False
+        context = self._orb_reference_capture_context
+        diagnostics = getattr(context, "diagnostics", None)
+        lock_name = next((name for name, attribute in (
+            ("publication", "_prediction_publication_lock"),
+            ("universe", "_universe_index_lock"),
+            ("quote", "_fresh_quote_lock"),
+            ("provider_clock", "_clock_evidence_lock"),
+            ("runtime_context", "_runtime_context_lock"),
+        ) if getattr(self, attribute, None) is lock), "other_shared_state")
+        wait_started = time.monotonic()
+        try:
+            try:
+                while not acquired:
+                    budget.require_current()
+                    acquired = lock.acquire(timeout=min(.025, budget.remaining()))
+                budget.require_current()
+            except TimeoutError:
+                self._opening_reference_rejection_stage()
+                if isinstance(diagnostics, dict):
+                    diagnostics.setdefault("capture_rejected_lock", lock_name)
+                    diagnostics.setdefault("capture_rejected_lock_acquired", acquired)
+                raise
+            finally:
+                if isinstance(diagnostics, dict):
+                    waits = diagnostics.setdefault("capture_lock_wait_seconds", {})
+                    waits[lock_name] = waits.get(lock_name, 0.0) + max(0.0, time.monotonic() - wait_started)
+            yield
+        finally:
+            if acquired:
+                lock.release()
+
     def _opening_reference_context_is_current(
         self,
         snapshot: dict[str, object],
     ) -> bool:
         market = str(snapshot["market"])
-        with self._prediction_publication_lock, self._universe_index_lock:
+        with self._opening_reference_lock(self._universe_index_lock):
             records = self._universe_records_by_market.get(market, ())
-            current_subscription_epoch_id = self.subscription_epoch_id
-            current_handoff_status = self.handoff_status
-            current_generation = int(self.active_generation)
+            with self._opening_reference_lock(self._runtime_context_lock):
+                current_subscription_epoch_id = self.subscription_epoch_id
+                current_handoff_status = str(self._handoff_status)
+                current_generation = int(self._active_generation)
             selected_universe_sha256 = str(
                 self.subscription_metadata.get("selected_universe_sha256") or ""
             )
@@ -7747,7 +7821,7 @@ class DatabentoGammaStreamer:
             # As in the initial snapshot, retain stable mapping object
             # references under the reader lock and do Python filtering/hashing
             # only after release.
-            with self._fresh_quote_lock:
+            with self._opening_reference_lock(self._fresh_quote_lock):
                 mapping_snapshot = tuple(self.symbol_mappings.values())
 
         mapping_versions_by_symbol: dict[str, str] = {}
@@ -7788,6 +7862,7 @@ class DatabentoGammaStreamer:
         result: dict[str, object],
         intended_bucket_utc: datetime,
         attempt_completed_at_utc: datetime,
+        persistence_budget=None,
     ) -> dict[str, object]:
         """Append a final progress decision without modifying raw evidence."""
         if result.get("recorded") is not True:
@@ -7822,6 +7897,11 @@ class DatabentoGammaStreamer:
             result.get("reason") or "REFERENCE_PROGRESS_INELIGIBLE"
         )
         try:
+            budget_options = ({"persistence_budget": persistence_budget}
+                              if persistence_budget is not None
+                              and getattr(journal, "supports_reference_persistence_budget", False)
+                              else {})
+            self._opening_reference_stage("decision_persistence")
             decision = dict(
                 decision_recorder(
                     sample_id=str(result.get("sample_id") or ""),
@@ -7830,17 +7910,22 @@ class DatabentoGammaStreamer:
                     attempt_completed_at_utc=attempt_completed_at_utc,
                     progress_eligible=eligible,
                     reason=reason,
+                    **budget_options,
                 )
             )
         except Exception as exc:
             logger.exception("ORB reference decision persistence failed: %s", exc)
             decision = {"recorded": False}
         if decision.get("recorded") is not True:
+            self._opening_reference_rejection_stage("decision_persistence")
+        self._opening_reference_stage("result_validation")
+        if decision.get("recorded") is not True:
             result.update(
                 progress_eligible=False,
                 progress_decision_pending=True,
                 progress_decision_recorded=False,
-                reason="REFERENCE_PROGRESS_DECISION_PERSISTENCE_FAILED",
+                reason=(result.get("reason") or decision.get("reason")
+                        or "REFERENCE_PROGRESS_DECISION_PERSISTENCE_FAILED"),
             )
             return result
         result.update(
@@ -7848,6 +7933,15 @@ class DatabentoGammaStreamer:
             progress_decision_recorded=True,
             progress_decided_at_utc=attempt_completed_at_utc.isoformat(),
         )
+        if persistence_budget is not None and persistence_budget.reason():
+            # The immutable sidecar records the post-raw-commit observation.
+            # A delayed sidecar return is not current runtime authority, even
+            # if the underlying COMMIT succeeded before the delay/stop.
+            result.update(
+                progress_eligible=False,
+                progress_decision_returned_after_budget=True,
+                reason=result.get("reason") or persistence_budget.reason(),
+            )
         return result
 
     def _complete_opening_reference_persisted_sample(
@@ -7861,6 +7955,7 @@ class DatabentoGammaStreamer:
         attempt_deadline_utc: datetime | None = None,
         attempt_deadline_monotonic: float | None = None,
         attempt_cancel_event: threading.Event | None = None,
+        persistence_budget=None,
     ) -> dict[str, object]:
         """Evaluate and retain the final decision while holding the save barrier."""
         if result.get("recorded") is not True:
@@ -7950,6 +8045,7 @@ class DatabentoGammaStreamer:
             result=result,
             intended_bucket_utc=decision_bucket,
             attempt_completed_at_utc=decision_completed_at,
+            persistence_budget=persistence_budget,
         )
 
     def _opening_reference_persist_rejection_reason(
@@ -8013,7 +8109,134 @@ class DatabentoGammaStreamer:
             return "REFERENCE_STATE_CHANGED_DURING_SAMPLE"
         return None
 
-    def _capture_opening_reference_once(
+    def _finalize_incomplete_opening_reference_decision(
+        self, *, journal, result: dict[str, object], intended_bucket: datetime | None,
+        clock: Callable[[], datetime],
+    ) -> dict[str, object]:
+        """Bound a negative terminal audit append after the capture path failed.
+
+        The capture budget still owns quote/raw/positive-decision admission.
+        Reusing that expired budget for audit finalization stranded committed
+        raw samples. No historical rows or already-final decisions are changed.
+        A busy/unavailable database leaves an explicit pending, ineligible result.
+        """
+        if result.get("recorded") is not True or result.get("progress_decision_recorded") is True:
+            return result
+        from backend.database import OrbPersistenceBudget
+
+        result.update(
+            progress_eligible=False,
+            progress_decision_pending=True,
+            progress_decision_recorded=False,
+            progress_decision_cleanup_attempted=True,
+            reason=result.get("reason") or "REFERENCE_PROGRESS_DECISION_PERSISTENCE_FAILED",
+        )
+        try:
+            bucket = intended_bucket or datetime.fromisoformat(
+                str(result.get("sample_timestamp_utc") or "").replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+            completed = clock().astimezone(timezone.utc)
+        except Exception as exc:
+            result["progress_decision_cleanup_error"] = "REFERENCE_DECISION_TIMESTAMP_UNAVAILABLE"
+            result["progress_decision_cleanup_error_type"] = type(exc).__name__
+            return result
+        cleanup_budget = OrbPersistenceBudget(
+            time.monotonic() + ORB_REFERENCE_DECISION_CLEANUP_TIMEOUT_SECONDS
+        )
+        cleanup_started = time.monotonic()
+        result["progress_decision_cleanup_timeout_seconds"] = ORB_REFERENCE_DECISION_CLEANUP_TIMEOUT_SECONDS
+        self._opening_reference_stage("rejection_decision_cleanup")
+        result = self._finalize_opening_reference_decision(
+            journal=journal, result=result, intended_bucket_utc=bucket,
+            attempt_completed_at_utc=completed, persistence_budget=cleanup_budget,
+        )
+        result["progress_decision_cleanup_elapsed_seconds"] = max(0.0, time.monotonic() - cleanup_started)
+        if result.get("progress_decision_recorded") is not True:
+            result["progress_decision_cleanup_error"] = (
+                cleanup_budget.reason() or "REFERENCE_PROGRESS_DECISION_PERSISTENCE_FAILED"
+            )
+        return result
+
+    def _capture_opening_reference_once(self, market: str, **options) -> dict[str, object]:
+        """Own one budget from initial snapshot through final persistence."""
+        from backend.database import OrbPersistenceBudget
+
+        clock = options.get("now_utc") or (lambda: datetime.now(timezone.utc))
+        intended = options.get("intended_bucket_utc")
+        wall_deadline = options.get("attempt_deadline_utc")
+        if intended is not None:
+            intended = intended.astimezone(timezone.utc)
+        if wall_deadline is not None:
+            wall_deadline = wall_deadline.astimezone(timezone.utc)
+        cancel = options.get("attempt_cancel_event")
+        deadline = time.monotonic() + ORB_REFERENCE_ATTEMPT_TIMEOUT_SECONDS
+        supplied_deadline = options.get("attempt_deadline_monotonic")
+        if supplied_deadline is not None:
+            supplied_deadline = float(supplied_deadline)
+            deadline = min(deadline, supplied_deadline) if math.isfinite(supplied_deadline) else supplied_deadline
+
+        def cancellation_reason():
+            if self._stop_event.is_set() or (intended is not None and not self.is_running):
+                return "REFERENCE_STREAMER_STOPPING"
+            if cancel is not None and cancel.is_set():
+                return "REFERENCE_ATTEMPT_DEADLINE_EXCEEDED"
+            observed = clock().astimezone(timezone.utc) if wall_deadline is not None or intended is not None else None
+            if wall_deadline is not None and observed >= wall_deadline:
+                return "REFERENCE_ATTEMPT_DEADLINE_EXCEEDED"
+            if intended is not None and self._orb_reference_bucket(observed) != intended:
+                return "REFERENCE_CAPTURE_COMPLETED_OUTSIDE_INTENDED_BUCKET"
+            return None
+
+        budget = OrbPersistenceBudget(deadline, cancellation_reason=cancellation_reason)
+        context = getattr(self, "_orb_reference_capture_context", None)
+        if context is None:
+            context = self._orb_reference_capture_context = threading.local()
+        previous_budget = getattr(context, "budget", None)
+        previous_result = getattr(context, "result", None)
+        previous_diagnostics = getattr(context, "diagnostics", None)
+        previous_stage = getattr(context, "stage", None)
+        previous_stage_started = getattr(context, "stage_started", None)
+        context.budget, context.result = budget, None
+        context.diagnostics = options.get("attempt_diagnostics")
+        context.stage, context.stage_started = None, None
+        self._opening_reference_stage("initial_checks")
+        try:
+            result = self._capture_opening_reference_budgeted(market, **options)
+            if result.get("reason") is not None or result.get("recorded") is not True:
+                self._opening_reference_rejection_stage()
+            return self._finalize_incomplete_opening_reference_decision(
+                journal=options.get("journal"), result=result,
+                intended_bucket=intended, clock=clock,
+            )
+        except TimeoutError:
+            self._opening_reference_rejection_stage()
+            result = dict(context.result or {"recorded": False})
+            result.update(progress_eligible=False, reason=budget.reason() or "REFERENCE_ATTEMPT_DEADLINE_EXCEEDED")
+            if result.get("recorded") is True:
+                result.update(progress_decision_pending=True, progress_decision_recorded=False)
+            return self._finalize_incomplete_opening_reference_decision(
+                journal=options.get("journal"), result=result,
+                intended_bucket=intended, clock=clock,
+            )
+        except Exception:
+            # Keep the raw-commit witness if a post-commit validation callback
+            # fails; the outer sampler must not replace it with recorded=False.
+            if not isinstance(context.result, dict) or context.result.get("recorded") is not True:
+                raise
+            logger.exception("ORB reference post-persist validation failed for %s", market)
+            result = dict(context.result)
+            result.update(progress_eligible=False, reason="REFERENCE_POST_PERSIST_VALIDATION_FAILED")
+            return self._finalize_incomplete_opening_reference_decision(
+                journal=options.get("journal"), result=result,
+                intended_bucket=intended, clock=clock,
+            )
+        finally:
+            self._opening_reference_stage(None)
+            context.budget, context.result = previous_budget, previous_result
+            context.diagnostics = previous_diagnostics
+            context.stage, context.stage_started = previous_stage, previous_stage_started
+
+    def _capture_opening_reference_budgeted(
         self,
         market: str,
         *,
@@ -8100,6 +8323,10 @@ class DatabentoGammaStreamer:
         window = live_subscription_window(observed_at)
         if window.get("state") != "regular_session":
             return {"recorded": False, "reason": "OUTSIDE_REGULAR_SESSION"}
+        if intended_bucket is not None and expected_subscription_generation is None:
+            # Resolve default identity after budget scope and initial bucket
+            # validation; this property also takes a shared context lock.
+            expected_subscription_generation = int(self.active_generation)
         clock_evidence = self._processing_clock_telemetry()
         clock_status = str(clock_evidence.get("status") or "unknown")
         gate_evidence: dict[str, object] = {
@@ -8107,21 +8334,82 @@ class DatabentoGammaStreamer:
             "processing_clock": clock_evidence,
             "pair_evaluation": "not_evaluated",
         }
-        with self._prediction_publication_lock:
+        # These diagnostics must not wait behind forecast persistence. Runtime
+        # identity has its own short lock; handoff maps are copied only when
+        # their publication lock is immediately available.
+        with self._opening_reference_lock(self._runtime_context_lock):
+            diagnostic_epoch = self.subscription_epoch_id
+            diagnostic_generation = int(self._active_generation)
+            arrivals = self._quote_arrivals
             gate_evidence["handoff"] = {
-                "status": self.handoff_status,
+                "status": str(self._handoff_status),
                 "reason": self.handoff_reason,
                 "required_symbols": list(self.required_handoff_symbols),
                 "missing_configured_symbols": list(self.missing_required_handoff_symbols),
-                "missing_fresh_symbols": [
-                    symbol for symbol in self.required_handoff_symbols
-                    if symbol not in self._fresh_markets_seen
-                ],
-                "fresh_observations": {
-                    symbol: {"generation": generation, "age_seconds": time.monotonic() - received}
-                    for symbol, (generation, received) in self._fresh_market_observations.items()
-                },
+                "missing_fresh_symbols": None,
+                "fresh_observations": None,
+                "fresh_observations_available": False,
+                "fresh_observations_unavailable_reason": "PUBLICATION_BUSY",
             }
+            # First-family receipt/admission milestones otherwise disappear
+            # when a reconnect replaces _quote_arrivals. Retain a detached
+            # diagnostic snapshot even when the clock gate rejects before
+            # quote selection. These observations never authorize admission.
+            if (
+                arrivals.epoch == diagnostic_epoch
+                and arrivals.generation == diagnostic_generation
+            ):
+                gate_evidence["quote_arrival_diagnostics"] = arrivals.snapshot()
+            else:
+                gate_evidence["quote_arrival_diagnostics"] = {
+                    "authority": "DIAGNOSTIC_ONLY",
+                    "available": False,
+                    "reason": "ARRIVAL_DIAGNOSTICS_IDENTITY_MISMATCH",
+                }
+            gate_evidence["transport_counters"] = {
+                "scope": "process_shared_cumulative",
+                "authority": "DIAGNOSTIC_ONLY",
+                "semantics": (
+                    "Shared lifetime counters sampled during capture; not "
+                    "per-family counts or an atomic transport snapshot"
+                ),
+                "messages_received": self.messages_received,
+                "quote_records_seen": self.quote_records_seen,
+                "invalid_quote_records": self.invalid_quote_records,
+                "crossed_quote_records": self.crossed_quote_records,
+                "unmapped_quote_records": self.unmapped_quote_records,
+                "provider_timestamp_missing_records": self.provider_timestamp_missing_records,
+                "provider_timestamp_order_errors": self.provider_timestamp_order_errors,
+                "provider_queue_full_warnings": self.provider_queue_full_warnings,
+                "provider_skipped_records": self.provider_skipped_records,
+            }
+        if self._prediction_publication_lock.acquire(blocking=False):
+            try:
+                handoff_evidence = gate_evidence["handoff"]
+                if (
+                    self.subscription_epoch_id == diagnostic_epoch
+                    and self.active_generation == diagnostic_generation
+                ):
+                    handoff_evidence.update(
+                        missing_fresh_symbols=[
+                            symbol for symbol in self.required_handoff_symbols
+                            if symbol not in self._fresh_markets_seen
+                        ],
+                        fresh_observations={
+                            symbol: {"generation": generation,
+                                     "age_seconds": time.monotonic() - received}
+                            for symbol, (generation, received)
+                            in self._fresh_market_observations.items()
+                        },
+                        fresh_observations_available=True,
+                        fresh_observations_unavailable_reason=None,
+                    )
+                else:
+                    handoff_evidence["fresh_observations_unavailable_reason"] = (
+                        "RUNTIME_IDENTITY_CHANGED_DURING_DIAGNOSTIC_COPY"
+                    )
+            finally:
+                self._prediction_publication_lock.release()
         if attempt_diagnostics is not None:
             attempt_diagnostics["opening_gate_evidence"] = gate_evidence
         if clock_status != "synchronized":
@@ -8130,6 +8418,7 @@ class DatabentoGammaStreamer:
                 "reason": "PROCESSING_CLOCK_NOT_SYNCHRONIZED",
             }
         trading_date = observed_at.astimezone(_NY_TZ).date()
+        self._opening_reference_stage("input_snapshot")
         snapshot, reason = self._snapshot_opening_reference_inputs(
             market,
             trading_date=trading_date,
@@ -8150,6 +8439,7 @@ class DatabentoGammaStreamer:
                 "reason": "REFERENCE_CAPTURE_STARTED_OUTSIDE_INTENDED_BUCKET",
                 "progress_eligible": False,
             }
+        self._opening_reference_stage("parity_calculation")
         payload, reason = self._compute_opening_reference_payload(
             snapshot,
             sample_timestamp_utc=self._orb_reference_bucket(captured_at),
@@ -8164,18 +8454,31 @@ class DatabentoGammaStreamer:
         # Shutdown publishes its stop request before waiting on this barrier.
         # A save already inside the critical section completes before stop
         # returns; a worker arriving afterward observes the stop and cannot
-        # begin persistence. Lock order is persist -> publication -> universe
-        # -> quote; stop releases its publication/quote locks before this barrier.
+        # begin persistence. Capture uses persist -> universe -> short runtime
+        # snapshot, then quote after runtime release. Forecast publication is
+        # independent; stop releases its state locks before this barrier.
+        self._opening_reference_stage("persist_barrier_wait")
         persist_lock_wait_started = time.monotonic()
-        with self._orb_reference_persist_barrier:
+        persistence_budget = self._orb_reference_capture_context.budget
+        while True:
+            reason = persistence_budget.reason()
+            if reason:
+                if attempt_diagnostics is not None:
+                    attempt_diagnostics["persist_lock_wait_seconds"] = max(0.0, time.monotonic() - persist_lock_wait_started)
+                    attempt_diagnostics["persist_lock_held_seconds"] = 0.0
+                return {"recorded": False, "reason": reason, "progress_eligible": False}
+            if self._orb_reference_persist_barrier.acquire(timeout=min(0.025, persistence_budget.remaining())):
+                break
+        try:
             persist_lock_acquired = time.monotonic()
             if attempt_diagnostics is not None:
                 attempt_diagnostics["persist_lock_wait_seconds"] = max(
                     0.0, persist_lock_acquired - persist_lock_wait_started
                 )
             try:
+                self._opening_reference_stage("pre_persist_context")
                 persist_observed_at = clock().astimezone(timezone.utc)
-                rejection_reason = self._opening_reference_persist_rejection_reason(
+                rejection_reason = persistence_budget.reason() or self._opening_reference_persist_rejection_reason(
                     snapshot=snapshot,
                     observed_at_utc=persist_observed_at,
                     intended_bucket_utc=intended_bucket,
@@ -8198,11 +8501,15 @@ class DatabentoGammaStreamer:
                     if rejection_reason != "REFERENCE_STATE_CHANGED_DURING_SAMPLE":
                         rejection["progress_eligible"] = False
                     return rejection
+                self._opening_reference_stage("raw_persistence")
                 result = dict(
                     journal.record_reference(
-                        {**payload, "_defer_progress_decision": True}
+                        {**payload, "_defer_progress_decision": True, "_persistence_budget": persistence_budget}
                     )
                 )
+                self._orb_reference_capture_context.result = result
+                if result.get("recorded") is True:
+                    self._opening_reference_stage("post_persist_context")
                 return self._complete_opening_reference_persisted_sample(
                     journal=journal,
                     result=result,
@@ -8212,12 +8519,15 @@ class DatabentoGammaStreamer:
                     attempt_deadline_utc=normalized_deadline_utc,
                     attempt_deadline_monotonic=attempt_deadline_monotonic,
                     attempt_cancel_event=attempt_cancel_event,
+                    persistence_budget=persistence_budget,
                 )
             finally:
                 if attempt_diagnostics is not None:
                     attempt_diagnostics["persist_lock_held_seconds"] = max(
                         0.0, time.monotonic() - persist_lock_acquired
                     )
+        finally:
+            self._orb_reference_persist_barrier.release()
 
     def _capture_opening_reference_for_bucket(
         self,
@@ -8263,7 +8573,7 @@ class DatabentoGammaStreamer:
         expected_generation = (
             int(expected_subscription_generation)
             if expected_subscription_generation is not None
-            else int(self.active_generation)
+            else None
         )
         attempt_diagnostics: dict[str, object] = {
             "opening_gate_evidence": {"pair_evaluation": "not_evaluated", "gates_evaluated": False}
@@ -8296,7 +8606,19 @@ class DatabentoGammaStreamer:
         except ValueError:
             pass
         if completed_at is None:
-            completed_at = clock().astimezone(timezone.utc)
+            try:
+                completed_at = clock().astimezone(timezone.utc)
+            except Exception as exc:
+                # Retain a committed raw witness even when completion timing
+                # cannot be established. Never invent a decision timestamp or
+                # let the outer sampler replace this with recorded=False.
+                result.update(
+                    progress_eligible=False,
+                    timing_metadata_unavailable=True,
+                    timing_metadata_error_type=type(exc).__name__,
+                    reason=result.get("reason") or "REFERENCE_CAPTURE_CLOCK_UNAVAILABLE",
+                )
+                return result
         result.update(
             {
                 "intended_sample_timestamp_utc": intended_bucket.isoformat(),
@@ -8381,6 +8703,16 @@ class DatabentoGammaStreamer:
             "subscription_generation": int(subscription_generation),
         }
         for key in (
+            "sample_id",
+            "progress_decision_pending",
+            "progress_decision_recorded",
+            "progress_decision_cleanup_attempted",
+            "progress_decision_cleanup_timeout_seconds",
+            "progress_decision_cleanup_elapsed_seconds",
+            "progress_decision_cleanup_error",
+            "progress_decision_cleanup_error_type",
+            "timing_metadata_unavailable",
+            "timing_metadata_error_type",
             "attempt_started_at_utc",
             "attempt_completed_at_utc",
             "attempt_duration_seconds",
@@ -8388,6 +8720,12 @@ class DatabentoGammaStreamer:
             "attempt_deadline_seconds",
             "persist_lock_wait_seconds",
             "persist_lock_held_seconds",
+            "capture_stage_elapsed_seconds",
+            "capture_completed_stage",
+            "capture_rejection_stage",
+            "capture_lock_wait_seconds",
+            "capture_rejected_lock",
+            "capture_rejected_lock_acquired",
             "sample_timestamp_utc",
             "subscription_epoch_id",
             "subscription_generation",
@@ -8487,10 +8825,18 @@ class DatabentoGammaStreamer:
         """Persist one lightweight reference per configured wall-clock bucket."""
         completed_by_market_generation: dict[tuple[str, str, int], datetime] = {}
         timed_out_by_market_generation: dict[tuple[str, str, int], datetime] = {}
+        capacity_reported_by_market_generation: dict[
+            tuple[str, str, int], datetime
+        ] = {}
         startup_markets = tuple(dict.fromkeys(self.symbols))
         if not startup_markets:
             return
         in_flight: dict[Future[dict[str, object]], _OrbReferenceAttempt] = {}
+        # A timed-out worker may still occupy its executor lane. Keep it in
+        # admission accounting until it actually finishes, without publishing
+        # its late result. Two unresolved attempts retain one spare per market.
+        retired: dict[Future[dict[str, object]], _OrbReferenceAttempt] = {}
+        maximum_unresolved_per_market = 2
         check_future = None
         check_key = None
         completed_checks: set[tuple] = set()
@@ -8593,6 +8939,9 @@ class DatabentoGammaStreamer:
                 self.last_orb_reference_results[market] = result
 
         def collect_completed() -> None:
+            for future in tuple(retired):
+                if future.done():
+                    del retired[future]
             observed_monotonic = time.monotonic()
             for future, attempt in tuple(in_flight.items()):
                 if not future.done():
@@ -8600,6 +8949,11 @@ class DatabentoGammaStreamer:
                         continue
                     del in_flight[future]
                     attempt.cancel_event.set()
+                    # Pending work can be cancelled; a running worker remains
+                    # counted until done and must observe its existing guard.
+                    future.cancel()
+                    if not future.done():
+                        retired[future] = attempt
                     timeout_key = (
                         attempt.market,
                         attempt.subscription_epoch_id,
@@ -8689,16 +9043,14 @@ class DatabentoGammaStreamer:
                         outstanding_markets = {
                             attempt.market for attempt in in_flight.values()
                         }
+                        capacity_rejections = []
                         # Optional-family rollback mutates self.symbols under this
                         # lock. Keep dispatch inside the same short critical section
                         # so every submission is ordered before or after rollback.
-                        # Runtime identity is guarded by the publication lock.
-                        # Keep the global lock order used by snapshot/recheck:
-                        # publication -> universe -> quote.
-                        with (
-                            self._prediction_publication_lock,
-                            self._universe_index_lock,
-                        ):
+                        # Do not wait for forecast persistence to dispatch the
+                        # next bucket. Universe mutation is ordered here; each
+                        # worker independently verifies its captured identity.
+                        with self._universe_index_lock:
                             # The lock may have been contended by an index rebuild
                             # or staged-universe transition. Re-read both clocks and
                             # runtime identity after acquiring it; otherwise the
@@ -8714,8 +9066,9 @@ class DatabentoGammaStreamer:
                                 intended_bucket = self._orb_reference_bucket(
                                     dispatch_observed
                                 )
-                                attempted_epoch_id = self.subscription_epoch_id
-                                attempted_generation = int(self.active_generation)
+                                with self._runtime_context_lock:
+                                    attempted_epoch_id = self.subscription_epoch_id
+                                    attempted_generation = int(self._active_generation)
                                 scheduled_markets = tuple(dict.fromkeys(self.symbols))
                                 for market in scheduled_markets:
                                     completion_key = (
@@ -8761,6 +9114,41 @@ class DatabentoGammaStreamer:
                                         + deadline_seconds,
                                         cancel_event=threading.Event(),
                                     )
+                                    unresolved = sum(
+                                        previous.market == market
+                                        for previous in retired.values()
+                                    )
+                                    if unresolved >= maximum_unresolved_per_market:
+                                        if (
+                                            capacity_reported_by_market_generation.get(
+                                                completion_key
+                                            )
+                                            != intended_bucket
+                                        ):
+                                            capacity_reported_by_market_generation[
+                                                completion_key
+                                            ] = intended_bucket
+                                            capacity_rejections.append((
+                                                attempt,
+                                                {
+                                                    "recorded": False,
+                                                    "progress_eligible": False,
+                                                    "reason": "REFERENCE_SAMPLER_CAPACITY_EXHAUSTED",
+                                                    "intended_sample_timestamp_utc": intended_bucket.isoformat(),
+                                                    "attempt_started_at_utc": dispatch_observed.isoformat(),
+                                                    "attempt_completed_at_utc": dispatch_observed.isoformat(),
+                                                    "attempt_duration_seconds": 0.0,
+                                                    "opening_gate_evidence": {
+                                                        "pair_evaluation": "not_evaluated",
+                                                        "gates_evaluated": False,
+                                                        "sampler_capacity": {
+                                                            "unresolved_attempts": unresolved,
+                                                            "maximum_unresolved_attempts": maximum_unresolved_per_market,
+                                                        },
+                                                    },
+                                                },
+                                            ))
+                                        continue
                                     future = executor.submit(
                                         self._capture_opening_reference_for_bucket,
                                         market,
@@ -8778,6 +9166,10 @@ class DatabentoGammaStreamer:
                                         ),
                                     )
                                     in_flight[future] = attempt
+                        # Durable failure evidence must not hold reader-facing
+                        # publication/universe locks during filesystem writes.
+                        for attempt, result in capacity_rejections:
+                            publish_result(attempt, result)
                 except Exception as exc:
                     logger.exception("ORB reference sampler error: %s", exc)
                 # The first live quotes and provider-clock proof can arrive
@@ -8800,7 +9192,11 @@ class DatabentoGammaStreamer:
                 check_future.cancel()
             for attempt in in_flight.values():
                 attempt.cancel_event.set()
+            for attempt in retired.values():
+                attempt.cancel_event.set()
             for future in in_flight:
+                future.cancel()
+            for future in retired:
                 future.cancel()
             # Python cannot kill a running worker. Cooperative cancellation and
             # the pre-persist guard prevent late writes; do not let one blocked
@@ -9288,6 +9684,8 @@ class DatabentoGammaStreamer:
             if payload is None and updated is None:
                 continue
             observations[family] = {
+                "subscription_epoch_id": (payload or {}).get("subscription_epoch_id"),
+                "subscription_generation": (payload or {}).get("subscription_generation"),
                 "validation_is_valid": family in self.latest_pins,
                 "data_age_seconds": max(0.0, (_utcnow_naive() - updated).total_seconds()) if updated else None,
                 "receive_to_process_lag_p95_seconds": (payload or {}).get("receive_to_process_lag_p95_seconds"),
@@ -9300,6 +9698,72 @@ class DatabentoGammaStreamer:
                 ),
             }
         return observations
+
+    def _canary_core_population_readiness(
+        self,
+        observations: Mapping[str, Mapping[str, object]],
+        budgets: Mapping[str, float],
+    ) -> dict[str, object]:
+        """Distinguish initial partial population from established quote loss.
+
+        This metadata never admits a quote or calculation. Missing, malformed
+        or retired-identity observations cannot establish a healthy baseline.
+        """
+        def number(row: Mapping[str, object], key: str) -> float | None:
+            value = row.get(key)
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                result = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return result if math.isfinite(result) else None
+
+        # The existing runtime-context lock serializes this bounded metadata
+        # update with generation publication; no I/O or publication lock here.
+        with self._runtime_context_lock:
+            identity = (str(self.subscription_epoch_id), int(self._active_generation))
+            if getattr(self, "_optional_family_canary_population_identity", None) != identity:
+                self._optional_family_canary_population_identity = identity
+                self._optional_family_canary_established_core_families = set()
+            established = self._optional_family_canary_established_core_families
+            startup_reasons: list[str] = []
+            complete = True
+            for family in ("SPX", "NDX"):
+                row = observations.get(family) or {}
+                age = number(row, "data_age_seconds")
+                lag = number(row, "receive_to_process_lag_p95_seconds")
+                pairs = number(row, "primary_pair_coverage_ratio")
+                fresh = number(row, "fresh_quote_count")
+                expected = number(row, "expected_quote_count")
+                generation = row.get("subscription_generation")
+                valid = bool(
+                    identity[1] > 0
+                    and row.get("subscription_epoch_id") == identity[0]
+                    and isinstance(generation, int) and not isinstance(generation, bool)
+                    and generation == identity[1]
+                    and row.get("validation_is_valid") is True
+                    and age is not None and 0.0 <= age <= budgets["core_freshness_seconds"]
+                    and lag is not None and 0.0 <= lag <= budgets["core_lag_seconds"]
+                    and pairs is not None and budgets["core_primary_pair_coverage_ratio"] <= pairs <= 1.0
+                    and fresh is not None and fresh.is_integer() and fresh > 0.0
+                    and expected is not None and expected.is_integer() and expected > 0.0
+                    and fresh <= expected
+                )
+                if not valid:
+                    complete = False
+                    continue
+                if fresh / expected >= budgets["core_fresh_quote_coverage_ratio"]:
+                    established.add(family)
+                elif family not in established:
+                    startup_reasons.append(f"CORE_FRESH_QUOTE_COVERAGE:{family}")
+            return {
+                "subscription_epoch_id": identity[0],
+                "subscription_generation": identity[1],
+                "established_core_families": sorted(established),
+                "core_population_observations_complete": complete,
+                "startup_quote_population_reasons": startup_reasons,
+            }
 
     @staticmethod
     def _canary_window_timestamp(
@@ -9509,6 +9973,24 @@ class DatabentoGammaStreamer:
         warmup_remaining = self._optional_family_canary_warmup_remaining(
             current_window
         )
+        population = self._canary_core_population_readiness(observations, preview.budgets)
+        evidence["core_quote_population"] = population
+        startup_deferred = set(population["startup_quote_population_reasons"]) if (
+            warmup_remaining > 0.0
+            and population["core_population_observations_complete"]
+            and not overload_active
+            and not measured_canary_lag
+            and not provider_integrity_risk_active
+        ) else set()
+        # A first valid calculation can have an incompletely populated outer
+        # chain. Honor the existing warmup only for that exact condition; once
+        # this family has been healthy, the same coverage loss remains urgent.
+        core_degradation_reasons = tuple(
+            reason for reason in core_degradation_reasons if reason not in startup_deferred
+        )
+        measured_core_degraded = bool(core_degradation_reasons)
+        evidence["core_degradation_reasons"] = list(core_degradation_reasons)
+        evidence["startup_quote_population_deferred_reasons"] = sorted(startup_deferred)
         if warmup_remaining > 0.0 and not (
             (overload_active and not initial_queue_backpressure_with_no_observations)
             or measured_core_degraded
@@ -9882,7 +10364,7 @@ class DatabentoGammaStreamer:
         lock = getattr(self, "_runtime_context_lock", None)
         if lock is None:
             return int(getattr(self, "_active_generation", 0))
-        with lock:
+        with self._opening_reference_lock(lock):
             return int(getattr(self, "_active_generation", 0))
 
     @active_generation.setter
@@ -9911,7 +10393,7 @@ class DatabentoGammaStreamer:
         lock = getattr(self, "_runtime_context_lock", None)
         if lock is None:
             return str(getattr(self, "_handoff_status", ""))
-        with lock:
+        with self._opening_reference_lock(lock):
             return str(getattr(self, "_handoff_status", ""))
 
     @handoff_status.setter

@@ -55,7 +55,12 @@ def research_code_fingerprint():
 def read_runtime_context():
     with urllib.request.urlopen("http://127.0.0.1:8000/health/live", timeout=2.0) as response:
         payload = json.load(response)
-    sampled = utc(payload.get("sampled_at_utc"))
+    if not isinstance(payload, dict):
+        raise ValueError("RUNTIME_HEALTH_PAYLOAD_INVALID")
+    try:
+        sampled = utc(payload.get("sampled_at_utc"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("RUNTIME_HEALTH_SAMPLE_INVALID") from exc
     age = (datetime.now(timezone.utc) - sampled).total_seconds()
     if not 0 <= age <= 15:
         raise ValueError("RUNTIME_HEALTH_SAMPLE_STALE")
@@ -192,7 +197,16 @@ class MarketResearchService:
             histories, diagnostics = load_research_history(
                 self.source_database, self.symbols, as_of_utc=as_of, runtime_context=context)
             reasons.extend(diagnostics)
-            context_after = self.context_reader() if context else {}
+            # A failed health recheck is a runtime-verification failure, not
+            # evidence that the retained database became unreadable. Preserve
+            # the loaded history, then invalidate intraday use below. Never
+            # substitute the successful first sample for a missing recheck.
+            try:
+                context_after = self.context_reader() if context else {}
+            except Exception as exc:
+                context_after = {}
+                reasons.append("RUNTIME_CONTEXT_UNAVAILABLE:" + type(exc).__name__)
+                reasons.append("RUNTIME_CONTEXT_RECHECK_UNAVAILABLE:" + type(exc).__name__)
             identity_keys = ("subscription_epoch_id", "subscription_generation", "handoff_status")
             context_invalid = (
                 any(context.get(k) != context_after.get(k) for k in identity_keys)

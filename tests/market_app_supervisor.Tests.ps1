@@ -44,6 +44,25 @@ foreach ($functionName in @(
     Invoke-Expression $definition[0].Extent.Text
 }
 
+# Parse registration source and load only pure readback validation. Never dot-
+# source registration or execute its Register-ScheduledTask statements.
+$registerParseErrors = $null
+$registerTokens = $null
+$registerTaskAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $ProjectRoot 'register_market_watchdog.ps1'),
+    [ref]$registerTokens, [ref]$registerParseErrors
+)
+if (@($registerParseErrors).Count -ne 0) { throw 'Registration script did not parse cleanly.' }
+foreach ($functionName in @('Resolve-MarketTaskIdentitySid','Assert-MarketTaskReadback')) {
+    $definition = @($registerTaskAst.FindAll({
+        param($candidate)
+        $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq $functionName
+    }, $true))
+    if ($definition.Count -ne 1) { throw "Expected exactly one $functionName registration definition." }
+    Invoke-Expression $definition[0].Extent.Text
+}
+
 # Load only the tested orchestration helpers from ensure_market_app.ps1. Dot-
 # sourcing the launcher would execute its live supervision path.
 $EnsureMarketAppPath = Join-Path $ProjectRoot 'ensure_market_app.ps1'
@@ -231,7 +250,7 @@ function New-TestMarketWatchdogTask {
     }
     $trigger = New-TestMarketTrigger `
         -ClassName 'MSFT_TaskWeeklyTrigger' `
-        -StartBoundary '2026-09-05T07:50:00-05:00'
+        -StartBoundary '2026-09-05T07:50:00'
     $trigger.Repetition.Interval = 'PT5M'
     $trigger.Repetition.Duration = 'PT10H10M'
     $trigger.Repetition.StopAtDurationEnd = $true
@@ -298,7 +317,7 @@ function New-TestMarketStartupTask {
         $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskBootTrigger' -Enabled $BootEnabled -Delay $BootDelay
     }
     foreach ($time in $WeeklyTimes) {
-        $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskWeeklyTrigger' -StartBoundary "2026-09-05T$($time):00-05:00"
+        $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskWeeklyTrigger' -StartBoundary "2026-09-05T$($time):00"
     }
     $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskLogonTrigger' -UserId $LogonUserId
     return [pscustomobject]@{
@@ -1847,7 +1866,7 @@ Describe 'Bounded pre-start universe cache preparation' {
         New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
         $sleeper = Join-Path $toolDir 'sleep_preparer.py'
         Set-Content -LiteralPath $sleeper -Value @('import time', 'time.sleep(30)')
-        $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+        $python = if ($env:MARKETPIN_TEST_PYTHON) { $env:MARKETPIN_TEST_PYTHON } else { Join-Path $ProjectRoot '.venv\Scripts\python.exe' }
         $module = Get-Module market_app_supervisor
 
         $result = & $module {
@@ -1899,7 +1918,7 @@ Describe 'Bounded pre-start universe cache preparation' {
             'import sys',
             'print(json.dumps(sys.argv[1:]))'
         )
-        $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+        $python = if ($env:MARKETPIN_TEST_PYTHON) { $env:MARKETPIN_TEST_PYTHON } else { Join-Path $ProjectRoot '.venv\Scripts\python.exe' }
         $module = Get-Module market_app_supervisor
 
         $result = & $module {
@@ -3297,10 +3316,115 @@ Describe 'Session recovery journal success latch' {
     }
 }
 
+Describe 'Weekly scheduler wall-time boundaries' {
+    It 'normalizes only weekly registration objects while preserving their wall fields and boot and logon objects' {
+        $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+        $StartupTriggers = (New-TestMarketStartupTask).Triggers
+        foreach ($trigger in @($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+            $trigger.StartBoundary += '-05:00'
+        }
+        $WatchdogTrigger = (New-TestMarketWatchdogTask).Triggers[0]
+        $WatchdogTrigger.StartBoundary = '2026-11-06T13:50:00Z'
+        $boot = @($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })[0]
+        $logon = @($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })[0]
+        $bootBefore = $boot | ConvertTo-Json -Depth 5 -Compress
+        $logonBefore = $logon | ConvertTo-Json -Depth 5 -Compress
+        $normalization = @($registerTaskAst.FindAll({
+            param($candidate)
+            $candidate -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                $candidate.Variable.VariablePath.UserPath -eq 'weeklyTrigger'
+        }, $true))
+        $normalization.Count | Should Be 1
+        Invoke-Expression $normalization[0].Extent.Text
+        (@($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' } | ForEach-Object StartBoundary) -join ',') |
+            Should Be '2026-09-05T07:00:00,2026-09-05T07:15:00,2026-09-05T07:45:00,2026-09-05T08:15:00'
+        $WatchdogTrigger.StartBoundary | Should Be '2026-11-06T07:50:00'
+        ($boot | ConvertTo-Json -Depth 5 -Compress) | Should Be $bootBefore
+        ($logon | ConvertTo-Json -Depth 5 -Compress) | Should Be $logonBefore
+    }
+
+    It 'accepts floating startup and watchdog readbacks dated in summer and winter' {
+        $TaskPrincipalSid = 'S-1-5-18'
+        $LogonRecoveryUser = 'S-1-5-21-1000-1000-1000-1001'
+        Mock Get-ScheduledTask { $script:readbackTask }
+        foreach ($date in @('2026-09-05','2026-11-06')) {
+            foreach ($kind in @('Startup','Watchdog')) {
+                if ($kind -eq 'Startup') { $script:readbackTask = New-TestMarketStartupTask }
+                else { $script:readbackTask = New-TestMarketWatchdogTask }
+                foreach ($trigger in @($script:readbackTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+                    $trigger.StartBoundary = $date + ([string]$trigger.StartBoundary).Substring(10)
+                }
+                $result = Assert-MarketTaskReadback -RegisteredTaskName $script:readbackTask.TaskName -Kind $kind -ExpectedAction $script:readbackTask.Actions[0]
+                $result.TaskName | Should Be $script:readbackTask.TaskName
+            }
+        }
+    }
+
+    It 'rejects fixed offsets and UTC suffixes in standalone registration readbacks in either season' {
+        $TaskPrincipalSid = 'S-1-5-18'
+        $LogonRecoveryUser = 'S-1-5-21-1000-1000-1000-1001'
+        Mock Get-ScheduledTask { $script:readbackTask }
+        foreach ($dateAndOffset in @(
+            @{Date='2026-09-05'; Offset='-05:00'},
+            @{Date='2026-11-06'; Offset='-06:00'},
+            @{Date='2026-09-05'; Offset='-06:00'},
+            @{Date='2026-11-06'; Offset='-05:00'},
+            @{Date='2026-09-05'; Offset='Z'}
+        )) {
+            foreach ($kind in @('Startup','Watchdog')) {
+                if ($kind -eq 'Startup') { $script:readbackTask = New-TestMarketStartupTask }
+                else { $script:readbackTask = New-TestMarketWatchdogTask }
+                foreach ($trigger in @($script:readbackTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+                    $time = ([string]$trigger.StartBoundary).Substring(11,8)
+                    $trigger.StartBoundary = "$($dateAndOffset.Date)T$time$($dateAndOffset.Offset)"
+                }
+                { Assert-MarketTaskReadback -RegisteredTaskName $script:readbackTask.TaskName -Kind $kind -ExpectedAction $script:readbackTask.Actions[0] } | Should Throw
+            }
+        }
+    }
+
+    It 'keeps seven AM Central in both DST seasons while its UTC instant changes' {
+        $central = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+        $summer = [datetime]::ParseExact('2026-09-08T07:00:00', "yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+        $winter = [datetime]::ParseExact('2026-11-09T07:00:00', "yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+        [TimeZoneInfo]::ConvertTimeToUtc($summer, $central).ToString('HH:mm') | Should Be '12:00'
+        [TimeZoneInfo]::ConvertTimeToUtc($winter, $central).ToString('HH:mm') | Should Be '13:00'
+        # The retained fixed winter offset at06:00 has the same UTC instant
+        # as07:00 during summer, which hid the defect in the previous cast.
+        ([datetimeoffset]'2026-09-05T06:00:00-06:00').UtcDateTime.ToString('HH:mm') | Should Be '12:00'
+    }
+}
+
 Describe 'AutoStart trigger self-heal exact task contract' {
     BeforeEach {
         $script:expectedLogonSid = 'S-1-5-21-1000-1000-1000-1001'
         $script:expectedPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    }
+
+    It 'rejects fixed-offset weekly startup boundaries in both seasons without making them repairable' {
+        foreach ($dateAndOffset in @(
+            @{Date='2026-09-05'; Offset='-05:00'},
+            @{Date='2026-11-06'; Offset='-06:00'},
+            @{Date='2026-09-05'; Offset='-06:00'},
+            @{Date='2026-11-06'; Offset='-05:00'}
+        )) {
+            $task = New-TestMarketStartupTask
+            foreach ($trigger in @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+                $time = ([string]$trigger.StartBoundary).Substring(11,8)
+                $trigger.StartBoundary = "$($dateAndOffset.Date)T$time$($dateAndOffset.Offset)"
+            }
+            $result = Test-MarketStartupTaskContract `
+                -Task $task `
+                -ExpectedTaskName $StartupTaskName `
+                -ExpectedTaskPath $StartupTaskPath `
+                -ExpectedProjectRoot $ProjectRoot `
+                -ExpectedLogonRecoverySid $script:expectedLogonSid `
+                -ExpectedPowerShellExe $script:expectedPowerShell
+            $result.Valid | Should Be $false
+            (@($result.Reasons) -contains 'trigger_weekly_shape_mismatch') | Should Be $true
+            $result.RepairableMissingBootTrigger | Should Be $false
+            $result.RepairableMissingUniversePrestageRetry | Should Be $false
+        }
     }
 
     It 'accepts the full four-weekly-trigger contract and classifies only exact legacy or missing-boot shapes as repairable' {
@@ -3367,6 +3491,9 @@ Describe 'AutoStart trigger self-heal exact task contract' {
             (New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At '08:15'),
             (New-ScheduledTaskTrigger -AtLogOn -User $script:expectedLogonSid)
         )
+        foreach ($trigger in @($realExistingTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+            $trigger.StartBoundary = ([datetimeoffset]$trigger.StartBoundary).LocalDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
+        }
         $script:testBootTrigger = New-ScheduledTaskTrigger -AtStartup
         $missing.Triggers = $realExistingTriggers
         $repaired.Triggers = @($script:testBootTrigger) + $realExistingTriggers
@@ -3464,6 +3591,9 @@ Describe 'AutoStart exact legacy universe pre-stage retry repair' {
             (New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At '08:15'),
             (New-ScheduledTaskTrigger -AtLogOn -User $script:expectedLogonSid)
         )
+        foreach ($trigger in @($realExistingTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+            $trigger.StartBoundary = ([datetimeoffset]$trigger.StartBoundary).LocalDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
+        }
         $script:testRetryTrigger = New-ScheduledTaskTrigger `
             -Weekly `
             -WeeksInterval 1 `
@@ -3498,6 +3628,7 @@ Describe 'AutoStart exact legacy universe pre-stage retry repair' {
 
         $result.Error | Should Be $null
         $result.Status | Should Be 'startup_universe_prestage_retry_repaired'
+        $script:testRetryTrigger.StartBoundary | Should Match '^\d{4}-\d{2}-\d{2}T07:15:00$'
         Assert-MockCalled New-ScheduledTaskTrigger -Times 1 -Scope It -ParameterFilter {
             $Weekly -and $WeeksInterval -eq 1 -and $At -eq '07:15'
         }
@@ -3512,6 +3643,28 @@ Describe 'AutoStart exact legacy universe pre-stage retry repair' {
 }
 
 Describe 'Watchdog self-heal exact task contract' {
+    It 'rejects fixed-offset weekly watchdog boundaries in both seasons without authorizing a principal repair' {
+        foreach ($boundary in @(
+            '2026-09-05T07:50:00-05:00',
+            '2026-11-06T07:50:00-06:00',
+            '2026-09-05T06:50:00-06:00',
+            '2026-11-06T08:50:00-05:00'
+        )) {
+            $task = New-TestMarketWatchdogTask
+            $task.Triggers[0].StartBoundary = $boundary
+            $result = Test-MarketWatchdogTaskContract `
+                -Task $task `
+                -ExpectedTaskName $WatchdogTaskName `
+                -ExpectedTaskPath $WatchdogTaskPath `
+                -ExpectedProjectRoot $ProjectRoot `
+                -ExpectedPrincipalSid 'S-1-5-18' `
+                -ExpectedPowerShellExe (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe')
+            $result.Valid | Should Be $false
+            (@($result.Reasons) -contains 'trigger_weekly_shape_mismatch') | Should Be $true
+            $result.RepairableLimitedPrincipal | Should Be $false
+        }
+    }
+
     It 'accepts the complete canonical watchdog task contract' {
         $task = New-TestMarketWatchdogTask
         $result = Test-MarketWatchdogTaskContract `

@@ -427,6 +427,72 @@ def opening_range_rows(payload: Mapping[str, Any] | None) -> list[dict[str, Any]
     return rows
 
 
+def observed_opening_context_rows(payload: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Show separately identified retained segments with no signal authority."""
+    envelope = _as_mapping(payload)
+    if envelope.get("schema_version") != ORB_COLLECTION_SCHEMA_V2:
+        return []
+    rows: list[dict[str, Any]] = []
+    for symbol, state_value in _as_mapping(envelope.get("symbols")).items():
+        state = _as_mapping(state_value)
+        if state.get("schema_version") != ORB_SYMBOL_SCHEMA_V2:
+            continue
+        windows = _as_mapping(state.get("opening_ranges"))
+        for duration in ("5m", "15m", "30m", "60m"):
+            window = _as_mapping(windows.get(duration))
+            grid = _as_mapping(window.get("observed_context_grid"))
+            segments = window.get("observed_context_segments")
+            if not isinstance(segments, list):
+                continue
+            for segment_value in segments:
+                segment = _as_mapping(segment_value)
+                identity = _as_mapping(segment.get("identity"))
+                low = _finite_float(segment.get("observed_low"))
+                high = _finite_float(segment.get("observed_high"))
+                epoch = _canonical_subscription_epoch(identity.get("subscription_epoch_id"))
+                generation = _positive_int(identity.get("subscription_generation"))
+                universe = _canonical_subscription_epoch(identity.get("universe_sha256"))
+                mapping = _canonical_subscription_epoch(identity.get("symbol_mapping_version"))
+                count = _positive_int(segment.get("observed_bucket_count"))
+                if (
+                    segment.get("schema_version") != "marketpin-orb-observed-context.v1"
+                    or segment.get("authority") != "DIAGNOSTIC_ONLY"
+                    or segment.get("usage") != "CONTEXT_ONLY"
+                    or any(segment.get(field) is not False for field in (
+                        "directional_evidence_eligible", "model_eligible", "usable_for_prediction",
+                        "eligible_for_training", "orb_complete",
+                    ))
+                    or epoch is None or generation is None or universe is None or mapping is None
+                    or low is None or high is None or not 0 < low <= high or count is None
+                ):
+                    continue
+                nominal_ratio = _finite_float(segment.get("nominal_window_coverage_ratio"))
+                elapsed_ratio = _finite_float(grid.get("elapsed_capture_ratio"))
+                rows.append({
+                    "Symbol": str(symbol), "Window": duration,
+                    "Segment": _positive_int(segment.get("segment_number")), "Use": "Context only",
+                    "Observed low": low, "Observed high": high, "Segment buckets": count,
+                    "Segment / full window %": nominal_ratio * 100 if nominal_ratio is not None else None,
+                    "Window elapsed coverage %": elapsed_ratio * 100 if elapsed_ratio is not None else None,
+                    "Elapsed expected buckets": _nonnegative_int(grid.get("elapsed_expected_bucket_count")),
+                    "Full window expected buckets": _nonnegative_int(grid.get("nominal_expected_bucket_count")),
+                    "Future buckets": _nonnegative_int(grid.get("future_bucket_count")),
+                    "Missing elapsed buckets": _nonnegative_int(grid.get("elapsed_missing_bucket_count")),
+                    "Opening bucket": "missing" if grid.get("opening_bucket_missing") is True else "observed" if grid.get("opening_bucket_missing") is False else "not due",
+                    "First bucket (UTC)": segment.get("first_bucket_utc"), "Last bucket (UTC)": segment.get("last_bucket_utc"),
+                    "First source (UTC)": segment.get("first_source_timestamp_utc"), "Last source (UTC)": segment.get("last_source_timestamp_utc"),
+                    "First captured (UTC)": segment.get("first_captured_at_utc"), "Last captured (UTC)": segment.get("last_captured_at_utc"),
+                    "Max segment gap (s)": _finite_float(segment.get("maximum_interbucket_gap_seconds")),
+                    "Missing interior segment buckets": _nonnegative_int(segment.get("interior_missing_bucket_count")),
+                    "Overlapping identity buckets": _nonnegative_int(grid.get("overlapping_identity_bucket_count")),
+                    "Generation": generation, "Epoch full": epoch,
+                    "Universe full": universe, "Mapping full": mapping,
+                    "Expiry": identity.get("primary_expiration"), "Formula": identity.get("spot_formula_version"),
+                    "ORB eligible": False, "Prediction eligible": False, "Training eligible": False,
+                })
+    return rows
+
+
 def render_opening_range_panel() -> None:
     """Render all configured markets plus explicit unavailable index canaries."""
     st.subheader("Opening Range & Pin Drift")
@@ -500,6 +566,24 @@ def render_opening_range_panel() -> None:
             "Pain move from open": st.column_config.NumberColumn(format="%+.2f"),
         },
     )
+    context_rows = observed_opening_context_rows(payload)
+    if context_rows:
+        st.caption(
+            "Observed segments are retained option-parity context only. Each row keeps one "
+            "provenance identity; ranges across different identities are shown separately. "
+            "Segment coverage uses the full window, while elapsed coverage counts only buckets "
+            "due so far. Future buckets are not missing. Gaps and a missing opening bucket "
+            "remain visible; these rows do not establish breakout, prediction or training eligibility."
+        )
+        st.dataframe(
+            pd.DataFrame(context_rows), width="stretch", hide_index=True,
+            column_config={
+                "Observed low": st.column_config.NumberColumn(format="%.2f"),
+                "Observed high": st.column_config.NumberColumn(format="%.2f"),
+                "Segment / full window %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Window elapsed coverage %": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
     st.caption(
         "High and low columns cover the first 60 minutes of sampled option parity. "
         "The first sampled price is not the official opening print. "

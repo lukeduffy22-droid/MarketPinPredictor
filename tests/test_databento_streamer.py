@@ -759,7 +759,7 @@ def test_reference_persist_barrier_finishes_save_before_stop_and_blocks_late_sav
     assert ordering == ["save_started", "save_finished", "stop_returned"]
     assert capture_result["recorded"] is True
     assert capture_result["progress_eligible"] is False
-    assert capture_result["reason"] == "REFERENCE_CONTEXT_CHANGED_AFTER_PERSIST"
+    assert capture_result["reason"] == "REFERENCE_STREAMER_STOPPING"
 
     late_result = streamer._capture_opening_reference_once(
         "SPX",
@@ -1359,15 +1359,22 @@ def test_reference_sampler_reports_persist_lock_timing_when_capture_rejects(
         lambda: {"status": "synchronized"},
     )
     monkeypatch.setattr(streamer, "_opening_reference_context_is_current", lambda _snapshot: False)
-    clock_values = iter(
-        intended + timedelta(milliseconds=offset)
-        for offset in (100, 200, 300, 400, 500)
-    )
+    clock = {"now": intended + timedelta(milliseconds=100)}
+    compute = streamer._compute_opening_reference_payload
+
+    def compute_then_advance(*args, **kwargs):
+        result = compute(*args, **kwargs)
+        clock["now"] = intended + timedelta(milliseconds=500)
+        return result
+
+    # Deadline probes may read the clock repeatedly. Advance at the actual
+    # phase boundary rather than encoding an implementation call count.
+    monkeypatch.setattr(streamer, "_compute_opening_reference_payload", compute_then_advance)
 
     result = streamer._capture_opening_reference_for_bucket(
         "SPX",
         intended,
-        now_utc=lambda: next(clock_values),
+        now_utc=lambda: clock["now"],
         journal=object(),
     )
 

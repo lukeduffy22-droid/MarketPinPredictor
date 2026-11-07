@@ -2215,8 +2215,140 @@ def _orb_reference_row_matches(
     return all(getattr(row, key) == value for key, value in payload.items())
 
 
+class OrbPersistenceBudget:
+    """One caller-owned deadline; no worker may outlive a rejected DB write."""
+
+    def __init__(self, deadline_monotonic: float, *, cancellation_reason: Callable[[], str | None] | None = None):
+        import math
+        self.deadline_monotonic = float(deadline_monotonic)
+        self.cancellation_reason = cancellation_reason
+        self.failure_reason: str | None = (
+            None if math.isfinite(self.deadline_monotonic) else "REFERENCE_PERSISTENCE_DEADLINE_INVALID"
+        )
+
+    def remaining(self) -> float:
+        import time
+        return max(0.0, self.deadline_monotonic - time.monotonic())
+
+    def reason(self) -> str | None:
+        if self.failure_reason is not None:
+            return self.failure_reason
+        if self.cancellation_reason is not None:
+            try:
+                reason = self.cancellation_reason()
+            except Exception:
+                self.failure_reason = "REFERENCE_PERSISTENCE_CANCELLATION_CHECK_FAILED"
+                return self.failure_reason
+            if reason:
+                self.failure_reason = reason
+                return self.failure_reason
+        if self.remaining() <= 0:
+            return "REFERENCE_ATTEMPT_DEADLINE_EXCEEDED"
+        return self.failure_reason
+
+    def require_current(self) -> None:
+        reason = self.reason()
+        if reason:
+            raise TimeoutError(reason)
+
+    def failed(self, exc: Exception) -> None:
+        if self.reason() is None:
+            self.failure_reason = ("REFERENCE_PERSISTENCE_BUSY" if "locked" in str(exc).lower()
+                                   or "busy" in str(exc).lower() else "REFERENCE_PERSISTENCE_FAILED")
+
+
+def _orb_reference_write_session(budget: OrbPersistenceBudget | None):
+    if budget is None:
+        return SessionLocal()
+    # Opening samples must not queue behind the application's general pool or
+    # inherit its ten-second SQLite busy timeout. The independent connection
+    # writes the same existing database and runs synchronously on this caller.
+    import sqlite3
+    from sqlalchemy.pool import NullPool
+
+    budget.require_current()
+    template = SessionLocal()
+    try:
+        bind = template.get_bind()
+        database_path = bind.url.database
+        if bind.dialect.name != "sqlite" or not database_path or database_path == ":memory:":
+            raise ValueError("bounded ORB persistence requires a file-backed SQLite database")
+    finally:
+        template.close()
+    uri = Path(database_path).resolve().as_uri() + "?mode=rw"
+
+    class BudgetedConnection(sqlite3.Connection):
+        def commit(self):
+            # SQLAlchemy's commit event precedes dialect dispatch. Check at
+            # DBAPI admission too, including a delay in a dialect wrapper.
+            budget.require_current()
+            return super().commit()
+
+    def connect():
+        budget.require_current()
+        connection = sqlite3.connect(uri, uri=True, timeout=0.0, check_same_thread=False,
+                                     factory=BudgetedConnection)
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=0")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.set_progress_handler(lambda: int(budget.reason() is not None), 100)
+            # Check inside SQLite as COMMIT is prepared as well. Rollback must
+            # remain permitted after cancellation. Each bounded session owns
+            # a fresh connection, so no previously prepared COMMIT is reused.
+            connection.set_authorizer(
+                lambda action, value, *_: (
+                    sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_TRANSACTION and value == "COMMIT"
+                    and budget.reason() is not None else sqlite3.SQLITE_OK
+                )
+            )
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    bounded_engine = create_engine("sqlite://", creator=connect, poolclass=NullPool)
+
+    def prepare_statement(connection):
+        budget.require_current()
+        # Permit brief normal writer contention, bounded by the remaining
+        # caller budget. Reapply before every statement/commit; SQLite's busy
+        # handler is not interrupted by its VM progress handler.
+        milliseconds = min(25, int(budget.remaining() * 1000))
+        cursor = connection.connection.driver_connection.cursor()
+        try:
+            cursor.execute(f"PRAGMA busy_timeout={milliseconds}")
+        finally:
+            cursor.close()
+        budget.require_current()
+
+    @event.listens_for(bounded_engine, "before_cursor_execute")
+    def before_statement(connection, *_args):
+        prepare_statement(connection)
+
+    @event.listens_for(bounded_engine, "commit")
+    def before_commit(connection):
+        prepare_statement(connection)
+
+    session = sessionmaker(bind=bounded_engine, expire_on_commit=False)()
+    session.info["orb_bounded_engine"] = bounded_engine
+    return session
+
+
+def _close_orb_reference_write_session(session) -> None:
+    if session is not None:
+        bounded_engine = session.info.get("orb_bounded_engine")
+        try:
+            session.close()
+        finally:
+            if bounded_engine is not None:
+                bounded_engine.dispose()
+
+
 def save_orb_reference_sample(
     sample: Mapping[str, Any],
+    *, persistence_budget: OrbPersistenceBudget | None = None,
 ) -> OrbReferenceSample | None:
     """Append one provenance-complete ORB reference sample idempotently.
 
@@ -2506,8 +2638,9 @@ def save_orb_reference_sample(
         "validation_status": "valid",
     }
 
-    session = SessionLocal()
+    session = None
     try:
+        session = _orb_reference_write_session(persistence_budget)
         existing = session.get(sample_model, sample_id)
         if existing is not None:
             if _orb_reference_row_matches(existing, payload):
@@ -2517,21 +2650,33 @@ def save_orb_reference_sample(
         row = sample_model(**payload)
         session.add(row)
         session.commit()
-        session.refresh(row)
+        if persistence_budget is None:
+            session.refresh(row)
         return row
     except IntegrityError:
         session.rollback()
-        existing = session.get(sample_model, sample_id)
+        if persistence_budget is not None and persistence_budget.reason():
+            return None
+        try:
+            existing = session.get(sample_model, sample_id)
+        except Exception as exc:
+            if persistence_budget is not None:
+                persistence_budget.failed(exc)
+            logger.warning("Failed ORB reference conflict check for %s: %s", sample_id, exc)
+            return None
         if _orb_reference_row_matches(existing, payload):
             return existing
         logger.warning("Rejected conflicting concurrent ORB reference sample id %s", sample_id)
         return None
     except Exception as exc:
-        session.rollback()
+        if persistence_budget is not None:
+            persistence_budget.failed(exc)
+        if session is not None:
+            session.rollback()
         logger.warning("Failed to persist ORB reference sample for %s: %s", symbol, exc)
         return None
     finally:
-        session.close()
+        _close_orb_reference_write_session(session)
 
 
 def _orb_reference_decision_row_matches(
@@ -2546,12 +2691,19 @@ def _orb_reference_decision_row_matches(
 
 def save_orb_reference_sample_decision(
     decision: Mapping[str, Any],
+    *, persistence_budget: OrbPersistenceBudget | None = None,
 ) -> OrbReferenceSampleDecision | None:
     """Append the one final progress decision for a retained ORB sample.
 
     A raw reference row without this sidecar is deliberately pending and is
     never returned by the eligible-only loaders below.  Conflicting duplicate
     decisions fail closed; only an exact replay is idempotent.
+
+    attempt_completed_at_utc records the observation after the raw sample's
+    commit, not the final sidecar commit-return time. Caller-owned budgets
+    bound lock admission and SQLite work; a kernel/storage stall inside COMMIT
+    cannot be forcibly interrupted. The caller rechecks live eligibility on
+    return without rewriting a committed historical decision.
     """
     sample_id = str(decision.get("sample_id") or "").lower().strip()
     sample_timestamp = _coerce_timestamp(decision.get("sample_timestamp_utc"))
@@ -2604,8 +2756,9 @@ def save_orb_reference_sample_decision(
         "decision_status": "final",
     }
     decision_model = OrbReferenceSampleDecision
-    session = SessionLocal()
+    session = None
     try:
+        session = _orb_reference_write_session(persistence_budget)
         raw_sample = session.get(OrbReferenceSample, sample_id)
         cbbo_sample = session.get(OrbCbboReferenceSample, sample_id)
         if raw_sample is not None and cbbo_sample is not None:
@@ -2631,11 +2784,20 @@ def save_orb_reference_sample_decision(
         row = decision_model(**payload)
         session.add(row)
         session.commit()
-        session.refresh(row)
+        if persistence_budget is None:
+            session.refresh(row)
         return row
     except IntegrityError:
         session.rollback()
-        existing = session.get(decision_model, sample_id)
+        if persistence_budget is not None and persistence_budget.reason():
+            return None
+        try:
+            existing = session.get(decision_model, sample_id)
+        except Exception as exc:
+            if persistence_budget is not None:
+                persistence_budget.failed(exc)
+            logger.warning("Failed ORB decision conflict check for %s: %s", sample_id, exc)
+            return None
         if _orb_reference_decision_row_matches(existing, payload):
             return existing
         logger.warning(
@@ -2644,7 +2806,10 @@ def save_orb_reference_sample_decision(
         )
         return None
     except Exception as exc:
-        session.rollback()
+        if persistence_budget is not None:
+            persistence_budget.failed(exc)
+        if session is not None:
+            session.rollback()
         logger.warning(
             "Failed to persist ORB reference decision for sample %s: %s",
             sample_id,
@@ -2652,7 +2817,7 @@ def save_orb_reference_sample_decision(
         )
         return None
     finally:
-        session.close()
+        _close_orb_reference_write_session(session)
 
 
 def reconcile_orb_reference_sample_decisions(*, as_of_utc: Any = None, maximum_rows: int | None = None) -> dict[str, int]:
