@@ -372,6 +372,59 @@ def _install_pre_auth_transport_guard(
     return True
 
 
+def _start_live_iterator(live_client: object):
+    """Arm the SDK consumer before start can deliver the first record batch.
+
+    The installed SDK starts its session before enabling the iteration queue.
+    A receive-thread turn inside start can otherwise discard initial mappings,
+    replay completion, and quotes. Only a new, known SDK queue is owned here;
+    iteration and transport shutdown remain the caller's existing lifecycle.
+    """
+    if not isinstance(live_client, _DATABENTO_SDK_LIVE_CLASS):
+        return iter(live_client)
+
+    from databento.live.session import DBNQueue
+
+    session = getattr(live_client, "_session", None)
+    queue = getattr(session, "_dbn_queue", None)
+    is_streaming = getattr(session, "is_streaming", None)
+    if (
+        not isinstance(queue, DBNQueue)
+        or not callable(is_streaming)
+        or not all(
+            callable(getattr(queue, method, None))
+            for method in ("enable", "disable", "is_enabled")
+        )
+    ):
+        raise RuntimeError("DATABENTO_ITERATOR_QUEUE_CONTRACT_UNAVAILABLE")
+    if is_streaming() is not False or queue.is_enabled() is not False:
+        # An existing consumer's queue is not ours to alter or disable.
+        raise RuntimeError("DATABENTO_ITERATOR_QUEUE_ALREADY_IN_USE")
+
+    try:
+        queue.enable()
+        if queue.is_enabled() is not True:
+            raise RuntimeError("DATABENTO_ITERATOR_QUEUE_ENABLE_FAILED")
+        iterator = iter(live_client)
+        if (
+            getattr(iterator, "_dbn_queue", None) is not queue
+            or getattr(iterator, "client", None) is not live_client
+        ):
+            raise RuntimeError("DATABENTO_ITERATOR_QUEUE_OWNERSHIP_CHANGED")
+        return iterator
+    except BaseException:
+        # Ownership was established while this queue was disabled. A partial
+        # enable or failed start must not leave an unconsumed enabled queue.
+        try:
+            queue.disable()
+        except Exception as exc:
+            logger.warning(
+                "Databento iterator queue cleanup failed error_type=%s",
+                type(exc).__name__,
+            )
+        raise
+
+
 def _record_timestamp_ns(record: object, field: str) -> int | None:
     """Return a usable DBN nanosecond timestamp without accepting sentinels."""
     try:
@@ -1970,6 +2023,14 @@ class DatabentoGammaStreamer:
         self.last_orb_reference_results: dict[str, dict[str, object]] = {}
         self.opening_capture_checks: dict[str, object] = {}
         self._orb_reference_progress_lock = threading.Lock()
+        self._opening_timeline_writer = None
+        self._opening_timeline = None
+        self._opening_timeline_observers = {}
+        self._opening_timeline_error = None
+        self._opening_timeline_sdk_registered = False
+        self._opening_timeline_dispatch_seen = set()
+        self._opening_timeline_dispatch_audited = set()
+        self._opening_timeline_cash_open = None
         # Serialize only the final ORB state recheck and local SQLite append
         # with shutdown. Expensive quote copying/parity work stays concurrent,
         # while stop can establish that no reference commit remains in flight.
@@ -1988,6 +2049,9 @@ class DatabentoGammaStreamer:
         ] = {}
         self._orb_reference_failure_warning_suppressed_count = 0
         self._stop_event = threading.Event()
+        # Advisory notifications wake only the existing first-bucket sampler.
+        self._orb_reference_wakeup_event = threading.Event()
+        self._orb_reference_last_interval_marker: tuple[int, int] | None = None
         self._last_off_hours_log_state: str | None = None
         self.client: Optional[db.Live] = None
         self._client_lock = threading.Lock()
@@ -2094,6 +2158,230 @@ class DatabentoGammaStreamer:
         self.exports_dir = DATA_DIR.parent / "exports"
         self.audit_dir = DATA_DIR.parent / "logs" / "audit"
 
+    def _opening_timeline_observer(self, epoch_id=None, generation=None):
+        current = getattr(self, "_opening_timeline", None)
+        if epoch_id is None or generation is None:
+            return current
+        key = (str(epoch_id), int(generation))
+        observer = getattr(self, "_opening_timeline_observers", {}).get(key)
+        if observer is None and current is not None:
+            if (current.epoch_id, current.generation) == key:
+                observer = current
+        return observer
+
+    def _opening_timeline_note(self, kind, *, family=None, details=None,
+                               expected_epoch_id=None, expected_generation=None):
+        """Attempt observations keep the captured identity across reconnects."""
+        observer = self._opening_timeline_observer(expected_epoch_id, expected_generation)
+        if observer is None:
+            if expected_epoch_id is not None:
+                self._opening_timeline_error = "ATTEMPT_OBSERVER_IDENTITY_NOT_RETAINED"
+            return
+        try:
+            late_attempt = expected_epoch_id is not None and expected_generation is not None
+            if not late_attempt and observer.generation != int(self._active_generation):
+                return
+            fields = dict(details or {})
+            if late_attempt:
+                fields["observation_runtime_epoch_id"] = self.subscription_epoch_id
+                fields["observation_runtime_generation"] = int(self._active_generation)
+            observer.milestone(
+                kind, family=family, details=fields,
+                allow_after_retirement=late_attempt,
+            )
+        except Exception as exc:
+            self._opening_timeline_error = type(exc).__name__
+
+    def _opening_timeline_snapshot(self):
+        observer = getattr(self, "_opening_timeline", None)
+        if observer is None:
+            return {"available": False, "reason": getattr(self, "_opening_timeline_error", None)
+                    or "SDK_CALLBACK_NOT_OBSERVED", "authority": "DIAGNOSTIC_ONLY"}
+        try:
+            snapshot = observer.snapshot()
+            # Receipts/health link to immutable detailed events, rather than
+            # copying retained raw bytes into every retry and bounded API read.
+            snapshot.pop("critical_latest", None)
+            snapshot.update(
+                available=True,
+                sdk_callback_registered=bool(self._opening_timeline_sdk_registered),
+                log_path=str(self.audit_dir.parent / "opening_readiness" /
+                             (observer.trading_date + ".ndjson")),
+                instrumentation_error=getattr(self, "_opening_timeline_error", None),
+            )
+            return snapshot
+        except Exception as exc:
+            return {"available": False, "reason": type(exc).__name__,
+                    "authority": "DIAGNOSTIC_ONLY"}
+
+    def _begin_opening_timeline(self, live_client, generation):
+        """Register the public decoded-record callback before iterator start."""
+        previous = getattr(self, "_opening_timeline", None)
+        if previous is not None:
+            try:
+                previous.retire("NEW_SUBSCRIPTION_GENERATION")
+            except Exception as exc:
+                self._opening_timeline_error = type(exc).__name__
+        self._opening_timeline = None
+        self._opening_timeline_sdk_registered = False
+        self._opening_timeline_dispatch_seen = set()
+        self._opening_timeline_dispatch_audited = set()
+        self._opening_timeline_cash_open = None
+        add_callback = getattr(live_client, "add_callback", None)
+        if not callable(add_callback):
+            self._opening_timeline_error = "SDK_CALLBACK_UNAVAILABLE"
+            return
+        try:
+            cash_open = self._canary_window_timestamp(
+                self._subscription_window(), "cash_open_utc",
+            )
+            if cash_open is None:
+                self._opening_timeline_error = "CASH_OPEN_UNAVAILABLE"
+                return
+            from backend.opening_readiness_timeline import (
+                BoundedOpeningTimelineWriter, OpeningReadinessTimeline,
+            )
+            writer = getattr(self, "_opening_timeline_writer", None)
+            if writer is None or not writer.status().get("writer_alive"):
+                writer = BoundedOpeningTimelineWriter(
+                    self.audit_dir.parent / "opening_readiness",
+                ).start()
+                self._opening_timeline_writer = writer
+            observer = OpeningReadinessTimeline(
+                writer, epoch_id=self.subscription_epoch_id,
+                generation=int(generation), cash_open_utc=cash_open,
+                quote_schema=self.schema, replay_pending=self._clock_replay_pending,
+                clock_ns=lambda: time.time_ns(),
+                monotonic_ns=lambda: time.monotonic_ns(),
+            )
+            self._opening_timeline = observer
+            registry = self._opening_timeline_observers
+            registry[(observer.epoch_id, observer.generation)] = observer
+            while len(registry) > 8:
+                del registry[next(iter(registry))]
+            self._opening_timeline_cash_open = cash_open
+            self._opening_timeline_error = None
+            add_callback(observer.sdk_callback)
+            self._opening_timeline_sdk_registered = True
+            self._opening_timeline_note("subscription_observed", details={
+                "stage": "before_iterator_start", "replay_pending": self._clock_replay_pending,
+                "handoff_status": str(self._handoff_status),
+                "required_handoff_symbols": list(self.required_handoff_symbols),
+                "processing_clock_sample_count": len(self._receive_lag_window),
+                "sdk_receipt_semantics": "decoded-record callback; socket/decode start unobservable",
+            })
+        except Exception as exc:
+            self._opening_timeline_error = type(exc).__name__
+            self._opening_timeline_note("instrumentation_unavailable", details={
+                "reason": type(exc).__name__, "stage": "sdk_callback_registration",
+            })
+
+    def _opening_timeline_quote(self, stage, record, family, observed_ns, monotonic_ns, reason=None):
+        observer = getattr(self, "_opening_timeline", None)
+        if observer is None:
+            return
+        try:
+            if observer.generation != int(self._active_generation):
+                return
+            if stage != "processed":
+                observed_ns, monotonic_ns = time.time_ns(), time.monotonic_ns()
+            options = {"observed_at_ns": observed_ns, "observed_monotonic_ns": monotonic_ns}
+            if stage == "rejected":
+                observer.rejected(record, family or "UNKNOWN", reason, **options)
+            else:
+                getattr(observer, stage)(record, family=family or "UNKNOWN", **options)
+        except Exception as exc:
+            self._opening_timeline_error = type(exc).__name__
+
+    def _opening_timeline_dispatch(self, attempt):
+        cash_open = getattr(self, "_opening_timeline_cash_open", None)
+        current = getattr(self, "_opening_timeline", None)
+        matches_current = bool(current is not None
+            and current.epoch_id == str(attempt.subscription_epoch_id)
+            and current.generation == int(attempt.subscription_generation)
+            and current.generation == int(self._active_generation))
+        if matches_current and cash_open is not None and attempt.intended_bucket_utc == cash_open:
+            self._opening_timeline_dispatch_seen.add((
+                str(attempt.subscription_epoch_id), int(attempt.subscription_generation), attempt.market,
+            ))
+        self._opening_timeline_note(
+            "sampler_dispatch", family=attempt.market,
+            expected_epoch_id=attempt.subscription_epoch_id,
+            expected_generation=attempt.subscription_generation, details={
+            "stage": "executor_submission_acknowledged",
+            "intended_bucket_utc": attempt.intended_bucket_utc.isoformat(),
+            "attempt_deadline_utc": attempt.deadline_utc.isoformat(),
+            "attempt_deadline_monotonic": attempt.deadline_monotonic,
+            "attempt_subscription_generation": attempt.subscription_generation,
+            "attempt_subscription_epoch_id": attempt.subscription_epoch_id,
+        })
+
+    def _opening_timeline_outcome(self, market, result, intended_bucket, *,
+                                  kind="orb_attempt_outcome", expected_epoch_id=None,
+                                  expected_generation=None):
+        accepted = bool(result.get("recorded") is True
+                        and result.get("progress_decision_recorded") is True
+                        and result.get("progress_eligible") is True)
+        sampler_accepted = bool(result.get("sampler_acceptance", accepted))
+        self._opening_timeline_note(
+            kind, family=market, expected_epoch_id=expected_epoch_id,
+            expected_generation=expected_generation, details={
+            "stage": "SAMPLER_ACCEPTED_FINAL_DECISION" if sampler_accepted else
+                     "RETIRED_WORKER_REPORTS_FINAL_DECISION" if accepted else
+                     str(result.get("reason") or "OUTCOME_UNVERIFIED"),
+            "reason": result.get("reason"), "accepted_final_decision": sampler_accepted,
+            "worker_final_decision_acknowledged": accepted,
+            "sampler_acceptance": result.get("sampler_acceptance", accepted),
+            "raw_recorded": result.get("recorded"),
+            "progress_decision_recorded": result.get("progress_decision_recorded"),
+            "progress_decision_pending": result.get("progress_decision_pending"),
+            "progress_eligible": result.get("progress_eligible"),
+            "sample_id": result.get("sample_id"),
+            "intended_bucket_utc": intended_bucket.isoformat(),
+            "attempt_deadline_utc": result.get("attempt_deadline_utc"),
+            "attempt_started_at_utc": result.get("attempt_started_at_utc"),
+            "attempt_completed_at_utc": result.get("attempt_completed_at_utc"),
+            "capture_rejection_stage": result.get("capture_rejection_stage"),
+            "failure_evidence_recorded": result.get("failure_evidence_recorded"),
+            "write_outcome": ("WORKER_FINAL_DECISION_ACKNOWLEDGED_SAMPLER_REJECTED"
+                if accepted and not sampler_accepted else "FINAL_ACCEPTANCE_ACKNOWLEDGED" if accepted else
+                "RAW_ACKNOWLEDGED_FINAL_DECISION_PENDING_OR_REJECTED"
+                if result.get("recorded") is True else "NO_RAW_ACCEPTANCE_OBSERVED"),
+        })
+
+    def _audit_opening_timeline_dispatch(self, observed):
+        observer = getattr(self, "_opening_timeline", None)
+        if observer is None:
+            return
+        identity = (observer.epoch_id, observer.generation)
+        cash_open = datetime.fromtimestamp(observer.open_ns / 1_000_000_000, timezone.utc)
+        audited = self._opening_timeline_dispatch_audited
+        if identity in audited or not cash_open + timedelta(seconds=5) <= observed < cash_open + timedelta(seconds=120):
+            return
+        audited.add(identity)
+        seen = self._opening_timeline_dispatch_seen
+        for market in ("SPX", "NDX"):
+            if market in self.symbols:
+                dispatched = (*identity, market) in seen
+                self._opening_timeline_note(
+                    "first_bucket_dispatch_audit", family=market,
+                    expected_epoch_id=identity[0], expected_generation=identity[1], details={
+                    "stage": "DISPATCH_OBSERVED" if dispatched else "NO_DISPATCH_OBSERVED",
+                    "scope": "captured subscription generation only",
+                    "reason": None if dispatched else "UNKNOWN_NO_SAMPLER_DISPATCH_OBSERVED",
+                    "intended_bucket_utc": cash_open.isoformat(),
+                    "bucket_deadline_utc": (cash_open + timedelta(seconds=5)).isoformat(),
+                    "upstream_cause": "UNKNOWN",
+                })
+
+    def _retire_opening_timeline(self, reason):
+        observer = getattr(self, "_opening_timeline", None)
+        if observer is not None:
+            try:
+                observer.retire(reason)
+            except Exception as exc:
+                self._opening_timeline_error = type(exc).__name__
+
     def _reset_stream_telemetry(self) -> None:
         """Reset connection-local latency gauges, not lifetime loss counters."""
         self.last_receive_to_process_lag_seconds = None
@@ -2132,6 +2420,53 @@ class DatabentoGammaStreamer:
             if len(self._clock_record_keys) > CLOCK_SYNC_WINDOW_RECORDS:
                 self._clock_record_keys.pop(next(iter(self._clock_record_keys)))
             self._receive_lag_window.append(lag)
+            observed_sample_count = len(self._receive_lag_window)
+            reached_sample_threshold = observed_sample_count == CLOCK_SYNC_MIN_SAMPLES
+        if observed_sample_count in (1, CLOCK_SYNC_MIN_SAMPLES):
+            self._opening_timeline_note("provider_timing_count", details={
+                "stage": str(observed_sample_count), "sample_count": observed_sample_count,
+                "minimum_samples": CLOCK_SYNC_MIN_SAMPLES, "scope": "shared_current_generation",
+            })
+        if reached_sample_threshold:
+            # This is a scheduling hint, never clock authority. Negative timing,
+            # handoff, complete pairs and persistence still pass their own gates.
+            self._signal_orb_reference_readiness()
+        return True
+
+    def _signal_orb_reference_readiness(self) -> None:
+        wakeup = getattr(self, "_orb_reference_wakeup_event", None)
+        if wakeup is not None:
+            wakeup.set()
+
+    def _record_orb_interval_completion(
+        self, record: object, *, generation: int, processed_at_ns: int,
+    ) -> bool:
+        """Wake after a complete live CBBO batch without scanning quotes.
+
+        END_OF_INTERVAL is an advisory boundary after the interval's records,
+        not proof that any instrument, pair, clock or capture gate is ready.
+        A single monotonic marker per generation/interval bounds notifications.
+        """
+        if (
+            self.schema not in CBBO_SCHEMAS
+            or type(record).__name__ != "SystemMsg"
+            or getattr(record, "code", None) != db.SystemCode.END_OF_INTERVAL
+        ):
+            return False
+        interval_end = _record_timestamp_ns(record, "ts_event")
+        if interval_end is None or interval_end % CBBO_SCHEMAS[self.schema]:
+            return False
+        lag_seconds = (processed_at_ns - interval_end) / 1_000_000_000
+        if not 0.0 <= lag_seconds <= QUOTE_FRESHNESS_SECONDS:
+            return False
+        with self._clock_evidence_lock:
+            if generation <= 0 or generation != self._active_generation or self._clock_replay_pending:
+                return False
+            previous = getattr(self, "_orb_reference_last_interval_marker", None)
+            if previous is not None and previous[0] == generation and interval_end <= previous[1]:
+                return False
+            self._orb_reference_last_interval_marker = (generation, interval_end)
+        self._signal_orb_reference_readiness()
         return True
 
     def _processing_clock_telemetry(self) -> dict[str, object]:
@@ -8410,6 +8745,19 @@ class DatabentoGammaStreamer:
                     )
             finally:
                 self._prediction_publication_lock.release()
+        gate_evidence["opening_readiness_timeline"] = self._opening_timeline_snapshot()
+        self._opening_timeline_note(
+            "capture_gates_observed", family=market,
+            expected_epoch_id=expected_subscription_epoch_id or diagnostic_epoch,
+            expected_generation=expected_subscription_generation if expected_subscription_generation is not None else diagnostic_generation,
+            details={
+            "observed_context_epoch_id": diagnostic_epoch,
+            "observed_context_generation": diagnostic_generation,
+            "stage": clock_status, "processing_clock": clock_evidence,
+            "handoff": gate_evidence["handoff"],
+            "intended_bucket_utc": intended_bucket.isoformat() if intended_bucket else None,
+            "attempt_deadline_utc": normalized_deadline_utc.isoformat() if normalized_deadline_utc else None,
+        })
         if attempt_diagnostics is not None:
             attempt_diagnostics["opening_gate_evidence"] = gate_evidence
         if clock_status != "synchronized":
@@ -8447,6 +8795,23 @@ class DatabentoGammaStreamer:
         )
         if payload is None:
             return {"recorded": False, "reason": reason}
+        observer = self._opening_timeline_observer(
+            snapshot["subscription_epoch_id"], int(snapshot["generation"]),
+        )
+        if observer is not None:
+            try:
+                self._opening_timeline_note(
+                    "qualified_quote_inputs", family=market,
+                    expected_epoch_id=snapshot["subscription_epoch_id"],
+                    expected_generation=int(snapshot["generation"]), details={
+                    "stage": "validated_primary_pair_set",
+                    "paired_quote_count": payload.get("paired_quote_count"),
+                    "captured_at_utc": captured_at.isoformat(),
+                    "sample_timestamp_utc": payload.get("sample_timestamp_utc"),
+                    "semantics": "real quote/pair validation passed; persistence and final decision still required",
+                })
+            except Exception as exc:
+                self._opening_timeline_error = type(exc).__name__
         if journal is None:
             from backend.market_structure import get_market_structure_journal
 
@@ -8935,12 +9300,33 @@ class DatabentoGammaStreamer:
                 intended_bucket_utc=intended_bucket,
                 result=result,
             )
+            self._opening_timeline_outcome(
+                market, result, intended_bucket,
+                expected_epoch_id=attempted_epoch_id,
+                expected_generation=attempted_generation,
+            )
             with self._orb_reference_progress_lock:
                 self.last_orb_reference_results[market] = result
 
         def collect_completed() -> None:
             for future in tuple(retired):
                 if future.done():
+                    retired_attempt = retired[future]
+                    try:
+                        retired_result = dict(future.result())
+                        retired_result["sampler_acceptance"] = False
+                    except Exception as exc:
+                        retired_result = {
+                            "reason": "RETIRED_WORKER_OUTCOME_UNKNOWN",
+                            "worker_error_type": type(exc).__name__,
+                            "sampler_acceptance": False,
+                        }
+                    self._opening_timeline_outcome(
+                        retired_attempt.market, retired_result,
+                        retired_attempt.intended_bucket_utc, kind="retired_worker_outcome",
+                        expected_epoch_id=retired_attempt.subscription_epoch_id,
+                        expected_generation=retired_attempt.subscription_generation,
+                    )
                     del retired[future]
             observed_monotonic = time.monotonic()
             for future, attempt in tuple(in_flight.items()):
@@ -9004,6 +9390,9 @@ class DatabentoGammaStreamer:
 
         try:
             while self.is_running:
+                # Clear before evaluating state so a transition during dispatch
+                # remains pending until the wait; notifications are coalesced.
+                self._orb_reference_wakeup_event.clear()
                 try:
                     collect_completed()
                     observed = datetime.now(timezone.utc)
@@ -9149,6 +9538,14 @@ class DatabentoGammaStreamer:
                                                 },
                                             ))
                                         continue
+                                    self._opening_timeline_note(
+                                        "sampler_submission_requested", family=market,
+                                        expected_epoch_id=attempt.subscription_epoch_id,
+                                        expected_generation=attempt.subscription_generation,
+                                        details={"stage": "before_executor_submission",
+                                                 "intended_bucket_utc": intended_bucket.isoformat(),
+                                                 "bucket_deadline_utc": attempt.deadline_utc.isoformat()},
+                                    )
                                     future = executor.submit(
                                         self._capture_opening_reference_for_bucket,
                                         market,
@@ -9165,12 +9562,17 @@ class DatabentoGammaStreamer:
                                             attempt.subscription_generation
                                         ),
                                     )
+                                    self._opening_timeline_dispatch(attempt)
                                     in_flight[future] = attempt
                         # Durable failure evidence must not hold reader-facing
                         # publication/universe locks during filesystem writes.
                         for attempt, result in capacity_rejections:
                             publish_result(attempt, result)
                 except Exception as exc:
+                    self._opening_timeline_note("sampler_loop_error", details={
+                        "stage": "submission_or_collection",
+                        "reason": type(exc).__name__, "exact_failed_step": "UNKNOWN_UNLESS_OTHER_EVIDENCE",
+                    })
                     logger.exception("ORB reference sampler error: %s", exc)
                 # The first live quotes and provider-clock proof can arrive
                 # between whole-second polls. Retry within the still-current
@@ -9185,7 +9587,9 @@ class DatabentoGammaStreamer:
                     < cash_open + timedelta(seconds=ORB_REFERENCE_INTERVAL_SECONDS)
                 ):
                     poll_seconds = min(poll_seconds, 0.25)
-                self._stop_event.wait(timeout=poll_seconds)
+                    self._orb_reference_wakeup_event.wait(timeout=poll_seconds)
+                else:
+                    self._stop_event.wait(timeout=poll_seconds)
                 collect_completed()
         finally:
             if check_future is not None:
@@ -9341,7 +9745,8 @@ class DatabentoGammaStreamer:
                 # record-processing exception unwinds a temporary iterator,
                 # Databento's destructor terminates immediately and removes the
                 # protocol state needed by block_for_close().
-                live_iterator = iter(live_client)
+                self._begin_opening_timeline(live_client, next_generation)
+                live_iterator = _start_live_iterator(live_client)
                 for record in live_iterator:
                     if not self.is_running:
                         break
@@ -9350,6 +9755,11 @@ class DatabentoGammaStreamer:
                         # One subscribed quote schema; a typed SDK replay-complete
                         # message marks the boundary, never a heuristic quote age.
                         self._clock_replay_pending = False
+                    elif class_name == "SystemMsg":
+                        self._record_orb_interval_completion(
+                            record, generation=next_generation,
+                            processed_at_ns=time.time_ns(),
+                        )
                     if class_name == "SymbolMappingMsg":
                         symbol = getattr(record, "stype_out_symbol", None) or getattr(record, "stype_in_symbol", None)
                         if symbol:
@@ -9359,6 +9769,19 @@ class DatabentoGammaStreamer:
                             with self._fresh_quote_lock:
                                 self.id_to_symbol[instrument_id] = raw_symbol
                                 self.symbol_mappings[instrument_id] = mapping
+                            observer = getattr(self, "_opening_timeline", None)
+                            if observer is not None:
+                                try:
+                                    observer.mapped(
+                                        instrument_id, raw_symbol,
+                                        family=self._market_for_raw_symbol(raw_symbol),
+                                        mapping_start_ns=mapping.get("start_ts_ns"),
+                                        mapping_end_ns=mapping.get("end_ts_ns"),
+                                        mapping_version=mapping.get("mapping_version"),
+                                        source="reader",
+                                    )
+                                except Exception as exc:
+                                    self._opening_timeline_error = type(exc).__name__
                         if self._stream_stalled():
                             raise RuntimeError("Databento stream stalled (no quote progress); reconnecting")
                         continue
@@ -9366,6 +9789,7 @@ class DatabentoGammaStreamer:
                         self.quote_records_seen += 1
                         processed_monotonic = time.monotonic()
                         processed_at_ns = time.time_ns()
+                        processed_timeline_monotonic_ns = time.monotonic_ns()
                         ts_event_ns = _record_timestamp_ns(record, "ts_event")
                         ts_recv_ns = _record_timestamp_ns(record, "ts_recv")
                         ts_index_ns = _record_timestamp_ns(record, "ts_index")
@@ -9406,19 +9830,35 @@ class DatabentoGammaStreamer:
                                 self.symbol_mappings.get(instrument_id) or {}
                             )
                         market_name = self._market_for_raw_symbol(symbol) if symbol else None
+                        self._opening_timeline_quote(
+                            "processed", record, market_name, processed_at_ns,
+                            processed_timeline_monotonic_ns,
+                        )
                         arrival_telemetry.received(market_name, processed_at_ns, ts_recv_ns, self._clock_replay_pending)
                         if not symbol:
                             arrival_telemetry.rejected(None, "SYMBOL_MAPPING_UNAVAILABLE")
+                            self._opening_timeline_quote(
+                                "rejected", record, market_name, processed_at_ns,
+                                processed_timeline_monotonic_ns, "SYMBOL_MAPPING_UNAVAILABLE",
+                            )
                             self.unmapped_quote_records += 1
                             continue
                         bid = normalize_price(getattr(record, "bid_px_00", None))
                         ask = normalize_price(getattr(record, "ask_px_00", None))
                         if bid is None or ask is None:
                             arrival_telemetry.rejected(market_name, "INVALID_QUOTE_PRICE")
+                            self._opening_timeline_quote(
+                                "rejected", record, market_name, processed_at_ns,
+                                processed_timeline_monotonic_ns, "INVALID_QUOTE_PRICE",
+                            )
                             self.invalid_quote_records += 1
                             continue
                         if ask < bid:
                             arrival_telemetry.rejected(market_name, "CROSSED_QUOTE")
+                            self._opening_timeline_quote(
+                                "rejected", record, market_name, processed_at_ns,
+                                processed_timeline_monotonic_ns, "CROSSED_QUOTE",
+                            )
                             self.crossed_quote_records += 1
                             continue
                         quote_payload = {
@@ -9455,9 +9895,17 @@ class DatabentoGammaStreamer:
                                 != mapping.get("mapping_version")
                             ):
                                 arrival_telemetry.rejected(market_name, "SYMBOL_MAPPING_CHANGED")
+                                self._opening_timeline_quote(
+                                    "rejected", record, market_name, processed_at_ns,
+                                    processed_timeline_monotonic_ns, "SYMBOL_MAPPING_CHANGED",
+                                )
                                 self.unmapped_quote_records += 1
                                 continue
                             self._store_quote(symbol, quote_payload)
+                        self._opening_timeline_quote(
+                            "cache_admitted", record, market_name, processed_at_ns,
+                            processed_timeline_monotonic_ns,
+                        )
                         arrival_telemetry.admitted(market_name, self._clock_replay_pending)
                         self.messages_received += 1
                         if healthy_progress_started_monotonic is None:
@@ -9511,6 +9959,13 @@ class DatabentoGammaStreamer:
                 with self._client_lock:
                     watchdog_reason = self._watchdog_stop_reason
                 failure_reason = watchdog_reason or str(exc)
+                self._opening_timeline_note("connection_failed", details={
+                    "stage": "after_subscription_reader_or_transport" if subscription_established
+                             else "before_subscription_acknowledgment",
+                    "reason": type(exc).__name__,
+                    "exact_upstream_cause": "UNKNOWN_UNLESS_RETAINED_PROVIDER_ERROR",
+                    "subscription_established": subscription_established,
+                })
                 self._set_subscription_stage_terminal(
                     "canceled", "RECONNECT_CANCELS_DEFERRED_STAGE"
                 )
@@ -9596,11 +10051,16 @@ class DatabentoGammaStreamer:
                         live_client,
                         subscription_established=subscription_established,
                     )
+                self._retire_opening_timeline("SDK_CONNECTION_CLOSED")
                 live_iterator = None
+        writer = getattr(self, "_opening_timeline_writer", None)
+        if writer is not None:
+            writer.close(timeout=0.5)
 
     def _watchdog_loop(self) -> None:
         while self.is_running:
             try:
+                self._audit_opening_timeline_dispatch(datetime.now(timezone.utc))
                 self._try_activate_fresh_handoff()
                 with self._client_lock:
                     observed_client = self.client
@@ -10292,6 +10752,7 @@ class DatabentoGammaStreamer:
         logger.info("Starting Databento OPRA streamer...")
         self._install_provider_warning_telemetry()
         self._stop_event.clear()
+        self._orb_reference_wakeup_event.clear()
         if self._host_clock_shadow is not None:
             self._host_clock_shadow.start()
         self.is_running = True
@@ -10312,6 +10773,7 @@ class DatabentoGammaStreamer:
         # client/thread joins. Live readers bind to this state and must stop
         # treating retained prices or pins as current immediately.
         self._stop_event.set()
+        self._signal_orb_reference_readiness()
         with self._prediction_publication_lock, self._fresh_quote_lock:
             self.handoff_status = "stopped"
             self.handoff_reason = "streamer stopped"
@@ -10344,6 +10806,10 @@ class DatabentoGammaStreamer:
             self.orb_reference_thread.join(timeout=2)
         if self._host_clock_shadow is not None:
             self._host_clock_shadow.stop()
+        self._retire_opening_timeline("STREAMER_STOPPED")
+        writer = getattr(self, "_opening_timeline_writer", None)
+        if writer is not None:
+            writer.close(timeout=0.5)
         self._remove_provider_warning_telemetry()
 
     def get_latest_data(self, symbol: str, n: int = 1) -> list:
@@ -10398,12 +10864,23 @@ class DatabentoGammaStreamer:
 
     @handoff_status.setter
     def handoff_status(self, value: str) -> None:
+        new_status = str(value)
         lock = getattr(self, "_prediction_publication_lock", None)
         if lock is None:
-            self._handoff_status = str(value)
-            return
-        with lock, self._runtime_context_lock:
-            self._handoff_status = str(value)
+            previous_status = getattr(self, "_handoff_status", None)
+            self._handoff_status = new_status
+        else:
+            with lock, self._runtime_context_lock:
+                previous_status = getattr(self, "_handoff_status", None)
+                self._handoff_status = new_status
+        if previous_status != new_status:
+            self._opening_timeline_note("handoff_state", details={
+                "stage": new_status, "previous_status": previous_status,
+                "required_symbols": list(getattr(self, "required_handoff_symbols", ())),
+                "semantics": "shared handoff; not per-symbol ORB acceptance",
+            })
+        if new_status == "active" and previous_status != "active":
+            self._signal_orb_reference_readiness()
 
     @contextmanager
     def prediction_publication_guard(
@@ -10706,6 +11183,7 @@ class DatabentoGammaStreamer:
             "fresh_quote_counts": fresh_quote_counts,
             "fresh_quote_counter_mode": "incremental-expiry-heap-v1",
             "quote_arrival_diagnostics": quote_arrivals.snapshot(),
+            "opening_readiness_timeline": self._opening_timeline_snapshot(),
             "active_generation": active_generation,
             "subscription_cutoff_monotonic": self.subscription_cutoff_monotonic,
             "handoff_status": active_handoff_status,

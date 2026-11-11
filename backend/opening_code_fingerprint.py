@@ -55,6 +55,7 @@ OPENING_CRITICAL_SOURCE_PATHS = (
     "backend/quote_timing.py",
     "backend/host_clock_shadow.py",
     "backend/opening_capture_receipts.py",
+    "backend/opening_readiness_timeline.py",
     "backend/database_target.py",
     "backend/databento_streamer.py",
     "backend/subscription_segment.py",

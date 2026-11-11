@@ -133,6 +133,12 @@ def test_actual_sampler_dispatches_configured_markets_while_forecast_guard_is_he
             self.stopped = True
 
     class StopAfterFirstPoll:
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
         def wait(self, timeout=None):
             streamer.is_running = False
             return True
@@ -144,6 +150,7 @@ def test_actual_sampler_dispatches_configured_markets_while_forecast_guard_is_he
     monkeypatch.setattr(stream_module, "ThreadPoolExecutor", RecordingExecutor)
     monkeypatch.setattr("backend.opening_capture_receipts.due_checks", lambda *_: [])
     streamer._stop_event = StopAfterFirstPoll()
+    streamer._orb_reference_wakeup_event = streamer._stop_event
 
     def dispatch():
         try:

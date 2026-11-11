@@ -84,6 +84,12 @@ def test_first_bucket_retries_late_arriving_evidence_without_backfill(monkeypatc
         }
 
     class StopAfterOpening:
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
         def is_set(self):
             return False
 
@@ -99,6 +105,7 @@ def test_first_bucket_retries_late_arriving_evidence_without_backfill(monkeypatc
     monkeypatch.setattr(streamer, "_capture_opening_reference_once", capture)
     monkeypatch.setattr(streamer, "_record_opening_reference_failed_attempt", lambda **_: None)
     streamer._stop_event = StopAfterOpening()
+    streamer._orb_reference_wakeup_event = streamer._stop_event
     streamer._opening_reference_loop()
     assert any(eligible and intended == opening for _, intended, eligible in attempts)
     assert streamer._orb_reference_recent_buckets_by_market["SPX"][0][0] == opening
