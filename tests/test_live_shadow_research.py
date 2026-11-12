@@ -115,6 +115,23 @@ def test_live_shadow_fails_closed_on_negative_receive_lag(tmp_path):
     assert all(prediction.predicted_price is None for prediction in result.predictions)
 
 
+def test_live_shadow_never_persists_missing_committed_provenance_identity(tmp_path):
+    path = tmp_path / "shadow.db"
+    recorder = LiveShadowResearchRecorder(journal_path=path, enabled=True)
+    index_at = datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
+    payload = _payload(index_at, calculation_id="committed")
+    payload["calculation_id"] = " "
+
+    result = recorder.record(
+        payload,
+        processed_at_utc=index_at + timedelta(milliseconds=50),
+    )
+
+    assert result.skipped_reason == "MISSING_COMMITTED_PROVENANCE_IDENTITY"
+    assert result.saved_count == 0
+    assert not path.exists()
+
+
 def test_live_shadow_fails_closed_on_low_primary_pair_coverage(tmp_path):
     recorder = LiveShadowResearchRecorder(journal_path=tmp_path / "shadow.db", enabled=True)
     index_at = datetime(2026, 8, 25, 15, 0, tzinfo=UTC)

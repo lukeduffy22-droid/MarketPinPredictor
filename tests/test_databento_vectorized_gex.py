@@ -65,6 +65,15 @@ def test_batch_rejects_invalid_quotes_and_unbracketed_iv_rows():
     )
 
     assert result["valid_mask"].tolist() == [True, False, False, False, False, False, False]
+    assert result["rejection_reason"].tolist() == [
+        "valid",
+        "price_not_above_intrinsic",
+        "nonfinite_input",
+        "invalid_strike",
+        "invalid_time_to_expiry",
+        "invalid_option_type",
+        "iv_root_not_bracketed",
+    ]
     for field in ("iv", "gamma", "gex"):
         assert np.isfinite(result[field][0])
         assert np.isnan(result[field][1:]).all()
@@ -100,6 +109,7 @@ def test_batch_preserves_canonical_call_positive_put_negative_gex():
 def test_batch_rejects_nonpositive_spot_and_mismatched_shapes():
     invalid_spot = batch_iv_gamma_gex(0.0, [100.0], [1 / 365], [1.0], ["C"], [1.0])
     assert invalid_spot["valid_mask"].tolist() == [False]
+    assert invalid_spot["rejection_reason"].tolist() == ["invalid_spot"]
     assert np.isnan(invalid_spot["iv"]).all()
 
     with pytest.raises(ValueError, match="equal lengths"):

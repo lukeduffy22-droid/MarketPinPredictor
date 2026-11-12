@@ -8,6 +8,7 @@ import pytest
 from backend.research.shadow_formula import (
     NAIVE_LAST_PRICE_V1,
     PIN_CONTEXT_LINEAR_V1,
+    PIN_CONTEXT_NO_ZERO_GAMMA_V2,
     PointInTimeObservation,
     ShadowFormulaEngine,
     ShadowPredictionJournal,
@@ -98,6 +99,38 @@ def test_naive_baseline_is_no_change_but_keeps_same_data_guardrails():
     assert prediction.predicted_price == 6500.0
     assert prediction.predicted_delta_points == 0.0
     assert prediction.predicted_delta_bps == 0.0
+
+
+def test_v1_is_frozen_and_v2_is_a_separate_zero_gamma_ablation():
+    assert PIN_CONTEXT_LINEAR_V1.identity == (
+        "shadow-pin-context-linear:0.1.0-preregistered"
+    )
+    assert PIN_CONTEXT_LINEAR_V1.coefficients["zero_gamma_gap_bps"] == 0.03
+    assert PIN_CONTEXT_NO_ZERO_GAMMA_V2.identity == (
+        "shadow-pin-context-no-zero-gamma:0.2.0-preregistered"
+    )
+    assert "zero_gamma_gap_bps" not in PIN_CONTEXT_NO_ZERO_GAMMA_V2.coefficients
+    prediction = ShadowFormulaEngine().evaluate(
+        _observation(zero_gamma=None),
+        PIN_CONTEXT_NO_ZERO_GAMMA_V2,
+    )
+    assert not prediction.abstained
+    assert prediction.formula.promotion_allowed is False
+
+
+def test_rut_uses_the_same_fail_closed_inputs_and_thresholds():
+    valid = ShadowFormulaEngine().evaluate(
+        _observation(symbol="RUT"),
+        PIN_CONTEXT_NO_ZERO_GAMMA_V2,
+    )
+    assert not valid.abstained
+
+    thin = ShadowFormulaEngine().evaluate(
+        _observation(symbol="RUT", paired_quote_count=24),
+        PIN_CONTEXT_NO_ZERO_GAMMA_V2,
+    )
+    assert thin.abstained
+    assert "INSUFFICIENT_PAIRED_QUOTES" in thin.abstention_reasons
 
 
 @pytest.mark.parametrize(
