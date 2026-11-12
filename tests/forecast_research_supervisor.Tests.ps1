@@ -259,4 +259,3 @@ Describe 'Research mutex across independent runspaces' {
         try { $next.Acquired | Should Be $true } finally { Exit-ResearchLock $next }
     }
 }
-

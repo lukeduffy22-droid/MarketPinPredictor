@@ -64,4 +64,3 @@ Recovery order:
 3. A new download or equal-price replacement must never be renamed or relabeled as an old artifact. It has its own hash and observation time. Since newer retained records already cover every affected pair, first validate those records rather than blindly importing another duplicate set.
 
 This follow-up changed no production records, vault files, services, provider connections, or gate criteria.
-

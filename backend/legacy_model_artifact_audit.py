@@ -507,4 +507,3 @@ def audit_legacy_model_directory(
         symbols=symbol_reports,
         reasons=tuple(dict.fromkeys(reasons)),
     )
-

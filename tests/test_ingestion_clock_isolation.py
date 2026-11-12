@@ -89,4 +89,3 @@ def test_actual_cbbo_reader_keeps_metadata_and_progresses_during_publication(mon
     assert quote['provider_timestamp_order_valid'] is True
     assert quote['last_sale_validation_version'] == 'cbbo-last-sale-metadata.v2'
     assert quote['raw_ts_event_ns'] == quote['ts_event_ns'] == recv - 86400 * 10**9
-

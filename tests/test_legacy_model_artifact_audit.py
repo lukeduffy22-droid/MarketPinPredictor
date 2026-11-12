@@ -249,4 +249,3 @@ def test_current_read_only_readiness_overrides_stale_snapshot(
     assert audit.model_evidence_sessions == 15
     assert "current read-only readiness model evidence sessions 15/60" in audit.reasons
     assert all("14/60" not in reason for reason in audit.reasons)
-

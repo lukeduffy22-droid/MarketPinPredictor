@@ -100,4 +100,3 @@ def test_old_and_new_policies_have_distinct_ids_and_do_not_merge_ranges(cbbo_sto
     assert len({_orb_reference_provenance_identity(row) for row in rows}) == 2
     state = journal.snapshot('SPX', as_of_utc=OPEN_UTC + timedelta(minutes=5))
     assert state['opening_ranges']['5m']['capture_status'] != 'complete'
-

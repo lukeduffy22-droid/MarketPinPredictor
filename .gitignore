@@ -108,3 +108,8 @@ data/raw/
 data/verified_close_sources/
 data/closing_prices/
 data/backups/
+
+# Retain machine evidence locally; exclude it from source publication
+data/diagnostic_automation/2026-09-17/f6f710de1a7f73e40df06e99ec05ae4d62b6c5d77c9c23473dfdb576d2c1e95c.evidence.json
+data/diagnostic_automation/2026-09-18/fb0c5ea0b2fa4b89e7b78bb9776cc97016a2486441e1a5f7363fcd51b19e0e22.evidence.json
+data/ui_preferences/advisor_selection.json
