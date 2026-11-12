@@ -125,4 +125,5 @@ view.render_advisor(['SPX'], preferences_path={str(path)!r})
     changed = AppTest.from_string(script).run()
     changed.button[0].click().run()
     assert changed.checkbox[0].value is False
-    assert any('older source version' in x.value for x in changed.warning)
+    assert any('Previously selected change proposals' in x.value and
+               'does not invalidate saved AI reviews' in x.value for x in changed.warning)

@@ -34,6 +34,7 @@ def opening_failure_record(receipt: dict, *, source_sha256: str, line: int,
             "mapped_primary_contract_count", "available_quote_count", "snapshot_generation",
             "snapshot_subscription_epoch_id", "selected_universe_sha256",
             "minimum_source_quote_age_seconds", "maximum_source_quote_age_seconds",
+            "timestamp_contract_version", "quote_schema", "trade_timestamp_count",
             "earliest_ts_event_ns", "latest_ts_event_ns", "earliest_ts_recv_ns", "latest_ts_recv_ns",
         ) if key in gates
     }

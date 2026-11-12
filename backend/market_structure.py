@@ -15,11 +15,17 @@ import logging
 import math
 import os
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from backend.quote_timing import (CBBO_TIMING, LEGACY_TIMING, timing_contract,
+                                 last_sale_policy, last_sale_identity,
+                                 timestamp_bounds_valid, cbbo_formula_timing_valid)
 from backend.database import (
+    OrbPersistenceBudget,
+    orb_reference_price_inputs_valid,
     load_orb_reference_snapshot_samples,
     load_market_structure_observations,
     save_orb_reference_sample,
@@ -234,6 +240,9 @@ def _orb_reference_provenance_identity(
     str | None,
     float | None,
     str | None,
+    str | None,
+    str | None,
+    str | None,
 ]:
     (
         provider,
@@ -254,7 +263,154 @@ def _orb_reference_provenance_identity(
         formula_version,
         risk_free_rate,
         mapping_version,
+        timing_contract(row),
+        row.get("quote_schema") or "legacy",
+        last_sale_policy(row),
     )
+
+
+def _observed_opening_context(
+    rows: Sequence[Mapping[str, Any]], *, start_utc: datetime,
+    end_utc: datetime, as_of_utc: datetime, expected_cadence_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Describe retained observations separately from strict ORB authority.
+
+    Callers supply normalized, validated, progress-eligible reference rows.
+    Preserve same-bucket identity overlap before the strict projection dedups.
+    """
+    identity_fields = (
+        "provider", "subscription_epoch_id", "subscription_generation",
+        "universe_sha256", "primary_expiration", "spot_formula_version",
+        "risk_free_rate", "symbol_mapping_version", "timestamp_contract_version",
+        "quote_schema", "last_sale_validation_version",
+    )
+    cadence = expected_cadence_seconds
+    nominal = int(math.ceil((end_utc - start_utc).total_seconds() / cadence))
+    elapsed = min(nominal, max(0, int((as_of_utc - start_utc).total_seconds() // cadence) + 1))
+    eligible: list[dict[str, Any]] = []
+    exclusions: dict[str, int] = {}
+
+    def exclude(reason: str) -> None:
+        exclusions[reason] = exclusions.get(reason, 0) + 1
+
+    for row in rows:
+        if row.get("progress_eligible") is not True:
+            exclude("PROGRESS_NOT_ELIGIBLE")
+            continue
+        sample = _parse_utc(row.get("_source_time"))
+        price = _finite(row.get("_price"))
+        if sample is None or price is None or isinstance(row.get("_price"), bool) or price <= 0:
+            exclude("INVALID_PRICE_OR_BUCKET")
+            continue
+        offset = (sample - start_utc).total_seconds() / cadence
+        if not (0 <= offset < nominal) or not math.isclose(offset, round(offset), abs_tol=1e-7, rel_tol=0):
+            exclude("OFF_GRID_BUCKET")
+            continue
+        identity = _orb_reference_provenance_identity(row)
+        if (
+            any(value is None for value in identity)
+            or identity[0] != "databento" or identity[2] <= 0
+            or isinstance(row.get("subscription_generation"), bool)
+            or _finite(row.get("subscription_generation")) != identity[2]
+            or isinstance(row.get("risk_free_rate"), bool)
+            or any(re.fullmatch(r"[0-9a-f]{64}", str(identity[index])) is None for index in (1, 3, 7))
+        ):
+            exclude("INCOMPLETE_PROVENANCE")
+            continue
+        try:
+            date.fromisoformat(str(identity[4]))
+        except ValueError:
+            exclude("INCOMPLETE_PROVENANCE")
+            continue
+        source = _parse_utc(row.get("source_timestamp_utc"))
+        # The bounded snapshot loader keeps this exact provider receive clock
+        # as nanoseconds rather than hydrating the full audit timestamp field.
+        if source is None and not isinstance(row.get("latest_ts_recv_ns"), bool):
+            source_ns = _integer(row.get("latest_ts_recv_ns"))
+            if source_ns is not None and 0 < source_ns < 10**19:
+                try:
+                    source = datetime.fromtimestamp(source_ns / 1_000_000_000, tz=UTC)
+                except (OverflowError, OSError, ValueError):
+                    source = None
+        captured = _parse_utc(row.get("captured_at_utc"))
+        decided_raw = row.get("progress_decided_at_utc")
+        decided = _parse_utc(decided_raw) if decided_raw is not None else None
+        if (
+            source is None or captured is None
+            or not 0 <= (captured - sample).total_seconds() < cadence
+            or (source - captured).total_seconds() > .05
+            or (decided_raw is not None and (decided is None or decided < captured))
+        ):
+            exclude("INVALID_OBSERVATION_CLOCKS")
+            continue
+        if sample > as_of_utc or captured > as_of_utc or (decided is not None and decided > as_of_utc):
+            exclude("KNOWLEDGE_AFTER_AS_OF")
+            continue
+        eligible.append({"row": row, "identity": identity, "index": int(round(offset)), "bucket": sample,
+                         "price": price, "source": source, "captured": captured})
+
+    eligible.sort(key=lambda item: (item["bucket"], item["captured"], str(item["row"].get("sample_id") or "")))
+    unique = {(item["identity"], item["index"]): item for item in eligible}
+    retained = sorted(unique.values(), key=lambda item: (item["bucket"], item["captured"], str(item["row"].get("sample_id") or "")))
+    observed_indices = {item["index"] for item in retained}
+    identities_by_bucket: dict[int, set[tuple]] = {}
+    for item in retained:
+        identities_by_bucket.setdefault(item["index"], set()).add(item["identity"])
+    missing = sorted(set(range(elapsed)) - observed_indices)
+    missing_spans: list[dict[str, Any]] = []
+    for index in missing:
+        bucket = start_utc + timedelta(seconds=index * cadence)
+        if missing_spans and index == missing_spans[-1]["_last_index"] + 1:
+            missing_spans[-1].update(last_bucket_utc=_utc_iso(bucket), bucket_count=missing_spans[-1]["bucket_count"] + 1, _last_index=index)
+        else:
+            missing_spans.append({"first_bucket_utc": _utc_iso(bucket), "last_bucket_utc": _utc_iso(bucket), "bucket_count": 1, "_last_index": index})
+    for span in missing_spans:
+        del span["_last_index"]
+    groups: list[list[dict[str, Any]]] = []
+    for item in retained:
+        if not groups or groups[-1][-1]["identity"] != item["identity"]:
+            groups.append([])
+        groups[-1].append(item)
+    segments: list[dict[str, Any]] = []
+    for index, group in enumerate(groups, 1):
+        indices = sorted({item["index"] for item in group})
+        gaps = [(right - left) * cadence for left, right in zip(indices, indices[1:])]
+        count = len(indices)
+        segments.append({
+            "schema_version": "marketpin-orb-observed-context.v1",
+            "segment_number": index, "authority": "DIAGNOSTIC_ONLY", "usage": "CONTEXT_ONLY",
+            "identity": dict(zip(identity_fields, group[0]["identity"])),
+            "first_bucket_utc": _utc_iso(group[0]["bucket"]), "last_bucket_utc": _utc_iso(group[-1]["bucket"]),
+            "first_source_timestamp_utc": _utc_iso(min(item["source"] for item in group)),
+            "last_source_timestamp_utc": _utc_iso(max(item["source"] for item in group)),
+            "first_captured_at_utc": _utc_iso(min(item["captured"] for item in group)),
+            "last_captured_at_utc": _utc_iso(max(item["captured"] for item in group)),
+            "observed_bucket_count": count,
+            "nominal_window_coverage_ratio": count / nominal if nominal else None,
+            "elapsed_capture_ratio": count / elapsed if elapsed else None,
+            "observed_high": max(item["price"] for item in group), "observed_low": min(item["price"] for item in group),
+            "maximum_interbucket_gap_seconds": max(gaps) if gaps else None,
+            "interior_missing_bucket_count": indices[-1] - indices[0] + 1 - count,
+            "directional_evidence_eligible": False, "model_eligible": False,
+            "usable_for_prediction": False, "eligible_for_training": False, "orb_complete": False,
+        })
+    ordered_indices = sorted(observed_indices)
+    grid = {
+        "schema_version": "marketpin-orb-observed-context.v1", "authority": "DIAGNOSTIC_ONLY", "usage": "CONTEXT_ONLY",
+        "nominal_expected_bucket_count": nominal, "elapsed_expected_bucket_count": elapsed,
+        "future_bucket_count": nominal - elapsed, "observed_bucket_count": len(observed_indices),
+        "nominal_window_coverage_ratio": len(observed_indices) / nominal if nominal else None,
+        "elapsed_capture_ratio": len(observed_indices) / elapsed if elapsed else None,
+        "elapsed_missing_bucket_count": len(missing), "elapsed_missing_spans": missing_spans,
+        "opening_bucket_missing": (0 not in observed_indices) if elapsed else None,
+        "overlapping_identity_bucket_count": sum(len(identities) > 1 for identities in identities_by_bucket.values()),
+        "duplicate_identity_bucket_count": len(eligible) - len(retained),
+        "excluded_context_sample_count": sum(exclusions.values()), "context_exclusion_counts": exclusions,
+        "maximum_interbucket_gap_seconds": max(((right - left) * cadence for left, right in zip(ordered_indices, ordered_indices[1:])), default=None),
+        "coverage_semantics": "Unique observed buckets; extrema are reported only within separate full-provenance segments.",
+        "deduplication_semantics": "Latest captured eligible row per full identity and bucket; duplicates do not multiply coverage.",
+    }
+    return segments, grid
 
 
 def _opening_window_projection(
@@ -458,9 +614,15 @@ def _opening_window_projection(
     if latest and not current_reference_fresh:
         warnings.append("CURRENT_REFERENCE_STALE")
 
+    observed_segments, observed_grid = _observed_opening_context(
+        raw_rows, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc,
+        expected_cadence_seconds=expected_cadence_seconds,
+    )
     duration_minutes = int((end_utc - start_utc).total_seconds() // 60)
     return {
         "duration_minutes": duration_minutes,
+        "observed_context_segments": observed_segments,
+        "observed_context_grid": observed_grid,
         "range_start_utc": _utc_iso(start_utc),
         "range_end_utc": _utc_iso(end_utc),
         "clock_status": clock_status,
@@ -499,6 +661,23 @@ def _opening_window_projection(
             "expected_cadence_seconds": expected_cadence_seconds,
             "first_sample_utc": _utc_iso(first_sample_utc),
             "opening_bucket_present": opening_bucket_present,
+            "first_bucket_receipts": [
+                {
+                    "sample_id": row.get("sample_id"),
+                    "sample_timestamp_utc": _utc_iso(row["_source_time"]),
+                    "captured_at_utc": _utc_iso(_parse_utc(row.get("captured_at_utc"))),
+                    "decision_timestamp_utc": _utc_iso(_parse_utc(row.get("progress_decided_at_utc"))),
+                    "subscription_epoch_id": row.get("subscription_epoch_id"),
+                    "subscription_generation": row.get("subscription_generation"),
+                    "timestamp_contract_version": timing_contract(row),
+                    "quote_schema": row.get("quote_schema"),
+                    "earliest_ts_recv_ns": row.get("earliest_ts_recv_ns"),
+                    "latest_ts_recv_ns": row.get("latest_ts_recv_ns"),
+                    "processing_clock_status": row.get("processing_clock_status"),
+                    "paired_quote_count": row.get("paired_quote_count"),
+                }
+                for row in raw_rows if row["_source_time"] == start_utc
+            ],
             "last_range_sample_utc": _utc_iso(last_sample_utc),
             "first_sample_lag_seconds": first_sample_lag_seconds,
             "end_gap_seconds": end_gap_seconds,
@@ -516,8 +695,72 @@ def _opening_window_projection(
     }
 
 
+@dataclass(frozen=True)
+class _SnapshotEvidence:
+    """Validated request-local inputs, before ORB classification/presentation."""
+
+    references: list[dict[str, Any]]
+    structures: list[dict[str, Any]]
+    raw_range: list[dict[str, Any]]
+    invalid_range: list[dict[str, Any]]
+    range_rows: list[dict[str, Any]]
+    latest: dict[str, Any] | None
+    latest_price_invalid: bool
+
+
+def _normalize_snapshot_evidence(
+    references: Sequence[Mapping[str, Any]],
+    structures: Sequence[Mapping[str, Any]],
+    start_utc: datetime,
+    end_utc: datetime,
+) -> _SnapshotEvidence:
+    """Keep rejected/latest-invalid evidence explicit; never mutate raw records."""
+    normalized_rows: list[dict[str, Any]] = []
+    invalid_price_rows: list[dict[str, Any]] = []
+    for row in references:
+        # Legacy/custom loaders cannot promote a pending raw row.
+        if row.get("progress_eligible") is not True or timing_contract(row) is None:
+            continue
+        source_time = _parse_utc(row.get("sample_timestamp_utc"))
+        price = _finite(row.get("reference_price"))
+        if source_time is None or price is None or price <= 0.0:
+            continue
+        if (row.get("reference_price_inputs_valid") is False
+                or ("formula_inputs_json" in row
+                    and not orb_reference_price_inputs_valid(row["formula_inputs_json"]))):
+            invalid_price_rows.append({**row, "_source_time": source_time})
+            continue
+        normalized_rows.append({**row, "_source_time": source_time, "_price": price})
+    normalized_rows.sort(key=lambda row: (
+        row["_source_time"],
+        _parse_utc(row.get("captured_at_utc")) or row["_source_time"],
+        str(row.get("sample_id") or ""),
+    ))
+    structure_rows = []
+    for row in structures:
+        source_time = _parse_utc(row.get("source_timestamp_utc"))
+        if source_time is not None:
+            structure_rows.append({**row, "_source_time": source_time})
+    structure_rows.sort(key=lambda row: (row["_source_time"], str(row.get("observation_id") or "")))
+    raw_range_rows = [row for row in normalized_rows if start_utc <= row["_source_time"] < end_utc]
+    invalid_range_rows = [row for row in invalid_price_rows if start_utc <= row["_source_time"] < end_utc]
+    # One sampler bucket is one price sample, including unchanged fresh quotes.
+    range_by_source_time = {row["_source_time"]: row for row in raw_range_rows}
+    range_rows = [range_by_source_time[key] for key in sorted(range_by_source_time)]
+    latest = normalized_rows[-1] if normalized_rows else None
+    latest_price_invalid = bool(invalid_price_rows and (
+        latest is None or max(row["_source_time"] for row in invalid_price_rows) >= latest["_source_time"]
+    ))
+    return _SnapshotEvidence(
+        normalized_rows, structure_rows, raw_range_rows, invalid_range_rows,
+        range_rows, None if latest_price_invalid else latest, latest_price_invalid,
+    )
+
+
 class MarketStructureJournal:
     """Record validated revisions and project current ORB/pin-drift state."""
+
+    supports_reference_persistence_budget = True
 
     def __init__(
         self,
@@ -653,6 +896,11 @@ class MarketStructureJournal:
 
     def record_reference(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Persist one independently sampled, provenance-complete ORB reference."""
+        contract = timing_contract(payload)
+        if contract is None:
+            return {"recorded": False, "reason": "TIMESTAMP_CONTRACT_UNSUPPORTED"}
+        timing_identity = ({"timestamp_contract_version": contract, "quote_schema": payload["quote_schema"]}
+                           if contract == CBBO_TIMING else {})
         defer_progress_decision = payload.get("_defer_progress_decision") is True
         symbol = str(payload.get("symbol") or "").upper().strip()
         if not symbol:
@@ -742,6 +990,8 @@ class MarketStructureJournal:
         formula_pairs = formula_inputs.get("pairs")
         if not isinstance(formula_pairs, list) or len(formula_pairs) != contributing_pair_count:
             return {"recorded": False, "reason": "REFERENCE_FORMULA_INPUTS_INVALID"}
+        if not orb_reference_price_inputs_valid(formula_inputs):
+            return {"recorded": False, "reason": "REFERENCE_OPTION_PRICE_INVALID"}
         canonical_pairs = json.dumps(
             formula_pairs,
             sort_keys=True,
@@ -842,25 +1092,10 @@ class MarketStructureJournal:
         earliest_ts_recv_ns = _integer(payload.get("earliest_ts_recv_ns"))
         latest_ts_recv_ns = _integer(payload.get("latest_ts_recv_ns"))
         observation_index_ns = _integer(payload.get("observation_index_ns"))
-        if (
-            earliest_ts_event_ns is None
-            or latest_ts_event_ns is None
-            or earliest_ts_recv_ns is None
-            or latest_ts_recv_ns is None
-            or observation_index_ns is None
-            or min(
-                earliest_ts_event_ns,
-                latest_ts_event_ns,
-                earliest_ts_recv_ns,
-                latest_ts_recv_ns,
-                observation_index_ns,
-            )
-            <= 0
-            or earliest_ts_event_ns > latest_ts_event_ns
-            or earliest_ts_recv_ns > latest_ts_recv_ns
-            or latest_ts_event_ns > latest_ts_recv_ns
-        ):
+        if not timestamp_bounds_valid(payload):
             return {"recorded": False, "reason": "PROVIDER_TIMESTAMP_ORDER_INVALID"}
+        if contract == CBBO_TIMING and not cbbo_formula_timing_valid(payload, formula_pairs):
+            return {"recorded": False, "reason": "PROVIDER_INTERVAL_EVIDENCE_INVALID"}
         recv_time = datetime.fromtimestamp(latest_ts_recv_ns / 1_000_000_000, tz=UTC)
         if abs((recv_time - source_time).total_seconds()) > 0.000002:
             return {"recorded": False, "reason": "SOURCE_TIMESTAMP_MISMATCH"}
@@ -902,6 +1137,8 @@ class MarketStructureJournal:
 
         identity = json.dumps(
             {
+                **timing_identity,
+                **last_sale_identity(payload),
                 "symbol": symbol,
                 "sample_timestamp_utc": _utc_iso(sample_time),
                 "subscription_epoch_id": subscription_epoch_id,
@@ -917,6 +1154,8 @@ class MarketStructureJournal:
         ).encode("utf-8")
         sample_id = hashlib.sha256(identity).hexdigest()
         sample = {
+            **timing_identity,
+            **({"trade_timestamp_count": payload["trade_timestamp_count"]} if contract == CBBO_TIMING else {}),
             "sample_id": sample_id,
             "symbol": symbol,
             "trading_date": sample_et.date(),
@@ -962,10 +1201,18 @@ class MarketStructureJournal:
             # instead and ignores this non-column field.
             "progress_eligible": not defer_progress_decision,
         }
-        saved = self.reference_saver(sample)
+        budget = payload.get("_persistence_budget")
+        if isinstance(budget, OrbPersistenceBudget) and budget.reason():
+            return {"recorded": False, "reason": budget.reason(), "progress_eligible": False}
+        if isinstance(budget, OrbPersistenceBudget) and self.reference_saver is save_orb_reference_sample:
+            saved = self.reference_saver(sample, persistence_budget=budget)
+        else:
+            saved = self.reference_saver(sample)
         result = {
             "recorded": saved is not None,
-            "reason": None if saved is not None else "PERSISTENCE_FAILED",
+            "reason": None if saved is not None else (
+                budget.reason() if isinstance(budget, OrbPersistenceBudget) and budget.reason()
+                else "PERSISTENCE_FAILED"),
             "sample_id": sample_id,
             "sample_timestamp_utc": _utc_iso(sample_time),
             "source_timestamp_utc": _utc_iso(source_time),
@@ -984,6 +1231,7 @@ class MarketStructureJournal:
                 attempt_completed_at_utc=captured_at,
                 progress_eligible=True,
                 reason=None,
+                persistence_budget=budget if isinstance(budget, OrbPersistenceBudget) else None,
             )
             if decision.get("recorded") is True:
                 result["progress_eligible"] = True
@@ -1001,6 +1249,7 @@ class MarketStructureJournal:
         attempt_completed_at_utc: Any,
         progress_eligible: bool,
         reason: str | None,
+        persistence_budget: OrbPersistenceBudget | None = None,
     ) -> dict[str, Any]:
         """Append the one final, immutable progress decision for a raw sample."""
         decision = {
@@ -1012,16 +1261,37 @@ class MarketStructureJournal:
             "reason": reason,
             "decision_status": "final",
         }
-        saved = self.reference_decision_saver(decision)
+        if persistence_budget is not None and persistence_budget.reason():
+            return {**decision, "recorded": False, "reason": persistence_budget.reason()}
+        if persistence_budget is not None and self.reference_decision_saver is save_orb_reference_sample_decision:
+            saved = self.reference_decision_saver(decision, persistence_budget=persistence_budget)
+        else:
+            saved = self.reference_decision_saver(decision)
         return {
+            **decision,
             "recorded": saved is not None,
             "reason": (
-                None
+                decision["reason"]
                 if saved is not None
-                else "REFERENCE_PROGRESS_DECISION_PERSISTENCE_FAILED"
+                else (persistence_budget.reason() if persistence_budget is not None and persistence_budget.reason()
+                      else "REFERENCE_PROGRESS_DECISION_PERSISTENCE_FAILED")
             ),
-            **decision,
         }
+
+    def snapshot_reader(self):
+        """Return a request-local reader that reuses inputs, never authority.
+
+        A runtime rollover can require several classifications of the same
+        symbol/date/as-of evidence. Keep that immutable input only for this
+        reader; every call still recomputes runtime alignment and freshness.
+        A new HTTP request creates a new reader and reads persistence again.
+        """
+        evidence = {}
+
+        def read(symbol, **kwargs):
+            return self.snapshot(symbol, _request_evidence=evidence, **kwargs)
+
+        return read
 
     def snapshot(
         self,
@@ -1033,6 +1303,7 @@ class MarketStructureJournal:
         active_subscription_epoch_id: str | None = None,
         active_subscription_generation: int | None = None,
         active_handoff_status: str | None = None,
+        _request_evidence: dict | None = None,
     ) -> dict[str, Any]:
         """Build one fail-closed ORB and pin-drift view from retained evidence."""
         normalized = str(symbol or "").upper().strip()
@@ -1051,45 +1322,23 @@ class MarketStructureJournal:
             )
         )
 
-        rows = self.reference_loader(normalized, target_date, as_of_utc=as_of)
-        normalized_rows: list[dict[str, Any]] = []
-        for row in rows:
-            # Production loaders always project the immutable decision sidecar.
-            # Requiring the marker here also prevents a custom/legacy loader
-            # from accidentally promoting a pending raw row.
-            if row.get("progress_eligible") is not True:
-                continue
-            source_time = _parse_utc(row.get("sample_timestamp_utc"))
-            price = _finite(row.get("reference_price"))
-            if source_time is None or price is None or price <= 0.0:
-                continue
-            normalized_rows.append({**row, "_source_time": source_time, "_price": price})
-        normalized_rows.sort(
-            key=lambda row: (
-                row["_source_time"],
-                _parse_utc(row.get("captured_at_utc")) or row["_source_time"],
-                str(row.get("sample_id") or ""),
+        evidence_key = (id(self), normalized, target_date, as_of)
+        evidence = (_request_evidence or {}).get(evidence_key)
+        if evidence is None:
+            evidence = _normalize_snapshot_evidence(
+                self.reference_loader(normalized, target_date, as_of_utc=as_of),
+                self.loader(normalized, target_date, as_of_utc=as_of),
+                start_utc, end_utc,
             )
-        )
-        structure_rows: list[dict[str, Any]] = []
-        for row in self.loader(normalized, target_date, as_of_utc=as_of):
-            source_time = _parse_utc(row.get("source_timestamp_utc"))
-            if source_time is not None:
-                structure_rows.append({**row, "_source_time": source_time})
-        structure_rows.sort(
-            key=lambda row: (row["_source_time"], str(row.get("observation_id") or ""))
-        )
-        raw_range_rows = [
-            row for row in normalized_rows if start_utc <= row["_source_time"] < end_utc
-        ]
-        # One sampler bucket is one price sample. Provider timestamps remain
-        # retained separately, so an unchanged but still-fresh quote does not
-        # make the 5-second cadence appear missing.
-        range_by_source_time: dict[datetime, dict[str, Any]] = {}
-        for row in raw_range_rows:
-            range_by_source_time[row["_source_time"]] = row
-        range_rows = [range_by_source_time[key] for key in sorted(range_by_source_time)]
-        latest = normalized_rows[-1] if normalized_rows else None
+            if _request_evidence is not None:
+                _request_evidence[evidence_key] = evidence
+        normalized_rows = evidence.references
+        structure_rows = evidence.structures
+        raw_range_rows = evidence.raw_range
+        invalid_range_rows = evidence.invalid_range
+        range_rows = evidence.range_rows
+        latest = evidence.latest
+        latest_price_invalid = evidence.latest_price_invalid
 
         if as_of < start_utc:
             clock_status = "not_started"
@@ -1252,6 +1501,13 @@ class MarketStructureJournal:
         latest_structure_identity = (
             _provenance_identity(latest_structure) if latest_structure else None
         )
+        latest_structure_identity_complete = bool(
+            latest_structure_identity is not None
+            and all(value is not None for value in latest_structure_identity)
+        )
+        # Request-local identities avoid repeatedly normalizing every day's
+        # row. Never cache runtime authority or reuse a completed projection.
+        structure_identities = [_provenance_identity(row) for row in structure_rows]
         structure_vs_reference_aligned = bool(
             latest_structure_identity is not None
             and latest is not None
@@ -1301,11 +1557,9 @@ class MarketStructureJournal:
 
         calculation_bound_rows = [
             row
-            for row in structure_rows
-            if latest_structure_identity is not None
-            and _complete_provenance_identity(latest_structure)
-            and _complete_provenance_identity(row)
-            and _provenance_identity(row) == latest_structure_identity
+            for row, identity in zip(structure_rows, structure_identities)
+            if latest_structure_identity_complete
+            and identity == latest_structure_identity
             and row.get("same_day_profile_available")
             is latest_structure.get("same_day_profile_available")
             and str(row.get("validation_status") or "").lower().strip() == "valid"
@@ -1420,11 +1674,10 @@ class MarketStructureJournal:
         comparison_rows = (
             [
                 row
-                for row in structure_rows
-                if _provenance_identity(row) == latest_structure_identity
+                for row, identity in zip(structure_rows, structure_identities)
+                if identity == latest_structure_identity
             ]
-            if latest_structure_identity is not None
-            and _complete_provenance_identity(latest_structure)
+            if latest_structure_identity_complete
             else []
         )
         opening_structure_rows = [
@@ -1503,8 +1756,8 @@ class MarketStructureJournal:
         comparison_reset = bool(
             latest_structure_identity is not None
             and any(
-                _provenance_identity(row) != latest_structure_identity
-                for row in structure_rows
+                identity != latest_structure_identity
+                for identity in structure_identities
             )
         )
         if current_gamma is not None and current_pain is not None:
@@ -1515,6 +1768,10 @@ class MarketStructureJournal:
             current_pin_level_availability = "unavailable"
         current_pin_levels_available = current_pin_level_availability == "available"
         warnings: list[str] = []
+        if invalid_range_rows:
+            warnings.append("INVALID_OPTION_PRICE_SAMPLES_EXCLUDED")
+        if latest_price_invalid:
+            warnings.append("LATEST_REFERENCE_OPTION_PRICE_INVALID")
         if capture_status == "partial":
             warnings.append("OPENING_RANGE_CAPTURE_PARTIAL")
         elif capture_status == "unavailable":
@@ -1560,6 +1817,13 @@ class MarketStructureJournal:
             for minutes in ORB_WINDOWS_MINUTES
         }
         for window in opening_ranges.values():
+            excluded = [row for row in invalid_range_rows
+                        if row["_source_time"] < start_utc + timedelta(minutes=window["duration_minutes"])]
+            window["capture_evidence"]["excluded_invalid_price_sample_count"] = len(excluded)
+            window["observed_context_grid"]["excluded_invalid_input_sample_count"] = len(excluded)
+            window["capture_evidence"]["raw_observation_count"] += len(excluded)
+            if excluded:
+                window["warnings"].append("INVALID_OPTION_PRICE_SAMPLES_EXCLUDED")
             window["reference_semantics"] = dict(reference_semantics)
             window["directional_evidence_eligible"] = bool(
                 reference_semantics["directional_base_eligible"]
@@ -1686,7 +1950,9 @@ class MarketStructureJournal:
             "opening_ranges": opening_ranges,
             "capture_evidence": {
                 "sample_count": sample_count,
-                "raw_observation_count": len(raw_range_rows),
+                "raw_observation_count": len(raw_range_rows) + len(invalid_range_rows),
+                "excluded_invalid_price_sample_count": len(invalid_range_rows),
+                "excluded_invalid_price_sample_ids": [row.get("sample_id") for row in invalid_range_rows],
                 "duplicate_source_timestamp_count": len(raw_range_rows) - sample_count,
                 "expected_sample_count": expected_samples,
                 "capture_ratio": capture_ratio,

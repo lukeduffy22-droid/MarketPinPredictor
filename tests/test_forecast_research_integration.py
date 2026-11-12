@@ -1,7 +1,9 @@
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -56,6 +58,13 @@ def test_service_end_to_end_journals_only_research_and_get_is_pure(tmp_path):
     assert state["symbols"]["SPX"]["forecasts"]["0"]["status"] == "RESEARCH_ONLY"
     assert state["symbols"]["SPX"]["forecasts"]["3"]["status"] == "ABSTAIN"
     assert state["symbols"]["SPY"]["forecasts"]["0"]["predicted_close"] is None
+    with sqlite3.connect(journal) as connection:
+        receipt_rows = connection.execute("SELECT f.forecast_id,f.payload_json,r.committed_at_utc,r.receipt_sha256 "
+            "FROM research_forecasts f JOIN research_forecast_receipts r ON f.forecast_id=r.forecast_id").fetchall()
+    assert receipt_rows
+    for key, raw, committed, digest in receipt_rows:
+        assert datetime.fromisoformat(committed) >= datetime.fromisoformat(json.loads(raw)["prepared_at_utc"])
+        assert digest == hashlib.sha256((key + "\n" + committed).encode()).hexdigest()
     frozen = service._state
     # Pin read clock independent of test's wall date by serving captured state.
     service.snapshot = lambda: json.loads(json.dumps(frozen))
@@ -64,6 +73,7 @@ def test_service_end_to_end_journals_only_research_and_get_is_pure(tmp_path):
         result = client.get("/v1/research/forecasts", params={"symbols": "SPX,SPY", "horizon_sessions": 3})
         assert result.status_code == 200
         assert result.json()["symbols"]["SPX"]["forecast"]["horizon_sessions"] == 3
+        assert "eod_learning" not in result.json()["symbols"]["SPX"]
         assert client.get("/v1/research/forecasts?horizon_sessions=11").status_code == 422
         assert client.get("/v1/research/forecasts?symbols=UNKNOWN").status_code == 422
     assert journal.read_bytes() == before
@@ -178,7 +188,17 @@ def _eod_source_db(tmp_path, closes):
     return path
 
 
-def test_trend_endpoint_serves_metrics_from_close_evidence(tmp_path):
+@pytest.fixture
+def trend_clock(monkeypatch):
+    # The September fixtures must not age out when this suite runs in October.
+    class FixtureDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 9, 14)
+    monkeypatch.setattr("backend.research_api.date", FixtureDate)
+
+
+def test_trend_endpoint_serves_metrics_from_close_evidence(tmp_path, trend_clock):
     closes = [("SPX", f"2026-09-{d:02d}", close, "databento")
               for d, close in enumerate((100.0, 102.0, 104.0, 103.0, 106.0), start=1)]
     service = MarketResearchService(_eod_source_db(tmp_path, closes), tmp_path / "research.db", symbols=["SPX"])
@@ -195,7 +215,7 @@ def test_trend_endpoint_serves_metrics_from_close_evidence(tmp_path):
         assert -1.0 <= metrics["momentum_score"] <= 1.0
 
 
-def test_trend_endpoint_rejects_untracked_and_thin_evidence(tmp_path):
+def test_trend_endpoint_rejects_untracked_and_thin_evidence(tmp_path, trend_clock):
     closes = [("SPX", "2026-09-01", 100.0, "databento")]
     service = MarketResearchService(_eod_source_db(tmp_path, closes), tmp_path / "research.db", symbols=["SPX"])
     with TestClient(create_research_app(service, manage_lifecycle=False)) as client:
@@ -204,7 +224,7 @@ def test_trend_endpoint_rejects_untracked_and_thin_evidence(tmp_path):
         assert client.get("/v1/research/trend", params={"symbol": "SPX", "lookback_days": 0}).status_code == 422
 
 
-def test_trend_endpoint_excludes_unit_test_rows(tmp_path):
+def test_trend_endpoint_excludes_unit_test_rows(tmp_path, trend_clock):
     closes = [("SPX", "2026-09-01", 100.0, "databento"),
               ("SPX", "2026-09-02", 110.0, "databento"),
               ("SPX", "2026-09-03", 999.0, "unit-test")]

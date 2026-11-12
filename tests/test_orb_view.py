@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import app.services.orb_view as orb_view
 from app.services.orb_view import (
     fetch_opening_ranges,
@@ -148,7 +150,7 @@ def test_opening_range_rows_preserves_unavailable_and_provenance_states():
     assert rows[1]["Capture"] == "not_configured"
     assert rows[1]["Provenance"] == "pending"
     assert rows[1]["Pin alignment"] == "unavailable"
-    assert rows[1]["ORB high"] is None
+    assert rows[1]["60m sampled high"] is None
 
 
 def test_fetch_opening_ranges_fails_closed_on_bad_backend_payload(monkeypatch):
@@ -164,6 +166,29 @@ def test_fetch_opening_ranges_fails_closed_on_bad_backend_payload(monkeypatch):
         lambda *_args, **_kwargs: Response(),
     )
     assert fetch_opening_ranges() == {}
+
+
+def test_orb_http_timeout_leaves_room_for_the_serial_backend_collection(monkeypatch):
+    from backend.api.routers.orb import _orb_reads
+
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"symbols": {}}
+
+    def get(url, *, timeout):
+        calls.append(timeout)
+        return Response()
+
+    monkeypatch.setattr(orb_view.requests, "get", get)
+    assert fetch_opening_ranges() == {"symbols": {}}
+    assert calls[0] >= _orb_reads._timeout_seconds + 0.5
+    fetch_opening_ranges(timeout_seconds=0.2)
+    assert calls[1] == 0.2
 
 
 def test_fetch_opening_ranges_preserves_bounded_runtime_timeout_reason(monkeypatch):
@@ -319,8 +344,8 @@ def test_legacy_or_unbound_orb_is_context_only_never_current():
         }
     )
 
-    assert rows[0]["Open"] == 6500.0
-    assert rows[0]["ORB high"] == 6510.0
+    assert rows[0]["First sampled price"] == 6500.0
+    assert rows[0]["60m sampled high"] == 6510.0
     assert rows[0]["Current"] is None
     assert rows[0]["Breakout"] == "unavailable"
     assert rows[0]["5m ORB"] == "6,495.00–6,505.00 | context only"
@@ -354,3 +379,137 @@ def test_noncanonical_runtime_epoch_cannot_authorize_current_orb_display():
     assert row["Epoch"] == "unavailable"
     assert row["Epoch full"] is None
     assert row["Epoch aligned"] is False
+
+
+def _live_range_with_unconfigured_canary():
+    from datetime import datetime, timezone
+    from backend.market_structure import MarketStructureJournal
+
+    payload = _live_envelope(
+        {
+            "SPX": {
+                "capture_status": "complete",
+                "configured": True,
+                "current_price": 6505.0,
+                "breakout_direction": "inside",
+                "directional_evidence_eligible": True,
+                "capture_evidence": {"opening_bucket_present": True},
+                "last_known_reference": {
+                    "subscription_epoch_id": EPOCH,
+                    "subscription_generation": 7,
+                },
+                "provenance": {
+                    "range_provenance_aligned": True,
+                    "current_vs_range_aligned": True,
+                },
+            }
+        }
+    )
+    # Use the actual empty-canary contract: it has a valid runtime binding but
+    # no latest sample, so active_runtime_epoch_aligned must remain false.
+    journal = MarketStructureJournal(
+        saver=lambda row: row,
+        loader=lambda *_args, **_kwargs: [],
+        reference_saver=lambda row: row,
+        reference_loader=lambda *_args, **_kwargs: [],
+    )
+    payload["symbols"]["RUT"] = journal.snapshot(
+        "RUT",
+        as_of_utc=datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc),
+        configured=False,
+        active_subscription_epoch_id=EPOCH,
+        active_subscription_generation=7,
+        active_handoff_status="active",
+    )
+    return payload
+
+
+def test_unconfigured_canary_does_not_claim_configured_orb_signals_are_withheld(monkeypatch):
+    payload = _live_range_with_unconfigured_canary()
+    messages = {name: [] for name in ("success", "warning", "error", "info", "caption")}
+    for name, collected in messages.items():
+        monkeypatch.setattr(orb_view.st, name, lambda message, bucket=collected: bucket.append(message))
+    monkeypatch.setattr(orb_view.st, "subheader", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orb_view.st, "dataframe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orb_view, "fetch_opening_ranges", lambda: payload)
+
+    orb_view.render_opening_range_panel()
+
+    assert messages["warning"] == []
+    assert messages["error"] == []
+    assert messages["success"] == [
+        "SPX: Opening range is complete and eligible for sampled-reference signals."
+    ]
+    assert "RUT: Not configured for live capture." in messages["caption"]
+    spx, rut = opening_range_rows(payload)
+    assert spx["ORB eligible"] is True
+    assert spx["Current"] == 6505.0
+    assert rut["ORB eligible"] is False
+    assert rut["Current"] is None
+    assert rut["Live contract"] == "context only"
+    assert rut["Warnings"] == ""
+
+
+def test_inactive_handoff_and_partial_capture_have_distinct_truthful_reasons():
+    payload = _live_range_with_unconfigured_canary()
+    payload["active_runtime_context"]["handoff_status"] = "degraded"
+    state = payload["symbols"]["SPX"]
+    state["capture_status"] = "partial"
+    state["directional_evidence_eligible"] = False
+    state["capture_evidence"]["opening_bucket_present"] = False
+    state["provenance"].update(
+        active_runtime_epoch_aligned=False,
+        active_handoff_status="degraded",
+        range_provenance_aligned=False,
+    )
+
+    row = opening_range_rows(payload)[0]
+
+    assert "Feed handoff is not active" in row["Status detail"]
+    assert "first opening bucket is missing" in row["Status detail"]
+    assert "mixed or incomplete provenance" in row["Status detail"]
+    assert "different runtime process" not in row["Status detail"]
+    assert row["Capture"] == "partial"
+    assert row["ORB eligible"] is False
+    assert row["Current"] is None
+    assert row["Breakout"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("subscription_epoch_id", "d" * 64, "different runtime process"),
+        ("subscription_generation", 6, "different subscription generation"),
+    ],
+)
+def test_real_sample_identity_mismatch_remains_unavailable(field, value, reason):
+    payload = _live_range_with_unconfigured_canary()
+    state = payload["symbols"]["SPX"]
+    state["last_known_reference"][field] = value
+    state["provenance"]["active_runtime_epoch_aligned"] = False
+
+    row = opening_range_rows(payload)[0]
+
+    assert reason in row["Status detail"]
+    assert row["ORB eligible"] is False
+    assert row["Current"] is None
+    assert row["Breakout"] == "unavailable"
+
+
+def test_aligned_partial_capture_reports_missing_bucket_without_identity_fault():
+    payload = _live_range_with_unconfigured_canary()
+    state = payload["symbols"]["SPX"]
+    state["capture_status"] = "partial"
+    state["directional_evidence_eligible"] = False
+    state["capture_evidence"]["opening_bucket_present"] = False
+
+    row = opening_range_rows(payload)[0]
+
+    assert row["Status detail"] == (
+        "The first opening bucket is missing. "
+        "Opening-range capture is partial; breakout signals are unavailable."
+    )
+    assert row["Live contract"] == "v2 current"
+    assert row["Current"] == 6505.0
+    assert row["ORB eligible"] is False
+    assert row["Capture"] == "partial"

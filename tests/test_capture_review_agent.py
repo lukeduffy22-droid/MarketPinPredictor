@@ -55,35 +55,37 @@ def response_client(review):
         assert kwargs['store'] is False
         assert 'tools' not in kwargs
         assert kwargs['text']['format']['strict'] is True
-        return SimpleNamespace(output_text=json.dumps(review))
+        return SimpleNamespace(status='completed', model='test-model', id='test-response', output=[], output_text=json.dumps(review))
     return SimpleNamespace(responses=SimpleNamespace(create=create))
 
 
-@pytest.mark.parametrize('ref,accepted', [('runtime', True), ('invented', False)])
+@pytest.mark.parametrize('ref,accepted', [('RUNTIME_UNAVAILABLE', True), ('invented', False)])
 def test_agent_rejects_fabricated_evidence(tmp_path, ref, accepted):
     packet = build_packet({}, {}, tmp_path)
-    review = {'summary':'Missing live proof', 'uncertainties':['No observation'],
-              'change_requests':[{'title':'Check capture','reason':'Missing proof',
-                                  'proposed_change':'Inspect', 'verification':'Compare timestamps',
-                                  'evidence_ids':[ref]}]}
+    review = {'finding_ids': [ref], 'investigation_ids': []}
     if accepted:
-        result = diagnose('Review readiness', packet, response_client(review))
+        result = diagnose('Review readiness', packet, response_client(review), root=tmp_path)
         assert result['execution_status'] == 'PROPOSED_ONLY'
     else:
-        with pytest.raises(ValueError, match='unsupported'):
-            diagnose('Review readiness', packet, response_client(review))
+        with pytest.raises(ValueError, match='UNSUPPORTED_FACT'):
+            diagnose('Review readiness', packet, response_client(review), root=tmp_path)
 
 
 def test_agent_refusal_cannot_become_a_change_request(tmp_path):
     with pytest.raises(Exception):
-        diagnose('Review', build_packet({}, {}, tmp_path), response_client({'summary':'refused'}))
+        diagnose('Review', build_packet({}, {}, tmp_path), response_client({'summary':'refused'}), root=tmp_path)
 
 
-def test_agent_ui_proposed_bundle_and_rerun(monkeypatch):
+def test_agent_ui_proposed_bundle_and_rerun(monkeypatch, tmp_path):
     from streamlit.testing.v1 import AppTest
     import app.services.diagnostic_agent as agent
-    monkeypatch.setattr(agent, 'build_packet', lambda *args: {'evidence': {}})
-    monkeypatch.setattr(agent, 'diagnose', lambda *args: {
+    import app.services.diagnostic_runtime as runtime
+    monkeypatch.setattr(agent, 'ROOT', tmp_path)
+    packet = {'session_date_ct': '2026-09-14', 'evidence': {}}
+    monkeypatch.setattr(agent, 'build_packet', lambda *args: packet)
+    monkeypatch.setattr(runtime, 'collect_live_packet', lambda *args: packet)
+    monkeypatch.setattr(agent, 'diagnose', lambda *args, **kwargs: {
+        'schema_version': 'diagnostic-review-v1', 'research_only': True, 'packet': packet,
         'generated_at_utc': '2026-09-14T20:00:00+00:00', 'execution_status': 'PROPOSED_ONLY',
         'review': {'summary': 'Test diagnosis', 'uncertainties': ['No live evidence'], 'change_requests': []}})
     app = AppTest.from_string('from app.services.diagnostic_agent import render_diagnostic_agent\nrender_diagnostic_agent({}, {})').run()

@@ -3,6 +3,7 @@ $ModulePath = Join-Path $ProjectRoot 'market_app_supervisor.psm1'
 $EnsurePath = Join-Path $ProjectRoot 'ensure_market_app.ps1'
 $StartMarketDayPath = Join-Path $ProjectRoot 'start_market_day.ps1'
 $PythonPath = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+if ($env:MARKETPIN_TEST_PYTHON) { $PythonPath = $env:MARKETPIN_TEST_PYTHON }
 
 Import-Module -Name $ModulePath -Force
 
@@ -18,7 +19,8 @@ if (@($ensureParseErrors).Count -ne 0) {
 }
 foreach ($functionName in @(
     'Invoke-OpeningAcceptancePreflight',
-    'Assert-OpeningAcceptanceMutationPreflight'
+    'Assert-OpeningAcceptanceMutationPreflight',
+    'Assert-ClosingTapeMutationPreflight'
 )) {
     $definition = @($ensureAst.FindAll(
         {
@@ -92,8 +94,12 @@ function New-TestPreflightPayload {
         schema_bootstrap_performed = $SchemaBootstrapPerformed
         bootstrap_attempt_count = $BootstrapAttemptCount
         source_fingerprint_sha256 = ('a' * 64)
-        required_file_count = 67
-        required_module_count = 50
+        database_fingerprint_sha256 = ('b' * 64)
+        database_fingerprint_scope = 'file_identity_and_schema_not_row_contents'
+        stage_timings_ms = @{}
+        database_query_timings = @()
+        required_file_count = 77
+        required_module_count = 59
         database_issues = @($DatabaseIssues)
         issues = @($Issues)
     }
@@ -117,10 +123,10 @@ Describe 'Bounded opening-acceptance preflight' {
         $script:CapturedWatchdogEvents = @()
         $script:ProjectRoot = $TestDrive
         $script:InvocationId = [guid]::NewGuid().ToString('N')
-        $script:OpeningAcceptancePreflightTimeoutSeconds = 150
+        $script:OpeningAcceptancePreflightTimeoutSeconds = 300
         $script:OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-        $script:OpeningAcceptancePreflightRequiredFileCount = 67
-        $script:OpeningAcceptancePreflightRequiredModuleCount = 50
+        $script:OpeningAcceptancePreflightRequiredFileCount = 77
+        $script:OpeningAcceptancePreflightRequiredModuleCount = 59
         $script:OpeningAcceptancePreflightResult = $null
         $script:PythonExe = $PythonPath
         $script:OpeningAcceptancePreflightScript = Join-Path $TestDrive 'preflight.py'
@@ -143,6 +149,86 @@ Describe 'Bounded opening-acceptance preflight' {
         @($script:CapturedWatchdogEvents | Where-Object {
             $_.Event -eq 'opening_acceptance_preflight_passed'
         }).Count | Should Be 1
+    }
+
+    It 'rejects completion first observed at or after either deadline' {
+        $module = Get-Module -Name market_app_supervisor
+        $deadlineUtc = [datetime]::SpecifyKind(
+            [datetime]'2026-10-22T22:15:05',
+            [DateTimeKind]::Utc
+        )
+
+        (& $module {
+            param($deadline)
+            Test-MarketAppChildCompletedBeforeDeadline `
+                -Completed $true `
+                -ObservedUtc $deadline.AddMilliseconds(-1) `
+                -DeadlineUtc $deadline `
+                -ObservedElapsedMilliseconds 999 `
+                -TimeoutMilliseconds 1000
+        } $deadlineUtc) | Should Be $true
+        (& $module {
+            param($deadline)
+            Test-MarketAppChildCompletedBeforeDeadline `
+                -Completed $true `
+                -ObservedUtc $deadline `
+                -DeadlineUtc $deadline `
+                -ObservedElapsedMilliseconds 999 `
+                -TimeoutMilliseconds 1000
+        } $deadlineUtc) | Should Be $false
+        (& $module {
+            param($deadline)
+            Test-MarketAppChildCompletedBeforeDeadline `
+                -Completed $true `
+                -ObservedUtc $deadline.AddSeconds(1) `
+                -DeadlineUtc $deadline `
+                -ObservedElapsedMilliseconds 999 `
+                -TimeoutMilliseconds 1000
+        } $deadlineUtc) | Should Be $false
+        (& $module {
+            param($deadline)
+            Test-MarketAppChildCompletedBeforeDeadline `
+                -Completed $true `
+                -ObservedUtc $deadline.AddMinutes(-10) `
+                -DeadlineUtc $deadline `
+                -ObservedElapsedMilliseconds 1000 `
+                -TimeoutMilliseconds 1000
+        } $deadlineUtc) | Should Be $false
+        (& $module {
+            param($deadline)
+            Test-MarketAppChildCompletedBeforeDeadline `
+                -Completed $true `
+                -ObservedUtc $deadline.AddMinutes(-10) `
+                -DeadlineUtc $deadline `
+                -ObservedElapsedMilliseconds 1001 `
+                -TimeoutMilliseconds 1000
+        } $deadlineUtc) | Should Be $false
+    }
+
+    It 'suppresses child output after a real one-second deadline' {
+        $tool = New-TestPreflightScript -Name 'timeout-output.py' -Body @'
+import time
+print("must-not-be-accepted", flush=True)
+time.sleep(30)
+'@
+        $module = Get-Module -Name market_app_supervisor
+        $result = & $module {
+            param($projectRoot, $pythonPath, $toolPath, $invocationId)
+            Invoke-MarketAppBoundedChildProcess `
+                -ProjectRoot $projectRoot `
+                -FilePath $pythonPath `
+                -ArgumentList @($toolPath) `
+                -InvocationId $invocationId `
+                -LogComponent 'absolute-deadline-test' `
+                -TimeoutSeconds 1
+        } $TestDrive $PythonPath $tool ([guid]::NewGuid().ToString('N'))
+
+        $result.Completed | Should Be $false
+        $result.TimedOut | Should Be $true
+        $result.TerminationAttempted | Should Be $true
+        $result.TerminationConfirmed | Should Be $true
+        @($result.Output).Count | Should Be 0
+        @($result.StandardError).Count | Should Be 0
     }
 
     It 'extracts exactly one UTC timestamp from raw child JSON' {
@@ -171,13 +257,16 @@ Describe 'Bounded opening-acceptance preflight' {
             -Name 'nonzero.py' `
             -Body ((New-TestJsonPrinterBody -Payload $payload) + "`nraise SystemExit(7)")
 
-        {
+        $failureMessage = $null
+        try {
             Invoke-OpeningAcceptancePreflight `
                 -PythonPath $PythonPath `
                 -PreflightScript $tool `
                 -DatabasePath (Join-Path $TestDrive 'market.db') `
                 -TimeoutSeconds 5
-        } | Should Throw
+        }
+        catch { $failureMessage = $_.Exception.Message }
+        $failureMessage | Should Match 'preflight failed'
 
         $failure = @($script:CapturedWatchdogEvents | Where-Object {
             $_.Event -eq 'opening_acceptance_preflight_failed'
@@ -218,13 +307,16 @@ Start-Sleep -Seconds 30
 import time
 time.sleep(30)
 '@
-            {
+            $timeoutMessage = $null
+            try {
                 Invoke-OpeningAcceptancePreflight `
                     -PythonPath $PythonPath `
                     -PreflightScript $tool `
                     -DatabasePath (Join-Path $TestDrive 'market.db') `
                     -TimeoutSeconds 1
-            } | Should Throw
+            }
+            catch { $timeoutMessage = $_.Exception.Message }
+            $timeoutMessage | Should Match 'timed out after 1 seconds'
 
             $timeout = @($script:CapturedWatchdogEvents | Where-Object {
                 $_.Event -eq 'opening_acceptance_preflight_timed_out'
@@ -260,12 +352,22 @@ time.sleep(30)
         }
     }
 
+    It 'rejects a mismatched database binding on cached proof reuse' {
+        $payload = New-TestPreflightPayload -Phase 'fingerprint' -DatabaseContract 'cached_full_proof_not_rechecked'
+        $tool = New-TestPreflightScript -Name 'wrong-database.py' -Body (New-TestJsonPrinterBody -Payload $payload)
+        { Invoke-OpeningAcceptancePreflight -PythonPath $PythonPath -PreflightScript $tool `
+            -DatabasePath (Join-Path $TestDrive 'market.db') -Phase 'fingerprint' `
+            -ExpectedSourceFingerprint ('a' * 64) -ExpectedDatabaseFingerprint ('c' * 64) `
+            -TimeoutSeconds 5 } | Should Throw 'Opening-acceptance source/schema preflight failed (phase=fingerprint issues=PREFLIGHT_PAYLOAD_CONTRACT_INVALID).'
+    }
+
     It 'memoizes one full proof and revalidates its fingerprint before reuse' {
         $script:successfulProof = [pscustomobject]@{
             schema_version = 'marketpin-opening-acceptance-preflight.v2'
             ready = $true
             schema_bootstrap_required = $false
             source_fingerprint_sha256 = ('a' * 64)
+            database_fingerprint_sha256 = ('b' * 64)
         }
         Mock Invoke-OpeningAcceptancePreflight { $script:successfulProof }
 
@@ -276,7 +378,18 @@ time.sleep(30)
         [object]::ReferenceEquals($second, $script:successfulProof) | Should Be $true
         Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 2 -Scope It
         Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 1 -Scope It -ParameterFilter {
-            $Phase -eq 'fingerprint' -and $ExpectedSourceFingerprint -eq ('a' * 64)
+            $Phase -eq 'fingerprint' -and $ExpectedSourceFingerprint -eq ('a' * 64) -and
+                $ExpectedDatabaseFingerprint -eq ('b' * 64)
+        }
+    }
+
+    It 'uses a separate bounded catalog gate for independent recorder work' {
+        Mock Invoke-OpeningAcceptancePreflight { [pscustomobject]@{ready=$true} }
+        $result = Assert-ClosingTapeMutationPreflight -TradingDate '2026-10-28'
+        $result.ready | Should Be $true
+        Assert-MockCalled Invoke-OpeningAcceptancePreflight -Times 1 -Scope It -ParameterFilter {
+            $Phase -eq 'capture' -and $TimeoutSeconds -eq 90 -and
+                $DatabasePath -eq (Join-Path $TestDrive 'data\closing_tape\2026-10-28\closing_tape.sqlite')
         }
     }
 
@@ -292,6 +405,7 @@ time.sleep(30)
                 ready = $true
                 schema_bootstrap_required = $false
                 source_fingerprint_sha256 = ('a' * 64)
+                database_fingerprint_sha256 = ('b' * 64)
             }
         }
 
@@ -307,9 +421,10 @@ time.sleep(30)
         $ensureSource = Get-Content -LiteralPath $EnsurePath -Raw
         $startSource = Get-Content -LiteralPath $StartMarketDayPath -Raw
 
-        $ensureSource | Should Match '\$OpeningAcceptancePreflightTimeoutSeconds = 150'
+        $ensureSource | Should Match '\$OpeningAcceptancePreflightTimeoutSeconds = 300'
         $ensureSource | Should Match '111\.716 and 113\.151 seconds'
         $ensureSource | Should Match 'former 120-second cutoff'
+        $ensureSource | Should Match 'identical-code pass exceeded 240 seconds'
         $ensureSource | Should Match 'opening_acceptance_preflight_timed_out'
         $ensureSource | Should Match 'action=abort_before_process_change'
         $ensureSource | Should Match 'Assign only after Invoke-OpeningAcceptancePreflight returns a successful'

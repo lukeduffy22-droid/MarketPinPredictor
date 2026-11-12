@@ -6,6 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Mapping
 
+from .catalog import TapeCatalog
 from .config import UTC, build_session_config
 from .contracts import (
     EVIDENCE_CONTRACT_VERSION,
@@ -14,6 +15,7 @@ from .contracts import (
     evidence_contract_for_source_kind,
 )
 from .finalize import finalize_closed_session
+from .live_recorder import ProcessFileLock
 from .replay import REPLAY_DECODER_VERSION
 
 
@@ -279,6 +281,24 @@ def finalize_closed_session_if_due(
     decision = postclose_finalize_decision(
         project_root, trading_day=trading_day, now=now
     )
+    if decision["action"] == "already_finalized" or (
+        decision["action"] == "incomplete" and decision.get("deduplicated") is True
+    ):
+        # A prior finalizer can commit its complete or incomplete audit and
+        # then fail while publishing WAL pages to the immutable base file.
+        # Retry that publication under the same recorder lock before reusing
+        # the committed audit result.
+        day_dir = (
+            Path(project_root).resolve()
+            / "data"
+            / "closing_tape"
+            / trading_day.isoformat()
+        )
+        with ProcessFileLock(day_dir / "recorder.lock"):
+            TapeCatalog(
+                day_dir / "closing_tape.sqlite"
+            ).checkpoint_wal_for_immutable_read()
+        return decision
     if decision["action"] != "finalize":
         return decision
     report = finalize_closed_session(

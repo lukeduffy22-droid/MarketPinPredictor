@@ -22,14 +22,17 @@ $ClosingTapeScript = Join-Path $ProjectRoot 'start_closing_tape.ps1'
 $ClosingTapeFinalizeScript = Join-Path $ProjectRoot 'tools\finalize_closing_tape_if_due.py'
 $OpeningAcceptancePreflightScript = Join-Path $ProjectRoot 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 67
-$OpeningAcceptancePreflightRequiredModuleCount = 50
+$OpeningAcceptancePreflightRequiredFileCount = 77
+$OpeningAcceptancePreflightRequiredModuleCount = 59
 # September 9 retained live full phases needed 111.716 and 113.151 seconds near
 # the open; later peers needed 101.906 and 107.919 seconds, while thirteen
 # same-day attempts hit the former 120-second cutoff under session I/O pressure.
-# A 150-second per-child bound adds bounded headroom while remaining below the
-# five-minute watchdog cadence and the scheduled task's 15-minute limit.
-$OpeningAcceptancePreflightTimeoutSeconds = 150
+# October 20 read-only integrity evidence needed as much as 213 seconds on the
+# expanded live database, and a later identical-code pass exceeded 240 seconds
+# while checking the large CBBO tables. The preflight contract's 300-second
+# maximum remains bounded by the scheduled task's 15-minute execution limit;
+# the five-minute IgnoreNew cadence prevents overlapping watchdog invocations.
+$OpeningAcceptancePreflightTimeoutSeconds = 300
 $InvocationId = [guid]::NewGuid().ToString('N')
 # This proof is intentionally scoped to one ensure_market_app.ps1 invocation.
 # Cache only a successful result; a failed or timed-out preflight must be
@@ -118,6 +121,10 @@ function Get-BackendReadinessState {
         LiveActiveGeneration = if ($null -ne $live.active_generation) { $live.active_generation } else { $live.subscription_generation }
         HealthHandoffStatus = [string]$health.handoff_status
         LiveHandoffStatus = [string]$live.handoff_status
+        ProviderClockStatus = [string]$health.processing_clock_telemetry.status
+        ProviderClockReadinessStage = [string]$health.processing_clock_telemetry.readiness_stage
+        ProviderClockSampleCount = $health.processing_clock_telemetry.sample_count
+        ProviderClockMinimumSamples = $health.processing_clock_telemetry.minimum_samples
         IsFallback = [bool]$health.universe_provenance.is_fallback
         ProvenanceMode = [string]$health.universe_provenance.mode
         SourceDate = [string]$health.universe_provenance.source_date
@@ -252,6 +259,8 @@ function Test-MarketAppCurrentDayUniversePreparationProof {
             [string]$provenance.mode -ceq 'current_day_cache' -and
             [string]$provenance.trading_date -ceq $ExpectedTradingDate -and
             [string]$provenance.source_date -ceq $ExpectedTradingDate -and
+            [string]$provenance.cache_metadata_status -ceq 'verified' -and
+            [string]$provenance.source_sha256 -cmatch '^[0-9a-f]{64}$' -and
             [string]$result.selected_universe_sha256 -cmatch '^[0-9a-f]{64}$' -and
             $selectedContractCount -ge 1 -and
             $selectedContractCount -le $ExpectedContractCap
@@ -308,6 +317,60 @@ function Test-MarketAppCurrentDayUniversePreparationProof {
             [System.Globalization.DateTimeStyles]::None,
             [ref]$expectedDate
         )) {
+            return $false
+        }
+
+        $parseProviderTimestampUtc = {
+            param([object]$Value)
+
+            $text = [string]$Value
+            # DateTimeOffset.TryParse accepts an offset-free timestamp as local
+            # time.  Current-day cache authority requires an explicit provider
+            # timezone so the launcher cannot silently reinterpret a cutoff.
+            if ($text -notmatch '(?:Z|[+-][0-9]{2}:[0-9]{2})$') {
+                return $null
+            }
+            $parsed = [datetimeoffset]::MinValue
+            if (-not [datetimeoffset]::TryParse(
+                $text,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundtripKind,
+                [ref]$parsed
+            )) {
+                return $null
+            }
+            return $parsed.ToUniversalTime()
+        }
+        $definitionStart = & $parseProviderTimestampUtc $provenance.provider_definition_start
+        $definitionEnd = & $parseProviderTimestampUtc $provenance.provider_definition_end
+        $statisticsStart = & $parseProviderTimestampUtc $provenance.provider_statistics_start
+        $statisticsEnd = & $parseProviderTimestampUtc $provenance.provider_statistics_end
+        if (
+            $null -eq $definitionStart -or
+            $null -eq $definitionEnd -or
+            $null -eq $statisticsStart -or
+            $null -eq $statisticsEnd
+        ) {
+            return $false
+        }
+        $expectedSourceStart = [datetimeoffset]::new(
+            $expectedDate.Year,
+            $expectedDate.Month,
+            $expectedDate.Day,
+            0,
+            0,
+            0,
+            [timespan]::Zero
+        )
+        $expectedSourceStop = $expectedSourceStart.AddDays(1)
+        if (
+            $definitionStart -ne $expectedSourceStart -or
+            $statisticsStart -ne $expectedSourceStart -or
+            $definitionEnd -le $expectedSourceStart -or
+            $definitionEnd -gt $expectedSourceStop -or
+            $statisticsEnd -le $expectedSourceStart -or
+            $statisticsEnd -gt $expectedSourceStop
+        ) {
             return $false
         }
 
@@ -440,7 +503,8 @@ function Invoke-BackendPreparedAutomaticListenerStop {
             -TradingDate $ExpectedTradingDate `
             -Deadline $PreparationDeadline `
             -InvocationId "$InvocationId-$RecoveryReason-prestop" `
-            -SkipProviderDiscovery:(-not $providerDiscoveryAllowed)
+            -SkipProviderDiscovery:(-not $providerDiscoveryAllowed) `
+            -AllowCacheValidationAfterDeadline:($AllowLateSessionSalvage -and -not $providerDiscoveryAllowed)
     }
     catch {
         Write-WatchdogLog `
@@ -556,15 +620,45 @@ function Test-ReadinessRecoveryPending {
         -ProjectRoot $ProjectRoot `
         -Component $Component `
         -TradingDate $TradingDate
-    return [bool]($state.Requested -and -not $state.Succeeded)
+    return [bool]$state.CompletionPending
 }
 
 function Test-BackendReadinessRecoveryAlreadyAttempted {
-    param([Parameter(Mandatory = $true)][string]$TradingDate)
+    param(
+        [Parameter(Mandatory = $true)][string]$TradingDate,
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$CurrentListenerProcessId,
+        [AllowNull()][string]$CurrentListenerIdentityToken
+    )
 
-    return Test-ReadinessRecoveryAlreadyAttempted `
+    $state = Get-MarketAppSessionRecoveryJournalState `
+        -ProjectRoot $ProjectRoot `
         -Component 'backend' `
         -TradingDate $TradingDate
+    if (-not [bool]$state.Readable) {
+        # Preserve the existing mutation-safety boundary: an unreadable
+        # journal cannot prove that another automatic restart is safe.
+        return $true
+    }
+    if (
+        -not [bool]$state.Succeeded -or
+        $null -eq $state.SuccessfulReplacementProcessId -or
+        [int]$state.SuccessfulReplacementProcessId -ne $CurrentListenerProcessId
+    ) {
+        return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace(
+        [string]$state.SuccessfulReplacementIdentityToken
+    )) {
+        return [bool](
+            -not [string]::IsNullOrWhiteSpace($CurrentListenerIdentityToken) -and
+            [string]$state.SuccessfulReplacementIdentityToken -ceq $CurrentListenerIdentityToken
+        )
+    }
+    # Older success receipts carry only the exact replacement PID. Preserve
+    # backward compatibility while every new receipt records strong identity.
+    return $true
 }
 
 function Test-DashboardReadinessRecoveryAlreadyAttempted {
@@ -632,11 +726,13 @@ function Start-VerifiedComponent {
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][string[]]$ArgumentList,
         [Parameter(Mandatory = $true)][string]$StandardOutputPath,
-        [Parameter(Mandatory = $true)][string]$StandardErrorPath
+        [Parameter(Mandatory = $true)][string]$StandardErrorPath,
+        [ValidateRange(1, 300)][int]$StartupTimeoutSeconds = 90,
+        [switch]$RequireStrongListenerIdentity
     )
 
     Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
-    Write-WatchdogLog -Event 'launch_requested' -Message "component=$Component port=$Port action=start"
+    Write-WatchdogLog -Event 'launch_requested' -Message "component=$Component port=$Port timeout_seconds=$StartupTimeoutSeconds action=start"
     $launch = Start-Process `
         -FilePath $FilePath `
         -ArgumentList $ArgumentList `
@@ -654,23 +750,43 @@ function Start-VerifiedComponent {
         -Port $Port `
         -LaunchProcessId $launch.Id `
         -ExpectedEndpointContract $ExpectedEndpointContract `
-        -TimeoutSeconds 90
+        -TimeoutSeconds $StartupTimeoutSeconds
     if (-not $listenerPid) {
         Write-WatchdogLog `
             -Event 'launch_ownership_failed' `
-            -Message "component=$Component port=$Port launch_pid=$($launch.Id) action=cleanup_attempted_launch"
+            -Message "component=$Component port=$Port launch_pid=$($launch.Id) timeout_seconds=$StartupTimeoutSeconds action=cleanup_attempted_launch"
         Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
         Stop-MarketAppAttemptedLaunch -LaunchProcessId $launch.Id
-        throw "$Component did not acquire port $Port and become HTTP-ready as a descendant of launch PID $($launch.Id)."
+        throw "$Component did not acquire port $Port and become HTTP-ready as a descendant of launch PID $($launch.Id) within $StartupTimeoutSeconds seconds."
+    }
+
+    $listenerIdentityToken = Get-MarketAppProcessIdentityTokenById `
+        -ProcessId ([int]$listenerPid)
+    if (
+        $RequireStrongListenerIdentity.IsPresent -and
+        (
+            [string]::IsNullOrWhiteSpace([string]$listenerIdentityToken) -or
+            [string]$listenerIdentityToken -notmatch (
+                '^' + [regex]::Escape([string][int]$listenerPid) + '\|[1-9][0-9]*$'
+            )
+        )
+    ) {
+        Write-WatchdogLog `
+            -Event 'launch_identity_unverified' `
+            -Message "component=$Component port=$Port launch_pid=$($launch.Id) listener_pid=$listenerPid action=cleanup_attempted_launch"
+        Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
+        Stop-MarketAppAttemptedLaunch -LaunchProcessId $launch.Id
+        throw "$Component listener identity could not be strongly bound to PID $listenerPid."
     }
 
     Write-WatchdogLog `
         -Event 'launch_succeeded' `
-        -Message "component=$Component port=$Port launch_pid=$($launch.Id) listener_pid=$listenerPid"
+        -Message "component=$Component port=$Port launch_pid=$($launch.Id) listener_pid=$listenerPid listener_identity_token=$(if ($listenerIdentityToken) { $listenerIdentityToken } else { 'unavailable' })"
     return [pscustomobject]@{
         Component = $Component
         LaunchProcessId = [int]$launch.Id
         ListenerProcessId = [int]$listenerPid
+        ListenerIdentityToken = $listenerIdentityToken
     }
 }
 
@@ -679,10 +795,12 @@ function Invoke-OpeningAcceptancePreflight {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$PreflightScript,
         [Parameter(Mandatory = $true)][string]$DatabasePath,
-        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint')]
+        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint', 'capture')]
         [string]$Phase = 'strict',
         [ValidatePattern('^[0-9a-f]{64}$')]
         [string]$ExpectedSourceFingerprint,
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$ExpectedDatabaseFingerprint,
         [ValidateSet('canonical_init_db', 'orb_reference_decision_sidecar')]
         [string]$BootstrapScope,
         [ValidateRange(1, 300)][int]$TimeoutSeconds = $OpeningAcceptancePreflightTimeoutSeconds
@@ -710,6 +828,9 @@ function Invoke-OpeningAcceptancePreflight {
             '--expected-source-fingerprint',
             $ExpectedSourceFingerprint
         )
+    }
+    if ($ExpectedDatabaseFingerprint) {
+        $preflightArguments += @('--expected-database-fingerprint', $ExpectedDatabaseFingerprint)
     }
     if ($BootstrapScope) {
         $preflightArguments += @('--bootstrap-scope', $BootstrapScope)
@@ -823,6 +944,10 @@ function Invoke-OpeningAcceptancePreflight {
             'schema_bootstrap_performed',
             'bootstrap_attempt_count',
             'source_fingerprint_sha256',
+            'database_fingerprint_sha256',
+            'database_fingerprint_scope',
+            'stage_timings_ms',
+            'database_query_timings',
             'required_file_count',
             'required_module_count',
             'database_issues',
@@ -932,6 +1057,17 @@ function Invoke-OpeningAcceptancePreflight {
             )
         }
 
+        # Invocation-local reuse is valid only for the same database file/schema.
+        # It does not assert that rows written after the full check were rescanned.
+        if ($Phase -ne 'capture' -and $payload.schema_bootstrap_required -ne $true) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -cmatch '^[0-9a-f]{64}$')
+        }
+        if ($ExpectedDatabaseFingerprint) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -ceq $ExpectedDatabaseFingerprint)
+        }
+
         $phaseContractValid = switch ($Phase) {
             'strict' {
                 $payload.database_contract -ceq 'strict' -and
@@ -982,6 +1118,16 @@ function Invoke-OpeningAcceptancePreflight {
                 $prebootstrapIssuesAreArray -and
                 @($payload.prebootstrap_database_issues).Count -gt 0
             }
+            'capture' {
+                $payload.database_contract -ceq 'independent_capture_catalog' -and
+                $payload.schema_bootstrap_required -is [bool] -and
+                $payload.schema_bootstrap_required -eq $false -and
+                $payload.schema_bootstrap_performed -is [bool] -and
+                $payload.schema_bootstrap_performed -eq $false -and
+                [int]$payload.bootstrap_attempt_count -eq 0 -and
+                $null -eq $payload.schema_bootstrap_scope -and
+                $payloadDatabaseIssues.Count -eq 0
+            }
             'fingerprint' {
                 $payload.database_contract -ceq 'cached_full_proof_not_rechecked' -and
                 $payload.schema_bootstrap_required -is [bool] -and
@@ -1030,6 +1176,7 @@ function Assert-OpeningAcceptanceMutationPreflight {
             -DatabasePath (Join-Path $ProjectRoot 'data\market_data.db') `
             -Phase 'fingerprint' `
             -ExpectedSourceFingerprint $cachedFingerprint `
+            -ExpectedDatabaseFingerprint ([string]$script:OpeningAcceptancePreflightResult.database_fingerprint_sha256) `
             -TimeoutSeconds $OpeningAcceptancePreflightTimeoutSeconds | Out-Null
         return $script:OpeningAcceptancePreflightResult
     }
@@ -1127,6 +1274,21 @@ function Assert-OpeningAcceptanceMutationPreflight {
     }
     $script:OpeningAcceptancePreflightResult = $preflight
     return $script:OpeningAcceptancePreflightResult
+}
+
+function Assert-ClosingTapeMutationPreflight {
+    param([Parameter(Mandatory = $true)][ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$TradingDate)
+
+    # Independent capture/finalization owns its catalog. Main-app historical
+    # opening-table scans cannot hold this component behind a 300-second gate.
+    # The launcher still repeats its primary-family/time/ownership gate, and
+    # post-close finalization still requires a stopped writer and raw integrity.
+    Invoke-OpeningAcceptancePreflight `
+        -PythonPath $PythonExe `
+        -PreflightScript $OpeningAcceptancePreflightScript `
+        -DatabasePath (Join-Path $ProjectRoot "data\closing_tape\$TradingDate\closing_tape.sqlite") `
+        -Phase 'capture' `
+        -TimeoutSeconds 90
 }
 
 function Invoke-MarketAppCurrentDayUniversePrestage {
@@ -1241,7 +1403,9 @@ if (-not $PrepareUniverseOnly) {
     }
 }
 
-if ($EnableRutCanary) {
+# Metadata-only pre-stage cannot start a component or admit an observation.
+# Keep its four-family plan independent of the live-launch clock requirement.
+if ($EnableRutCanary -and -not $PrepareUniverseOnly) {
     $timeService = Get-Service -Name W32Time -ErrorAction Stop
     if ($timeService.Status -ne 'Running') {
         throw '-EnableRutCanary requires the Windows Time service to be Running.'
@@ -1255,6 +1419,10 @@ if ($EnableRutCanary) {
 $sqlitePath = (Join-Path $ProjectRoot 'data\market_data.db').Replace('\', '/')
 $env:DATABASE_URL = "sqlite:///$sqlitePath"
 $env:MARKET_DATA_PROVIDER = 'databento'
+if (-not (Test-Path Env:MARKETPIN_HOST_CLOCK_SHADOW_ENABLED)) {
+    # Independent read-only clock observations; no opening-admission authority.
+    $env:MARKETPIN_HOST_CLOCK_SHADOW_ENABLED = '1'
+}
 # Protect opening SPX/NDX capacity. ETF families remain supported canaries but
 # are not part of the launch-critical subscription.
 $env:DATABENTO_SYMBOLS = if ($EnableRutCanary) { 'SPX,NDX,VIX,RUT' } else { 'SPX,NDX,VIX' }
@@ -1332,6 +1500,16 @@ try {
             -Message "component=universe trading_date=$($prestage.Result.provenance.trading_date) symbols=$($env:DATABENTO_SYMBOLS) selected_contract_count=$($prestage.Result.selected_contract_count) selected_hash=$($prestage.Result.selected_universe_sha256) action=return_without_component_change"
     }
     else {
+    # Deployment opt-in; research failure must not abort core upkeep.
+    if (-not ($RestartBackend -or $RestartDashboard -or $StartDashboardIfMissing)) {
+        try {
+            $researchResult = & (Join-Path $ProjectRoot 'tools\start_forecast_research.ps1') -Supervised
+            Write-WatchdogLogBestEffort -Event 'research_supervision' -Message "component=research status=$($researchResult.Status) code=$($researchResult.Code)"
+        }
+        catch {
+            Write-WatchdogLogBestEffort -Event 'research_supervision_failed' -Message "component=research error_type=$($_.Exception.GetType().Name) action=preserve_core"
+        }
+    }
     $backendWasStopped = $false
     $preparedBackendUniverse = $null
     $dashboardWasStopped = $false
@@ -1346,10 +1524,9 @@ try {
     )
     $manageRecorder = -not $explicitComponentAction
     $currentTradingDate = $now.ToString('yyyy-MM-dd')
-    $backendRecoveryAlreadySucceeded = if ($manageBackend) {
-        Test-BackendReadinessRecoveryAlreadyAttempted -TradingDate $currentTradingDate
-    }
-    else { $false }
+    # Backend success receipts are listener-specific. Resolve that latch only
+    # after each decision branch has identified its current exact owner PID.
+    $backendRecoveryAlreadySucceeded = $false
     $dashboardRecoveryAlreadySucceeded = if ($manageDashboard) {
         Test-DashboardReadinessRecoveryAlreadyAttempted -TradingDate $currentTradingDate
     }
@@ -1393,6 +1570,14 @@ try {
         if ($backendListenerPresent -and -not $backendWasStopped) {
             $expectedTradingDate = $now.ToString('yyyy-MM-dd')
             $backendReadinessState = Get-BackendReadinessState
+            if ($backendReadinessState.SubscriptionSessionState -eq 'preopen') {
+                Write-WatchdogLog -Event 'opening_readiness_observed' -Message (
+                    "component=backend provider_clock=$($backendReadinessState.ProviderClockStatus) " +
+                    "stage=$($backendReadinessState.ProviderClockReadinessStage) " +
+                    "samples=$($backendReadinessState.ProviderClockSampleCount) " +
+                    "minimum_samples=$($backendReadinessState.ProviderClockMinimumSamples) " +
+                    "handoff=$($backendReadinessState.HealthHandoffStatus) opening_reference_authority=none action=observe_existing_gates")
+            }
             $backendUniverseState = Get-BackendUniverseState -RuntimeState $backendReadinessState
             $evaluateBackendReadiness = $false
             $observedTradingDate = if ($backendUniverseState) {
@@ -1402,13 +1587,24 @@ try {
                 $null
             }
             if ($observedTradingDate -and $observedTradingDate -ne $expectedTradingDate) {
+                $backendPids = @(Get-MarketAppListenerProcessIds -Port 8000)
+                $backendListenerIdentityToken = if ($backendPids.Count -eq 1) {
+                    Get-MarketAppProcessIdentityTokenById -ProcessId ([int]$backendPids[0])
+                }
+                else { $null }
+                $backendRecoveryAlreadySucceeded = if ($backendPids.Count -eq 1) {
+                    Test-BackendReadinessRecoveryAlreadyAttempted `
+                        -TradingDate $currentTradingDate `
+                        -CurrentListenerProcessId ([int]$backendPids[0]) `
+                        -CurrentListenerIdentityToken $backendListenerIdentityToken
+                }
+                else { $false }
                 if ($backendRecoveryAlreadySucceeded) {
                     Write-WatchdogLog `
                         -Event 'backend_session_recovery_deferred' `
                         -Message "component=backend trading_date=$expectedTradingDate observed_trading_date=$observedTradingDate reason=session_recovery_already_succeeded action=preserve_listener"
                 }
                 else {
-                    $backendPids = @(Get-MarketAppListenerProcessIds -Port 8000)
                     if ($backendPids.Count -ne 1) {
                         throw "Stale backend trading date was observed, but port 8000 did not resolve to exactly one listener PID."
                     }
@@ -1594,6 +1790,15 @@ try {
                         }
                     }
                 }
+                $backendRecoveryAlreadySucceeded = if ($backendPids.Count -eq 1) {
+                    $backendListenerIdentityToken = Get-MarketAppProcessIdentityTokenById `
+                        -ProcessId ([int]$backendPids[0])
+                    Test-BackendReadinessRecoveryAlreadyAttempted `
+                        -TradingDate $currentTradingDate `
+                        -CurrentListenerProcessId ([int]$backendPids[0]) `
+                        -CurrentListenerIdentityToken $backendListenerIdentityToken
+                }
+                else { $false }
                 $missingDateDecision = Resolve-MarketAppMissingTradingDateAction `
                     -Now $now `
                     -ListenerCount $backendPids.Count `
@@ -1604,9 +1809,6 @@ try {
                     Write-WatchdogLog `
                         -Event 'prior_day_backend_health_unverified' `
                         -Message "component=backend expected_trading_date=$expectedTradingDate listener_pid=$($backendPids[0]) listener_start_date=$($listenerStartTime.ToString('yyyy-MM-dd')) reason=$($missingDateDecision.Reason) action=request_bounded_stop"
-                    Write-WatchdogLog `
-                        -Event 'backend_session_recovery_requested' `
-                        -Message "component=backend trading_date=$expectedTradingDate listener_pid=$($backendPids[0]) reason=$($missingDateDecision.Reason) action=request_exact_owner_stop"
                     Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
                     $automaticStop = Invoke-MarketAppBoundedAutomaticListenerStop `
                         -Port 8000 `
@@ -1620,6 +1822,11 @@ try {
                         -RecoveryReason 'prior_day_backend_health_unverified' `
                         -AllowLateSessionSalvage:($missingDateDecision.Reason -eq 'verified_prior_day_listener_late_salvage')
                     if ($automaticStop.Stopped) {
+                        # This durable request is also the replacement-pending
+                        # receipt. Do not write it when the exact stop abstains.
+                        Write-WatchdogLog `
+                            -Event 'backend_session_recovery_requested' `
+                            -Message "component=backend trading_date=$expectedTradingDate listener_pid=$($backendPids[0]) reason=$($missingDateDecision.Reason) action=launch_replacement"
                         $backendWasStopped = $true
                         $backendListenerPresent = $false
                         $backendRecoveryCompletionPending = $true
@@ -1657,6 +1864,15 @@ try {
                         }
                     }
                 }
+                $backendRecoveryAlreadySucceeded = if ($backendPids.Count -eq 1) {
+                    $backendListenerIdentityToken = Get-MarketAppProcessIdentityTokenById `
+                        -ProcessId ([int]$backendPids[0])
+                    Test-BackendReadinessRecoveryAlreadyAttempted `
+                        -TradingDate $currentTradingDate `
+                        -CurrentListenerProcessId ([int]$backendPids[0]) `
+                        -CurrentListenerIdentityToken $backendListenerIdentityToken
+                }
+                else { $false }
                 $readinessDecision = Resolve-MarketAppBackendReadinessAction `
                     -Now $now `
                     -ListenerCount $backendPids.Count `
@@ -1687,9 +1903,6 @@ try {
                     Write-WatchdogLog `
                         -Event 'backend_readiness_recovery_requested' `
                         -Message "component=backend trading_date=$expectedTradingDate listener_pid=$($backendPids[0]) start_age_seconds=$([math]::Round([double]$readinessDecision.StartAgeSeconds, 1)) failures=$readinessFailures action=request_bounded_stop"
-                    Write-WatchdogLog `
-                        -Event 'backend_session_recovery_requested' `
-                        -Message "component=backend trading_date=$expectedTradingDate listener_pid=$($backendPids[0]) reason=$($readinessDecision.Reason) action=request_exact_owner_stop"
                     if ($readinessDecision.Reason -ceq 'verified_prior_day_backend_preopen_refresh') {
                         Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
                         $refreshPreparationNow = Get-Date
@@ -1724,6 +1937,11 @@ try {
                             -AllowLateSessionSalvage:($readinessDecision.Reason -in @('verified_prior_day_backend_late_salvage', 'verified_current_day_dead_handoff_late_salvage'))
                     }
                     if ($automaticStop.Stopped) {
+                        # The session latch tracks only a stopped owner whose
+                        # replacement launch is genuinely pending.
+                        Write-WatchdogLog `
+                            -Event 'backend_session_recovery_requested' `
+                            -Message "component=backend trading_date=$expectedTradingDate listener_pid=$($backendPids[0]) reason=$($readinessDecision.Reason) action=launch_replacement"
                         $backendWasStopped = $true
                         $backendListenerPresent = $false
                         $backendRecoveryCompletionPending = $true
@@ -1827,11 +2045,13 @@ try {
                     ('"' + $BackendEntrypoint + '"')
                 ) `
                 -StandardOutputPath $backendLogPaths.StandardOutputPath `
-                -StandardErrorPath $backendLogPaths.StandardErrorPath
+                -StandardErrorPath $backendLogPaths.StandardErrorPath `
+                -StartupTimeoutSeconds 180 `
+                -RequireStrongListenerIdentity
             if ($backendRecoveryCompletionPending) {
                 Write-WatchdogLog `
                     -Event 'backend_session_recovery_succeeded' `
-                    -Message "component=backend trading_date=$currentTradingDate reason=$backendSessionRecoveryReason replacement_listener_pid=$($backendLaunchResult.ListenerProcessId) action=latched"
+                    -Message "component=backend trading_date=$currentTradingDate reason=$backendSessionRecoveryReason replacement_listener_pid=$($backendLaunchResult.ListenerProcessId) replacement_listener_identity_token=$($backendLaunchResult.ListenerIdentityToken) action=latched"
                 $backendRecoveryAlreadySucceeded = $true
                 $backendRecoveryCompletionPending = $false
             }
@@ -1946,7 +2166,8 @@ try {
                     'none'
                 ) `
                 -StandardOutputPath $dashboardLogPaths.StandardOutputPath `
-                -StandardErrorPath $dashboardLogPaths.StandardErrorPath
+                -StandardErrorPath $dashboardLogPaths.StandardErrorPath `
+                -StartupTimeoutSeconds 90
             if ($dashboardRecoveryCompletionPending) {
                 Write-WatchdogLog `
                     -Event 'dashboard_session_recovery_succeeded' `
@@ -1983,7 +2204,7 @@ try {
         else {
             $gateResult = & $ClosingTapeScript -TradingDate $tradingDate -NoParquet -CheckOnly
             $gateStatus = [string]$gateResult.Status
-            if ($gateStatus -notin @('ready_to_start', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_replay_blocked')) {
+            if ($gateStatus -notin @('ready_to_start', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_attempt_limit_reached')) {
                 throw "Closing-tape check-only gate returned unexpected status: $gateStatus"
             }
             Write-WatchdogLog `
@@ -1995,11 +2216,11 @@ try {
                 Write-WatchdogLog `
                     -Event 'launch_requested' `
                     -Message "component=closing_tape trading_date=$tradingDate action=start"
-                Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
+                Assert-ClosingTapeMutationPreflight -TradingDate $tradingDate | Out-Null
                 $result = & $ClosingTapeScript -TradingDate $tradingDate -NoParquet
             }
             $resultStatus = [string]$result.Status
-            if ($resultStatus -notin @('started', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_replay_blocked')) {
+            if ($resultStatus -notin @('started', 'already_running', 'not_yet_due', 'primary_capture_not_ready', 'outside_start_window', 'recovery_attempt_limit_reached')) {
                 throw "Closing-tape launcher returned unexpected status: $resultStatus"
             }
             Write-WatchdogLog `
@@ -2013,18 +2234,16 @@ try {
             elseif ($resultStatus -eq 'primary_capture_not_ready') {
                 Write-WatchdogLog `
                     -Event 'closing_tape_deferred_for_primary_capture' `
-                    -Message "component=closing_tape action=defer reason=primary_or_all_four_orb_not_ready"
+                    -Message "component=closing_tape action=defer reason=primary_transport_or_subscription_unsafe"
             }
-            elseif ($resultStatus -eq 'recovery_replay_blocked') {
-                # Preserve the prior raw tape and the healthy primary backend.
-                # An operator can reconstruct/finalize the orphan after hours;
-                # never launch another full-session OPRA replay automatically.
+            elseif ($resultStatus -eq 'recovery_attempt_limit_reached') {
+                # Preserve both bounded attempts and require operator review.
                 Write-WatchdogLog `
-                    -Event 'closing_tape_recovery_replay_blocked' `
+                    -Event 'closing_tape_recovery_attempt_limit_reached' `
                     -Message "component=closing_tape prior_nonempty_dbn_count=$($result.PriorNonemptyDbnCount) action=preserve_primary_backend"
             }
             elseif ($resultStatus -eq 'outside_start_window') {
-                Assert-OpeningAcceptanceMutationPreflight -AllowSchemaBootstrap | Out-Null
+                Assert-ClosingTapeMutationPreflight -TradingDate $tradingDate | Out-Null
                 $finalizeOutput = @(& $PythonExe $ClosingTapeFinalizeScript `
                     --project-root $ProjectRoot `
                     --trading-date $tradingDate)

@@ -17,6 +17,27 @@ def test_pipeline_message_reports_all_symbols_ready():
     )
 
 
+def test_unavailable_status_preserves_read_failure_without_claiming_recording_stopped(monkeypatch):
+    from app.services import live_panel_view as view
+    from types import SimpleNamespace
+    messages = []
+    monkeypatch.setattr(view, 'st', SimpleNamespace(
+        subheader=lambda *_args: None,
+        warning=lambda text: messages.append(text),
+        caption=lambda text: messages.append(text),
+    ))
+    monkeypatch.setattr(view, 'fetch_live_status_snapshot',
+                        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('must reuse page observation')))
+    view.render_backend_streaming_status(live_snapshot={
+        'health': {},
+        'read_failures': [{'endpoint': '/health', 'http_status': 503,
+                           'backend_reason': 'RUNTIME_READ_TIMEOUT'}],
+    })
+    assert 'RUNTIME_READ_TIMEOUT' in messages[0]
+    assert 'Backend not responding' not in messages[0]
+    assert any('does not establish that recording stopped' in text for text in messages)
+
+
 def test_pipeline_message_reports_partial_symbol_readiness():
     assert _pipeline_status_message(False, ["NDX", "SPX"]) == (
         "warning",
@@ -82,6 +103,31 @@ def test_closing_tape_message_marks_running_as_unfinalized():
         "info",
         "Capture: recording; final integrity is not yet known",
     )
+
+
+def test_missing_capture_is_distinct_from_model_gates_and_read_failures():
+    payload = {
+        "trading_date": "2026-10-01",
+        "catalog_available": False,
+        "state": "unavailable",
+        "observed": {"available": False},
+        "inferred": {"available": False},
+        "model_gate": {"passed": False},
+    }
+    level, message = _closing_tape_status_message(payload)
+    assert level == "warning"
+    assert "2026-10-01" in message
+    assert "no closing-tape catalog" in message
+    assert "model-training requirements do not hide these counts" in message
+    level, message = _closing_tape_analysis_message(payload)
+    assert level == "warning"
+    assert "capture evidence is missing" in message
+    assert "pending" not in message
+
+    # A failed request cannot establish that the catalog is actually absent.
+    failed_read = {**payload, "transport_ok": False, "transport_error": "timeout"}
+    assert _closing_tape_status_message(failed_read)[0] == "error"
+    assert _closing_tape_analysis_message(failed_read)[0] == "error"
 
 
 def test_closing_tape_transport_failure_is_not_missing_evidence():
@@ -305,3 +351,11 @@ def test_promoted_prediction_view_hides_mixed_or_invalid_calibration_evidence():
     for row in invalid:
         row["calibration_evidence_sha256"] = "invalid"
     assert _promoted_prediction_view({"rows": invalid})["state"] == "invalid"
+
+def test_clock_message_distinguishes_warmup_from_measured_failure():
+    from app.services.live_panel_view import _clock_status_message
+    base = {'sample_count': 49, 'minimum_samples': 50, 'status': 'unknown'}
+    assert _clock_status_message(base)[0] == 'info'
+    assert '49/50' in _clock_status_message(base)[1]
+    assert _clock_status_message({**base, 'sample_count': 50, 'status': 'unsynchronized'})[0] == 'warning'
+    assert _clock_status_message({}) is None

@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from backend.research.outcome_protocol import assess_outcome, PROTOCOL_ID
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -828,8 +829,9 @@ class ShadowPredictionJournal:
     or another explicitly research-only path.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, clock=None):
         self.path = Path(path)
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -886,12 +888,35 @@ class ShadowPredictionJournal:
             "CREATE INDEX IF NOT EXISTS idx_shadow_formula_symbol_time "
             "ON shadow_prediction_journal(formula_id, formula_version, symbol, prediction_timestamp_utc)"
         )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_shadow_due ON shadow_prediction_journal "
+                           "(symbol,target_timestamp_utc) WHERE abstained=0 AND realized_price IS NULL")
+        connection.execute("CREATE TABLE IF NOT EXISTS shadow_outcome_observations ("
+            "prediction_id TEXT PRIMARY KEY, protocol_id TEXT NOT NULL, status TEXT NOT NULL, "
+            "reasons_json TEXT NOT NULL, observed_reference_price REAL NOT NULL, "
+            "observed_at_utc TEXT NOT NULL, actual_horizon_seconds REAL, target_lag_seconds REAL, "
+            "tolerance_seconds REAL NOT NULL, recorded_at_utc TEXT NOT NULL)")
+        for action in ("UPDATE", "DELETE"):
+            connection.execute(f"CREATE TRIGGER IF NOT EXISTS shadow_outcome_no_{action.lower()} "
+                f"BEFORE {action} ON shadow_outcome_observations BEGIN "
+                "SELECT RAISE(ABORT, 'outcome observations are append only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS shadow_outcome_no_replace BEFORE INSERT ON "
+            "shadow_outcome_observations WHEN EXISTS(SELECT 1 FROM shadow_outcome_observations "
+            "WHERE prediction_id=NEW.prediction_id) BEGIN SELECT RAISE(ABORT, 'outcome observations are append only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS shadow_prediction_no_replace BEFORE INSERT ON "
+            "shadow_prediction_journal WHEN EXISTS(SELECT 1 FROM shadow_prediction_journal "
+            "WHERE prediction_id=NEW.prediction_id) BEGIN SELECT RAISE(IGNORE); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS shadow_prediction_no_delete BEFORE DELETE ON "
+            "shadow_prediction_journal BEGIN SELECT RAISE(ABORT, 'issued predictions are append only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS shadow_issued_values_immutable "
+            "BEFORE UPDATE OF prediction_timestamp_utc,target_timestamp_utc,created_at_utc,"
+            "predicted_price,spot,formula_id,formula_version,record_sha256 ON shadow_prediction_journal "
+            "BEGIN SELECT RAISE(ABORT, 'issued prediction values are immutable'); END")
         return connection
 
     def save(self, prediction: ShadowPrediction) -> bool:
         payload = prediction.as_dict()
         record_sha256 = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-        now = _iso(datetime.now(UTC))
+        now = _iso(self._clock())
         values = (
             prediction.prediction_id,
             PERSISTENCE_SCHEMA_VERSION,
@@ -979,6 +1004,18 @@ class ShadowPredictionJournal:
             if int(row["abstained"]):
                 raise ValueError("an abstained prediction has no forecast to score")
 
+            audit = assess_outcome(dict(row), realized_at)
+            try:
+                connection.execute("INSERT INTO shadow_outcome_observations VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (prediction_id, PROTOCOL_ID, audit["status"], _canonical_json(audit["reasons"]),
+                     price, _iso(realized_at), audit["actual_horizon_seconds"], audit["target_lag_seconds"],
+                     audit["tolerance_seconds"], _iso(scored_at)))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("realized outcome is already recorded and immutable") from exc
+            if audit["status"] != "ELIGIBLE":
+                return {"prediction_id": prediction_id, "outcome_eligibility": audit,
+                        "scored": False, "error_points": None}
+
             predicted = float(row["predicted_price"])
             spot = float(row["spot"])
             error = predicted - price
@@ -1006,6 +1043,8 @@ class ShadowPredictionJournal:
             )
             return {
                 "prediction_id": prediction_id,
+                "outcome_eligibility": audit,
+                "scored": True,
                 "realized_price": price,
                 "realized_timestamp_utc": _iso(realized_at),
                 "error_points": error,
@@ -1090,6 +1129,8 @@ class ShadowPredictionJournal:
                   AND abstained = 0
                   AND realized_price IS NULL
                   AND target_timestamp_utc <= ?
+                  AND NOT EXISTS (SELECT 1 FROM shadow_outcome_observations o
+                                  WHERE o.prediction_id=shadow_prediction_journal.prediction_id)
                   AND json_extract(provenance_json, '$.subscription_epoch_id') = ?
                   AND json_extract(provenance_json, '$.subscription_generation') = ?
                 ORDER BY target_timestamp_utc, prediction_id

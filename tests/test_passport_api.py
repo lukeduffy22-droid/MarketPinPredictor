@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
+import pytest
 
 from backend.api.routers import passports as passport_router
 from backend.passport_analyst import AnalystEvidenceError
@@ -11,6 +12,12 @@ from backend.prediction_passport import PassportIntegrityError
 
 TOKEN = "test-governance-token-123"
 TOKEN_HEADER = {"X-MarketPin-Governance-Token": TOKEN}
+
+
+@pytest.fixture(autouse=True)
+def isolate_governance_config(tmp_path, monkeypatch):
+    from backend import governance_credentials
+    monkeypatch.setattr(governance_credentials, 'ROOT', tmp_path)
 
 
 def _request(host: str) -> Request:

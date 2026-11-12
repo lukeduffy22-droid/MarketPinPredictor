@@ -149,6 +149,13 @@ def _live_pipeline_snapshot(streamer, health: dict) -> dict:
         and all(character in "0123456789abcdef" for character in active_epoch_id)
     )
     fresh_quote_counts = health.get("fresh_quote_counts") or {}
+    arrival_diagnostics = health.get("quote_arrival_diagnostics") or {}
+    arrival_families = (
+        arrival_diagnostics.get("families") or {}
+        if arrival_diagnostics.get("subscription_epoch_id") == active_epoch_id
+        and arrival_diagnostics.get("subscription_generation") == active_generation
+        else {}
+    )
 
     most_recent_symbol = None
     most_recent_age = None
@@ -194,6 +201,8 @@ def _live_pipeline_snapshot(streamer, health: dict) -> dict:
                 "fresh_quote_count": int(fresh_quote_counts.get(symbol) or 0),
             }
         )
+        if symbol in arrival_families:
+            detail["quote_arrival_diagnostics"] = dict(arrival_families[symbol])
         symbol_status[symbol] = detail
         age = detail.get("data_age_seconds")
         if isinstance(age, (float, int)) and (most_recent_age is None or float(age) < most_recent_age):
@@ -439,6 +448,8 @@ async def health_live_status():
         "provider": health.get("provider", MARKET_DATA_PROVIDER),
         "formula_health": health.get("formula_health"),
         "stream_stalled_seconds": health.get("stream_stalled_seconds"),
+        "processing_clock_telemetry": health.get("processing_clock_telemetry"),
+        "quote_arrival_diagnostics": health.get("quote_arrival_diagnostics"),
         "reconnect_attempts": health.get("reconnect_attempts", 0),
         "last_reconnect_utc": health.get("last_reconnect_utc"),
         "last_reconnect_reason": health.get("last_reconnect_reason"),
@@ -522,6 +533,10 @@ async def events_live(include_symbols: bool = False):
                     "last_update_utc": health.get("last_update_utc"),
                     "last_error": health.get("last_error"),
                     "formula_health": health.get("formula_health"),
+                    "processing_clock_telemetry": health.get("processing_clock_telemetry"),
+                    "subscription_session_state": health.get("subscription_session_state"),
+                    "subscription_allowed": health.get("subscription_allowed"),
+                    "subscription_window": health.get("subscription_window"),
                 },
                 "universe": _universe_snapshot(health, include_symbols=include_symbols),
                 "pipeline": {

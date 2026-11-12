@@ -74,6 +74,38 @@ def test_observed_and_inferred_minute_truths_are_separate(tmp_path):
     } <= reference
 
 
+def test_final_catalog_checkpoint_rejects_busy_result(tmp_path, monkeypatch):
+    catalog = TapeCatalog(tmp_path / "catalog.sqlite")
+
+    class _Cursor:
+        @staticmethod
+        def fetchall():
+            return [(1, 3, 2)]
+
+    class _Connection:
+        closed = False
+
+        def execute(self, statement):
+            if statement == "PRAGMA busy_timeout=10000":
+                return self
+            assert statement == "PRAGMA wal_checkpoint(TRUNCATE)"
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    connection = _Connection()
+    monkeypatch.setattr(
+        "backend.closing_tape.catalog.sqlite3.connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint was busy"):
+        catalog.checkpoint_wal_for_immutable_read()
+
+    assert connection.closed is True
+
+
 def test_observed_microstructure_columns_migrate_additively(tmp_path):
     path = tmp_path / "old.sqlite"
     with sqlite3.connect(path) as connection:

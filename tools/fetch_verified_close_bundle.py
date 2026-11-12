@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import hashlib
 import io
 import json
 import math
@@ -11,10 +12,9 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
-from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,11 +29,12 @@ from tools.ingest_verified_closes import (
     _pdf_text,
     validate_official_artifact_semantics,
 )
+from backend.closing_tape.config import (
+    official_close_publication_cutoff_utc as _publication_cutoff_utc,
+)
 
 
 UTC = timezone.utc
-NEW_YORK = ZoneInfo("America/New_York")
-PUBLICATION_NOT_BEFORE_ET = time(18, 0)
 CSV_FIELDS = (
     "symbol",
     "trading_date",
@@ -287,18 +288,29 @@ def extract_official_close(path: str | Path, *, symbol: str, trading_day: date) 
     return extractor(Path(path), trading_day)
 
 
-def _publication_cutoff_utc(trading_day: date) -> datetime:
-    return datetime.combine(
-        trading_day, PUBLICATION_NOT_BEFORE_ET, tzinfo=NEW_YORK
-    ).astimezone(UTC)
-
-
 def _serialize_candidate_rows(rows: list[dict[str, object]]) -> str:
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS, lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
     return stream.getvalue()
+
+
+def _append_acquisition_receipt(directory: Path, payload: dict) -> str:
+    """Retain each attempt, including partial source availability, before raising."""
+    rendered = (json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                           allow_nan=False) + "\n").encode("utf-8")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (hashlib.sha256(rendered).hexdigest() + ".json")
+    try:
+        with path.open("xb") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        if path.read_bytes() != rendered:
+            raise RuntimeError("official-close acquisition receipt conflict")
+    return str(path.resolve())
 
 
 def fetch_verified_close_bundle(
@@ -330,48 +342,78 @@ def fetch_verified_close_bundle(
         )
     candidate_rows: list[dict[str, object]] = []
     fetched: list[dict[str, object]] = []
+    acquisition_started = datetime.now(UTC).isoformat()
+    source_results: list[dict[str, object]] = []
+    failed_symbols: list[str] = []
     for endpoint in OFFICIAL_CLOSE_ENDPOINTS:
-        result = fetch_official_artifact(
-            symbol=endpoint.symbol,
-            source=endpoint.source,
-            source_reference=endpoint.url(trading_day),
-            trading_date=trading_day,
-            project_root=root,
-        )
-        artifact_path = Path(str(result["source_artifact_path"])).resolve()
-        close = extract_official_close(
-            artifact_path, symbol=endpoint.symbol, trading_day=trading_day
-        )
-        observed_at = datetime.fromisoformat(
-            str(result["retrieved_at_utc"]).replace("Z", "+00:00")
-        )
-        row = VerifiedCloseInput(
-            symbol=endpoint.symbol,
-            trading_date=trading_day,
-            official_close=close,
-            source=endpoint.source,
-            source_reference=str(result["source_reference"]),
-            source_artifact_sha256=str(result["source_artifact_sha256"]),
-            source_artifact_path=artifact_path,
-            observed_at_utc=observed_at,
-            correction_of_id=None,
-        )
-        validate_official_artifact_semantics(row)
-        relative_artifact = artifact_path.relative_to(candidate_dir.resolve())
-        candidate_rows.append(
-            {
-                "symbol": row.symbol,
-                "trading_date": row.trading_date.isoformat(),
-                "official_close": format(row.official_close, ".15g"),
-                "source": row.source,
-                "source_reference": row.source_reference,
-                "source_artifact_sha256": row.source_artifact_sha256,
-                "source_artifact_path": relative_artifact.as_posix(),
-                "observed_at_utc": row.observed_at_utc.astimezone(UTC).isoformat(),
-                "correction_of_id": "",
-            }
-        )
-        fetched.append(result)
+        started = datetime.now(UTC).isoformat()
+        result = None
+        try:
+            result = fetch_official_artifact(
+                symbol=endpoint.symbol,
+                source=endpoint.source,
+                source_reference=endpoint.url(trading_day),
+                trading_date=trading_day,
+                project_root=root,
+            )
+            artifact_path = Path(str(result["source_artifact_path"])).resolve()
+            close = extract_official_close(
+                artifact_path, symbol=endpoint.symbol, trading_day=trading_day
+            )
+            observed_at = datetime.fromisoformat(
+                str(result["retrieved_at_utc"]).replace("Z", "+00:00")
+            )
+            row = VerifiedCloseInput(
+                symbol=endpoint.symbol,
+                trading_date=trading_day,
+                official_close=close,
+                source=endpoint.source,
+                source_reference=str(result["source_reference"]),
+                source_artifact_sha256=str(result["source_artifact_sha256"]),
+                source_artifact_path=artifact_path,
+                observed_at_utc=observed_at,
+                correction_of_id=None,
+            )
+            validate_official_artifact_semantics(row)
+            relative_artifact = artifact_path.relative_to(candidate_dir.resolve())
+            candidate_rows.append(
+                {
+                    "symbol": row.symbol,
+                    "trading_date": row.trading_date.isoformat(),
+                    "official_close": format(row.official_close, ".15g"),
+                    "source": row.source,
+                    "source_reference": row.source_reference,
+                    "source_artifact_sha256": row.source_artifact_sha256,
+                    "source_artifact_path": relative_artifact.as_posix(),
+                    "observed_at_utc": row.observed_at_utc.astimezone(UTC).isoformat(),
+                    "correction_of_id": "",
+                }
+            )
+            fetched.append(result)
+            source_results.append({"symbol": endpoint.symbol, "status": "VERIFIED",
+                                   "official_close": close, "artifact": result,
+                                   "started_at_utc": started,
+                                   "completed_at_utc": datetime.now(UTC).isoformat()})
+        except Exception as exc:
+            # A missing date in one source must not prevent observing the others.
+            # Partial results are evidence only; they never become an ingestible bundle.
+            failed_symbols.append(endpoint.symbol)
+            source_results.append({"symbol": endpoint.symbol, "status": "UNAVAILABLE",
+                                   "error_type": type(exc).__name__, "error": str(exc),
+                                   "artifact": result, "started_at_utc": started,
+                                   "completed_at_utc": datetime.now(UTC).isoformat()})
+    acquisition_receipt = _append_acquisition_receipt(candidate_dir / "acquisition_attempts", {
+        "schema_version": "marketpin-official-close-acquisition.v1",
+        "trading_date": trading_day.isoformat(),
+        "started_at_utc": acquisition_started,
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+        "publication_cutoff_utc": cutoff.isoformat(),
+        "all_sources_verified": not failed_symbols,
+        "sources": source_results, "database_ingested": False,
+    })
+    if failed_symbols:
+        raise RuntimeError("Official close bundle incomplete for " + ", ".join(failed_symbols)
+                           + "; acquisition receipt: " + acquisition_receipt)
 
     candidate_dir.mkdir(parents=True, exist_ok=True)
     serialized = _serialize_candidate_rows(candidate_rows)
@@ -416,6 +458,7 @@ def fetch_verified_close_bundle(
         "candidate_csv": str(destination.resolve()),
         "publication_cutoff_utc": cutoff.isoformat(),
         "fetched_artifacts": fetched,
+        "acquisition_receipt": acquisition_receipt,
         "audit": audit,
         "database_ingested": False,
     }

@@ -260,18 +260,11 @@ def test_live_client_maps_total_gex_to_gross_exposure(monkeypatch):
     ]
     assert prediction["indicators_available"] is False
     assert prediction["indicator_status"] == "unavailable"
-    assert prediction["indicator_provenance"] == {
-        "status": "unavailable",
-        "reason_code": "OBSERVED_INTRADAY_BARS_UNAVAILABLE",
-        "reason": (
-            "The Databento prediction payload does not include verified observed "
-            "intraday OHLCV bars."
-        ),
-        "required_source_kind": "observed_intraday_ohlcv",
-        "is_observed": False,
-        "is_synthetic": False,
-        "row_count": 0,
-    }
+    # A pin/forecast response cannot masquerade as a verified bar response.
+    assert prediction["indicator_provenance"]["reason_code"] == "BAR_RESPONSE_INVALID_OR_STALE"
+    assert prediction["indicator_provenance"]["is_observed"] is False
+    assert prediction["indicator_provenance"]["is_synthetic"] is False
+    assert prediction["indicator_provenance"]["row_count"] == 0
     assert prediction["current_price"] == 7500.0
     assert prediction["predicted_price"] == 7510.0
     assert prediction["change_pct"] == pytest.approx(10.0 / 7500.0 * 100.0)
@@ -758,3 +751,60 @@ def test_poll_live_status_fails_closed_when_runtime_pipeline_is_unavailable(monk
     assert snapshot["pipeline"]["prediction_pipeline_ok"] is False
     assert snapshot["pipeline"]["runtime_context_available"] is False
     assert live_pipeline_symbol_is_current(snapshot["pipeline"], "SPX") is False
+
+
+def test_sse_unavailable_event_uses_bounded_poll_and_retains_failure_reason(monkeypatch):
+    import json
+    calls = []
+
+    class Response:
+        def __init__(self, code, payload):
+            self.status_code, self.payload = code, payload
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def raise_for_status(self): pass
+        def json(self): return self.payload
+        def iter_lines(self, **_kwargs):
+            yield 'data: ' + json.dumps(self.payload)
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        if url.endswith('/events/live'):
+            return Response(200, {'status': 'unavailable', 'reason': 'RUNTIME_READ_TIMEOUT'})
+        return Response(503, {'detail': {'reason': 'RUNTIME_READ_TIMEOUT'}})
+
+    monkeypatch.setattr('app.services.live_data_client.requests.get', get)
+    snapshot = fetch_live_status_snapshot()
+    assert snapshot['source'] == 'poll'
+    assert len(calls) == 4  # One SSE attempt and the existing three bounded polls.
+    assert snapshot['timestamp_utc'] is None  # Request time is not observation time.
+    assert snapshot['pipeline']['prediction_pipeline_ok'] is False
+    assert any(f.get('endpoint') == '/health' and f.get('backend_reason') == 'RUNTIME_READ_TIMEOUT'
+               and f.get('http_status') == 503 for f in snapshot['read_failures'])
+
+
+def test_sse_unavailable_event_can_recover_from_fresh_poll(monkeypatch):
+    import json
+    pipeline = _current_pipeline()
+    health = {'websocket': 'active', 'valid_symbols': ['SPX'],
+              'sampled_at_utc': '2026-09-25T18:00:00+00:00'}
+
+    class Response:
+        status_code = 200
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def raise_for_status(self): pass
+        def json(self): return self.payload
+        def iter_lines(self, **_kwargs):
+            yield 'data: ' + json.dumps({'status': 'unavailable', 'reason': 'RUNTIME_READ_BUSY'})
+
+    def get(url, **_kwargs):
+        return Response(pipeline if url.endswith('/health/live') else
+                        health if url.endswith('/health') else {})
+
+    monkeypatch.setattr('app.services.live_data_client.requests.get', get)
+    snapshot = fetch_live_status_snapshot()
+    assert snapshot['source'] == 'poll'
+    assert snapshot['timestamp_utc'] == health['sampled_at_utc']
+    assert live_pipeline_symbol_is_current(snapshot['pipeline'], 'SPX') is True

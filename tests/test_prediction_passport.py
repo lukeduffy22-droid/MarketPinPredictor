@@ -80,22 +80,40 @@ def _prediction(*, calculation_id: str, usable: bool = True) -> dict:
     return result
 
 
-def _calculation(calculation_id: str) -> None:
+def _calculation(
+    calculation_id: str, *, input_overrides: dict | None = None, provider: str = "test",
+) -> None:
     saved = database.save_gamma_calculation_inputs(
         {
             "calculation_id": calculation_id,
             "symbol": "SPX",
             "calculated_at_utc": "2026-06-18T15:29:59Z",
-            "provider": "test",
+            "provider": provider,
             "subscription_epoch_id": "e" * 64,
+            "subscription_generation": 7,
             "status": "valid",
             "formula_version": "gex-v1",
             "universe_sha256": "b" * 64,
+            "spot_price": 100.0,
+            "gamma_pin": 101.5,
+            "selected_target": 101.0,
+            "zero_gamma": 99.0,
+            "max_pain": 100.5,
+            "net_gex": 20.0,
+            "gross_gex": 40.0,
+            "chain_row_count": 1,
+            "gex_row_count": 1,
         },
         {
             "input_schema_version": "gamma-inputs-v1",
+            "calculation_id": calculation_id,
+            "symbol": "SPX",
+            "calculated_at_utc": "2026-06-18T15:29:59Z",
             "subscription_epoch_id": "e" * 64,
+            "subscription_generation": 7,
+            "output_summary": {"price": 100.0},
             "rows": [{"strike": 100.0}],
+            **(input_overrides or {}),
         },
     )
     assert saved is not None
@@ -210,7 +228,7 @@ def test_unapproved_or_unresolved_production_evidence_abstains(passport_store):
     assert passport["prediction"]["interval_upper"] is None
     assert "approved_production_manifest" in passport["quality"]["missing_evidence"]
     assert "resolved_calibration_evidence" in passport["quality"]["missing_evidence"]
-    assert "verified_calculation_lineage" in passport["quality"]["missing_evidence"]
+    assert "verified_calculation_lineage" not in passport["quality"]["missing_evidence"]
 
 
 def test_requested_valid_cannot_bypass_missing_evidence(passport_store):
@@ -662,6 +680,7 @@ def test_future_prediction_timestamp_is_rejected_before_issuance(
 def test_snapshot_passport_rejects_cross_symbol_or_date_binding(
     passport_store, overrides
 ):
+    _calculation("snapshot-binding")
     prediction = _prediction(calculation_id="snapshot-binding")
     snapshot = database.save_prediction_snapshot(
         prediction, prediction_mode="backend_periodic"
@@ -673,6 +692,7 @@ def test_snapshot_passport_rejects_cross_symbol_or_date_binding(
 
 
 def test_direct_issuer_cannot_attach_arbitrary_snapshot_id(passport_store):
+    _calculation("direct-binding")
     prediction = _prediction(calculation_id="direct-binding")
     snapshot = database.save_prediction_snapshot(
         prediction, prediction_mode="backend_periodic"
@@ -684,3 +704,71 @@ def test_direct_issuer_cannot_attach_arbitrary_snapshot_id(passport_store):
             prediction_mode="unit",
             prediction_snapshot_id=snapshot.id,
         )
+
+
+@pytest.mark.parametrize("calculation_id", [None, "invented-uncommitted-id"])
+def test_new_research_passport_without_committed_lineage_abstains(
+    passport_store, calculation_id,
+):
+    prediction = _prediction(calculation_id=calculation_id)
+    # Even affirmative source validity and a forged commit marker cannot
+    # replace exact lookup of a committed input record.
+    prediction["pin_payload"]["calculation_inputs_persisted"] = True
+    passport = issue_prediction_passport(
+        prediction,
+        prediction_mode="backend_lifecycle",
+        origin_key="uncommitted-" + str(calculation_id),
+    )
+
+    assert passport["state"] == "ABSTAIN"
+    assert passport["prediction"]["point_estimate"] is None
+    assert "verified_calculation_lineage" in passport["quality"]["missing_evidence"]
+    assert "MISSING_EVIDENCE:verified_calculation_lineage" in passport["quality"]["state_reasons"]
+
+
+def test_new_research_passport_rejects_other_calculation_reference_price(passport_store):
+    _calculation("different-reference")
+    prediction = _prediction(calculation_id="different-reference")
+    prediction["current_price"] = 100.25
+    prediction["pin_payload"]["price"] = 100.25
+
+    passport = issue_prediction_passport(
+        prediction, prediction_mode="backend_lifecycle", origin_key="wrong-reference",
+    )
+
+    assert passport["state"] == "ABSTAIN"
+    assert passport["prediction"]["point_estimate"] is None
+    assert "CALCULATION_REFERENCE_PRICE_MISMATCH" in passport["quality"]["state_reasons"]
+
+
+def test_new_research_passport_rejects_hash_valid_blob_for_different_identity(passport_store):
+    _calculation("blob-binding", input_overrides={"calculation_id": "other-calculation"})
+    prediction = _prediction(calculation_id="blob-binding")
+
+    passport = issue_prediction_passport(
+        prediction, prediction_mode="backend_lifecycle", origin_key="wrong-blob-identity",
+    )
+
+    assert passport["provenance"]["calculation_input_sha256"]
+    assert passport["state"] == "ABSTAIN"
+    assert passport["prediction"]["point_estimate"] is None
+    assert "CALCULATION_INPUT_IDENTITY_MISMATCH" in passport["quality"]["state_reasons"]
+
+
+def test_direct_databento_passport_rejects_hash_valid_incomplete_v2_capture(passport_store):
+    _calculation(
+        "incomplete-databento-v2", provider="databento",
+        input_overrides={"input_schema_version": "gamma-inputs-v2-point-in-time"},
+    )
+    prediction = _prediction(calculation_id="incomplete-databento-v2")
+    prediction["provider"] = "databento"
+    prediction["pin_payload"]["provider"] = "databento"
+
+    passport = issue_prediction_passport(
+        prediction, prediction_mode="backend_lifecycle", origin_key="incomplete-v2-direct",
+    )
+
+    assert passport["provenance"]["calculation_input_sha256"]
+    assert passport["state"] == "ABSTAIN"
+    assert passport["prediction"]["point_estimate"] is None
+    assert "CALCULATION_REPLAY_INPUTS_INCOMPLETE" in passport["quality"]["state_reasons"]

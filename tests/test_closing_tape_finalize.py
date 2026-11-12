@@ -1,10 +1,12 @@
 import json
 import shutil
+import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
+import backend.closing_tape.finalize as finalize_module
 from backend.closing_tape.catalog import TapeCatalog
 from backend.closing_tape.config import build_session_config
 from backend.closing_tape.contracts import (
@@ -16,6 +18,7 @@ from backend.closing_tape.finalize import (
     _recoverable_monitor_pause_reasons,
     finalize_closed_session,
 )
+from backend.closing_tape.integrity import TapeIntegrityReport
 from backend.closing_tape.live_recorder import ProcessFileLock
 
 
@@ -94,6 +97,62 @@ def _catalog_session(tmp_path, *, dbn_path=None):
     return config, catalog
 
 
+def _stub_successful_finalization(monkeypatch, config):
+    source = config.output_dir / "raw.dbn"
+    source.write_bytes(b"offline checkpoint fixture")
+    event_ns = int(datetime(2026, 8, 25, 21, 0, tzinfo=UTC).timestamp() * 1e9)
+    integrity = TapeIntegrityReport(
+        path=str(source.resolve()),
+        dataset="OPRA.PILLAR",
+        sha256="a" * 64,
+        file_bytes=source.stat().st_size,
+        records_seen=1,
+        trade_records=1,
+        tcbbo_records=0,
+        tcbbo_timestamped_records=0,
+        tcbbo_valid_nbbo_records=0,
+        tcbbo_flagged_records=0,
+        tcbbo_action_counts=(),
+        mapping_records=0,
+        statistics_records=0,
+        definition_records=0,
+        system_records=0,
+        first_event_ns=event_ns,
+        last_event_ns=event_ns,
+        last_trade_event_ns=event_ns,
+        first_receive_ns=event_ns,
+        last_receive_ns=event_ns,
+        subscription_acks=0,
+        replay_completed=0,
+        provider_errors=(),
+        slow_reader_warnings=0,
+        local_file_intact=True,
+        session_complete=None,
+        complete=True,
+        incomplete_reasons=(),
+    )
+    monkeypatch.setattr(finalize_module, "inspect_dbn", lambda *args, **kwargs: integrity)
+    monkeypatch.setattr(finalize_module, "_feed_schemas", lambda *args: [])
+    monkeypatch.setattr(finalize_module, "_expected_roots", lambda *args: set())
+    monkeypatch.setattr(
+        finalize_module,
+        "build_minute_rows",
+        lambda *args, **kwargs: ([], [], [], [], "fixture-feature-hash"),
+    )
+    monkeypatch.setattr(finalize_module, "persist_minute_rows", lambda *args: None)
+    monkeypatch.setattr(
+        finalize_module, "_persist_contract_minute_rows", lambda *args: None
+    )
+    monkeypatch.setattr(
+        finalize_module,
+        "estimate_tcbbo_parity_reference_prices",
+        lambda *args, **kwargs: finalize_module.pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        finalize_module, "persist_parity_reference_prices", lambda *args, **kwargs: None
+    )
+
+
 def test_offline_finalizer_refuses_active_recorder_lock(tmp_path):
     config, _catalog = _catalog_session(tmp_path)
 
@@ -104,6 +163,60 @@ def test_offline_finalizer_refuses_active_recorder_lock(tmp_path):
                 trading_date="2026-08-25",
                 session_id=config.session_id,
             )
+
+
+def test_successful_finalization_is_visible_to_immutable_base_reader(
+    tmp_path, monkeypatch
+):
+    config, catalog = _catalog_session(tmp_path)
+    _stub_successful_finalization(monkeypatch, config)
+
+    report = finalize_closed_session(
+        tmp_path,
+        trading_date="2026-08-25",
+        session_id=config.session_id,
+        rebuild_minutes=True,
+        now=datetime(2026, 8, 25, 21, 0, tzinfo=UTC),
+    )
+
+    assert report["complete"] is True
+    wal_path = Path(f"{catalog.path}-wal")
+    assert not wal_path.exists() or wal_path.stat().st_size == 0
+    immutable_uri = f"{catalog.path.resolve().as_uri()}?immutable=1"
+    with sqlite3.connect(immutable_uri, uri=True) as connection:
+        feed = connection.execute(
+            "SELECT status, complete, sha256 FROM tape_feed_status WHERE session_id=?",
+            (config.session_id,),
+        ).fetchone()
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM tape_finalization_runs WHERE session_id=?",
+            (config.session_id,),
+        ).fetchone()[0]
+    assert feed == ("complete", 1, "a" * 64)
+    assert audit_count == 1
+
+
+def test_checkpoint_failure_prevents_successful_finalizer_return(
+    tmp_path, monkeypatch
+):
+    config, _catalog = _catalog_session(tmp_path)
+    _stub_successful_finalization(monkeypatch, config)
+
+    def _busy_checkpoint(_self):
+        raise RuntimeError("closing-tape WAL checkpoint was busy")
+
+    monkeypatch.setattr(
+        TapeCatalog, "checkpoint_wal_for_immutable_read", _busy_checkpoint
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint was busy"):
+        finalize_closed_session(
+            tmp_path,
+            trading_date="2026-08-25",
+            session_id=config.session_id,
+            rebuild_minutes=True,
+            now=datetime(2026, 8, 25, 21, 0, tzinfo=UTC),
+        )
 
 
 def test_offline_finalizer_rejects_catalog_path_outside_day_directory(tmp_path):

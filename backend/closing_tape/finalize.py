@@ -556,4 +556,5 @@ def finalize_closed_session(
                 "error": "; ".join(issues) if issues else None,
             },
         )
+        catalog.checkpoint_wal_for_immutable_read()
         return report

@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from numbers import Integral
-from statistics import fmean
+from statistics import fmean, median
 from typing import Any, Iterable, Mapping
 
 from backend.forecast_calendar import ET, resolve_target_session, session_bounds, shift_session
@@ -201,6 +201,57 @@ def _history_returns(daily: list[_Observation], horizon: int) -> list[dict]:
             "return": change,
         })
     return samples
+
+
+def inventory_daily_history(symbol: str, history: Iterable[Mapping], *, as_of_utc) -> dict:
+    """Explain history availability even when current spot/session gates abstain.
+
+    Uses the evaluator's normalization, cap and exact-session return windows.
+    This diagnostic does not issue forecasts or change their formulas/gates.
+    """
+    as_of = _utc(as_of_utc)
+    if as_of is None:
+        raise ValueError("as_of_utc_must_be_timezone_aware")
+    excluded = Counter()
+    by_day = {}
+    conflict = False
+    for record in history:
+        if not isinstance(record, Mapping) or record.get("kind") != "daily_close":
+            continue
+        row, reason = _normalize(record, symbol, as_of)
+        if row is None:
+            excluded[reason] += 1
+            continue
+        if row.day in by_day and by_day[row.day].price != row.price:
+            conflict = True
+        by_day[row.day] = row
+    daily = sorted(by_day.values(), key=lambda row: row.timestamp)[-MAX_DAILY_OBSERVATIONS:]
+    common_reasons = ["conflicting_official_close"] if conflict else []
+    try:
+        anchor = date.fromisoformat(resolve_target_session(as_of, 0)["anchor_session_date"])
+        previous = shift_session(anchor, -1)
+        if not daily or daily[-1].day != previous:
+            common_reasons.append("daily_close_history_not_current")
+        if any(shift_session(a.day, 1) == b.day and abs(b.price / a.price - 1) > MAX_DAILY_ABS_RETURN
+               for a, b in zip(daily, daily[1:])):
+            common_reasons.append("daily_close_discontinuity_requires_review")
+    except ValueError:
+        common_reasons.append("daily_history_calendar_unsupported")
+    result = {}
+    for horizon in range(11):
+        count = len(_history_returns(daily, horizon)) if horizon else None
+        reasons = list(common_reasons) if horizon else []
+        if horizon and count < MIN_DAILY_RETURN_SAMPLES:
+            reasons.append("insufficient_verified_daily_history")
+        result[str(horizon)] = {
+            "status": "NOT_REQUIRED" if not horizon else "BLOCKED" if reasons else "SUFFICIENT_HISTORY",
+            "verified_daily_close_count": len(daily),
+            "latest_verified_session_date": daily[-1].day.isoformat() if daily else None,
+            "qualified_return_samples": count,
+            "required_return_samples": MIN_DAILY_RETURN_SAMPLES if horizon else None,
+            "excluded_daily_rows": dict(excluded), "reasons": reasons,
+        }
+    return result
 
 
 def _metrics(predictions: list[float], actuals: list[float], baselines: list[float]) -> dict:
@@ -487,7 +538,54 @@ def _intraday_candidates(result: dict, rows: list[_Observation], latest: _Observ
     else:
         result["selected_method"] = "last_price_v1"
         result["predicted_close"] = latest.price
+    # A new comparison must not silently change the existing blend or its
+    # weights. Freeze the selected result first, then expose the challenger.
+    result["candidates"].append(_robust_trend_candidate(recent, latest, as_of, closed, continuous))
     result["evaluation"] = {"status": "AWAITING_MATURED_OUTCOMES", "production_promotion_allowed": False}
+
+
+def _robust_trend_candidate(rows, latest, as_of, closed, continuous):
+    """Bounded Theil-Sen trend using equally weighted completed-minute bins.
+
+    Bins contain medians of retained reference samples, not exchange OHLC bars.
+    No close outcomes fit this fixed comparison and it never enters selection.
+    """
+    method = "eod_robust_trend_v1"
+    details = {
+        "default_selection_eligible": False,
+        "prospective_only": True,
+        "comparison_status": "PROSPECTIVE_RESEARCH_COMPARISON_NOT_SELECTED",
+        "accuracy_improvement_verified": False,
+        "limitation": "Retrospective diagnostic holdout did not beat baseline; prospective research comparison only",
+        "equation": "spot + 0.5*min(1,remaining/lookback)*clip(TheilSenSlope*lookback,-0.02*spot,0.02*spot)",
+        "input_kind": "completed_minute_medians_of_reference_samples_not_OHLCV",
+        "lookback_definition": "observed completed-minute bins within the preceding 30 minutes",
+    }
+    if not continuous:
+        return _candidate(method, None, "insufficient_contiguous_intraday_history", **details)
+    complete_before = as_of.replace(second=0, microsecond=0)
+    bins = defaultdict(list)
+    scale = max(row.price for row in rows)
+    for row in rows:
+        if row.timestamp < complete_before:
+            bins[row.timestamp.replace(second=0, microsecond=0)].append(row.price / scale)
+    points = [(stamp, median(prices)) for stamp, prices in sorted(bins.items())]
+    lookback = (points[-1][0] - points[0][0]).total_seconds() if len(points) >= 2 else 0
+    details.update(observed_minute_count=len(points), lookback_seconds=lookback)
+    if (len(points) < 12 or lookback < 900
+            or any((b[0] - a[0]).total_seconds() > 180 for a, b in zip(points, points[1:]))):
+        return _candidate(method, None, "insufficient_completed_minute_trend_history", **details)
+    current = latest.price / scale
+    if current <= 0:
+        return _candidate(method, None, "unsupported_reference_numeric_scale", **details)
+    slopes = [(b[1] - a[1]) / (b[0] - a[0]).total_seconds()
+              for i, a in enumerate(points) for b in points[i + 1:]]
+    # Work in scaled units so large finite references cannot overflow a slope.
+    projected = median(slopes) * lookback
+    projected = max(-0.02 * current, min(0.02 * current, projected))
+    decay = min(1.0, (closed - as_of).total_seconds() / lookback)
+    estimate = latest.price * (1.0 + 0.5 * decay * projected / current)
+    return _candidate(method, estimate, **details)
 
 
 def evaluate_methods(forecasts: Iterable[Mapping], outcomes: Iterable[Mapping], *, as_of_utc: datetime | str) -> dict:

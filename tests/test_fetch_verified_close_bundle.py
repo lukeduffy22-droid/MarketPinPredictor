@@ -187,3 +187,61 @@ def test_bundle_fetch_writes_audited_candidate_without_ingesting(tmp_path, monke
     assert "SPY,2026-08-25,765.91,nyse-arca-official" in text
     assert payload["audit"]["bundle_status"] == "READY"
     assert payload["database_ingested"] is False
+
+
+def test_partial_sources_are_all_observed_but_never_ingested(tmp_path, monkeypatch):
+    import hashlib
+
+    calls = []
+    def fetch(**kwargs):
+        symbol = kwargs["symbol"]
+        calls.append(symbol)
+        if symbol == "SPX":
+            raise tool.OfficialArtifactStaleError("requested date missing")
+        raise TimeoutError("source not yet reachable")
+    monkeypatch.setattr(tool, "fetch_official_artifact", fetch)
+    monkeypatch.setattr(tool, "audit_close_bundle_csv", lambda *a, **k: pytest.fail("partial audit"))
+    def attempt():
+        with pytest.raises(RuntimeError, match="bundle incomplete"):
+            tool.fetch_verified_close_bundle(project_root=tmp_path, trading_day=TRADING_DAY,
+                now_utc=datetime(2026, 8, 25, 23, 1, tzinfo=UTC))
+    attempt()
+    assert calls == [endpoint.symbol for endpoint in tool.OFFICIAL_CLOSE_ENDPOINTS]
+    root = tmp_path / "data" / "verified_close_sources" / TRADING_DAY.isoformat()
+    assert not (root / "candidate_bundle.csv").exists()
+    paths = list((root / "acquisition_attempts").glob("*.json"))
+    assert len(paths) == 1
+    original = paths[0].read_bytes()
+    assert paths[0].stem == hashlib.sha256(original).hexdigest()
+    receipt = json.loads(original)
+    assert receipt["all_sources_verified"] is False
+    assert len(receipt["sources"]) == 5
+    assert receipt["sources"][0]["error_type"] == "OfficialArtifactStaleError"
+    attempt()
+    assert len(list((root / "acquisition_attempts").glob("*.json"))) == 2
+    assert paths[0].read_bytes() == original
+
+
+def test_unavailable_spx_does_not_hide_other_verified_values(tmp_path, monkeypatch):
+    def fetch(**kwargs):
+        symbol = kwargs["symbol"]
+        folder = tmp_path / "data/verified_close_sources" / TRADING_DAY.isoformat() / symbol
+        folder.mkdir(parents=True)
+        artifact = folder / "source.json"
+        artifact.write_text("{}")
+        return {"source_artifact_path": str(artifact), "source_reference": kwargs["source_reference"],
+                "source_artifact_sha256": "a" * 64, "retrieved_at_utc": "2026-08-25T23:00:00+00:00"}
+    def extract(path, *, symbol, trading_day):
+        if symbol == "SPX": raise tool.OfficialArtifactStaleError("no exact date")
+        return 100.5
+    monkeypatch.setattr(tool, "fetch_official_artifact", fetch)
+    monkeypatch.setattr(tool, "extract_official_close", extract)
+    monkeypatch.setattr(tool, "validate_official_artifact_semantics", lambda row: None)
+    with pytest.raises(RuntimeError, match="incomplete for SPX;"):
+        tool.fetch_verified_close_bundle(project_root=tmp_path, trading_day=TRADING_DAY,
+            now_utc=datetime(2026, 8, 25, 23, 1, tzinfo=UTC))
+    root = tmp_path / "data/verified_close_sources" / TRADING_DAY.isoformat()
+    receipt = json.loads(next((root / "acquisition_attempts").glob("*.json")).read_text())
+    assert len([r for r in receipt["sources"] if r["status"] == "VERIFIED"]) == 4
+    assert receipt["sources"][0]["artifact"]["source_artifact_path"]
+    assert not (root / "candidate_bundle.csv").exists()

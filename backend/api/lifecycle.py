@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI
+from sqlalchemy.exc import OperationalError
 
 from backend.config import (
     LIVE_DATA_STALE_AFTER_SECONDS,
@@ -22,11 +23,16 @@ from backend.config import (
     SYMBOLS,
 )
 from backend.ai_predictor import build_ai_prediction
-from backend.database import init_db, save_prediction_snapshot
+from backend.database import (
+    init_db,
+    save_prediction_snapshot,
+    verify_prediction_calculation_lineage,
+)
 from backend.historical_context import get_historical_context, historical_adjustment
 from backend.inference import (
     GEX_INFERENCE_FEATURE_SCHEMA_VERSION,
     build_live_inference_features,
+    get_inference_engine,
     load_all_models,
 )
 from backend.market_structure import (
@@ -34,6 +40,13 @@ from backend.market_structure import (
     run_market_structure_capture_loop,
 )
 from backend.research.live_shadow import LiveShadowResearchRecorder
+from backend.research.cuda_shadow import (
+    CudaShadowResearchRecorder,
+    cuda_shadow_runtime_status,
+    run_cuda_shadow_research_loop,
+)
+from backend.structural_regime_live import FIELD as STRUCTURAL_FIELD, build_structural_prediction
+from backend.structural_regime_journal import StructuralRegimeJournal
 from backend.runtime_controls import SystemSleepGuard
 from backend.streamer import get_streamer, start_streaming
 from backend.workstation import (
@@ -47,6 +60,8 @@ from backend.workstation import (
 )
 
 logger = logging.getLogger(__name__)
+PUBLICATION_RETRY_SECONDS = 2.0
+PUBLICATION_MAX_ATTEMPTS = 3
 
 _application_sleep_guard = SystemSleepGuard()
 
@@ -54,7 +69,10 @@ _application_sleep_guard = SystemSleepGuard()
 def runtime_control_health() -> dict[str, object]:
     """Expose process-lifetime runtime controls without claiming more than observed."""
 
-    return {"sleep_prevention": _application_sleep_guard.to_dict()}
+    return {
+        "sleep_prevention": _application_sleep_guard.to_dict(),
+        "cuda_shadow_inference": cuda_shadow_runtime_status(),
+    }
 
 try:
     from backend.prediction_passport import (
@@ -82,6 +100,8 @@ class WorkstationPredictionCoordinator:
         monotonic_clock: Callable[[], float] = time.monotonic,
         passport_writer: Callable[..., dict[str, Any]] | None = None,
         snapshot_passport_writer: Callable[..., dict[str, Any]] | None = None,
+        structural_journal: StructuralRegimeJournal | None = None,
+        lineage_verifier: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.streamer = streamer
         self.shadow_research = shadow_research
@@ -93,10 +113,17 @@ class WorkstationPredictionCoordinator:
         self.monotonic_clock = monotonic_clock
         self.passport_writer = passport_writer
         self.snapshot_passport_writer = snapshot_passport_writer
+        self.structural_journal = structural_journal
+        self.lineage_verifier = lineage_verifier or verify_prediction_calculation_lineage
         self.last_prediction_capture: dict[str, float] = {}
+        self.publication_retry_symbols: set[str] = set()
         # Only committed input captures carry calculation_id. Their cadence is
         # independent of periodic prediction saves; retain one success per symbol.
         self.last_shadow_capture: dict[str, tuple[str, int, str]] = {}
+        # A structural estimate uses one committed input revision. Transient
+        # quote updates must not erase it or borrow its calculation ID. Retain
+        # its original source and result separately, subject to the same TTL.
+        self.last_committed_structural: dict[str, tuple[dict, dict]] = {}
         # One bounded retained identity per symbol. This lets a source revision
         # age from fresh to stale without minting a second forecast id.
         self.last_passport_by_revision: dict[
@@ -111,6 +138,7 @@ class WorkstationPredictionCoordinator:
         passport: dict[str, Any] | None,
     ) -> None:
         if passport_contract_is_complete(passport):
+            self.publication_retry_symbols.discard(symbol)
             self.last_passport_by_revision[symbol] = (
                 payload_revision_key(data),
                 copy.deepcopy(passport),
@@ -176,7 +204,8 @@ class WorkstationPredictionCoordinator:
                 prediction,
                 **kwargs,
             )
-        except Exception:
+        except Exception as exc:
+            self._remember_retryable_failure(exc, prediction.get("symbol") or data.get("symbol"))
             logger.exception(
                 "Prediction-passport issuance failed for %s; publishing nullable forecast_id",
                 prediction.get("symbol") or data.get("symbol"),
@@ -199,12 +228,23 @@ class WorkstationPredictionCoordinator:
             ):
                 kwargs["publication_guard"] = publication_guard
             return self.snapshot_passport_writer(int(getattr(saved, "id")), **kwargs)
-        except Exception:
+        except Exception as exc:
+            self._remember_retryable_failure(exc, prediction.get("symbol"))
             logger.exception(
                 "Snapshot-passport issuance failed for %s; publishing nullable forecast_id",
                 prediction.get("symbol"),
             )
             return None
+
+    def _remember_retryable_failure(self, exc: Exception, symbol: Any) -> None:
+        if not isinstance(exc, OperationalError):
+            return
+        code = getattr(exc.orig, "sqlite_errorcode", None)
+        if (
+            isinstance(code, int) and (code & 0xFF) in {5, 6}
+            or str(exc.orig).lower() in {"database is locked", "database table is locked"}
+        ):
+            self.publication_retry_symbols.add(str(symbol or "").upper())
 
     @staticmethod
     def _accepts_keyword(writer: Callable[..., Any], keyword: str) -> bool:
@@ -265,6 +305,21 @@ class WorkstationPredictionCoordinator:
     def _publication_allowed(self, data: dict[str, Any]) -> bool:
         return self._guard_snapshot(data)["requested_state"] is None
 
+    def _structural_for_revision(self, symbol, data, prediction, vix_payload):
+        result = build_structural_prediction(data, prediction, vix_payload=vix_payload)
+        if result.get("reasons") != ["COMMITTED_CALCULATION_ID_MISSING"]:
+            return result
+        retained = self.last_committed_structural.get(symbol)
+        if retained is None:
+            return result
+        source, committed_result = retained
+        if not self._publication_allowed(source):
+            self.last_committed_structural.pop(symbol, None)
+            return result
+        # The retained result carries its own timestamp, calculation ID, inputs,
+        # model lean, content hash and journal receipt. No new inference occurs.
+        return copy.deepcopy(committed_result)
+
     def _publication_context(self, data: dict[str, Any]):
         factory = getattr(self.streamer, "prediction_publication_guard", None)
         if not callable(factory):
@@ -274,7 +329,12 @@ class WorkstationPredictionCoordinator:
             subscription_generation=int(data.get("subscription_generation") or 0),
         )
 
-    def _guard_snapshot(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _guard_snapshot(
+        self,
+        data: dict[str, Any],
+        *,
+        expected_revision: tuple[Any, ...] | None = None,
+    ) -> dict[str, Any]:
         """Classify whether one payload may proceed to inference and publication."""
 
         provider = str(data.get("provider") or MARKET_DATA_PROVIDER)
@@ -348,6 +408,9 @@ class WorkstationPredictionCoordinator:
             validation_reasons.append("SUBSCRIPTION_EPOCH_MISMATCH")
         if handoff_unready:
             validation_reasons.append(f"HANDOFF_NOT_ACTIVE:{handoff_status}")
+        if expected_revision is not None and payload_revision_key(data) != expected_revision:
+            requested_state = "abstain"
+            validation_reasons.append("CALCULATION_INPUT_REVISION_CHANGED")
         return {
             "provider": provider,
             "is_fallback": is_fallback,
@@ -417,13 +480,52 @@ class WorkstationPredictionCoordinator:
     def process_payload(self, data: dict[str, Any]) -> dict[str, Any] | None:
         """Publish one backend-produced market revision and capture it when due."""
 
+        # The stream may continue publishing while inference runs.  A local
+        # immutable observation prevents that activity from changing the
+        # calculation whose retained inputs were verified below.
+        data = copy.deepcopy(data)
         symbol = str(data.get("symbol") or "").upper()
         if not symbol:
             return None
 
+        self.publication_retry_symbols.discard(symbol)
+
         guard = self._guard_snapshot(data)
         if guard["requested_state"] is not None:
             return self._publish_guarded_state(symbol=symbol, data=data, guard=guard)
+
+        # A nonempty ID (or a caller's persisted=True flag) is not a receipt.
+        # Resolve the exact committed run/blob before context loading, model
+        # work or numeric publication.  This verification is once per process
+        # call; the repeated live lease checks below stay cheap. Persistence
+        # and passport issuance revalidate lineage at their own boundaries.
+        try:
+            lineage = self.lineage_verifier(
+                data,
+                symbol=symbol,
+                predicted_at_utc=datetime.now(timezone.utc),
+            )
+        except Exception:
+            logger.exception("Calculation lineage verification failed for %s", symbol)
+            lineage = {"valid": False, "reasons": ["CALCULATION_LINEAGE_UNAVAILABLE"]}
+        if not isinstance(lineage, dict) or lineage.get("valid") is not True:
+            lineage_reasons = (
+                list(lineage.get("reasons") or []) if isinstance(lineage, dict) else []
+            )
+            return self._publish_guarded_state(
+                symbol=symbol,
+                data=data,
+                guard={
+                    **guard,
+                    "requested_state": "abstain",
+                    "validation_failure_reasons": list(dict.fromkeys([
+                        *guard["validation_failure_reasons"],
+                        *lineage_reasons,
+                        "CALCULATION_LINEAGE_NOT_VERIFIED",
+                    ])),
+                },
+            )
+        verified_revision = payload_revision_key(data)
 
         provider = str(guard["provider"])
         spot = float(guard["spot"])
@@ -471,6 +573,7 @@ class WorkstationPredictionCoordinator:
         feature_snapshot = prediction.get("feature_snapshot") or {}
         prediction_record = {
             **prediction,
+            STRUCTURAL_FIELD: self._structural_for_revision(symbol, data, prediction, vix_payload),
             "symbol": symbol,
             "provider": provider,
             # Decision-grade persistence requires affirmative model evidence;
@@ -531,7 +634,7 @@ class WorkstationPredictionCoordinator:
 
         # Recheck after inference so a generation change or handoff that began
         # during model work cannot persist or publish the obsolete forecast.
-        guard = self._guard_snapshot(data)
+        guard = self._guard_snapshot(data, expected_revision=verified_revision)
         if guard["requested_state"] is not None:
             return self._publish_guarded_state(symbol=symbol, data=data, guard=guard)
 
@@ -539,9 +642,11 @@ class WorkstationPredictionCoordinator:
         passport = None
         now = self.monotonic_clock()
         deferred_guard = None
-        publication_guard = lambda: self._publication_allowed(data)
+        publication_guard = lambda: self._guard_snapshot(
+            data, expected_revision=verified_revision
+        )["requested_state"] is None
         with self._publication_context(data) as publication_lease:
-            guard = self._guard_snapshot(data)
+            guard = self._guard_snapshot(data, expected_revision=verified_revision)
             if not publication_lease or guard["requested_state"] is not None:
                 if guard["requested_state"] is None:
                     guard = {
@@ -567,7 +672,7 @@ class WorkstationPredictionCoordinator:
                             symbol,
                         )
 
-                guard = self._guard_snapshot(data)
+                guard = self._guard_snapshot(data, expected_revision=verified_revision)
                 if guard["requested_state"] is not None:
                     deferred_guard = guard
                     saved = None
@@ -587,7 +692,7 @@ class WorkstationPredictionCoordinator:
                             data=data,
                             publication_guard=publication_guard,
                         )
-                    guard = self._guard_snapshot(data)
+                    guard = self._guard_snapshot(data, expected_revision=verified_revision)
                     if guard["requested_state"] is not None:
                         deferred_guard = guard
                         saved = None
@@ -624,11 +729,11 @@ class WorkstationPredictionCoordinator:
         # decision-valid state to readers.
         final_guard = None
         with self._publication_context(data) as publication_lease:
-            guard = self._guard_snapshot(data)
+            guard = self._guard_snapshot(data, expected_revision=verified_revision)
             if publication_lease and guard["requested_state"] is None:
                 self._record_committed_shadow(symbol, data)
                 # Journal latency must not make the final published state stale.
-                guard = self._guard_snapshot(data)
+                guard = self._guard_snapshot(data, expected_revision=verified_revision)
             if not publication_lease or guard["requested_state"] is not None:
                 if guard["requested_state"] is None:
                     guard = {
@@ -647,6 +752,24 @@ class WorkstationPredictionCoordinator:
                     passport=passport,
                     prediction_snapshot_id=snapshot_id,
                 )
+                structural = (state.get("prediction") or {}).get(STRUCTURAL_FIELD)
+                if isinstance(structural, dict) and structural.get("status") == "AVAILABLE":
+                    is_current_committed_revision = structural.get("calculation_id") == data.get("calculation_id")
+                    if is_current_committed_revision:
+                        structural["journal_status"] = "DISABLED"
+                    if is_current_committed_revision and self.structural_journal is not None:
+                        try:
+                            self.structural_journal.record(structural)
+                            structural["journal_status"] = "RECORDED"
+                        except Exception:
+                            structural["journal_status"] = "FAILED"
+                            logger.exception("Structural regime journal failed for %s", symbol)
+                    # Persistence must not expose a forecast after its live lease expires.
+                    guard = self._guard_snapshot(data, expected_revision=verified_revision)
+                    if guard["requested_state"] is not None:
+                        return self._publish_guarded_state(symbol=symbol, data=data, guard=guard)
+                    if is_current_committed_revision and structural.get("journal_status") == "RECORDED":
+                        self.last_committed_structural[symbol] = (copy.deepcopy(data), copy.deepcopy(structural))
                 return workstation_state_store.publish(state)
         return self._publish_guarded_state(
             symbol=symbol,
@@ -661,9 +784,10 @@ async def run_workstation_state_loop(
     *,
     poll_seconds: float = 0.25,
 ) -> None:
-    """Observe backend buffers and publish each new revision exactly once."""
+    """Deduplicate revisions, with bounded retries for transient passport locks."""
 
     seen: dict[str, tuple[Any, ...]] = {}
+    retries: dict[str, tuple[tuple[Any, ...], int, float]] = {}
     while True:
         latest_by_symbol = streamer.get_all_latest()
         for raw_symbol, raw_payload in latest_by_symbol.items():
@@ -689,6 +813,14 @@ async def run_workstation_state_loop(
             )
             if seen.get(symbol) == observation_key:
                 continue
+            retry = retries.get(symbol)
+            attempts = 0
+            if retry is not None and retry[0] == observation_key:
+                attempts = retry[1]
+                if time.monotonic() < retry[2]:
+                    continue
+            else:
+                retries.pop(symbol, None)
             try:
                 await asyncio.to_thread(coordinator.process_payload, payload)
             except asyncio.CancelledError:
@@ -696,7 +828,19 @@ async def run_workstation_state_loop(
             except Exception:
                 logger.exception("Workstation state publication failed for %s", symbol)
                 continue
-            seen[symbol] = observation_key
+            attempts += 1
+            if (
+                symbol in getattr(coordinator, "publication_retry_symbols", ())
+                and attempts < PUBLICATION_MAX_ATTEMPTS
+            ):
+                # Re-read the latest payload and repeat all guards on retry;
+                # never retain a stale numeric forecast for later publication.
+                retries[symbol] = (
+                    observation_key, attempts, time.monotonic() + PUBLICATION_RETRY_SECONDS
+                )
+            else:
+                seen[symbol] = observation_key
+                retries.pop(symbol, None)
         await asyncio.sleep(max(0.05, float(poll_seconds)))
 
 
@@ -733,6 +877,10 @@ async def lifespan(app: FastAPI):
     streamer = get_streamer()
     market_structure_journal = get_market_structure_journal()
     shadow_research = LiveShadowResearchRecorder()
+    cuda_shadow_research = CudaShadowResearchRecorder(
+        inference_engine=get_inference_engine()
+    )
+    logger.info("CUDA shadow inference: %s", cuda_shadow_research.status())
     prediction_capture_seconds = float(os.getenv("PREDICTION_CAPTURE_INTERVAL_SECONDS", "60"))
     coordinator = WorkstationPredictionCoordinator(
         streamer=streamer,
@@ -740,6 +888,7 @@ async def lifespan(app: FastAPI):
         capture_seconds=prediction_capture_seconds,
         passport_writer=_issue_prediction_passport,
         snapshot_passport_writer=_issue_snapshot_passport,
+        structural_journal=StructuralRegimeJournal(),
     )
     workstation_state_store.reset()
     configured_symbols = getattr(streamer, "symbols", None) or SYMBOLS
@@ -753,6 +902,15 @@ async def lifespan(app: FastAPI):
     workstation_task = asyncio.create_task(
         run_workstation_state_loop(streamer, coordinator)
     )
+    cuda_shadow_task = (
+        asyncio.create_task(
+            run_cuda_shadow_research_loop(streamer, cuda_shadow_research)
+        )
+        if cuda_shadow_research.ready_symbols
+        else None
+    )
+    from backend.diagnostic_automation import run_diagnostic_review_loop
+    diagnostic_task = asyncio.create_task(run_diagnostic_review_loop())
 
     logger.info("✅ API ready for requests")
     try:
@@ -764,10 +922,15 @@ async def lifespan(app: FastAPI):
         streaming_task.cancel()
         market_structure_task.cancel()
         workstation_task.cancel()
+        if cuda_shadow_task is not None:
+            cuda_shadow_task.cancel()
+        diagnostic_task.cancel()
         await asyncio.gather(
             streaming_task,
             market_structure_task,
             workstation_task,
+            *([cuda_shadow_task] if cuda_shadow_task is not None else []),
+            diagnostic_task,
             return_exceptions=True,
         )
         _application_sleep_guard.release()

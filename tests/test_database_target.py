@@ -33,6 +33,23 @@ def test_configured_market_database_honors_database_url(monkeypatch, tmp_path):
     assert configured_market_database_path(tmp_path / "other-project") == configured.resolve()
 
 
+def test_configured_market_database_can_require_canonical_target(monkeypatch, tmp_path):
+    configured = tmp_path / "market.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{configured}")
+
+    with pytest.raises(RuntimeError, match="does not select the canonical"):
+        configured_market_database_path(tmp_path, require_canonical=True)
+
+
+def test_configured_market_database_accepts_explicit_canonical_target(monkeypatch, tmp_path):
+    canonical = (tmp_path / "data" / "market_data.db").resolve()
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{canonical.as_posix()}")
+
+    assert configured_market_database_path(
+        tmp_path, require_canonical=True
+    ) == canonical
+
+
 @pytest.mark.parametrize(
     ("url", "message"),
     [

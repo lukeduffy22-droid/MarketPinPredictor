@@ -103,6 +103,12 @@ function New-TestCurrentDayUniversePreparation {
                 is_fallback = $false
                 trading_date = $TradingDate
                 source_date = $TradingDate
+                cache_metadata_status = 'verified'
+                source_sha256 = ('b' * 64)
+                provider_definition_start = "${TradingDate}T00:00:00+00:00"
+                provider_definition_end = "${TradingDate}T23:59:59+00:00"
+                provider_statistics_start = "${TradingDate}T00:00:00+00:00"
+                provider_statistics_end = "${TradingDate}T23:59:59+00:00"
             }
         }
     }
@@ -112,7 +118,7 @@ function Assert-OpeningAcceptanceMutationPreflight { param([switch]$AllowSchemaB
 function Write-WatchdogLog { param($Event, $Message) }
 function Start-VerifiedComponent {
     param($Component, $Port, $Url, $ExpectedEndpointContract, $FilePath, $ArgumentList,
-          $StandardOutputPath, $StandardErrorPath)
+          $StandardOutputPath, $StandardErrorPath, [switch]$RequireStrongListenerIdentity)
 }
 
 Describe 'Same-day fallback backend adopts proven morning cache before the opening cutoff' {
@@ -145,8 +151,21 @@ Describe 'Same-day fallback backend adopts proven morning cache before the openi
         Mock Get-MarketAppListenerProcessIds { @(44224) }
         Mock Invoke-MarketAppUniverseCachePreparation { $script:prepared }
         Mock Invoke-MarketAppBoundedAutomaticListenerStop { [pscustomobject]@{ Stopped = $true } }
+        Mock Invoke-MarketAppVerifiedOrphanBackendCleanup {
+            [pscustomobject]@{
+                Cleaned = $false
+                ProcessIds = @()
+                ProviderOwnerProcessIds = @()
+                PreservedRecorderProcessIds = @()
+            }
+        }
         Mock New-MarketAppLaunchLogPaths { [pscustomobject]@{} }
-        Mock Start-VerifiedComponent { [pscustomobject]@{ ListenerProcessId = 42424 } }
+        Mock Start-VerifiedComponent {
+            [pscustomobject]@{
+                ListenerProcessId = 42424
+                ListenerIdentityToken = '42424|638929455050000000'
+            }
+        }
     }
 
     foreach ($clock in @('07:45:00', '08:15:00')) {
@@ -215,6 +234,49 @@ Describe 'Current-day preparation proof requires every configured primary family
             -ExpectedTradingDate '2026-09-10' `
             -ExpectedContractCap 3200 `
             -ExpectedSymbols @('SPX', 'NDX', 'VIX', 'RUT') | Should Be $true
+    }
+
+    foreach ($invalidProof in @(
+        'missing_metadata_status',
+        'invalid_source_hash',
+        'offset_free_definition_start',
+        'wrong_statistics_day',
+        'definition_end_after_source_day'
+    )) {
+        It "rejects unauthenticated or temporally inconsistent cache proof: $invalidProof" {
+            $prepared = New-TestCurrentDayUniversePreparation `
+                -Symbols @('SPX', 'NDX', 'VIX', 'RUT') `
+                -TradingDate '2026-09-10' `
+                -SelectedContractCount 2064
+            switch ($invalidProof) {
+                'missing_metadata_status' {
+                    $prepared.Result.provenance.PSObject.Properties.Remove(
+                        'cache_metadata_status'
+                    )
+                }
+                'invalid_source_hash' {
+                    $prepared.Result.provenance.source_sha256 = 'not-a-sha256'
+                }
+                'offset_free_definition_start' {
+                    $prepared.Result.provenance.provider_definition_start =
+                        '2026-09-10T00:00:00'
+                }
+                'wrong_statistics_day' {
+                    $prepared.Result.provenance.provider_statistics_start =
+                        '2026-09-09T00:00:00+00:00'
+                }
+                'definition_end_after_source_day' {
+                    $prepared.Result.provenance.provider_definition_end =
+                        '2026-09-11T00:00:01+00:00'
+                }
+            }
+
+            Test-MarketAppCurrentDayUniversePreparationProof `
+                -Preparation $prepared `
+                -ExpectedTradingDate '2026-09-10' `
+                -ExpectedContractCap 3200 `
+                -ExpectedSymbols @('SPX', 'NDX', 'VIX', 'RUT') | Should Be $false
+        }
     }
 
     foreach ($missingFamily in @('VIX', 'RUT')) {

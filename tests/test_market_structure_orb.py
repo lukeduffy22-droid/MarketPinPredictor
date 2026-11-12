@@ -1641,6 +1641,10 @@ def test_orb_snapshot_loader_preserves_projection_without_hydrating_audit_payloa
         "sample_id",
         "sample_timestamp_utc",
         "captured_at_utc",
+        "earliest_ts_recv_ns",
+        "latest_ts_recv_ns",
+        "processing_clock_status",
+        "paired_quote_count",
         "provider",
         "subscription_epoch_id",
         "subscription_generation",
@@ -1656,6 +1660,7 @@ def test_orb_snapshot_loader_preserves_projection_without_hydrating_audit_payloa
         "progress_decision_status",
         "progress_decision_reason",
         "progress_decided_at_utc",
+        "reference_price_inputs_valid",
     }
     assert len(full) == 3
     assert len(projected) == 2
@@ -1769,20 +1774,31 @@ def test_orb_snapshot_loader_bounds_full_day_growth_without_changing_projection(
         event.remove(temp_engine, "before_cursor_execute", record_projection_read)
     # Runtime reads must not sort a second full-session provenance window or
     # hydrate the growing post-open audit payload merely to publish two rows.
-    assert len(projection_reads) == 2
+    # Two legacy reads plus one indexed empty-store scan for the new contract.
+    assert len(projection_reads) == 3
     with temp_engine.connect() as connection:
         metadata_sql, metadata_parameters = projection_reads[0]
         plan = connection.exec_driver_sql(
             "EXPLAIN QUERY PLAN " + metadata_sql, metadata_parameters
+        ).fetchall()
+        detail_sql, detail_parameters = projection_reads[1]
+        detail_plan = connection.exec_driver_sql(
+            "EXPLAIN QUERY PLAN " + detail_sql, detail_parameters
         ).fetchall()
     assert any(
         "COVERING INDEX idx_orb_reference_snapshot_metadata" in row[3]
         for row in plan
     )
     assert not any("TEMP B-TREE" in row[3] for row in plan)
-    assert all("row_number" not in sql and "formula_inputs_json" not in sql
-               for sql, _parameters in projection_reads)
-    assert len(projection_reads[-1][1]) == 2
+    assert all("row_number" not in sql for sql, _parameters in projection_reads)
+    # Pair validity is evaluated for the bounded detail selection only. The
+    # growing full-session metadata scan still never reads formula payloads.
+    assert "formula_inputs_json" not in metadata_sql
+    assert any(
+        "INDEX idx_orb_reference_snapshot_metadata" in row[3]
+        for row in detail_plan
+    )
+    assert not any("TEMP B-TREE" in row[3] for row in detail_plan)
     assert len(full) == post_open_count + 1
     assert len(projected) == 2
     assert [row["sample_id"] for row in projected] == [

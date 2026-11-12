@@ -54,7 +54,7 @@ def _regular_minute(timestamp: datetime) -> bool:
 class EquityContextTracker:
     def __init__(self, *, symbols, enabled: bool = False, db_path: Path | None = None,
                  fetcher: Callable[..., Any] | None = None, poll_seconds: float = 60.0,
-                 max_bars_per_symbol: int = 20000):
+                 max_bars_per_symbol: int = 20000, clock=None):
         self.symbols = resolve_equity_context_symbols(symbols)
         self.enabled = bool(enabled)
         self.subscription_epoch_id = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
@@ -64,6 +64,7 @@ class EquityContextTracker:
         self.db_path = Path(db_path) if db_path is not None else None
         self.poll_seconds = max(60.0, float(poll_seconds))
         self._fetcher = fetcher or self._fetch
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._bars = {symbol: deque(maxlen=max(2, min(20000, int(max_bars_per_symbol))))
                       for symbol in self.symbols}
         self._lock = threading.Lock()
@@ -81,6 +82,8 @@ class EquityContextTracker:
         import databento as db
         from backend.underlying_validator import _available_end_from_error
         client = db.Historical(os.getenv("DATABENTO_API_KEY", ""))
+        # Per-client network deadline, without changing the shared SDK class.
+        client.timeseries.TIMEOUT = 10
         try:
             result = client.timeseries.get_range(**kwargs)
         except Exception as exc:
@@ -140,7 +143,7 @@ class EquityContextTracker:
         return restored
 
     def poll_once(self, now: datetime | None = None) -> int:
-        now = _utc(now or datetime.now(UTC))
+        now = _utc(now or self._clock())
         if not self.enabled or not self.symbols or not _regular_minute(now):
             return 0
         if not self._poll_lock.acquire(blocking=False):
@@ -151,21 +154,30 @@ class EquityContextTracker:
                     return 0
                 if self._last_attempt and (now - self._last_attempt).total_seconds() < self.poll_seconds:
                     return 0
-                first_attempt = self._last_attempt is None
                 self._last_attempt = now
-            # Initial session catch-up is at most one regular session. Later
-            # polls overlap three minutes to capture delayed completed bars.
+            # Repair the earliest missing minute, including after a denial,
+            # disconnect, persistence failure, restart or trading-day rollover.
+            # A failed first request must never move the catch-up cursor ahead.
             from app.utils.time_et import open_time_et
             session_open = open_time_et(now.astimezone(ET)).astimezone(UTC)
-            start = session_open if first_attempt else max(session_open, now - timedelta(minutes=3))
-            if start >= now.replace(second=0, microsecond=0):
+            end = now.replace(second=0, microsecond=0)
+            start = max(session_open, end - timedelta(minutes=3))
+            with self._lock:
+                for symbol in self.symbols:
+                    stamps = {_utc(row["timestamp_utc"]) for row in self._bars[symbol]}
+                    cursor = session_open
+                    while cursor < end and cursor in stamps:
+                        cursor += timedelta(minutes=1)
+                    start = min(start, cursor)
+            if start >= end:
                 return 0
             rows = self._fetcher(dataset=DATASET, schema=SCHEMA, symbols=list(self.symbols),
-                                 start=start.isoformat(), end=now.replace(second=0, microsecond=0).isoformat(),
+                                 start=start.isoformat(), end=end.isoformat(),
                                  limit=500 * len(self.symbols))
             if self._stop.is_set():
                 return 0
-            accepted = self.ingest(rows, observed_at=now)
+            # Availability is when retrieval finishes, never the request start.
+            accepted = self.ingest(rows, observed_at=self._clock())
             with self._lock:
                 self._failure = None
                 self._retry_after = None
@@ -218,20 +230,26 @@ class EquityContextTracker:
                 rejected += 1
         accepted = []
         with self._lock:
+            revisions = {}
             for payload in sorted(pending, key=lambda item: item["timestamp_utc"]):
                 bucket = self._bars[payload["symbol"]]
-                matching = next((item for item in reversed(bucket) if item["timestamp_utc"] == payload["timestamp_utc"]), None)
+                key = (payload["symbol"], payload["timestamp_utc"])
+                matching = revisions.get(key) or next((item for item in reversed(bucket) if item["timestamp_utc"] == payload["timestamp_utc"]), None)
                 if matching and matching["source_revision"] == payload["source_revision"]:
                     continue
+                revisions[key] = payload
+                accepted.append(payload)
+            # Commit before publishing in memory. Failed writes remain retryable.
+            if accepted and self.db_path is not None:
+                self._persist(accepted)
+            for payload in accepted:
+                bucket = self._bars[payload["symbol"]]
                 retained = [item for item in bucket if item["timestamp_utc"] != payload["timestamp_utc"]]
                 retained.append(payload)
                 bucket.clear()
                 bucket.extend(sorted(retained, key=lambda item: item["timestamp_utc"])[-bucket.maxlen:])
-                accepted.append(payload)
             self._accepted += len(accepted)
             self._rejected += rejected
-        if accepted and self.db_path is not None:
-            self._persist(accepted)
         return len(accepted)
 
     def _persist(self, rows) -> None:

@@ -11,6 +11,9 @@ from typing import Any, Callable
 import pandas as pd
 import requests
 from app.utils.gamma_wall_evidence import normalize_gamma_walls
+from app.services.options_structure_view import oi_max_pain_context
+from app.services.observed_indicators import attach_indicators, fetch_indicator_bars
+from app.services.universe_provenance_view import universe_provenance_view
 
 from app.services.sidebar_live_state import SidebarStateBatch, retained_prediction_matches_state
 from backend.prediction_authority import build_prediction_authority
@@ -120,11 +123,21 @@ def _request_json_object(
         message = f"request failed ({type(exc).__name__})"
     else:
         if response.status_code != 200:
+            backend_reason = None
+            try:
+                detail = response.json().get("detail")
+                candidate = detail.get("reason") if isinstance(detail, dict) else None
+                if candidate in {"RUNTIME_READ_BUSY", "RUNTIME_READ_TIMEOUT", "RUNTIME_READ_FAILED"}:
+                    backend_reason = candidate
+            except (AttributeError, TypeError, ValueError):
+                pass
             return None, {
                 "transport_ok": False,
                 "transport_error": "http_error",
                 "transport_message": f"backend returned HTTP {response.status_code}",
                 "checked_at_utc": checked_at_utc,
+                "http_status": response.status_code,
+                "backend_reason": backend_reason,
             }
         try:
             payload = response.json()
@@ -231,6 +244,7 @@ def build_expiration_profile_view(
 
     provenance = payload.get("universe_provenance")
     provenance = provenance if isinstance(provenance, dict) else {}
+    provenance_view = universe_provenance_view(payload)
     open_interest_as_of_utc = (
         payload.get("open_interest_as_of_utc")
         or payload.get("oi_as_of_utc")
@@ -399,6 +413,7 @@ def build_expiration_profile_view(
                 "validation_reasons": reasons,
                 "gamma_pin": required_values["gamma pin"],
                 "max_pain": _finite_number(profile.get("max_pain")) if profile else None,
+                "oi_max_pain_context": oi_max_pain_context(payload, expiration),
                 "first_strike_bucket_gex_sign_crossing": (
                     _finite_number(profile.get("zero_gamma")) if profile else None
                 ),
@@ -461,20 +476,14 @@ def build_expiration_profile_view(
         ),
         "subscription_profile": payload.get("subscription_profile"),
         "selected_target_mode": selected_target_mode,
+        "future_expiration_capture_segment": payload.get("future_expiration_capture_segment") or {},
         "payload_timestamp": payload.get("timestamp") or payload.get("timestamp_utc"),
         "quote_age_seconds": quote_age,
         "freshness_status": freshness_status,
         "freshness_scope": "shared_payload",
         "open_interest_as_of_utc": open_interest_as_of_utc,
         "open_interest_source_end_utc": open_interest_source_end_utc,
-        "provenance": {
-            "mode": provenance.get("mode"),
-            "source_date": provenance.get("source_date"),
-            "is_fallback": provenance.get("is_fallback"),
-            "reason": provenance.get("reason"),
-            "source_sha256": provenance.get("source_sha256") or payload.get("universe_sha256"),
-            "selected_universe_sha256": payload.get("selected_universe_sha256"),
-        },
+        "provenance": provenance_view,
         "invalid_profile_entries": invalid_profile_entries,
         "invalid_subscription_entries": invalid_subscription_entries,
         "zero_gamma_label": ZERO_GAMMA_DISPLAY_LABEL,
@@ -630,6 +639,7 @@ def _current_promoted_row(
 def fetch_live_status_snapshot(timeout_seconds: float = 1.2) -> dict[str, Any]:
     """Fetch one live status snapshot, preferring SSE stream and falling back to polling endpoints."""
     sse_url = "http://localhost:8000/events/live"
+    failures = []
     try:
         with requests.get(sse_url, stream=True, timeout=(1.0, timeout_seconds)) as response:
             response.raise_for_status()
@@ -640,32 +650,34 @@ def fetch_live_status_snapshot(timeout_seconds: float = 1.2) -> dict[str, Any]:
                 if not line.startswith("data:"):
                     continue
                 payload = json.loads(line[5:].strip())
-                if isinstance(payload, dict):
+                if (isinstance(payload, dict)
+                        and isinstance(payload.get("health"), dict)
+                        and isinstance(payload.get("pipeline"), dict)):
                     payload["source"] = "sse"
                     return payload
-    except Exception:
-        pass
+                # An SSE unavailable event is a failed read, not an empty
+                # successful snapshot. Try the existing bounded poll fallback.
+                reason = payload.get("reason") if isinstance(payload, dict) else None
+                failures.append({"endpoint": "/events/live", "backend_reason": reason
+                                 if reason in {"RUNTIME_READ_BUSY", "RUNTIME_READ_TIMEOUT", "RUNTIME_READ_FAILED"}
+                                 else "INVALID_STATUS_EVENT"})
+                break
+    except Exception as exc:
+        failures.append({"endpoint": "/events/live", "transport_error": type(exc).__name__})
 
     health_data = {}
     pipeline_data = {}
     universe_data = {}
-    try:
-        health_resp = requests.get("http://localhost:8000/health", timeout=2)
-        if health_resp.status_code == 200:
-            health_data = health_resp.json()
-    except Exception:
-        health_data = {}
-
-    try:
-        pipeline_resp = requests.get(
-            "http://localhost:8000/health/live", timeout=2
-        )
-        if pipeline_resp.status_code == 200:
-            candidate = pipeline_resp.json()
-            if isinstance(candidate, dict):
-                pipeline_data = candidate
-    except Exception:
-        pipeline_data = {}
+    health_payload, health_transport = _request_json_object(
+        "http://localhost:8000/health", timeout_seconds=2)
+    health_data = health_payload or {}
+    if health_payload is None:
+        failures.append({"endpoint": "/health", **health_transport})
+    pipeline_payload, pipeline_transport = _request_json_object(
+        "http://localhost:8000/health/live", timeout_seconds=2)
+    pipeline_data = pipeline_payload or {}
+    if pipeline_payload is None:
+        failures.append({"endpoint": "/health/live", **pipeline_transport})
 
     if not pipeline_data:
         # The compact compatibility health response does not include the
@@ -703,7 +715,9 @@ def fetch_live_status_snapshot(timeout_seconds: float = 1.2) -> dict[str, Any]:
 
     return {
         "source": "poll",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": health_data.get("sampled_at_utc"),
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+        "read_failures": failures,
         "health": health_data,
         "pipeline": pipeline_data,
         "universe": universe_data,
@@ -894,19 +908,36 @@ def _current_lifecycle_close_forecast(
 
 def _source_metadata(payload: dict[str, Any], ai_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     provider = str(payload.get("provider") or (ai_payload or {}).get("provider") or "databento")
+    provenance_views = [
+        universe_provenance_view(candidate)
+        for candidate in (payload, ai_payload)
+        if isinstance(candidate, dict)
+    ]
+    mismatched_provenance = next(
+        (view for view in provenance_views if view.get("date_mismatch") is True),
+        None,
+    )
     is_fallback = bool(
         payload_has_fallback_provenance(payload)
         or payload_has_fallback_provenance(ai_payload)
         or provider == "historical-fallback"
+        or any(view.get("is_fallback") is True for view in provenance_views)
     )
-    market_data_source_label = str(
-        payload.get("source_label")
-        or (
-            "Closed-market historical context only"
-            if is_fallback
-            else "Databento Live"
+    if mismatched_provenance is not None:
+        market_data_source_label = (
+            "Prior-session universe context only (non-authoritative)"
+            if mismatched_provenance.get("prior_session") is True
+            else "Mismatched-date universe context only (non-authoritative)"
         )
-    )
+    else:
+        market_data_source_label = str(
+            payload.get("source_label")
+            or (
+                "Closed-market historical context only"
+                if is_fallback
+                else "Databento Live"
+            )
+        )
     prediction_authority = (ai_payload or {}).get("prediction_authority")
     prediction_authority = (
         dict(prediction_authority)
@@ -927,6 +958,26 @@ def _source_metadata(payload: dict[str, Any], ai_payload: dict[str, Any] | None 
         "market_data_source_label": market_data_source_label,
         "prediction_authority": prediction_authority,
         "display_mode": "fallback" if is_fallback else "live",
+        "universe_provenance_status": (
+            mismatched_provenance.get("authority_status")
+            if mismatched_provenance is not None
+            else None
+        ),
+        "universe_session_trading_date": (
+            mismatched_provenance.get("trading_date")
+            if mismatched_provenance is not None
+            else None
+        ),
+        "universe_source_date": (
+            mismatched_provenance.get("source_date")
+            if mismatched_provenance is not None
+            else None
+        ),
+        "provenance_warning": (
+            mismatched_provenance.get("warning")
+            if mismatched_provenance is not None
+            else None
+        ),
     }
 
 
@@ -964,10 +1015,8 @@ def fetch_databento_prediction(
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """Fetch Databento-backed prediction payload and enforce freshness.
 
-    ``indicator_builder`` remains in the public call contract for compatibility,
-    but is only safe to invoke once a verified observed-bar payload is available.
-    The current backend payload contains pin and estimate fields, not intraday
-    OHLCV bars, so this function returns an explicit unavailable surface instead.
+    ``indicator_builder`` remains for legacy compatibility. Display indicators
+    use separately verified retained bars, never generated candles from pins.
     """
     ai_payload = None
     dashboard_payload: dict[str, Any] = {}
@@ -990,7 +1039,7 @@ def fetch_databento_prediction(
     except Exception as exc:  # noqa: BLE001
         return None, f"{symbol}: backend unavailable ({str(exc)[:50]})", None
 
-    return build_databento_prediction_from_payloads(
+    prediction, warning, info = build_databento_prediction_from_payloads(
         symbol=symbol,
         timeframe=timeframe,
         stale_after_seconds=stale_after_seconds,
@@ -999,6 +1048,9 @@ def fetch_databento_prediction(
         ai_payload=ai_payload,
         payload=payload,
     )
+    if prediction is not None:
+        prediction = attach_indicators(prediction, fetch_indicator_bars(symbol))
+    return prediction, warning, info
 
 
 def build_databento_predictions_from_state_batch(
@@ -1007,6 +1059,7 @@ def build_databento_predictions_from_state_batch(
     timeframe: str,
     stale_after_seconds: float,
     promoted_predictions: dict[str, Any] | None = None,
+    indicator_loader: Callable | None = None,
 ) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
     """Build and validate each forecast from the same captured state and health read."""
 
@@ -1031,6 +1084,8 @@ def build_databento_predictions_from_state_batch(
             continue
         matches, reason = retained_prediction_matches_state(prediction, state)
         if matches:
+            if indicator_loader is not None:
+                prediction = attach_indicators(prediction, indicator_loader(state.symbol))
             predictions[state.symbol] = prediction
         else:
             messages.append(f"{state.symbol}: {reason}")
@@ -1136,6 +1191,7 @@ def build_databento_prediction_from_payloads(
             "ticker": symbol,
             "current_price": current_price,
             "predicted_price": predicted_price,
+            "structural_regime_prediction": (ai_payload or {}).get("structural_regime_prediction"),
             **confidence_metadata,
             "df": df,
             "indicators_available": False,
@@ -1230,6 +1286,12 @@ def build_databento_prediction_from_payloads(
             "market_data_source_label": source["market_data_source_label"],
             "is_fallback": source["is_fallback"],
             "display_mode": source["display_mode"],
+            "universe_provenance_status": source["universe_provenance_status"],
+            "universe_session_trading_date": source[
+                "universe_session_trading_date"
+            ],
+            "universe_source_date": source["universe_source_date"],
+            "provenance_warning": source["provenance_warning"],
             "inference_device": (
                 promoted_row.get("execution_device")
                 if promoted_row is not None

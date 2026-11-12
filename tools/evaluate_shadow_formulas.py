@@ -20,6 +20,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
+from backend.research.outcome_protocol import assess_outcome, PROTOCOL_ID
+from backend.research.evaluation_statistics import paired_session_summary
 
 
 UTC = timezone.utc
@@ -183,6 +185,11 @@ def _formula_summary(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
             "eligibility_coverage": _round(len(eligible) / len(group)) if group else None,
             "scoring_coverage_of_eligible": _round(len(scored) / len(eligible)) if eligible else None,
             "metrics": _metrics(scored),
+            "session_paired_baseline": paired_session_summary([
+                {"session": _parse_timestamp(r["prediction_timestamp_utc"]).astimezone(CENTRAL).date().isoformat(),
+                 "prediction": float(r["predicted_price"]), "baseline": float(r["spot"]),
+                 "outcome": float(r["realized_price"])} for r in scored
+            ]),
             "metrics_by_time_of_day": _group_metrics(
                 scored,
                 lambda row: _time_bucket(_parse_timestamp(row.get("prediction_timestamp_utc"))),
@@ -217,7 +224,9 @@ def _paired_comparison(rows: list[dict[str, Any]]) -> list[dict[str, object]]:
         keyed[key][str(row["formula_id"])] = row
     by_symbol: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
     for (symbol, _timestamp, _horizon, _epoch, _generation), formulas in keyed.items():
-        if BASELINE_ID in formulas and CANDIDATE_ID in formulas:
+        if (BASELINE_ID in formulas and CANDIDATE_ID in formulas
+                and formulas[BASELINE_ID]["realized_timestamp_utc"] == formulas[CANDIDATE_ID]["realized_timestamp_utc"]
+                and formulas[BASELINE_ID]["realized_price"] == formulas[CANDIDATE_ID]["realized_price"]):
             by_symbol[symbol].append((formulas[BASELINE_ID], formulas[CANDIDATE_ID]))
     output: list[dict[str, object]] = []
     for symbol, pairs in sorted(by_symbol.items()):
@@ -516,6 +525,11 @@ def _chronological_ablation(rows: list[dict[str, Any]]) -> dict[str, object]:
         reasons = _safe_json(frozen.get("abstention_reasons_json"), [])
         reasons = [str(reason) for reason in reasons] if isinstance(reasons, list) else []
         stored_frozen_prediction = _finite(frozen.get("predicted_price"))
+        if int(frozen.get("abstained") or 0) == 0 and (
+                frozen.get("realized_price") is None
+                or frozen.get("realized_timestamp_utc") != baseline.get("realized_timestamp_utc")
+                or frozen.get("realized_price") != baseline.get("realized_price")):
+            continue
         item = {
             "symbol": key[0],
             "session": timestamp.astimezone(CENTRAL).date().isoformat(),
@@ -617,6 +631,20 @@ def evaluate(journal_path: Path) -> dict[str, object]:
     if not rows:
         raise ValueError("shadow journal is empty")
 
+    retained_rows = rows
+    excluded_outcomes = Counter()
+    rows = []
+    for original in retained_rows:
+        row = dict(original)
+        if row.get("realized_price") is not None:
+            timing = assess_outcome(row)
+            if timing["status"] != "ELIGIBLE":
+                excluded_outcomes.update(timing["reasons"])
+                # Preserve historical bytes and raw integrity evidence, but do
+                # not let a late or retrospectively inserted row earn skill.
+                row.update(realized_price=None, error_points=None, direction_hit=None)
+        rows.append(row)
+
     formulas: dict[tuple[str, str], dict[str, object]] = {}
     for row in rows:
         key = (str(row["formula_id"]), str(row["formula_version"]))
@@ -672,12 +700,14 @@ def evaluate(journal_path: Path) -> dict[str, object]:
         "journal_physical_sha256": _file_sha256(resolved),
         "journal_wal_sha256": _file_sha256(Path(f"{resolved}-wal")),
         "logical_snapshot_sha256": hashlib.sha256(
-            json.dumps(rows, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            json.dumps(retained_rows, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
         ).hexdigest(),
         "sqlite_quick_check": quick_check,
         "trading_dates": trading_dates,
         "formulas": list(formulas.values()),
-        "integrity_checks": _integrity_checks(rows),
+        "integrity_checks": _integrity_checks(retained_rows),
+        "outcome_protocol": {"protocol_id": PROTOCOL_ID, "excluded_reasons": dict(excluded_outcomes),
+                             "outcome_kind": "option_derived_reference_not_official_close", "historical_rows_rewritten": False},
         "formula_symbol_results": _formula_summary(rows),
         "paired_candidate_vs_baseline": _paired_comparison(rows),
         "abstention_reasons": abstention_reasons,

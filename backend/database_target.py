@@ -41,14 +41,25 @@ def sqlite_database_path_from_url(url: _DatabaseUrl) -> Path:
     return Path(database).resolve()
 
 
-def configured_market_database_path(project_root: str | Path) -> Path:
+def configured_market_database_path(
+    project_root: str | Path,
+    *,
+    require_canonical: bool = False,
+) -> Path:
     """Resolve DATABASE_URL, falling back to this checkout's canonical market DB."""
     root = Path(project_root).resolve()
     configured = os.getenv("DATABASE_URL")
+    canonical = (root / "data" / "market_data.db").resolve()
     if not configured:
-        return (root / "data" / "market_data.db").resolve()
+        return canonical
     try:
         url = make_url(configured)
     except Exception as exc:
         raise RuntimeError("DATABASE_URL is invalid") from exc
-    return sqlite_database_path_from_url(url)
+    selected = sqlite_database_path_from_url(url)
+    if require_canonical and selected != canonical:
+        raise RuntimeError(
+            "DATABASE_URL does not select the canonical MarketPin database: "
+            f"selected={selected}; canonical={canonical}"
+        )
+    return selected

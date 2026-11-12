@@ -50,8 +50,9 @@ def _payload(index_at: datetime, *, calculation_id: str, spot: float = 100.0) ->
 
 def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     path = tmp_path / "shadow.db"
-    recorder = LiveShadowResearchRecorder(journal_path=path, enabled=True)
     first_index = datetime(2026, 8, 25, 14, 30, tzinfo=UTC)
+    clock = [first_index + timedelta(milliseconds=50)]
+    recorder = LiveShadowResearchRecorder(journal_path=path, enabled=True, persistence_clock=lambda: clock[0])
 
     first = recorder.record(
         _payload(first_index, calculation_id="first", spot=100.0),
@@ -59,7 +60,7 @@ def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     )
 
     assert first.error is None
-    assert first.saved_count == 3
+    assert first.saved_count == 2
     by_formula = {prediction.formula.formula_id: prediction for prediction in first.predictions}
     assert by_formula["shadow-naive-last-price"].abstained is False
     assert by_formula["shadow-pin-context-linear"].abstained is True
@@ -68,13 +69,14 @@ def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     ].abstention_reasons
 
     second_index = first_index + timedelta(seconds=301)
+    clock[0] = second_index + timedelta(milliseconds=50)
     second = recorder.record(
         _payload(second_index, calculation_id="second", spot=101.0),
         processed_at_utc=second_index + timedelta(milliseconds=50),
     )
 
     assert second.error is None
-    assert second.saved_count == 3
+    assert second.saved_count == 2
     assert second.scored_count == 1
     candidate = next(
         prediction
@@ -87,9 +89,9 @@ def test_live_shadow_records_baseline_candidate_and_matured_outcome(tmp_path):
     assert candidate.predicted_price is not None
 
     state = load_shadow_research_state(path)
-    assert state["summary"]["journal_rows"] == 6
-    assert state["summary"]["eligible_forecasts"] == 4
-    assert state["summary"]["abstentions"] == 2
+    assert state["summary"]["journal_rows"] == 4
+    assert state["summary"]["eligible_forecasts"] == 3
+    assert state["summary"]["abstentions"] == 1
     assert state["summary"]["scored_outcomes"] == 1
     assert state["summary"]["production_replacements"] == 0
 
@@ -104,7 +106,7 @@ def test_live_shadow_fails_closed_on_negative_receive_lag(tmp_path):
         processed_at_utc=index_at - timedelta(milliseconds=200),
     )
 
-    assert result.saved_count == 3
+    assert result.saved_count == 2
     assert all(prediction.abstained for prediction in result.predictions)
     assert all(
         "NEGATIVE_RECEIVE_TO_PROCESSING_LAG" in prediction.abstention_reasons
@@ -210,14 +212,14 @@ def test_duplicate_symbol_index_is_preserved_as_abstention(tmp_path):
         processed_at_utc=index_at + timedelta(seconds=1),
     )
 
-    assert duplicate.saved_count == 3
+    assert duplicate.saved_count == 2
     assert all(prediction.abstained for prediction in duplicate.predictions)
     assert all(
         "DUPLICATE_SYMBOL_INDEX_TIMESTAMP" in prediction.abstention_reasons
         for prediction in duplicate.predictions
     )
     with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM shadow_prediction_journal").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM shadow_prediction_journal").fetchone()[0] == 4
 
 
 def test_process_restart_resets_momentum_duplicate_and_outcome_alignment(tmp_path):
@@ -239,7 +241,7 @@ def test_process_restart_resets_momentum_duplicate_and_outcome_alignment(tmp_pat
         same_index_new_process,
         processed_at_utc=first_index + timedelta(seconds=1),
     )
-    assert same_index.saved_count == 3
+    assert same_index.saved_count == 2
     assert all(
         "DUPLICATE_SYMBOL_INDEX_TIMESTAMP" not in prediction.abstention_reasons
         for prediction in same_index.predictions
@@ -304,3 +306,38 @@ def test_read_only_shadow_view_does_not_create_missing_database(tmp_path):
     assert state["present"] is False
     assert state["rows"] == []
     assert not path.exists()
+
+
+def test_v2_is_separate_opt_in_research_arm(tmp_path, monkeypatch):
+    monkeypatch.delenv("SHADOW_RESEARCH_V2_ENABLED", raising=False)
+    recorder = LiveShadowResearchRecorder(journal_path=tmp_path / "default.db", enabled=True)
+    assert [f.version for f in recorder.formulas] == ["1.0.0", "0.1.0-preregistered"]
+    monkeypatch.setenv("SHADOW_RESEARCH_V2_ENABLED", "true")
+    opted_in = LiveShadowResearchRecorder(journal_path=tmp_path / "v2.db", enabled=True)
+    assert [f.version for f in opted_in.formulas] == ["1.0.0", "0.1.0-preregistered", "0.2.0-preregistered"]
+    assert all(not f.promotion_allowed for f in opted_in.formulas)
+
+
+def test_missing_committed_identity_is_never_recorded(tmp_path):
+    path = tmp_path / "shadow.db"
+    recorder = LiveShadowResearchRecorder(journal_path=path, enabled=True)
+    payload = _payload(datetime(2026, 10, 27, 19, tzinfo=UTC), calculation_id="")
+    result = recorder.record(payload)
+    assert result.skipped_reason == "MISSING_COMMITTED_PROVENANCE_IDENTITY"
+    assert not path.exists()
+
+
+def test_invalid_reference_cannot_score_an_earlier_forecast(tmp_path):
+    start = datetime(2026, 10, 27, 19, tzinfo=UTC)
+    clock = [start + timedelta(milliseconds=50)]
+    recorder = LiveShadowResearchRecorder(journal_path=tmp_path / "shadow.db", enabled=True,
+                                         persistence_clock=lambda: clock[0])
+    first = recorder.record(_payload(start, calculation_id="first"), processed_at_utc=clock[0])
+    later = start + timedelta(seconds=301)
+    clock[0] = later + timedelta(milliseconds=50)
+    invalid = _payload(later, calculation_id="invalid-price", spot=900.)
+    invalid["validation_is_valid"] = False
+    result = recorder.record(invalid, processed_at_utc=clock[0])
+    assert result.scored_count == 0
+    baseline = next(p for p in first.predictions if p.formula.formula_id == "shadow-naive-last-price")
+    assert recorder.journal.fetch(baseline.prediction_id)["realized_price"] is None

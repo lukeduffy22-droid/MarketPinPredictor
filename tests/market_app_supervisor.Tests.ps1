@@ -44,6 +44,25 @@ foreach ($functionName in @(
     Invoke-Expression $definition[0].Extent.Text
 }
 
+# Parse registration source and load only pure readback validation. Never dot-
+# source registration or execute its Register-ScheduledTask statements.
+$registerParseErrors = $null
+$registerTokens = $null
+$registerTaskAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $ProjectRoot 'register_market_watchdog.ps1'),
+    [ref]$registerTokens, [ref]$registerParseErrors
+)
+if (@($registerParseErrors).Count -ne 0) { throw 'Registration script did not parse cleanly.' }
+foreach ($functionName in @('Resolve-MarketTaskIdentitySid','Assert-MarketTaskReadback')) {
+    $definition = @($registerTaskAst.FindAll({
+        param($candidate)
+        $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq $functionName
+    }, $true))
+    if ($definition.Count -ne 1) { throw "Expected exactly one $functionName registration definition." }
+    Invoke-Expression $definition[0].Extent.Text
+}
+
 # Load only the tested orchestration helpers from ensure_market_app.ps1. Dot-
 # sourcing the launcher would execute its live supervision path.
 $EnsureMarketAppPath = Join-Path $ProjectRoot 'ensure_market_app.ps1'
@@ -61,7 +80,10 @@ foreach ($functionName in @(
     'Test-MarketAppCurrentDayUniversePreparationProof',
     'Invoke-BackendPreparedAutomaticListenerStop',
     'Assert-OpeningAcceptanceMutationPreflight',
-    'Invoke-MarketAppCurrentDayUniversePrestage'
+    'Invoke-MarketAppCurrentDayUniversePrestage',
+    'Test-ReadinessRecoveryAlreadyAttempted',
+    'Test-BackendReadinessRecoveryAlreadyAttempted',
+    'Test-DashboardReadinessRecoveryAlreadyAttempted'
 )) {
     $definition = @($ensureMarketAppAst.FindAll(
         {
@@ -161,6 +183,12 @@ function New-TestBackendUniversePreparation {
                 source_date = if ($UsesFallback) { '2026-09-08' } else { $TradingDate }
                 mode = if ($UsesFallback) { 'prior_cache_filtered' } else { 'current_day_cache' }
                 is_fallback = $UsesFallback
+                cache_metadata_status = if ($UsesFallback) { 'fallback' } else { 'verified' }
+                source_sha256 = ('b' * 64)
+                provider_definition_start = "${TradingDate}T00:00:00+00:00"
+                provider_definition_end = "${TradingDate}T23:59:59+00:00"
+                provider_statistics_start = "${TradingDate}T00:00:00+00:00"
+                provider_statistics_end = "${TradingDate}T23:59:59+00:00"
             }
         }
     }
@@ -222,7 +250,7 @@ function New-TestMarketWatchdogTask {
     }
     $trigger = New-TestMarketTrigger `
         -ClassName 'MSFT_TaskWeeklyTrigger' `
-        -StartBoundary '2026-09-05T07:50:00-05:00'
+        -StartBoundary '2026-09-05T07:50:00'
     $trigger.Repetition.Interval = 'PT5M'
     $trigger.Repetition.Duration = 'PT10H10M'
     $trigger.Repetition.StopAtDurationEnd = $true
@@ -289,7 +317,7 @@ function New-TestMarketStartupTask {
         $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskBootTrigger' -Enabled $BootEnabled -Delay $BootDelay
     }
     foreach ($time in $WeeklyTimes) {
-        $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskWeeklyTrigger' -StartBoundary "2026-09-05T$($time):00-05:00"
+        $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskWeeklyTrigger' -StartBoundary "2026-09-05T$($time):00"
     }
     $triggers += New-TestMarketTrigger -ClassName 'MSFT_TaskLogonTrigger' -UserId $LogonUserId
     return [pscustomobject]@{
@@ -1814,13 +1842,31 @@ Describe 'Pre-start universe cache preparation result handling' {
 }
 
 Describe 'Bounded pre-start universe cache preparation' {
+    It 'rejects late cache validation unless provider discovery is explicitly disabled' {
+        $rejection = $null
+        try {
+            Invoke-MarketAppUniverseCachePreparation `
+                -ProjectRoot $ProjectRoot `
+                -PythonExe 'python.exe' `
+                -Symbols 'SPX,NDX' `
+                -Deadline ([DateTime]::UtcNow.AddMinutes(-1)) `
+                -InvocationId 'unsafe-late-cache-only' `
+                -AllowCacheValidationAfterDeadline
+        }
+        catch {
+            $rejection = $_
+        }
+        $rejection | Should Not BeNullOrEmpty
+        $rejection.Exception.Message | Should Be '-AllowCacheValidationAfterDeadline requires -SkipProviderDiscovery.'
+    }
+
     It 'terminates the exact real Python process tree after a bounded timeout' {
         $root = Join-Path $TestDrive 'real-timeout-child'
         $toolDir = Join-Path $root 'tools'
         New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
         $sleeper = Join-Path $toolDir 'sleep_preparer.py'
         Set-Content -LiteralPath $sleeper -Value @('import time', 'time.sleep(30)')
-        $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+        $python = if ($env:MARKETPIN_TEST_PYTHON) { $env:MARKETPIN_TEST_PYTHON } else { Join-Path $ProjectRoot '.venv\Scripts\python.exe' }
         $module = Get-Module market_app_supervisor
 
         $result = & $module {
@@ -1872,7 +1918,7 @@ Describe 'Bounded pre-start universe cache preparation' {
             'import sys',
             'print(json.dumps(sys.argv[1:]))'
         )
-        $python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+        $python = if ($env:MARKETPIN_TEST_PYTHON) { $env:MARKETPIN_TEST_PYTHON } else { Join-Path $ProjectRoot '.venv\Scripts\python.exe' }
         $module = Get-Module market_app_supervisor
 
         $result = & $module {
@@ -2010,6 +2056,36 @@ Describe 'Bounded pre-start universe cache preparation' {
             $result.UsesFallback | Should Be $true
             Assert-MockCalled -CommandName Invoke-MarketAppUniversePreparationChild -ModuleName market_app_supervisor -Times 1 -ParameterFilter {
                 [bool]$CacheOnly
+            }
+        }
+
+        It 'permits bounded cache-only validation after an expired deadline only for explicit late salvage' {
+            Mock -CommandName Invoke-MarketAppUniversePreparationChild -ModuleName market_app_supervisor -MockWith {
+                [pscustomobject]@{
+                    Completed = $true
+                    TimedOut = $false
+                    ExitedAndQuiescent = $true
+                    ExitCode = 0
+                    Output = @('{"status":"fallback","preparation_mode":"cache_only","provenance_label":"PRIOR_SESSION_FALLBACK","current_day_cache_ready":false,"provenance":{"mode":"prior_cache_filtered","is_fallback":true,"trading_date":"2026-09-09"}}')
+                }
+            }
+
+            $result = Invoke-MarketAppUniverseCachePreparation `
+                -ProjectRoot $ProjectRoot `
+                -PythonExe 'python.exe' `
+                -Symbols 'SPX,NDX,VIX,RUT' `
+                -TradingDate '2026-09-09' `
+                -ProviderTimeoutSeconds 1 `
+                -CacheValidationTimeoutSeconds 1 `
+                -Deadline ([DateTime]::UtcNow.AddMinutes(-1)) `
+                -InvocationId 'late-cache-only' `
+                -SkipProviderDiscovery `
+                -AllowCacheValidationAfterDeadline
+
+            $result.StartupMayContinue | Should Be $true
+            $result.Outcome | Should Be 'provider_skipped_cache_only_validated'
+            Assert-MockCalled -CommandName Invoke-MarketAppUniversePreparationChild -ModuleName market_app_supervisor -Times 1 -ParameterFilter {
+                [bool]$CacheOnly -and $TimeoutMilliseconds -eq 1000 -and $DeadlineUtc -gt [DateTime]::UtcNow
             }
         }
 
@@ -2543,6 +2619,48 @@ Describe 'Verified backend cash-close boundary' {
 }
 
 Describe 'Bounded backend readiness recovery decision' {
+    It 'preserves an aged same-day handoff warming before open without spending recovery' {
+        $state = New-TestBackendReadinessState
+        $state.SubscriptionSessionState = 'preopen'
+        $state.HealthHandoffStatus = 'warming'
+        $state.LiveHandoffStatus = 'warming'
+        $decision = Resolve-MarketAppBackendReadinessAction `
+            -Now ([datetime]'2026-09-08T08:00:00') -ListenerCount 1 `
+            -OwnershipVerified $true -ListenerStartTime ([datetime]'2026-09-08T07:45:00') `
+            -RuntimeState $state
+        $decision.Action | Should Be 'preserve'
+        $decision.Reason | Should Be 'preopen_handoff_warming'
+        @($decision.FailureReasons).Count | Should Be 0
+    }
+
+    It 'still diagnoses a dead sampler while a preopen handoff warms' {
+        $state = New-TestBackendReadinessState
+        $state.SubscriptionSessionState = 'preopen'
+        $state.HealthHandoffStatus = 'warming'
+        $state.LiveHandoffStatus = 'warming'
+        $state.OrbSamplerAlive = $false
+        $decision = Resolve-MarketAppBackendReadinessAction `
+            -Now ([datetime]'2026-09-08T08:00:00') -ListenerCount 1 `
+            -OwnershipVerified $true -ListenerStartTime ([datetime]'2026-09-08T07:45:00') `
+            -RuntimeState $state
+        $decision.Action | Should Be 'restart'
+        (@($decision.FailureReasons) -contains 'orb_sampler_not_alive') | Should Be $true
+    }
+
+    It 'requires active handoff at the exact cash open' {
+        $state = New-TestBackendReadinessState
+        $state.SubscriptionSessionState = 'regular_session'
+        $state.HealthHandoffStatus = 'warming'
+        $state.LiveHandoffStatus = 'warming'
+        $decision = Resolve-MarketAppBackendReadinessAction `
+            -Now ([datetime]'2026-09-08T08:30:00') -ListenerCount 1 `
+            -OwnershipVerified $true -ListenerStartTime ([datetime]'2026-09-08T07:45:00') `
+            -RuntimeState $state
+        (@($decision.FailureReasons) -contains 'health_handoff_not_active') | Should Be $true
+        (@($decision.FailureReasons) -contains 'live_handoff_not_active') | Should Be $true
+        $decision.Reason | Should Be 'protected_opening_boundary_reached'
+    }
+
     It 'preserves a healthy pre-open backend' {
         $decision = Resolve-MarketAppBackendReadinessAction `
             -Now ([datetime]'2026-09-08T08:20:00') `
@@ -2994,6 +3112,9 @@ Describe 'Session recovery journal success latch' {
             -TradingDate '2026-09-08'
         $state.Requested | Should Be $true
         $state.Succeeded | Should Be $false
+        $state.CompletionPending | Should Be $true
+        $state.SuccessfulReplacementProcessId | Should BeNullOrEmpty
+        $state.SuccessfulReplacementIdentityToken | Should BeNullOrEmpty
 
         $retry = Resolve-MarketAppDashboardReadinessAction `
             -Now ([datetime]'2026-09-08T08:30:00') `
@@ -3022,6 +3143,9 @@ Describe 'Session recovery journal success latch' {
             -TradingDate '2026-09-08'
         $state.Requested | Should Be $true
         $state.Succeeded | Should Be $true
+        $state.CompletionPending | Should Be $false
+        $state.SuccessfulReplacementProcessId | Should Be 5252
+        $state.SuccessfulReplacementIdentityToken | Should BeNullOrEmpty
 
         $latched = Resolve-MarketAppDashboardReadinessAction `
             -Now ([datetime]'2026-09-08T08:30:00') `
@@ -3033,12 +3157,274 @@ Describe 'Session recovery journal success latch' {
         $latched.Action | Should Be 'preserve'
         $latched.Reason | Should Be 'session_recovery_already_succeeded'
     }
+
+    It 'does not let a readable success receipt without an exact PID suppress a different backend owner' {
+        $root = Join-Path $TestDrive 'backend-success-without-identity'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 action=request_exact_owner_stop',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 action=latched'
+        )
+
+        $state = Get-MarketAppSessionRecoveryJournalState `
+            -ProjectRoot $root `
+            -Component 'backend' `
+            -TradingDate '2026-09-08'
+        $state.Succeeded | Should Be $true
+        $state.SuccessfulReplacementProcessId | Should BeNullOrEmpty
+
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $differentListenerSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 6262
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+        }
+        $differentListenerSucceeded | Should Be $false
+    }
+
+    It 'binds a backend success receipt only to its exact replacement listener PID' {
+        $root = Join-Path $TestDrive 'backend-bound-success'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=4141 action=request_exact_owner_stop',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=5252 action=latched'
+        )
+
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $matchingListenerSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252
+            $differentListenerSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 6262
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+        }
+
+        $matchingListenerSucceeded | Should Be $true
+        $differentListenerSucceeded | Should Be $false
+    }
+
+    It 'rejects a reused backend PID when the process creation identity changed' {
+        $root = Join-Path $TestDrive 'backend-strong-identity'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=4141 action=launch_replacement',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=5252 replacement_listener_identity_token=5252|638929455050000000 action=latched'
+        )
+
+        $state = Get-MarketAppSessionRecoveryJournalState `
+            -ProjectRoot $root `
+            -Component 'backend' `
+            -TradingDate '2026-09-08'
+        $state.SuccessfulReplacementProcessId | Should Be 5252
+        $state.SuccessfulReplacementIdentityToken | Should Be '5252|638929455050000000'
+
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $exactIdentitySucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252 `
+                -CurrentListenerIdentityToken '5252|638929455050000000'
+            $reusedPidSucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252 `
+                -CurrentListenerIdentityToken '5252|638929999990000000'
+            $unresolvedIdentitySucceeded = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 5252
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+        }
+
+        $exactIdentitySucceeded | Should Be $true
+        $reusedPidSucceeded | Should Be $false
+        $unresolvedIdentitySucceeded | Should Be $false
+    }
+
+    It 'uses the latest backend success PID and leaves a later request pending' {
+        $root = Join-Path $TestDrive 'backend-latest-success-and-request'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value @(
+            '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=4141 action=request_exact_owner_stop',
+            '2026-09-08 08:25:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=5252 action=latched',
+            '2026-09-08 09:00:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=5252 action=request_exact_owner_stop',
+            '2026-09-08 09:00:05 -05:00 event=backend_session_recovery_succeeded trading_date=2026-09-08 replacement_listener_pid=6262 action=latched',
+            '2026-09-08 09:30:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 listener_pid=6262 action=request_exact_owner_stop'
+        )
+
+        $state = Get-MarketAppSessionRecoveryJournalState `
+            -ProjectRoot $root `
+            -Component 'backend' `
+            -TradingDate '2026-09-08'
+        $state.Requested | Should Be $true
+        $state.Succeeded | Should Be $true
+        $state.CompletionPending | Should Be $true
+        $state.SuccessfulReplacementProcessId | Should Be 6262
+        $state.SuccessfulReplacementIdentityToken | Should BeNullOrEmpty
+    }
+
+    It 'keeps the backend latch fail closed when the recovery journal is unreadable' {
+        $root = Join-Path $TestDrive 'backend-unreadable-journal'
+        $runtimeDir = Join-Path $root 'logs\runtime'
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+        $journal = Join-Path $runtimeDir 'watchdog.log'
+        Set-Content -LiteralPath $journal -Value '2026-09-08 08:25:00 -05:00 event=backend_session_recovery_requested trading_date=2026-09-08 action=request_exact_owner_stop'
+
+        $lock = [System.IO.File]::Open(
+            $journal,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $originalProjectRoot = $script:ProjectRoot
+        try {
+            $script:ProjectRoot = $root
+            $state = Get-MarketAppSessionRecoveryJournalState `
+                -ProjectRoot $root `
+                -Component 'backend' `
+                -TradingDate '2026-09-08'
+            $alreadyAttempted = Test-BackendReadinessRecoveryAlreadyAttempted `
+                -TradingDate '2026-09-08' `
+                -CurrentListenerProcessId 6262
+        }
+        finally {
+            $script:ProjectRoot = $originalProjectRoot
+            $lock.Dispose()
+        }
+
+        $state.Readable | Should Be $false
+        $state.CompletionPending | Should Be $false
+        $alreadyAttempted | Should Be $true
+    }
+}
+
+Describe 'Weekly scheduler wall-time boundaries' {
+    It 'normalizes only weekly registration objects while preserving their wall fields and boot and logon objects' {
+        $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+        $StartupTriggers = (New-TestMarketStartupTask).Triggers
+        foreach ($trigger in @($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+            $trigger.StartBoundary += '-05:00'
+        }
+        $WatchdogTrigger = (New-TestMarketWatchdogTask).Triggers[0]
+        $WatchdogTrigger.StartBoundary = '2026-11-06T13:50:00Z'
+        $boot = @($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })[0]
+        $logon = @($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })[0]
+        $bootBefore = $boot | ConvertTo-Json -Depth 5 -Compress
+        $logonBefore = $logon | ConvertTo-Json -Depth 5 -Compress
+        $normalization = @($registerTaskAst.FindAll({
+            param($candidate)
+            $candidate -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                $candidate.Variable.VariablePath.UserPath -eq 'weeklyTrigger'
+        }, $true))
+        $normalization.Count | Should Be 1
+        Invoke-Expression $normalization[0].Extent.Text
+        (@($StartupTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' } | ForEach-Object StartBoundary) -join ',') |
+            Should Be '2026-09-05T07:00:00,2026-09-05T07:15:00,2026-09-05T07:45:00,2026-09-05T08:15:00'
+        $WatchdogTrigger.StartBoundary | Should Be '2026-11-06T07:50:00'
+        ($boot | ConvertTo-Json -Depth 5 -Compress) | Should Be $bootBefore
+        ($logon | ConvertTo-Json -Depth 5 -Compress) | Should Be $logonBefore
+    }
+
+    It 'accepts floating startup and watchdog readbacks dated in summer and winter' {
+        $TaskPrincipalSid = 'S-1-5-18'
+        $LogonRecoveryUser = 'S-1-5-21-1000-1000-1000-1001'
+        Mock Get-ScheduledTask { $script:readbackTask }
+        foreach ($date in @('2026-09-05','2026-11-06')) {
+            foreach ($kind in @('Startup','Watchdog')) {
+                if ($kind -eq 'Startup') { $script:readbackTask = New-TestMarketStartupTask }
+                else { $script:readbackTask = New-TestMarketWatchdogTask }
+                foreach ($trigger in @($script:readbackTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+                    $trigger.StartBoundary = $date + ([string]$trigger.StartBoundary).Substring(10)
+                }
+                $result = Assert-MarketTaskReadback -RegisteredTaskName $script:readbackTask.TaskName -Kind $kind -ExpectedAction $script:readbackTask.Actions[0]
+                $result.TaskName | Should Be $script:readbackTask.TaskName
+            }
+        }
+    }
+
+    It 'rejects fixed offsets and UTC suffixes in standalone registration readbacks in either season' {
+        $TaskPrincipalSid = 'S-1-5-18'
+        $LogonRecoveryUser = 'S-1-5-21-1000-1000-1000-1001'
+        Mock Get-ScheduledTask { $script:readbackTask }
+        foreach ($dateAndOffset in @(
+            @{Date='2026-09-05'; Offset='-05:00'},
+            @{Date='2026-11-06'; Offset='-06:00'},
+            @{Date='2026-09-05'; Offset='-06:00'},
+            @{Date='2026-11-06'; Offset='-05:00'},
+            @{Date='2026-09-05'; Offset='Z'}
+        )) {
+            foreach ($kind in @('Startup','Watchdog')) {
+                if ($kind -eq 'Startup') { $script:readbackTask = New-TestMarketStartupTask }
+                else { $script:readbackTask = New-TestMarketWatchdogTask }
+                foreach ($trigger in @($script:readbackTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+                    $time = ([string]$trigger.StartBoundary).Substring(11,8)
+                    $trigger.StartBoundary = "$($dateAndOffset.Date)T$time$($dateAndOffset.Offset)"
+                }
+                { Assert-MarketTaskReadback -RegisteredTaskName $script:readbackTask.TaskName -Kind $kind -ExpectedAction $script:readbackTask.Actions[0] } | Should Throw
+            }
+        }
+    }
+
+    It 'keeps seven AM Central in both DST seasons while its UTC instant changes' {
+        $central = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+        $summer = [datetime]::ParseExact('2026-09-08T07:00:00', "yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+        $winter = [datetime]::ParseExact('2026-11-09T07:00:00', "yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+        [TimeZoneInfo]::ConvertTimeToUtc($summer, $central).ToString('HH:mm') | Should Be '12:00'
+        [TimeZoneInfo]::ConvertTimeToUtc($winter, $central).ToString('HH:mm') | Should Be '13:00'
+        # The retained fixed winter offset at06:00 has the same UTC instant
+        # as07:00 during summer, which hid the defect in the previous cast.
+        ([datetimeoffset]'2026-09-05T06:00:00-06:00').UtcDateTime.ToString('HH:mm') | Should Be '12:00'
+    }
 }
 
 Describe 'AutoStart trigger self-heal exact task contract' {
     BeforeEach {
         $script:expectedLogonSid = 'S-1-5-21-1000-1000-1000-1001'
         $script:expectedPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    }
+
+    It 'rejects fixed-offset weekly startup boundaries in both seasons without making them repairable' {
+        foreach ($dateAndOffset in @(
+            @{Date='2026-09-05'; Offset='-05:00'},
+            @{Date='2026-11-06'; Offset='-06:00'},
+            @{Date='2026-09-05'; Offset='-06:00'},
+            @{Date='2026-11-06'; Offset='-05:00'}
+        )) {
+            $task = New-TestMarketStartupTask
+            foreach ($trigger in @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+                $time = ([string]$trigger.StartBoundary).Substring(11,8)
+                $trigger.StartBoundary = "$($dateAndOffset.Date)T$time$($dateAndOffset.Offset)"
+            }
+            $result = Test-MarketStartupTaskContract `
+                -Task $task `
+                -ExpectedTaskName $StartupTaskName `
+                -ExpectedTaskPath $StartupTaskPath `
+                -ExpectedProjectRoot $ProjectRoot `
+                -ExpectedLogonRecoverySid $script:expectedLogonSid `
+                -ExpectedPowerShellExe $script:expectedPowerShell
+            $result.Valid | Should Be $false
+            (@($result.Reasons) -contains 'trigger_weekly_shape_mismatch') | Should Be $true
+            $result.RepairableMissingBootTrigger | Should Be $false
+            $result.RepairableMissingUniversePrestageRetry | Should Be $false
+        }
     }
 
     It 'accepts the full four-weekly-trigger contract and classifies only exact legacy or missing-boot shapes as repairable' {
@@ -3105,6 +3491,9 @@ Describe 'AutoStart trigger self-heal exact task contract' {
             (New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At '08:15'),
             (New-ScheduledTaskTrigger -AtLogOn -User $script:expectedLogonSid)
         )
+        foreach ($trigger in @($realExistingTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+            $trigger.StartBoundary = ([datetimeoffset]$trigger.StartBoundary).LocalDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
+        }
         $script:testBootTrigger = New-ScheduledTaskTrigger -AtStartup
         $missing.Triggers = $realExistingTriggers
         $repaired.Triggers = @($script:testBootTrigger) + $realExistingTriggers
@@ -3202,6 +3591,9 @@ Describe 'AutoStart exact legacy universe pre-stage retry repair' {
             (New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At '08:15'),
             (New-ScheduledTaskTrigger -AtLogOn -User $script:expectedLogonSid)
         )
+        foreach ($trigger in @($realExistingTriggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })) {
+            $trigger.StartBoundary = ([datetimeoffset]$trigger.StartBoundary).LocalDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
+        }
         $script:testRetryTrigger = New-ScheduledTaskTrigger `
             -Weekly `
             -WeeksInterval 1 `
@@ -3236,6 +3628,7 @@ Describe 'AutoStart exact legacy universe pre-stage retry repair' {
 
         $result.Error | Should Be $null
         $result.Status | Should Be 'startup_universe_prestage_retry_repaired'
+        $script:testRetryTrigger.StartBoundary | Should Match '^\d{4}-\d{2}-\d{2}T07:15:00$'
         Assert-MockCalled New-ScheduledTaskTrigger -Times 1 -Scope It -ParameterFilter {
             $Weekly -and $WeeksInterval -eq 1 -and $At -eq '07:15'
         }
@@ -3250,6 +3643,28 @@ Describe 'AutoStart exact legacy universe pre-stage retry repair' {
 }
 
 Describe 'Watchdog self-heal exact task contract' {
+    It 'rejects fixed-offset weekly watchdog boundaries in both seasons without authorizing a principal repair' {
+        foreach ($boundary in @(
+            '2026-09-05T07:50:00-05:00',
+            '2026-11-06T07:50:00-06:00',
+            '2026-09-05T06:50:00-06:00',
+            '2026-11-06T08:50:00-05:00'
+        )) {
+            $task = New-TestMarketWatchdogTask
+            $task.Triggers[0].StartBoundary = $boundary
+            $result = Test-MarketWatchdogTaskContract `
+                -Task $task `
+                -ExpectedTaskName $WatchdogTaskName `
+                -ExpectedTaskPath $WatchdogTaskPath `
+                -ExpectedProjectRoot $ProjectRoot `
+                -ExpectedPrincipalSid 'S-1-5-18' `
+                -ExpectedPowerShellExe (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe')
+            $result.Valid | Should Be $false
+            (@($result.Reasons) -contains 'trigger_weekly_shape_mismatch') | Should Be $true
+            $result.RepairableLimitedPrincipal | Should Be $false
+        }
+    }
+
     It 'accepts the complete canonical watchdog task contract' {
         $task = New-TestMarketWatchdogTask
         $result = Test-MarketWatchdogTaskContract `
@@ -3590,8 +4005,19 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $ensureScript | Should Match 'RecoveryReason \$readinessDecision\.Reason[\s\S]+-RuntimeState \$backendReadinessState'
         $ensureScript | Should Match 'backend_readiness_recovery_requested'
         $ensureScript | Should Match 'Test-BackendReadinessRecoveryAlreadyAttempted'
+        ([regex]::Matches(
+            $ensureScript,
+            'Test-BackendReadinessRecoveryAlreadyAttempted\s+`\r?\n\s+-TradingDate \$currentTradingDate\s+`\r?\n\s+-CurrentListenerProcessId \(\[int\]\$backendPids\[0\]\)\s+`\r?\n\s+-CurrentListenerIdentityToken \$backendListenerIdentityToken'
+        ).Count) | Should Be 3
+        ([regex]::Matches(
+            $ensureScript,
+            'if \(\$(?:preparedStop|automaticStop)\.Stopped\) \{[\s\S]{0,700}?-Event ''backend_session_recovery_requested'''
+        ).Count) | Should Be 3
         $ensureScript | Should Match "backend_session_recovery_requested[\s\S]+backend_session_recovery_succeeded"
         $ensureScript | Should Match 'backendLaunchResult\.ListenerProcessId[\s\S]+action=latched'
+        $ensureScript | Should Match 'replacement_listener_identity_token=\$\(\$backendLaunchResult\.ListenerIdentityToken\)'
+        $ensureScript | Should Match 'Start-VerifiedComponent[\s\S]+-RequireStrongListenerIdentity[\s\S]+backend_session_recovery_succeeded'
+        $ensureScript | Should Match "launch_identity_unverified[\s\S]+Stop-MarketAppAttemptedLaunch"
         $ensureScript | Should Match 'backend_prior_day_process_current_session_verified[\s\S]+reason=current_session_contract_progressing[\s\S]+action=preserve_listener'
         $ensureScript | Should Match "verified_prior_day_backend_preopen_refresh[\s\S]+Invoke-BackendPreparedAutomaticListenerStop[\s\S]+-RequireCurrentDay"
         $ensureScript | Should Match '\$preparedBackendUniverse = \$automaticStop\.Preparation'
@@ -3675,12 +4101,12 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
     It 'returns closing-tape status without terminating the parent supervisor runspace' {
         $startClosingScript | Should Not Match '(?m)^\s*exit\b'
         $startClosingScript | Should Match "Status = 'not_yet_due'[\s\S]+\r?\n\s*return"
-        $startClosingScript | Should Match "Status = 'recovery_replay_blocked'[\s\S]+\r?\n\s*return"
+        $startClosingScript | Should Match "Status = 'recovery_attempt_limit_reached'[\s\S]+\r?\n\s*return"
         $startClosingScript | Should Match "Status = 'outside_start_window'[\s\S]+\r?\n\s*return"
         $startClosingScript | Should Match "Status = 'already_running'[\s\S]+\r?\n\s*return"
     }
 
-    It 'defers the broad closing-tape stream until the opening ORB is complete' {
+    It 'defers the broad closing-tape stream until transport and primary subscriptions are safe' {
         $ensureScript | Should Match 'closing_tape_deferred_for_opening_capture'
         $ensureScript | Should Match "resultStatus -eq 'not_yet_due'"
         $ensureScript | Should Match 'protect_opening_gamma_and_orb'
@@ -3689,11 +4115,20 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startClosingScript | Should Match '--require-primary-ready'
     }
 
-    It 'preserves prior tape evidence instead of auto-replaying it during live hours' {
-        $ensureScript | Should Match "resultStatus -eq 'recovery_replay_blocked'"
-        $ensureScript | Should Match 'closing_tape_recovery_replay_blocked'
+    It 'preserves tape evidence after the bounded recovery attempt limit' {
+        $ensureScript | Should Match "resultStatus -eq 'recovery_attempt_limit_reached'"
+        $ensureScript | Should Match 'closing_tape_recovery_attempt_limit_reached'
         $ensureScript | Should Match 'action=preserve_primary_backend'
         $ensureScript | Should Match "resultStatus -eq 'outside_start_window'[\s\S]+Resolve-MarketAppPostCloseFinalizeResult"
+    }
+
+    It 'records catalog DBN status process and runtime-log launch evidence' {
+        $startClosingScript | Should Match '\$sqlitePath = .*data\\market_data\.db'
+        $startClosingScript | Should Match '\$env:DATABASE_URL = "sqlite:///\$sqlitePath"'
+        $startClosingScript | Should Match 'marketpin\.closing-tape-launch-receipt\.v1'
+        $startClosingScript | Should Match 'catalog_path[\s\S]+status_path[\s\S]+dbn_paths'
+        $startClosingScript | Should Match 'stdout_path[\s\S]+stderr_path'
+        $startClosingScript | Should Match "capture_mode[\s\S]+capture_only"
     }
 
     It 'limits explicit restart execution to the requested component' {
@@ -3771,13 +4206,14 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startMarketDayScript | Should Match 'Start-Service -Name W32Time'
         $startMarketDayScript | Should Match 'w32tm /resync /rediscover'
         $startMarketDayScript | Should Not Match '(?m)^\s*& w32tm /resync /nowait'
-        $startMarketDayScript | Should Match 'UtcNow\.AddSeconds\(30\)[\s\S]+w32tm /query /status[\s\S]+Start-Sleep -Milliseconds 500'
+        $startMarketDayScript | Should Match 'ConfirmationTimeoutSeconds = 30'
+        $startMarketDayScript | Should Match 'Stopwatch\]::StartNew\(\)[\s\S]+w32tm /query /status[\s\S]+Start-Sleep -Milliseconds 500'
         $startMarketDayScript | Should Match "Status='synchronized'"
         $startMarketDayScript | Should Match 'clock_sync\.log'
         $startMarketDayScript | Should Match 'PROCESSING_CLOCK_NOT_SYNCHRONIZED|fails closed'
         $startMarketDayScript | Should Match 'All-index ORB launch failed closed because RUT clock eligibility was not proven'
         $startMarketDayScript | Should Match 'No SPX/NDX/VIX-only downgrade will be launched'
-        $startMarketDayScript | Should Match '(?s)if \(-not \$rutCanaryEligible\) \{.*?Write-Error.*?exit 1\s*\}'
+        $startMarketDayScript | Should Match '(?s)if \(-not \$rutCanaryEligible -and -not \$clockPreflightOnly\) \{.*?Write-Error.*?exit 1\s*\}'
         $startMarketDayScript | Should Not Match 'core SPX/NDX/VIX launch will continue'
     }
 
@@ -3790,7 +4226,7 @@ Describe 'Launcher integration is component-scoped and ownership-aware' {
         $startMarketDayScript | Should Match '\$Date -ge \$universePrestageCutoff -and[\s\S]+\$Date -lt \$launchWindowEndExclusive'
         $startMarketDayScript | Should Match '\$clockPreflightOnly = \$action -ceq ''clock_and_universe_prestage'''
         $startMarketDayScript | Should Match "'clock_and_universe_prestage'"
-        $startMarketDayScript | Should Match 'if \(\$clockPreflightOnly\)[\s\S]+-PrepareUniverseOnly[\s\S]+exit \$LASTEXITCODE'
+        $startMarketDayScript | Should Match 'if \(\$clockPreflightOnly\)[\s\S]+-PrepareUniverseOnly[\s\S]+if \(\$prestageExitCode -ne 0\) \{ exit \$prestageExitCode \}'
         $startMarketDayScript | Should Match '07:00 and 07:15 triggers repair/verify time and stage only the[\s\S]+07:40-through-18:00 guarded launch window[\s\S]+pre-stage stops[\s\S]+by 07:40'
         $startMarketDayScript | Should Match "'ScheduledTaskUniversePrestage'"
     }

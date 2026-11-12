@@ -65,9 +65,18 @@ _OPENING_MILESTONE_SPECS = (
         "final_complete_60m_orb",
     ),
 )
+_SUPPLEMENTAL_OPENING_MILESTONES = {"first_opening_bucket", "complete_15m_orb", "complete_30m_orb"}
+_OPENING_MILESTONE_SPECS += (
+    ("first_opening_bucket", "first_opening_bucket_notified", "first_opening_bucket"),
+    ("complete_15m_orb", "complete_15m_orb_notified", "complete_15m_orb"),
+    ("complete_30m_orb", "complete_30m_orb_notified", "complete_30m_orb"),
+)
 _OPENING_MILESTONE_DEPENDENCIES = {
     "startup": (),
     "first_eligible_gamma_capture": (),
+    "first_opening_bucket": ("startup",),
+    "complete_15m_orb": ("startup",),
+    "complete_30m_orb": ("startup",),
     "complete_5m_orb": ("startup",),
     "complete_60m_orb": ("startup", "complete_5m_orb"),
 }
@@ -1189,6 +1198,8 @@ def _validate_opening_acceptance_receipts(
         detail = opening.get(detail_name)
         flag_value = opening.get(flag)
         row = milestone_by_name.get(name)
+        if name in _SUPPLEMENTAL_OPENING_MILESTONES and flag not in opening and detail is None and row is None:
+            continue
         if type(flag_value) is not bool:
             raise MonitorSessionRolloverError(
                 f"opening_flag_invalid:{flag}"

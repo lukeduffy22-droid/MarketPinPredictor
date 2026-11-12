@@ -14,7 +14,8 @@ import sqlite3
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 from .catalog import TapeCatalog
 from .config import FeedSpec, SessionConfig, UTC, build_session_config
 from .integrity import inspect_dbn
+from .recovery import MAX_RECOVERY_SEGMENTS, RECOVERY_DELAYS_SECONDS, transport_failure_kind, write_recovery_receipt
 from backend.runtime_controls import ES_CONTINUOUS, ES_SYSTEM_REQUIRED, SystemSleepGuard
 
 
@@ -44,6 +46,9 @@ RECORD_FLAG_BITS = {
 }
 DATA_QUALITY_FLAG_MASK = 8 | 4 | 2
 TAPE_LIVE_CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
+TAPE_AGGREGATE_DRAIN_TIMEOUT_SECONDS = 120.0
+TAPE_MONITOR_DRAIN_MINIMUM_SECONDS = 5.0
+TAPE_CLEANUP_OWNERSHIP_POLL_SECONDS = 1.0
 NORMAL_PRIORITY_CLASS = 0x00000020
 WINDOWS_PRIORITY_NAMES = {
     0x00000040: "idle",
@@ -57,6 +62,30 @@ WINDOWS_PRIORITY_NAMES = {
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _capture_recorder_source_identity(project_root: Path) -> dict[str, object]:
+    files = {}
+    for relative in ("backend/closing_tape/live_recorder.py", "backend/closing_tape/recovery.py"):
+        try:
+            raw = (project_root / relative).read_bytes()
+            files[relative] = {"sha256": hashlib.sha256(raw).hexdigest(),
+                               "size_bytes": len(raw), "error": None}
+        except OSError as exc:
+            files[relative] = {"sha256": None, "size_bytes": None, "error": type(exc).__name__}
+    return {
+        "schema_version": "marketpin-recorder-loaded-source.v1",
+        "capture_semantics": "captured_once_at_live_recorder_import",
+        "captured_at_utc": utcnow().isoformat(), "process_id": os.getpid(),
+        "current_on_disk_recomputed": False, "files": files,
+    }
+
+
+# Retain immutable import-time evidence. Later status reads must not substitute
+# newly edited disk bytes for the source actually admitted by this process.
+_LOADED_RECORDER_SOURCE_IDENTITY_JSON = json.dumps(
+    _capture_recorder_source_identity(Path(__file__).resolve().parents[2]), sort_keys=True
+)
 
 
 def monitor_pause_reason(
@@ -889,6 +918,9 @@ class FeedThread(threading.Thread):
         *,
         live_factory: Callable[..., object] = db.Live,
         parquet: bool = True,
+        analysis_enabled: bool = True,
+        recovery_context: dict[str, object] | None = None,
+        recovery_guard: Callable[[], dict[str, object]] | None = None,
     ):
         super().__init__(name=f"closing-tape-{feed.name}", daemon=False)
         self.config = config
@@ -897,6 +929,13 @@ class FeedThread(threading.Thread):
         self.status_callback = status_callback
         self.live_factory = live_factory
         self.parquet = parquet
+        self.recovery_context = dict(recovery_context or {})
+        self.analysis_enabled = bool(analysis_enabled and not self.recovery_context)
+        self.recovery_guard = recovery_guard
+        self.transport_failure_kind: str | None = None
+        self.capture_resources_closed = False
+        self.cleanup_state: dict[str, object] = {"state": "not_started"}
+        self.stop_requested = threading.Event()
         self.path = config.output_dir / f"{feed.name}.{config.session_id}.dbn"
         self.aggregator = LiveAggregator(config.session_id, feed, catalog)
         self.client = None
@@ -941,7 +980,8 @@ class FeedThread(threading.Thread):
             next_sequence = self.enqueued_sequence + 1
             raw_end_bytes = int(self.stream_metadata_bytes) + self.enqueued_record_bytes
             if (
-                self.analysis_deadline_sequence is None
+                self.analysis_enabled
+                and self.analysis_deadline_sequence is None
                 and self.config.analysis_due_utc <= callback_observed_at < self.config.stop_due_utc
             ):
                 # The SDK writes the raw record before dispatching this callback.
@@ -973,6 +1013,16 @@ class FeedThread(threading.Thread):
 
     def _status_snapshot(self) -> dict[str, object]:
         values = self.aggregator.status()
+        if self.recovery_context:
+            values["gaps_json"] = json.dumps([
+                *json.loads(str(values.get("gaps_json") or "[]")),
+                {"live_only_recovery": self.recovery_context},
+            ], default=str)
+        if self.cleanup_state.get("state") != "not_started":
+            values["gaps_json"] = json.dumps([
+                *json.loads(str(values.get("gaps_json") or "[]")),
+                {"cleanup_ownership": self.cleanup_state},
+            ], default=str)
         values.update(
             expected_subscription_acks=len(self.feed.subscriptions),
             callback_queue_depth=self.record_queue.qsize(),
@@ -1016,6 +1066,16 @@ class FeedThread(threading.Thread):
                 values.update(status="running", file_bytes=self.path.stat().st_size if self.path.exists() else 0)
                 self.catalog.update_feed_status(self.config.session_id, self.feed.name, values)
                 return True
+            with self.sequence_condition:
+                prefix_drained = (
+                    self.analysis_pause_target is not None
+                    and self.worker_paused
+                    and self.processed_sequence >= self.analysis_pause_target
+                )
+            if prefix_drained:
+                # No future callbacks may enter this frozen horizon. Waiting
+                # for them cannot improve readiness and only grows the queue.
+                break
             time.sleep(0.25)
         reason = "close-minus-15 input did not catch up: " + "; ".join(last_reasons)
         self.aggregator.mark_incomplete(reason)
@@ -1154,13 +1214,17 @@ class FeedThread(threading.Thread):
 
     def release_analysis_snapshot(self) -> None:
         with self.sequence_condition:
+            self.analysis_enabled = False
             self.analysis_pause_target = None
             self.worker_paused = False
             self.sequence_condition.notify_all()
 
     def stop(self, reason: str | None = None) -> None:
+        self.stop_requested.set()
         if reason:
-            self.failure = reason
+            self.failure = self.failure or reason
+        if self.cleanup_state.get("state") == "failed_cleanup_ownership_retained":
+            return
         if self.client is not None:
             try:
                 self.client.stop()
@@ -1197,6 +1261,68 @@ class FeedThread(threading.Thread):
             self.failure,
             cleanup_failure,
         )
+
+    def _capture_writer_blockers(self, worker, monitor, *, require_stream_closed: bool = False) -> list[str]:
+        blockers = []
+        if worker.is_alive():
+            blockers.append("aggregate_worker_alive")
+        if monitor.is_alive():
+            blockers.append("catalog_monitor_alive")
+        try:
+            disconnected = self.client is None or self.client.is_connected() is False
+        except Exception:
+            disconnected = False
+        if not disconnected:
+            blockers.append("live_client_disconnect_unproven")
+        if require_stream_closed and self.stream_handle is not None and not self.stream_handle.closed:
+            blockers.append("raw_stream_close_unproven")
+        return blockers
+
+    def _hold_ownership_until_writers_stop(self, worker, monitor, *, require_stream_closed: bool = False) -> None:
+        """Fatal cleanup holds the feed thread, hence the owner lock, until safe.
+
+        This is deliberately not another retry loop. It never reconnects, repeats
+        stop/close operations, finalizes, hashes, or abandons a writer. If a writer
+        cannot finish, an operator/supervisor must terminate the verified entire
+        process; merely signalling ordinary shutdown cannot release ownership.
+        """
+        blockers = self._capture_writer_blockers(worker, monitor, require_stream_closed=require_stream_closed)
+        if not blockers:
+            return
+        self.transport_failure_kind = None
+        self.failure = self.failure or "fatal cleanup: capture writer termination is unproven"
+        self.cleanup_state = {
+            "state": "failed_cleanup_ownership_retained", "code": "FAILED_CLEANUP_OWNERSHIP_RETAINED",
+            "observed_at_utc": utcnow().isoformat(), "owner_pid": os.getpid(),
+            "blockers": blockers, "initial_blockers": list(blockers), "automatic_recovery_allowed": False,
+            "raw_finalization_allowed": False,
+            "required_action": "wait for writers to stop or terminate the verified entire recorder process",
+        }
+        try:
+            self.cleanup_state["receipt"] = write_recovery_receipt(self.config.output_dir / "recovery_receipts", {
+                "schema_version": "marketpin-tape-cleanup-ownership.v1", "event": "cleanup_blocked",
+                "session_id": self.config.session_id, "feed_name": self.feed.name,
+                "recorder_source_identity": json.loads(_LOADED_RECORDER_SOURCE_IDENTITY_JSON),
+                **self.cleanup_state,
+            })
+        except Exception:
+            LOGGER.exception("Could not write fatal cleanup receipt; ownership is still retained")
+        LOGGER.critical("FAILED_CLEANUP_OWNERSHIP_RETAINED session=%s feed=%s blockers=%s; "
+                        "no finalization or recovery; wait for writers or terminate the verified whole process",
+                        self.config.session_id, self.feed.name, blockers)
+        wait_event = threading.Event()
+        while blockers:
+            self.cleanup_state = {**self.cleanup_state, "blockers": blockers}
+            try:
+                self.status_callback()
+            except Exception:
+                LOGGER.warning("Could not request fatal cleanup status publication", exc_info=True)
+            wait_event.wait(TAPE_CLEANUP_OWNERSHIP_POLL_SECONDS)
+            blockers = self._capture_writer_blockers(worker, monitor, require_stream_closed=require_stream_closed)
+        self.cleanup_state = {**self.cleanup_state, "state": "cleanup_released_incomplete",
+                              "released_at_utc": utcnow().isoformat(), "blockers": []}
+        LOGGER.warning("Capture writers stopped after fatal cleanup; preserving incomplete session %s/%s",
+                       self.config.session_id, self.feed.name)
 
     def _monitor(self) -> None:
         last_tick = time.monotonic()
@@ -1268,6 +1394,7 @@ class FeedThread(threading.Thread):
         try:
             self._run_impl()
         except BaseException as exc:
+            self.transport_failure_kind = None
             self.failure = self.failure or f"terminal feed failure: {type(exc).__name__}: {str(exc)[:500]}"
             self.aggregator.exception(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
             try:
@@ -1298,7 +1425,10 @@ class FeedThread(threading.Thread):
             LOGGER.exception("Unhandled terminal failure in tape feed %s", self.feed.name)
 
     def _run_impl(self) -> None:
-        self.catalog.register_feed(self.config.session_id, self.feed, self.path)
+        self.catalog.register_feed(
+            self.config.session_id, self.feed, self.path,
+            source_components={"recovery": self.recovery_context} if self.recovery_context else None,
+        )
         started = utcnow()
         self.catalog.update_feed_status(
             self.config.session_id,
@@ -1314,29 +1444,55 @@ class FeedThread(threading.Thread):
         timer = None
         close_barrier_returned = False
         try:
+            if self.stop_requested.is_set():
+                raise RuntimeError("tape feed stopped before connection")
+            if self.recovery_context:
+                if utcnow() >= min(self.config.cash_close_utc, self.config.stop_due_utc):
+                    raise RuntimeError("recovery segment cash-session deadline reached")
+                checked = time.monotonic()
+                decision = self.recovery_guard() if self.recovery_guard is not None else None
+                if (not isinstance(decision, dict) or decision.get("allowed") is not True
+                        or time.monotonic() - checked > 8.0
+                        or self.stop_requested.is_set()
+                        or utcnow() >= min(self.config.cash_close_utc, self.config.stop_due_utc)):
+                    raise RuntimeError("recovery segment primary capture guard did not pass")
             client = self.live_factory(
                 heartbeat_interval_s=5,
-                # This optional secondary must never reclaim a provider slot
-                # after a disconnect while the primary gamma/ORB client owns
-                # the session. A failed tape remains explicitly incomplete.
+                # The SDK must not reconnect itself. Only the session owner may
+                # admit a separately guarded live-only segment after this
+                # client's resources are closed; the failed tape stays partial.
                 reconnect_policy="none",
                 slow_reader_behavior="warn",
                 compression=db.Compression.ZSTD,
             )
             self.client = client
             for subscription in self.feed.subscriptions:
-                client.subscribe(
+                if self.stop_requested.is_set():
+                    raise RuntimeError("tape feed stopped before subscription")
+                if self.recovery_context and utcnow() >= min(self.config.cash_close_utc, self.config.stop_due_utc):
+                    raise RuntimeError("recovery segment deadline reached before subscription")
+                request = dict(
                     dataset=self.feed.dataset,
                     schema=subscription.schema,
                     symbols=list(subscription.symbols),
                     stype_in=subscription.stype_in,
-                    start=subscription.start_utc.isoformat(),
                 )
+                if not self.recovery_context:
+                    request["start"] = subscription.start_utc.isoformat()
+                client.subscribe(**request)
+            if self.stop_requested.is_set():
+                raise RuntimeError("tape feed stopped before starting capture")
+            if self.recovery_context and utcnow() >= min(self.config.cash_close_utc, self.config.stop_due_utc):
+                raise RuntimeError("recovery segment deadline reached before starting capture")
             self.stream_handle = self.path.open("xb", buffering=0)
             client.add_stream(self.stream_handle, exception_callback=self._fatal_stream_exception)
             client.add_callback(self._enqueue_record, exception_callback=self.aggregator.exception)
             client.add_reconnect_callback(self.aggregator.reconnect_gap, exception_callback=self.aggregator.exception)
             worker.start()
+            if self.stop_requested.is_set():
+                raise RuntimeError("tape feed stopped before client start")
+            if self.recovery_context and utcnow() >= min(self.config.cash_close_utc, self.config.stop_due_utc):
+                raise RuntimeError("recovery segment deadline reached before client start")
             client.start()
             self.catalog.update_feed_status(
                 self.config.session_id,
@@ -1355,7 +1511,9 @@ class FeedThread(threading.Thread):
             client.block_for_close()
             close_barrier_returned = True
         except Exception as exc:
-            self.failure = f"{type(exc).__name__}: {str(exc)[:500]}"
+            if not self.failure:
+                self.transport_failure_kind = transport_failure_kind(exc)
+            self.failure = self.failure or f"{type(exc).__name__}: {str(exc)[:500]}"
             self.aggregator.exception(exc)
             LOGGER.exception("Tape feed %s failed", self.feed.name)
         finally:
@@ -1368,25 +1526,44 @@ class FeedThread(threading.Thread):
                 self._cleanup_unclosed_live_client()
             self.monitor_stop.set()
             if monitor.is_alive():
-                monitor.join(timeout=max(5.0, self.config.flush_seconds * 2))
+                monitor.join(timeout=max(TAPE_MONITOR_DRAIN_MINIMUM_SECONDS, self.config.flush_seconds * 2))
             self.worker_stop.set()
             self.release_analysis_snapshot()
             if worker.is_alive():
-                worker.join(timeout=120.0)
+                worker.join(timeout=TAPE_AGGREGATE_DRAIN_TIMEOUT_SECONDS)
+            # Never touch the raw handle or publish final evidence while SDK,
+            # aggregate, or monitor writers can still change it/the catalog.
+            self._hold_ownership_until_writers_stop(worker, monitor)
             if worker.is_alive() or not self.record_queue.empty():
                 remaining = self.record_queue.qsize()
                 self.aggregator.callback_drop()
                 self.failure = self.failure or f"derived aggregation queue did not drain ({remaining} records remain)"
+                self.transport_failure_kind = None
             if self.stream_handle is not None and not self.stream_handle.closed:
                 try:
                     self.stream_handle.flush()
                     self.stream_handle.close()
                 except Exception as exc:
                     self.failure = self.failure or f"raw DBN stream close failed: {exc}"
+                    self.transport_failure_kind = None
+            self._hold_ownership_until_writers_stop(worker, monitor, require_stream_closed=True)
+            try:
+                disconnected = self.client is None or self.client.is_connected() is False
+            except Exception:
+                disconnected = False
+            self.capture_resources_closed = bool(
+                disconnected and not worker.is_alive() and not monitor.is_alive()
+                and (self.stream_handle is None or self.stream_handle.closed)
+            )
+            if self.cleanup_state.get("state") == "cleanup_released_incomplete":
+                self.cleanup_state = {**self.cleanup_state,
+                                      "raw_finalization_allowed": self.capture_resources_closed,
+                                      "evidence_remains_incomplete": True}
             try:
                 self.aggregator.flush()
             except Exception as exc:
                 self.failure = self.failure or f"final aggregate flush failed: {exc}"
+                self.transport_failure_kind = None
             status = self._status_snapshot()
             file_bytes = self.path.stat().st_size if self.path.exists() else 0
             complete = False
@@ -1407,6 +1584,8 @@ class FeedThread(threading.Thread):
                     reconnect_count = int(status.get("reconnect_count") or 0)
                     provider_error_count = int(status.get("provider_error_count") or 0)
                     completion_issues: list[str] = []
+                    if self.recovery_context:
+                        completion_issues.append("live-only recovery segment: prior gap and session coverage remain incomplete")
                     expected_roots = self._expected_trade_roots()
                     root_counts = json.loads(str(status.get("root_trade_counts_json") or "{}"))
                     if int(status.get("subscription_acks") or 0) < len(self.feed.subscriptions):
@@ -1519,6 +1698,9 @@ class FeedThread(threading.Thread):
                         self.failure = "; ".join(completion_issues)
                 except Exception as exc:
                     self.failure = self.failure or f"DBN integrity check failed: {exc}"
+                    # A transport symptom must not authorize another writer
+                    # when local finalization itself could not be verified.
+                    self.transport_failure_kind = None
             status.update(
                 status="complete" if complete else "incomplete",
                 ended_at_utc=utcnow().isoformat(),
@@ -1556,6 +1738,8 @@ class StreamingSessionRecorder:
         parquet: bool = True,
         live_factory: Callable[..., object] = db.Live,
         process_priority: ProcessPriorityControl | None = None,
+        max_recovery_segments: int = MAX_RECOVERY_SEGMENTS,
+        recovery_guard: Callable[[], dict[str, object]] | None = None,
     ):
         self.config = config
         # Opening TapeCatalog performs schema migrations. Defer it until run()
@@ -1575,6 +1759,152 @@ class StreamingSessionRecorder:
         self.analysis_thread: threading.Thread | None = None
         self.sleep_guard = SystemSleepGuard()
         self.process_priority = process_priority or ProcessPriorityControl()
+        if type(max_recovery_segments) is not int or not 0 <= max_recovery_segments <= MAX_RECOVERY_SEGMENTS:
+            raise ValueError("max_recovery_segments must be an integer from 0 through 2")
+        self.max_recovery_segments = max_recovery_segments
+        self.recovery_guard = recovery_guard or self._probe_recovery_guard
+        self.root_session_id = config.session_id
+        self.recovery_segment_count = 0
+        self.recovery_context: dict[str, object] = {}
+        self.recovery_state: dict[str, object] = {"state": "not_needed"}
+
+    def _probe_recovery_guard(self) -> dict[str, object]:
+        from .config import ET
+        from .start_gate import AUTOMATIC_START_NOT_BEFORE_ET, probe_primary_capture_readiness
+
+        not_before = datetime.combine(
+            self.config.trading_date, AUTOMATIC_START_NOT_BEFORE_ET, tzinfo=ET
+        ).astimezone(UTC)
+        if utcnow() < not_before:
+            return {"allowed": False, "reason": "PRIMARY_OPENING_CAPTURE_PROTECTED",
+                    "not_before_utc": not_before.isoformat()}
+        return probe_primary_capture_readiness(
+            backend_url="http://127.0.0.1:8000", timeout_seconds=2.0,
+            trading_day=self.config.trading_date,
+        )
+
+    def _recovery_receipt(self, event: str, **values) -> dict[str, str]:
+        return write_recovery_receipt(self.config.output_dir / "recovery_receipts", {
+            "schema_version": "marketpin-tape-segment-recovery.v1",
+            "event": event, "observed_at_utc": utcnow().isoformat(),
+            "root_session_id": self.root_session_id,
+            "previous_session_id": self.config.session_id,
+            "owner_pid": os.getpid(), "recovery_segment_count": self.recovery_segment_count,
+            "recorder_source_identity": json.loads(_LOADED_RECORDER_SOURCE_IDENTITY_JSON),
+            "historical_records_modified": False, "historical_replay_requested": False,
+            "complete_session_claimed": False, "prediction_authority": False,
+            **values,
+        })
+
+    def _prepare_recovery(self) -> bool:
+        """Retain ownership until every prior writer closes; then try a new segment."""
+        required = [feed for feed in self.feeds if feed.feed.required]
+        failed = [feed for feed in required if getattr(feed, "transport_failure_kind", None)]
+        if not failed:
+            return False
+        def blocked(reason: str) -> bool:
+            self.recovery_state = {"state": "blocked", "reason": reason}
+            try:
+                self._recovery_receipt("blocked", reason=reason)
+                self._write_status_heartbeat()
+            except Exception:
+                LOGGER.exception("Could not persist blocked tape recovery state")
+            return False
+
+        if self.shutdown.is_set():
+            return blocked("SHUTDOWN_REQUESTED")
+        if self.recovery_segment_count >= self.max_recovery_segments:
+            return blocked("RECOVERY_SEGMENT_BUDGET_EXHAUSTED")
+        if any(feed.is_alive() or not getattr(feed, "capture_resources_closed", False)
+               for feed in self.feeds):
+            return blocked("PREVIOUS_CAPTURE_CLEANUP_UNPROVEN")
+        if any(feed.failure and not getattr(feed, "transport_failure_kind", None)
+               for feed in required):
+            return blocked("NON_TRANSIENT_REQUIRED_FEED_FAILURE")
+        # Do not recover through known data-loss or local storage failure.
+        if any(int(feed._status_snapshot().get(key) or 0) > 0
+               for feed in self.feeds for key in ("slow_reader_warnings", "provider_error_count")):
+            return blocked("DATA_LOSS_OR_PROVIDER_ERROR")
+        previous = self.config
+        deadline = min(previous.cash_close_utc, previous.stop_due_utc)
+        if utcnow() >= deadline:
+            return blocked("CASH_SESSION_DEADLINE_REACHED")
+        with self.catalog.connect(read_only=True) as connection:
+            session = connection.execute(
+                "SELECT status, completed_at_utc FROM tape_sessions WHERE session_id=?",
+                (previous.session_id,),
+            ).fetchone()
+            rows = [dict(row) for row in connection.execute(
+                "SELECT feed_name, dbn_path, complete, sha256, file_bytes, last_receive_ns, "
+                "last_trade_event_ns, ended_at_utc FROM tape_feed_status WHERE session_id=?",
+                (previous.session_id,),
+            )]
+        if session is None or session["status"] != "incomplete":
+            return blocked("PREVIOUS_SESSION_INCOMPLETENESS_UNPROVEN")
+        try:
+            self._recovery_receipt("transport_failure_finalized", previous_feeds=rows,
+                                   failure_kinds=[feed.transport_failure_kind for feed in failed])
+            for attempt, delay in enumerate(RECOVERY_DELAYS_SECONDS, 1):
+                if self.shutdown.is_set() or utcnow() >= deadline:
+                    break
+                self.recovery_state = {"state": "waiting_for_primary", "attempt": attempt,
+                                       "retry_delay_seconds": delay, "deadline_utc": deadline.isoformat()}
+                self._write_status_heartbeat()
+                # Event.wait is monotonic and lets signals cancel immediately.
+                remaining = (deadline - utcnow()).total_seconds()
+                if self.shutdown.wait(min(delay, max(0.0, remaining))):
+                    break
+                if utcnow() >= deadline:
+                    break
+                checked = time.monotonic()
+                try:
+                    decision = self.recovery_guard()
+                except Exception as exc:
+                    decision = {"allowed": False, "reason": type(exc).__name__}
+                guard_age = time.monotonic() - checked
+                self._recovery_receipt("primary_guard_checked", attempt=attempt,
+                                       decision=decision, elapsed_seconds=guard_age)
+                if (not isinstance(decision, dict) or decision.get("allowed") is not True
+                        or guard_age > 8.0):
+                    continue
+                if self.shutdown.is_set() or utcnow() >= deadline:
+                    break
+                if shutil.disk_usage(previous.output_dir).free < previous.min_free_bytes:
+                    return blocked("DISK_SAFETY_FLOOR")
+                observed = utcnow()
+                next_number = self.recovery_segment_count + 1
+                next_id = f"{self.root_session_id}-r{next_number}-{uuid.uuid4().hex}"
+                context = {
+                    "kind": "live_only_partial_recovery", "root_session_id": self.root_session_id,
+                    "previous_session_id": previous.session_id, "session_id": next_id,
+                    "segment_number": next_number, "resume_requested_at_utc": observed.isoformat(),
+                    "previous_completed_at_utc": session["completed_at_utc"],
+                    "previous_feeds": rows, "gap_end_utc": None,
+                    "continuity": "unverified_gap_not_backfilled", "subscription_start_omitted": True,
+                    "historical_replay_requested": False, "analysis_enabled": False,
+                    "complete_session_claimed": False, "prediction_authority": False,
+                }
+                context["receipt"] = self._recovery_receipt("segment_authorized", segment=context)
+                self.config = replace(previous, session_id=next_id,
+                    feeds=tuple(replace(feed, subscriptions=tuple(
+                        replace(sub, start_utc=observed) for sub in feed.subscriptions
+                    )) for feed in previous.feeds))
+                self.recovery_context = context
+                self.recovery_segment_count = next_number
+                self.recovery_state = {"state": "partial_segment", "segment_number": next_number}
+                self.run_analysis = False
+                self.analysis_error = None
+                self.analysis_thread = None
+                self.paper_shadow_result = None
+                return True
+            self.recovery_state = {"state": "exhausted_or_stopped"}
+            self._recovery_receipt("stopped", reason="GUARD_BUDGET_DEADLINE_OR_SHUTDOWN")
+        except Exception:
+            # No receipt, database or guard error may cause an unreceipted retry.
+            LOGGER.exception("Tape recovery failed closed before creating a new connection")
+            self.recovery_state = {"state": "failed_closed"}
+        self._write_status_heartbeat()
+        return False
 
     def write_status(self) -> None:
         if self.catalog is None:
@@ -1596,6 +1926,7 @@ class StreamingSessionRecorder:
                     "python_prefix": sys.prefix,
                     "python_base_prefix": sys.base_prefix,
                     "venv_active": sys.prefix != sys.base_prefix,
+                    "loaded_source": json.loads(_LOADED_RECORDER_SOURCE_IDENTITY_JSON),
                 },
                 "process_priority": self.process_priority.to_dict(),
                 "sleep_prevention": self.sleep_guard.to_dict(),
@@ -1603,6 +1934,10 @@ class StreamingSessionRecorder:
                 "feeds": [dict(row) for row in feeds],
                 "analysis_error": self.analysis_error,
                 "paper_shadow": self.paper_shadow_result,
+                "capture_recovery": {**self.recovery_state, "segment": self.recovery_context,
+                                     "maximum_new_segments": self.max_recovery_segments},
+                "feed_cleanup": {feed.feed.name: dict(getattr(feed, "cleanup_state", {}))
+                                 for feed in self.feeds},
             }
             # Use a writer-unique temporary name. A stale/overlapping process or
             # an external status reader must never contend for one shared tmp
@@ -1750,7 +2085,9 @@ class StreamingSessionRecorder:
             self.analysis_error = f"{type(exc).__name__}: {str(exc)[:500]}"
             LOGGER.exception("Close-minus-15 analysis failed")
         finally:
-            for feed in frozen_feeds:
+            # The callback can pause a feed before it reaches frozen_feeds.
+            # Any readiness/flush/cutoff exception must release that pause too.
+            for feed in self.feeds:
                 feed.release_analysis_snapshot()
             try:
                 self.write_status()
@@ -1769,94 +2106,114 @@ class StreamingSessionRecorder:
                     "Marked orphaned recorder sessions incomplete after exclusive-lock recovery: %s",
                     ",".join(orphaned),
                 )
-            self.catalog.start_session(self.config)
-            analysis_started = False
-            parent_failure: str | None = None
-            started_feeds: list[FeedThread] = []
-            try:
-                self.feeds = [
-                    FeedThread(
-                        self.config,
-                        feed,
-                        self.catalog,
-                        self._request_status_heartbeat,
-                        live_factory=self.live_factory,
-                        parquet=self.parquet,
-                    )
-                    for feed in self.config.feeds
-                ]
-                for feed in self.feeds:
-                    if self.shutdown.is_set():
-                        break
-                    feed.start()
-                    started_feeds.append(feed)
-                self._write_status_heartbeat()
-                while any(feed.is_alive() for feed in started_feeds):
-                    self._stop_feeds_at_absolute_deadline(started_feeds)
-                    if self.shutdown.wait(2.0):
-                        break
-                    if self.run_analysis and not analysis_started and utcnow() >= self.config.analysis_due_utc:
-                        analysis_started = True
-                        self.analysis_thread = threading.Thread(
-                            target=self._analysis,
-                            name="closing-analysis",
-                            daemon=False,
-                        )
-                        self.analysis_thread.start()
-                    self._write_status_heartbeat()
-            except BaseException as exc:
-                parent_failure = f"recorder orchestration failed: {type(exc).__name__}: {str(exc)[:500]}"
-                LOGGER.exception("Closing-tape session orchestration failed")
-                self.stop(parent_failure)
-            finally:
-                if self.shutdown.is_set() or parent_failure:
-                    stop_reason = parent_failure or self.shutdown_reason or "operator shutdown requested"
+            while True:
+                result = self._run_segment()
+                if not self._prepare_recovery():
+                    return result
+
+    def _run_segment(self) -> int:
+        self.catalog.start_session(self.config)
+        analysis_started = False
+        parent_failure: str | None = None
+        started_feeds: list[FeedThread] = []
+        try:
+            self.feeds = [
+                FeedThread(
+                    self.config,
+                    feed,
+                    self.catalog,
+                    self._request_status_heartbeat,
+                    live_factory=self.live_factory,
+                    parquet=self.parquet,
+                    analysis_enabled=self.run_analysis,
+                    recovery_context=self.recovery_context,
+                    recovery_guard=self.recovery_guard if self.recovery_context else None,
+                )
+                for feed in self.config.feeds
+            ]
+            for feed in self.feeds:
+                if self.shutdown.is_set():
+                    break
+                feed.start()
+                started_feeds.append(feed)
+            self._write_status_heartbeat()
+            while any(feed.is_alive() for feed in started_feeds):
+                self._stop_feeds_at_absolute_deadline(started_feeds)
+                if any(getattr(feed, "cleanup_state", {}).get("state") == "failed_cleanup_ownership_retained"
+                       for feed in started_feeds):
+                    self.recovery_state = {"state": "failed_cleanup_ownership_retained",
+                                           "automatic_recovery_allowed": False}
+                    self.run_analysis = False
+                if any(not feed.is_alive() and feed.feed.required
+                       and getattr(feed, "transport_failure_kind", None) for feed in started_feeds):
                     for feed in started_feeds:
                         if feed.is_alive():
-                            feed.stop(stop_reason)
-                for feed in started_feeds:
-                    # Keep the process lock until hashing/finalization is truly
-                    # finished; otherwise a second recorder could overlap.
-                    feed.join()
-                if self.analysis_thread is not None:
-                    self.analysis_thread.join()
-
-            failures = [parent_failure] if parent_failure else []
-            failures.extend(
-                feed.failure for feed in self.feeds if feed.feed.required and feed.failure
-            )
-            with self.catalog.connect(read_only=True) as connection:
-                final_rows = {
-                    str(row["feed_name"]): row
-                    for row in connection.execute(
-                        "SELECT * FROM tape_feed_status WHERE session_id=?",
-                        (self.config.session_id,),
+                            feed.stop("required sibling feed lost transport")
+                    break
+                if self.shutdown.wait(2.0):
+                    break
+                if self.run_analysis and not analysis_started and utcnow() >= self.config.analysis_due_utc:
+                    analysis_started = True
+                    self.analysis_thread = threading.Thread(
+                        target=self._analysis,
+                        name="closing-analysis",
+                        daemon=False,
                     )
-                }
-            for feed in self.config.feeds:
-                if not feed.required:
-                    continue
-                row = final_rows.get(feed.name)
-                if row is None:
-                    failures.append(f"required feed {feed.name} has no terminal status")
-                elif int(row["complete"] or 0) != 1 or str(row["status"]) != "complete":
-                    failures.append(f"required feed {feed.name} failed completeness gates")
-            if self.run_analysis and not analysis_started:
-                failures.append("close-minus-15 analysis did not run")
-            if self.run_analysis and self.analysis_error:
-                failures.append(f"close-minus-15 analysis failed: {self.analysis_error}")
-            failures = list(dict.fromkeys(str(item) for item in failures if item))
-            self.catalog.finish_session(
-                self.config.session_id,
-                "complete" if not failures else "incomplete",
-                "; ".join(failures) if failures else None,
-            )
-            try:
-                self.write_status()
-            except Exception:
-                LOGGER.exception("Could not publish final tape status")
-                return 2
-            return 0 if not failures else 2
+                    self.analysis_thread.start()
+                self._write_status_heartbeat()
+        except BaseException as exc:
+            parent_failure = f"recorder orchestration failed: {type(exc).__name__}: {str(exc)[:500]}"
+            LOGGER.exception("Closing-tape session orchestration failed")
+            self.stop(parent_failure)
+        finally:
+            if self.shutdown.is_set() or parent_failure:
+                stop_reason = parent_failure or self.shutdown_reason or "operator shutdown requested"
+                for feed in started_feeds:
+                    if feed.is_alive():
+                        feed.stop(stop_reason)
+            for feed in started_feeds:
+                # Keep the process lock until hashing/finalization is truly
+                # finished; otherwise a second recorder could overlap.
+                feed.join()
+            if self.analysis_thread is not None:
+                self.analysis_thread.join()
+
+        failures = [parent_failure] if parent_failure else []
+        failures.extend(
+            feed.failure for feed in self.feeds if feed.feed.required and feed.failure
+        )
+        with self.catalog.connect(read_only=True) as connection:
+            final_rows = {
+                str(row["feed_name"]): row
+                for row in connection.execute(
+                    "SELECT * FROM tape_feed_status WHERE session_id=?",
+                    (self.config.session_id,),
+                )
+            }
+        for feed in self.config.feeds:
+            if not feed.required:
+                continue
+            row = final_rows.get(feed.name)
+            if row is None:
+                failures.append(f"required feed {feed.name} has no terminal status")
+            elif int(row["complete"] or 0) != 1 or str(row["status"]) != "complete":
+                failures.append(f"required feed {feed.name} failed completeness gates")
+        if self.run_analysis and not analysis_started:
+            failures.append("close-minus-15 analysis did not run")
+        if self.run_analysis and self.analysis_error:
+            failures.append(f"close-minus-15 analysis failed: {self.analysis_error}")
+        failures = list(dict.fromkeys(str(item) for item in failures if item))
+        self.catalog.finish_session(
+            self.config.session_id,
+            "complete" if not failures else "incomplete",
+            "; ".join(failures) if failures else None,
+        )
+        try:
+            self.write_status()
+        except Exception:
+            LOGGER.exception("Could not publish final tape status")
+            return 2
+        return 0 if not failures else 2
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1867,6 +2224,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--include-equities", action="store_true")
     result.add_argument("--no-analysis", action="store_true")
     result.add_argument("--no-parquet", action="store_true")
+    result.add_argument("--max-recovery-segments", type=int, choices=(0, 1, 2), default=MAX_RECOVERY_SEGMENTS,
+                        help="Maximum new live-only partial segments after transport failure (0 disables)")
     result.add_argument("--flush-seconds", type=float)
     result.add_argument("--stop-after-seconds", type=float)
     result.add_argument("--log-level", default="INFO")
@@ -1910,6 +2269,7 @@ def main(argv: list[str] | None = None) -> int:
         run_analysis=not args.no_analysis,
         parquet=not args.no_parquet,
         process_priority=process_priority,
+        max_recovery_segments=args.max_recovery_segments,
     )
 
     def shutdown(_signum, _frame):

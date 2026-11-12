@@ -12,11 +12,31 @@ Daily Snapshot Exports -> Official closing prices — save and review -> choose 
 
 Current backend inventory observed 2026-09-14 15:26 CT: SPX, NDX, VIX, RUT. Each has an existing official source adapter. SPY is also supported; other symbols are explicitly UNSUPPORTED_SOURCE until a validated adapter is added.
 
-The existing official-source publication gate is 18:00 Eastern / 17:00 Central. This is a publication delay, not a market recording cutoff. Before that gate the report saves AWAITING_PUBLICATION with empty prices. Fetching is manual; no recurring collector was installed. A provider may still be unavailable after the gate, so inspect per-symbol results and retry. Prior reports are retained.
+The existing official-source publication gate is 18:00 Eastern / 17:00 Central. This is a publication delay, not a market recording cutoff. Before that gate the report saves AWAITING_PUBLICATION with empty prices. Manual fetching remains available. The optional `MarketPin-VerifiedClose-Settlement` task runs at 17:05, 17:20, and 17:45 Central so a temporarily unavailable authority can be retried without weakening validation. Prior reports and source artifacts are retained.
 
 Successful official artifacts are hashed and semantically checked for symbol, date, price and observation chronology. Reading saved closes rechecks the retained hash and semantics; changed/missing artifacts suppress the price and show ARTIFACT_INVALID. One source failure does not hide the other symbols. Missing values are never filled from AI, last trade, option parity or gamma pin.
 
 Reports persist under C:/Cprojectsgpu_app/MarketPinPredictor/data/closing_prices/YYYY-MM-DD/. Source artifacts use the existing data/verified_close_sources vault. Reports remain distinct from the existing complete-bundle outcome ledger. No database ingestion, model scoring or training occurs through this UI action.
+
+## Scheduled verified-close settlement
+
+Install the two current-user tasks with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install_verified_close_postclose_tasks.ps1
+```
+
+`MarketPin-VerifiedClose-Selection` runs at 15:05 Central. It records the last lineage-valid SPX, NDX, and RUT prediction at or before the cash close in an immutable SHA-256-named receipt under `data/prediction_score_selections/YYYY-MM-DD/`. It must complete after cash close and before the 17:00 publication gate. The selection rule is fixed before official close evidence is fetched, so retries cannot select a different prediction after observing the outcome.
+
+`MarketPin-VerifiedClose-Settlement` runs after the publication gate. It reuses the existing five-family SPX/NDX/RUT/VIX/SPY official-source fetcher and semantic audit, requires the canonical `data/market_data.db`, atomically ingests the complete bundle, and scores only prediction IDs in the immutable selection receipt. Diagnostic scores remain `training_eligible=false` and `performance_claim_eligible=false`. Result receipts are retained under `data/postclose_pipeline/YYYY-MM-DD/`.
+
+DJI remains explicitly unsupported for verified-close scoring because the current repository has no approved official DJIA close adapter and the Databento path has no direct DJI cash-index feed. DIA is not substituted because its price is in different units. The dashboard shows this state instead of implying complete four-index coverage.
+
+Remove the tasks without deleting retained evidence:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install_verified_close_postclose_tasks.ps1 -Uninstall
+```
 
 The AI evidence packet now includes today's saved closing-price report when available, including missing statuses. Codex can read these workspace files on a later request; there is no automatic message handoff.
 

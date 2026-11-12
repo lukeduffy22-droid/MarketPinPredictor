@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import threading
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -24,6 +26,11 @@ REPLAY_CONTRACT_VERSION = "databento-quant-ensemble-replay-v1"
 CONFIDENCE_KIND = "data_quality_heuristic"
 CONFIDENCE_SCALE = "percent_0_100"
 EQUITY_INDEX_SYMBOLS = {"SPX", "NDX", "SPY", "QQQ", "RUT", "OEX", "DJX", "RUI", "XAU", "HGX", "OSX", "UTY", "XSP", "XND", "MRUT"}
+
+logger = logging.getLogger(__name__)
+_cuda_fallback_warning_lock = threading.Lock()
+_cuda_fallback_warning_emitted = False
+_cuda_disabled_after_failure = False
 
 
 @lru_cache(maxsize=1)
@@ -88,7 +95,13 @@ def replay_ai_prediction(feature_snapshot: dict[str, Any]) -> float:
 
 def inference_device() -> torch.device:
     """Return the available inference device without claiming CUDA when unavailable."""
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if _cuda_circuit_is_open():
+        return torch.device("cpu")
+    try:
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    except Exception as exc:  # CUDA discovery must never prevent a CPU prediction.
+        _warn_cuda_fallback(exc, stage="device_discovery")
+        return torch.device("cpu")
 
 
 def _num(value: Any) -> float | None:
@@ -146,6 +159,47 @@ def _weighted_average(anchors: list[tuple[str, float, float]], device: torch.dev
         device=device,
     )
     return float(torch.sum(values * weights).div(torch.sum(weights)).item())
+
+
+def _warn_cuda_fallback(exc: Exception, *, stage: str) -> None:
+    """Open the CUDA circuit and log at most one fallback warning per process."""
+    global _cuda_disabled_after_failure, _cuda_fallback_warning_emitted
+    with _cuda_fallback_warning_lock:
+        _cuda_disabled_after_failure = True
+        if _cuda_fallback_warning_emitted:
+            return
+        _cuda_fallback_warning_emitted = True
+    logger.warning(
+        "CUDA %s failed; deterministic prediction is retrying on CPU and CUDA "
+        "is disabled for subsequent predictions in this process: %s: %s",
+        stage,
+        type(exc).__name__,
+        exc,
+    )
+
+
+def _cuda_circuit_is_open() -> bool:
+    """Return whether an earlier CUDA failure latched this process to CPU."""
+    with _cuda_fallback_warning_lock:
+        return _cuda_disabled_after_failure
+
+
+def _weighted_average_with_fallback(
+    anchors: list[tuple[str, float, float]],
+    device: torch.device,
+) -> tuple[float | None, torch.device]:
+    """Compute on the requested device, with one identical CPU retry for CUDA faults."""
+    if device.type == "cuda" and _cuda_circuit_is_open():
+        cpu = torch.device("cpu")
+        return _weighted_average(anchors, cpu), cpu
+    try:
+        return _weighted_average(anchors, device), device
+    except Exception as exc:
+        if device.type != "cuda":
+            raise
+        _warn_cuda_fallback(exc, stage="weighted_average")
+        cpu = torch.device("cpu")
+        return _weighted_average(anchors, cpu), cpu
 
 
 def _confidence(payload: dict, target: float, spot: float, vix_adjustment: float, historical_context: dict | None = None) -> float:
@@ -231,7 +285,7 @@ def build_ai_prediction(symbol: str, payload: dict, vix_payload: dict | None = N
     if max_pain is not None:
         anchors.append(("max_pain", max_pain, _anchor_weight(spot, max_pain, 0.12)))
 
-    target = _weighted_average(anchors, device)
+    target, device = _weighted_average_with_fallback(anchors, device)
     if target is None:
         target = spot
 
@@ -252,12 +306,10 @@ def build_ai_prediction(symbol: str, payload: dict, vix_payload: dict | None = N
         if vix_spot and vix_target:
             vix_pressure = (vix_target - vix_spot) / vix_spot
             # Rising VIX is bearish for equity indexes. Keep this a small, capped context adjustment.
+            # This is already a deterministic Python scalar. Keeping it off the
+            # accelerator prevents a second, unnecessary CUDA failure point.
             vix_adjustment = float(
-                torch.tensor(
-                    -spot * max(min(vix_pressure * 0.05, 0.0008), -0.0008),
-                    dtype=torch.float64,
-                    device=device,
-                ).item()
+                -spot * max(min(vix_pressure * 0.05, 0.0008), -0.0008)
             )
             target += vix_adjustment
             signals.append({

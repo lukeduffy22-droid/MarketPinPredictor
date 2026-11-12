@@ -1,8 +1,38 @@
 """Normalize derived wall displays without changing retained producer records."""
 
 import math
+from typing import Callable
 
 import pandas as pd
+
+
+def format_gamma_walls(frame: pd.DataFrame, format_gex: Callable) -> pd.DataFrame:
+    """Make a text-only presentation table; retained/exported values stay numeric."""
+    display = normalize_gamma_walls(frame)
+    if "strike" in display:
+        display["strike"] = display["strike"].map(
+            lambda value: f"${float(value):.0f}" if pd.notna(value) else "N/A"
+        )
+    for column in ("net_gex", "total_gex", "call_gex", "put_gex"):
+        if column in display:
+            display[column] = display[column].map(
+                lambda value: format_gex(value) if pd.notna(value) else "N/A"
+            )
+    if "days_to_expiry" in display:
+        def format_days(row):
+            value = row["days_to_expiry"]
+            if pd.isna(value):
+                return "N/A"
+            suffix = " avg" if pd.notna(row.get("expiration_count")) and float(row["expiration_count"]) > 1 else ""
+            return f"{float(value):.0f} days{suffix}"
+        display["days_to_expiry"] = display.apply(format_days, axis=1)
+    display = display.rename(columns={
+        "strike": "Strike Price", "net_gex": "Net GEX", "total_gex": "Total GEX",
+        "days_to_expiry": "Days to Expiry", "expiration_count": "Expiries",
+    })
+    # Filling a numeric column with a string creates mixed object values that
+    # Arrow cannot serialize. Convert the display copy before adding labels.
+    return display.astype("string").fillna("N/A")
 
 
 def normalize_gamma_walls(frame: pd.DataFrame) -> pd.DataFrame:

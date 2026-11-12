@@ -291,6 +291,9 @@ def test_optional_tape_client_never_auto_reconnects(tmp_path):
     observed_kwargs = {}
 
     class OneShotClient:
+        def is_connected(self):
+            return False
+
         def subscribe(self, **_kwargs):
             return None
 
@@ -336,6 +339,9 @@ def test_subscribe_failure_stops_exact_tape_client_before_finalization(tmp_path)
     )
 
     class SubscribeFailureClient:
+        def is_connected(self):
+            return False
+
         def __init__(self):
             self.stop_calls = 0
             self.close_timeouts = []
@@ -377,6 +383,9 @@ def test_tape_cleanup_errors_do_not_mask_original_start_failure(tmp_path):
     )
 
     class StartFailureClient:
+        def is_connected(self):
+            return False
+
         def subscribe(self, **_kwargs):
             return None
 

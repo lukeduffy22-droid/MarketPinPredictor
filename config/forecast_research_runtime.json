@@ -1,0 +1,10 @@
+{
+  "schema_version": "marketpin-research-runtime.v1",
+  "supervision_enabled": true,
+  "authorization_date": "2026-09-21",
+  "scope": "Independent research service on loopback port 8001 with display-only ETF minute-bar capture; existing watchdog only.",
+  "indicator_capture": {
+    "enabled": true,
+    "symbols": ["SPY", "QQQ", "IWM", "DIA"]
+  }
+}

@@ -65,6 +65,20 @@ $WatchdogTrigger = New-ScheduledTaskTrigger `
     -WeeksInterval 1 `
     -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday `
     -At '07:50'
+
+# Weekly tasks follow Central wall time through DST on this validated Central
+# host. The constructor may emit UTC or an explicit offset. Convert that new
+# instant to the validated host zone before storing a floating local boundary.
+# Boot and logon triggers have no weekly wall-time boundary and remain intact.
+foreach ($weeklyTrigger in @(@($StartupTriggers | Where-Object {
+    $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger'
+}) + @($WatchdogTrigger))) {
+    $weeklyTrigger.StartBoundary = [TimeZoneInfo]::ConvertTime(
+        [datetimeoffset]$weeklyTrigger.StartBoundary, $timeZone
+    ).ToString(
+        "yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture
+    )
+}
 $WatchdogRepetition = New-CimInstance `
     -ClassName MSFT_TaskRepetitionPattern `
     -Namespace 'root/Microsoft/Windows/TaskScheduler' `
@@ -149,7 +163,17 @@ function Assert-MarketTaskReadback {
         $weekly = @($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' })
         $boot = @($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })
         $logon = @($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
-        $times = @($weekly | ForEach-Object { ([datetime]$_.StartBoundary).ToString('HH:mm') } | Sort-Object)
+        $times = @($weekly | ForEach-Object {
+            $boundary = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact(
+                [string]$_.StartBoundary, "yyyy-MM-dd'T'HH:mm:ss",
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None, [ref]$boundary
+            ) -or $boundary.Second -ne 0) {
+                throw 'Startup weekly boundary must use floating local wall time.'
+            }
+            $boundary.ToString('HH:mm')
+        } | Sort-Object)
         if ($triggers.Count -ne 6 -or $weekly.Count -ne 4 -or $boot.Count -ne 1 -or $logon.Count -ne 1) { throw 'Startup trigger count or type mismatch.' }
         if (($times -join ',') -cne '07:00,07:15,07:45,08:15') { throw 'Startup trigger time mismatch.' }
         if (@($weekly | Where-Object {
@@ -175,9 +199,17 @@ function Assert-MarketTaskReadback {
     else {
         if ($triggers.Count -ne 1 -or $triggers[0].CimClass.CimClassName -ne 'MSFT_TaskWeeklyTrigger') { throw 'Watchdog trigger count or type mismatch.' }
         $trigger = $triggers[0]
+        $boundary = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact(
+            [string]$trigger.StartBoundary, "yyyy-MM-dd'T'HH:mm:ss",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$boundary
+        ) -or $boundary.Second -ne 0) {
+            throw 'Watchdog weekly boundary must use floating local wall time.'
+        }
         if (
             -not $trigger.Enabled -or
-            ([datetime]$trigger.StartBoundary).ToString('HH:mm') -cne '07:50' -or
+            $boundary.ToString('HH:mm') -cne '07:50' -or
             [int]$trigger.DaysOfWeek -ne 62 -or
             [int]$trigger.WeeksInterval -ne 1 -or
             [string]$trigger.Repetition.Interval -cne 'PT5M' -or

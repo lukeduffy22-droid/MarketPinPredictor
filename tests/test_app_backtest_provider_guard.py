@@ -15,6 +15,7 @@ BLOCKED_CONNECTIONS = [
     ("databento", "synthetic-legacy-key"),
     ("polygon", ""),
     ("polygon", " \t\n "),
+    ("polygon", "synthetic-legacy-key"),
     ("unknown", "synthetic-legacy-key"),
 ]
 
@@ -129,17 +130,6 @@ def test_sidebar_disables_legacy_backtest_despite_retained_true_widget(
         assert any("unavailable" in message and "Databento" in message for message in ui.messages)
 
 
-def test_sidebar_keeps_explicitly_configured_legacy_mode_available(app_tree):
-    ui, namespace = _run_sidebar(app_tree, "polygon", " synthetic-legacy-key ")
-
-    assert ui.checkboxes[0][1]["disabled"] is False
-    assert namespace["backtest_available"] is True
-    assert namespace["run_backtest_btn"] is True
-    assert namespace["run_backtest_analysis"] is True
-    assert [name for name, _ in ui.configuration_calls].count("date_input") == 2
-    assert any(name == "button" for name, _ in ui.configuration_calls)
-
-
 class NoResultsUI:
     def __init__(self, provider, api_key):
         self.session_state = SimpleNamespace(data_provider=provider, api_key=api_key)
@@ -188,10 +178,10 @@ def test_execution_independently_blocks_stale_true_flags_without_requests_or_res
     assert not hasattr(namespace["st"].session_state, "backtest_results")
 
 
-def test_execution_condition_accepts_configured_legacy_positive_control(app_tree):
+def test_execution_condition_rejects_configured_legacy_provider(app_tree):
     namespace, requests = _execution_namespace("polygon", " synthetic-legacy-key ")
     actual_condition = ast.Expression(body=_execution_block(app_tree).test)
 
-    assert bool(eval(compile(actual_condition, str(APP_PATH), "eval"), namespace)) is True
+    assert bool(eval(compile(actual_condition, str(APP_PATH), "eval"), namespace)) is False
     assert requests == []
     assert namespace["st"].render_calls == []

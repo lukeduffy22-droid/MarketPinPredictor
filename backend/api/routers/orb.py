@@ -12,9 +12,11 @@ from backend.market_structure import get_market_structure_journal
 from backend.streamer import get_streamer
 
 router = APIRouter(tags=["market-data"])
-# Concurrent full-day projections competed for reads and missed the deadline.
-# Serialize ORB work, retaining bounded admission and no completed-result cache.
-_orb_reads = BoundedRuntimeReads(max_workers=1, timeout_seconds=1.0)
+# Four serial projections can exceed one second under live ingestion load even
+# when an individual symbol completes within that budget. Keep one worker and
+# a finite collection budget; health/prediction retain their separate limits.
+# The dashboard HTTP timeout must allow this budget plus response overhead.
+_orb_reads = BoundedRuntimeReads(max_workers=1, timeout_seconds=4.0)
 
 DEFAULT_ORB_INDEX_SYMBOLS = ("SPX", "NDX", "VIX", "RUT")
 
@@ -73,11 +75,13 @@ def _live_snapshots(journal, streamer, symbols, *, configured):
 
     context = _runtime_context(streamer)
     as_of_utc = datetime.now(timezone.utc)
+    reader_factory = getattr(journal, "snapshot_reader", None)
+    read_snapshot = reader_factory() if callable(reader_factory) else journal.snapshot
 
     def build(binding):
         kwargs = _live_snapshot_kwargs(binding)
         def snapshot(symbol):
-            return symbol, journal.snapshot(
+            return symbol, read_snapshot(
                 symbol,
                 as_of_utc=as_of_utc,
                 configured=symbol in configured,

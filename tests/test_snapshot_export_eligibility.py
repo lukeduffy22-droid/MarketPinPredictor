@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from backend.databento_streamer import DatabentoGammaStreamer
+from backend.databento_streamer import DatabentoGammaStreamer, current_market_date
 
 
 @pytest.fixture
@@ -42,7 +42,11 @@ def capture(tmp_path, monkeypatch):
         "subscription_epoch_id": streamer.subscription_epoch_id,
         "subscription_generation": 3,
         "calculation_id": "capture-one",
-        "universe_provenance": {"is_fallback": False},
+        "universe_provenance": {
+            "is_fallback": False,
+            "source_date": current_market_date().isoformat(),
+            "trading_date": current_market_date().isoformat(),
+        },
         "oi_analytics_provenance": {"is_fallback": False},
         "_calculation_inputs": {
             "rejection_counts": {},
@@ -53,26 +57,58 @@ def capture(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("field", ["universe_provenance", "oi_analytics_provenance", "is_fallback", "historical_context_only"])
-def test_fallback_capture_retains_formula_evidence_without_prediction_eligibility(capture, field):
+def test_fallback_capture_is_diagnostic_only(capture, field, monkeypatch):
     streamer, source, audited = capture
     source[field] = {"is_fallback": True} if field.endswith("provenance") else True
     before = copy.deepcopy(source)
 
-    assert streamer._write_snapshot(source) is True
+    import backend.database as backend_database
+    import database as root_database
+    writes = []
+    monkeypatch.setattr(backend_database, "save_gamma_calculation_inputs", lambda *_args: writes.append("inputs"))
+    monkeypatch.setattr(backend_database, "save_market_snapshot", lambda *_args, **_kwargs: writes.append("market"))
+    monkeypatch.setattr(root_database, "save_gamma_snapshot", lambda **_kwargs: writes.append("gamma"))
+    assert streamer._write_snapshot(source) is False
 
-    exported = json.loads(next(streamer.exports_dir.rglob("*.ndjson")).read_text())
+    assert not writes
+    assert not list(streamer.exports_dir.rglob("*.ndjson"))
+    exported = json.loads(next(streamer.audit_dir.rglob("*.json")).read_text())
     assert exported["usable_for_prediction"] is False
-    assert exported["validation_is_valid"] is True
-    assert exported["gamma_excluded_from_model"] is False
+    assert exported["capture_block_reason"] == "UNIVERSE_CAPTURE_NOT_CURRENT_SESSION"
+    assert "FALLBACK_PROVENANCE" in exported["validation_failure_reasons"]
+    assert "CALCULATION_INPUT_PERSISTENCE_FAILED" not in exported["validation_failure_reasons"]
     assert exported["likely_close"] == 7505.0
     assert exported["primary_gamma_pin_strike"] == 7510.0
-    assert exported["calculation_id"] == "capture-one"
+    assert not exported.get("calculation_id")
     assert "NON_PRODUCTION_FALLBACK" in exported["prediction_eligibility_reasons"]
-    from app.utils.snapshot_history import RESEARCH_FALLBACK_PROVENANCE, gamma_snapshot_provenance_status
-
-    assert gamma_snapshot_provenance_status(exported) == RESEARCH_FALLBACK_PROVENANCE
     assert json.loads(json.dumps(audited[0], default=str)) == exported
     assert source == before
+
+
+@pytest.mark.parametrize("provenance", [
+    None, {}, {"is_fallback": False},
+    {"is_fallback": False, "trading_date": "2026-09-23", "source_date": "2026-09-23"},
+    {"is_fallback": False, "trading_date": "2026-09-24", "source_date": "2026-09-23"},
+    {"is_fallback": False, "trading_date": "2026-09-24", "source_date": "2026-09-25"},
+])
+def test_universe_date_must_match_capture_session(capture, monkeypatch, provenance):
+    from datetime import date
+    import backend.database as backend_database
+    import database as root_database
+    streamer, source, audited = capture
+    monkeypatch.setattr("backend.databento_streamer.current_market_date", lambda: date(2026, 9, 24))
+    source["universe_provenance"] = provenance
+    writes = []
+    monkeypatch.setattr(backend_database, "save_gamma_calculation_inputs", lambda *_args: writes.append("inputs"))
+    monkeypatch.setattr(backend_database, "save_market_snapshot", lambda *_args, **_kwargs: writes.append("market"))
+    monkeypatch.setattr(root_database, "save_gamma_snapshot", lambda **_kwargs: writes.append("gamma"))
+    assert streamer._write_snapshot(source) is False
+    assert writes == []
+    assert audited[0]["capture_block_reason"] == "UNIVERSE_CAPTURE_NOT_CURRENT_SESSION"
+    assert "UNIVERSE_CAPTURE_NOT_CURRENT_SESSION" in audited[0]["validation_failure_reasons"]
+    assert "CALCULATION_INPUT_PERSISTENCE_FAILED" not in audited[0]["validation_failure_reasons"]
+    assert audited[0]["usable_for_prediction"] is False
+    assert not list(streamer.exports_dir.rglob("*.ndjson"))
 
 
 @pytest.mark.parametrize("failure", ["missing_capture", "generation", "epoch", "handoff", "explicit_false", "invalid", "model_excluded"])

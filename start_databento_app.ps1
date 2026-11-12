@@ -16,11 +16,11 @@ $BackendEntrypoint = [System.IO.Path]::GetFullPath((Join-Path $AppDir 'server.py
 $DashboardEntrypoint = [System.IO.Path]::GetFullPath((Join-Path $AppDir 'app.py'))
 $OpeningAcceptancePreflightScript = Join-Path $AppDir 'tools\preflight_opening_acceptance.py'
 $OpeningAcceptancePreflightSchemaVersion = 'marketpin-opening-acceptance-preflight.v2'
-$OpeningAcceptancePreflightRequiredFileCount = 67
-$OpeningAcceptancePreflightRequiredModuleCount = 50
+$OpeningAcceptancePreflightRequiredFileCount = 77
+$OpeningAcceptancePreflightRequiredModuleCount = 59
 # Keep the manual full-stack launcher aligned with the scheduled recovery's
 # bounded live-I/O headroom.
-$OpeningAcceptancePreflightTimeoutSeconds = 150
+$OpeningAcceptancePreflightTimeoutSeconds = 300
 $InvocationId = [guid]::NewGuid().ToString('N')
 $script:OpeningAcceptancePreflightResult = $null
 Import-Module -Name $SupervisorModule -Force -ErrorAction Stop
@@ -99,10 +99,12 @@ function Invoke-OpeningAcceptancePreflight {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$PreflightScript,
         [Parameter(Mandatory = $true)][string]$DatabasePath,
-        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint')]
+        [ValidateSet('strict', 'bootstrap-eligibility', 'bootstrap', 'fingerprint', 'capture')]
         [string]$Phase = 'strict',
         [ValidatePattern('^[0-9a-f]{64}$')]
         [string]$ExpectedSourceFingerprint,
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$ExpectedDatabaseFingerprint,
         [ValidateSet('canonical_init_db', 'orb_reference_decision_sidecar')]
         [string]$BootstrapScope,
         [ValidateRange(1, 300)][int]$TimeoutSeconds = $OpeningAcceptancePreflightTimeoutSeconds
@@ -130,6 +132,9 @@ function Invoke-OpeningAcceptancePreflight {
             '--expected-source-fingerprint',
             $ExpectedSourceFingerprint
         )
+    }
+    if ($ExpectedDatabaseFingerprint) {
+        $preflightArguments += @('--expected-database-fingerprint', $ExpectedDatabaseFingerprint)
     }
     if ($BootstrapScope) {
         $preflightArguments += @('--bootstrap-scope', $BootstrapScope)
@@ -243,6 +248,10 @@ function Invoke-OpeningAcceptancePreflight {
             'schema_bootstrap_performed',
             'bootstrap_attempt_count',
             'source_fingerprint_sha256',
+            'database_fingerprint_sha256',
+            'database_fingerprint_scope',
+            'stage_timings_ms',
+            'database_query_timings',
             'required_file_count',
             'required_module_count',
             'database_issues',
@@ -352,6 +361,17 @@ function Invoke-OpeningAcceptancePreflight {
             )
         }
 
+        # Invocation-local reuse is valid only for the same database file/schema.
+        # It does not assert that rows written after the full check were rescanned.
+        if ($Phase -ne 'capture' -and $payload.schema_bootstrap_required -ne $true) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -cmatch '^[0-9a-f]{64}$')
+        }
+        if ($ExpectedDatabaseFingerprint) {
+            $baseContractValid = $baseContractValid -and
+                ([string]$payload.database_fingerprint_sha256 -ceq $ExpectedDatabaseFingerprint)
+        }
+
         $phaseContractValid = switch ($Phase) {
             'strict' {
                 $payload.database_contract -ceq 'strict' -and
@@ -402,6 +422,16 @@ function Invoke-OpeningAcceptancePreflight {
                 $prebootstrapIssuesAreArray -and
                 @($payload.prebootstrap_database_issues).Count -gt 0
             }
+            'capture' {
+                $payload.database_contract -ceq 'independent_capture_catalog' -and
+                $payload.schema_bootstrap_required -is [bool] -and
+                $payload.schema_bootstrap_required -eq $false -and
+                $payload.schema_bootstrap_performed -is [bool] -and
+                $payload.schema_bootstrap_performed -eq $false -and
+                [int]$payload.bootstrap_attempt_count -eq 0 -and
+                $null -eq $payload.schema_bootstrap_scope -and
+                $payloadDatabaseIssues.Count -eq 0
+            }
             'fingerprint' {
                 $payload.database_contract -ceq 'cached_full_proof_not_rechecked' -and
                 $payload.schema_bootstrap_required -is [bool] -and
@@ -450,6 +480,7 @@ function Assert-OpeningAcceptanceMutationPreflight {
             -DatabasePath (Join-Path $AppDir 'data\market_data.db') `
             -Phase 'fingerprint' `
             -ExpectedSourceFingerprint $cachedFingerprint `
+            -ExpectedDatabaseFingerprint ([string]$script:OpeningAcceptancePreflightResult.database_fingerprint_sha256) `
             -TimeoutSeconds $OpeningAcceptancePreflightTimeoutSeconds | Out-Null
         return $script:OpeningAcceptancePreflightResult
     }
@@ -566,6 +597,10 @@ if (-not $UseRemoteDatabase) {
     $env:DATABASE_URL = "sqlite:///$sqlitePath"
 }
 $env:MARKET_DATA_PROVIDER = "databento"
+if (-not (Test-Path Env:MARKETPIN_HOST_CLOCK_SHADOW_ENABLED)) {
+    # Independent read-only clock observations; no opening-admission authority.
+    $env:MARKETPIN_HOST_CLOCK_SHADOW_ENABLED = '1'
+}
 # Protect opening SPX/NDX capacity. ETF families remain supported canaries but
 # are not part of the launch-critical subscription.
 $env:DATABENTO_SYMBOLS = if ($EnableRutCanary) { "SPX,NDX,VIX,RUT" } else { "SPX,NDX,VIX" }
@@ -600,7 +635,7 @@ function Stop-MarketPinProcesses {
     # future caller cannot bypass the source/schema proof accidentally.
     Assert-OpeningAcceptanceMutationPreflight | Out-Null
 
-    $processes = Get-CimInstance Win32_Process | Where-Object {
+    $directProcesses = @(Get-CimInstance Win32_Process | Where-Object {
         (Test-MarketAppDirectComponentProcessRecord `
             -ProcessRecord $_ `
             -ProjectRoot $Root `
@@ -609,11 +644,54 @@ function Stop-MarketPinProcesses {
             -ProcessRecord $_ `
             -ProjectRoot $Root `
             -Component 'dashboard')
+    })
+
+    # A venv executable can be a launcher whose child owns the socket. Stop
+    # verified listeners before their parents so ancestry remains available
+    # for ownership checks and a surviving child cannot strand an occupied port.
+    $processes = @()
+    $plannedIds = @{}
+    foreach ($port in @(8000, 8501)) {
+        foreach ($listenerId in @(Get-MarketAppListenerProcessIds -Port $port)) {
+            if (-not (Test-MarketAppVerifiedProcess `
+                -ProcessId $listenerId -ProjectRoot $Root `
+                -RequiredCommandMarkers @('backend.app:app', 'server.py', 'streamlit', 'app.py'))) {
+                throw "Refusing to stop PID $listenerId because it is not a verified MarketPinPredictor process."
+            }
+            $listenerRecord = Get-CimInstance Win32_Process -Filter "ProcessId=$listenerId" -ErrorAction Stop
+            if (-not $listenerRecord) {
+                throw "Verified listener PID $listenerId disappeared while planning startup. Retry after rechecking ownership."
+            }
+            if (-not $plannedIds.ContainsKey([int]$listenerId)) {
+                $processes += $listenerRecord
+                $plannedIds[[int]$listenerId] = $true
+            }
+        }
+    }
+    foreach ($directProcess in $directProcesses) {
+        if (-not $plannedIds.ContainsKey([int]$directProcess.ProcessId)) {
+            $processes += $directProcess
+            $plannedIds[[int]$directProcess.ProcessId] = $true
+        }
+    }
+    $plannedIdentities = @{}
+    foreach ($proc in $processes) {
+        $createdAt = [datetime]$proc.CreationDate
+        if ($createdAt -eq [datetime]::MinValue -or [int]$proc.ProcessId -le 0) {
+            throw "Refusing to stop PID $($proc.ProcessId) without a creation-time identity."
+        }
+        $identityToken = "$($proc.ProcessId)|$($createdAt.ToUniversalTime().Ticks)"
+        $plannedIdentities[[int]$proc.ProcessId] = $identityToken
     }
 
     if ($processes) {
         $pids = @()
         foreach ($proc in $processes) {
+            $currentIdentity = Get-MarketAppProcessIdentityTokenById -ProcessId $proc.ProcessId
+            if (-not $currentIdentity) { continue }
+            if ($currentIdentity -cne $plannedIdentities[[int]$proc.ProcessId]) {
+                throw "Refusing to stop PID $($proc.ProcessId) because its creation-time identity changed."
+            }
             if (-not (Test-MarketAppVerifiedProcess `
                 -ProcessId $proc.ProcessId `
                 -ProjectRoot $Root `
@@ -666,7 +744,7 @@ function Wait-ForHttpEndpoint {
         [ValidateSet('BackendHealth', 'StreamlitHealth')]
         [string]$ExpectedEndpointContract,
 
-        [int]$TimeoutSeconds = 90
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 90
     )
 
     $listenerPid = Wait-MarketAppOwnedEndpoint `
@@ -741,6 +819,10 @@ if (-not (Test-Path -LiteralPath $StreamlitExe -PathType Leaf)) {
 }
 
 Write-Host "  Project dir : $AppDir"
+& $PythonExe (Join-Path $AppDir 'tools\configure_diagnostic_access.py') --ensure
+if ($LASTEXITCODE -ne 0) {
+    throw 'Private diagnostic passport access configuration failed; startup aborted before process changes.'
+}
 Write-Host "  Python      : $PythonExe"
 Write-Host ""
 
@@ -799,6 +881,7 @@ Write-StartupSupervisorLog `
 
 $backendProcess = Start-Process `
     -FilePath $PythonExe `
+    -WindowStyle Hidden `
     -ArgumentList @(
         ('"' + $BackendEntrypoint + '"')
     ) `
@@ -824,7 +907,7 @@ $dashboardProcess = Start-Process -FilePath $StreamlitExe -ArgumentList @(
     # which can crash Python dataclass decoration mid-import.
     "--server.fileWatcherType",
     "none"
-) -WorkingDirectory $AppDir `
+) -WorkingDirectory $AppDir -WindowStyle Hidden `
     -RedirectStandardOutput $dashboardLogPaths.StandardOutputPath `
     -RedirectStandardError $dashboardLogPaths.StandardErrorPath `
     -PassThru
@@ -840,7 +923,7 @@ if (-not (Wait-ForHttpEndpoint `
     -Port 8000 `
     -LaunchProcessId $backendProcess.Id `
     -ExpectedEndpointContract 'BackendHealth' `
-    -TimeoutSeconds 90)) {
+    -TimeoutSeconds 180)) {
     Write-Host "Backend failed to start. Cleaning up processes." -ForegroundColor Red
     Stop-StartupProcesses -BackendProcess $backendProcess -DashboardProcess $dashboardProcess
     throw 'Backend launch ownership/readiness verification failed.'
@@ -894,11 +977,17 @@ Write-StartupSupervisorLog `
 
 if ($env:MARKETPIN_FORECAST_RESEARCH_AUTOSTART -ne '0') {
     try {
-        & (Join-Path $AppDir 'tools\start_forecast_research.ps1')
+        $researchResult = & (Join-Path $AppDir 'tools\start_forecast_research.ps1')
+        Write-StartupSupervisorLog -Event 'research_supervision' -Message "component=research status=$($researchResult.Status) code=$($researchResult.Code)"
     }
     catch {
         Write-Warning "Independent forecast research did not start: $($_.Exception.GetType().Name). Core capture remains running."
     }
+}
+
+& $PythonExe (Join-Path $AppDir 'tools\configure_diagnostic_access.py') --check-live
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning 'Diagnostic passport API access is not verified. Inspect the safe readiness result before requesting forecast explanations.'
 }
 
 if (-not $NoBrowser) {

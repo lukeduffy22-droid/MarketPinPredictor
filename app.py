@@ -1,11 +1,11 @@
 import streamlit as st
 from app.services.forecast_research_view import render_forecast_research
+from app.services.live_api_demo import render_live_api_demo
 import pandas as pd
 import numpy as np
 import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from polygon import RESTClient
 from datetime import datetime, timedelta
 import time
 import requests
@@ -15,11 +15,9 @@ from sklearn.preprocessing import StandardScaler
 from typing import Any, Optional
 from database import save_prediction, get_predictions_by_ticker, get_all_predictions, save_alert, get_active_alerts, get_prediction_accuracy_stats
 from models import train_linear_regression, train_random_forest
-from options_gamma import get_gamma_analysis
-from backtesting import run_backtest, calculate_backtest_metrics, optimize_model_features
-# BACKEND-ONLY WEBSOCKET: Only REST-based helpers are imported here
-# WebSocket creation functions are NOT imported - all WebSocket is backend-only
-from websocket_streaming import get_snapshot_data
+# Polygon-era helpers are intentionally not imported by the Databento-only
+# dashboard. Retained legacy functions below are unreachable from the active
+# provider path and must not make the frontend depend on that namespace.
 from ai_analysis import (
     analyze_prediction, analyze_streaming_data,
     get_risk_assessment, explain_gamma_exposure
@@ -29,12 +27,19 @@ from app.core.audit_persistence import dict_to_audit_snapshot, load_last_valid_s
 from app.services.live_data_client import (
     build_databento_predictions_from_state_batch,
     ZERO_GAMMA_DISPLAY_LABEL,
-    fetch_backend_market_session_status,
+    fetch_live_status_snapshot,
+    market_session_status_from_health,
     fetch_databento_prediction as fetch_databento_prediction_live,
     fetch_promoted_closing_tape_predictions,
 )
+from app.services.observed_indicators import fetch_indicator_bars, render_observed_indicators, render_indicator_panel
 from app.services.dashboard_status import (
     diagnostic_state_label, near_close_caption, near_close_seconds,
+)
+from app.services.options_structure_view import (
+    close_overlay_unavailable_message,
+    expiration_gamma_unavailable_message,
+    shadow_expiration_table_rows,
 )
 from app.services.live_advisor import fetch_advisor_context, build_advisor_report
 from app.services.sidebar_live_state import (
@@ -47,6 +52,7 @@ from app.services.live_panel_view import (
     render_closing_tape_evidence,
 )
 from app.services.shadow_research_view import render_shadow_research_panel
+from app.services.structural_regime_view import render_structural_regime
 from app.services.orb_view import (
     initialize_live_autorefresh,
     render_opening_range_panel,
@@ -75,7 +81,7 @@ from app.utils.display_time import (
     resolve_display_timezone,
 )
 from app.utils.export_catalog import list_gamma_snapshot_symbols
-from app.utils.gamma_wall_evidence import normalize_gamma_walls
+from app.utils.gamma_wall_evidence import normalize_gamma_walls, format_gamma_walls
 from app.utils.snapshot_history import (
     DIAGNOSTIC_INVALID_SNAPSHOT,
     SnapshotSelection,
@@ -422,8 +428,9 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = ""
 if 'ui_preferences' not in st.session_state:
     st.session_state.ui_preferences = _load_ui_preferences()
-if 'data_provider' not in st.session_state:
-    st.session_state.data_provider = 'databento'
+# Normalize stale browser state so a pre-migration value cannot reactivate a
+# retired provider path. The production dashboard is Databento-only.
+st.session_state.data_provider = 'databento'
 if 'selected_indexes_by_provider' not in st.session_state:
     saved_by_provider = st.session_state.ui_preferences.get("selected_indexes_by_provider", {})
     if not isinstance(saved_by_provider, dict):
@@ -1108,6 +1115,18 @@ def export_to_csv(predictions_data, include_indicators=True):
             df['subscription_generation'] = subscription_generation
             df['index_name'] = index_name
             df['predicted_price'] = pred_data.get('predicted_price', None)
+            if indicator_provenance.get('indicator_version'):
+                # Keep the ETF bar's source identity; forecast identity is separate.
+                df['record_type'] = 'derived_indicators_from_observed_bars'
+                df['forecast_subscription_epoch_id'] = subscription_epoch_id
+                df['forecast_subscription_generation'] = subscription_generation
+                df['subscription_epoch_id'] = indicator_frame['subscription_epoch_id']
+                df['subscription_generation'] = indicator_frame['subscription_generation']
+                df['indicator_source_symbol'] = indicator_provenance.get('bar_symbol')
+                df['indicator_context_for_symbol'] = pred_data.get('ticker')
+                df['indicator_units'] = indicator_provenance.get('units')
+                if indicator_provenance.get('is_proxy_context'):
+                    df['predicted_price'] = None
             df['confidence'] = pred_data.get('confidence', None)
             df['confidence_kind'] = pred_data.get('confidence_kind', 'unavailable')
             df['confidence_scale'] = pred_data.get('confidence_scale', 'not_applicable')
@@ -1949,7 +1968,11 @@ with st.sidebar:
 
     # The backend subscription window is the holiday/early-close authority.
     # If it cannot be read coherently, never infer an open session locally.
-    market_session_status = fetch_backend_market_session_status()
+    # One observation owns the session badge and streaming panel in this rerun.
+    live_status_snapshot = fetch_live_status_snapshot()
+    market_session_status = market_session_status_from_health(
+        live_status_snapshot.get("health")
+    )
     market_session_state = market_session_status["state"]
     if market_session_state == "open":
         st.info("Market Status: 🟢 OPEN")
@@ -1958,11 +1981,13 @@ with st.sidebar:
     else:
         st.warning("Market Status: 🟠 UNAVAILABLE (backend session authority not verified)")
 
-    # Create tabs for Live Streaming, Advisor, Frozen Gamma, and Debug Snapshot Viewer
-    streaming_tab, advisor_tab, frozen_gamma_tab, debug_snapshot_tab = st.tabs(["📡 Live Streaming", "🧠 Advisor", "🧊 Frozen Gamma (Audit)", "🔍 Debug Snapshot"])
+    # Streamlit tabs execute every body. Select one body so inactive panels do
+    # not issue backend/database reads on every interaction.
+    from app.services.market_view_navigation import select_market_view
+    market_view = select_market_view()
 
     # === FROZEN GAMMA TAB ===
-    with frozen_gamma_tab:
+    if market_view == "Frozen Gamma (Audit)":
         st.markdown("Read-only research view — Shows the last calculation-valid stored gamma state; current authority is not established.")
 
         # Check freeze status
@@ -2116,7 +2141,12 @@ with st.sidebar:
                     if not pin_history.empty:
                         with st.expander(f"📊 Intraday Pin History ({len(pin_history)} samples)", expanded=False):
                             # Display table (hide internal columns)
-                            display_cols = ['Time', 'Pin Strike', 'Spot Price', 'Distance', 'Pull Strength', 'Total GEX', 'Net GEX', 'Valid', 'Provenance']
+                            display_cols = [
+                                'Time', 'Pin Strike', 'Spot Price', 'Distance',
+                                'Pull Strength', 'Total GEX', 'Net GEX',
+                                'Producer Check', 'Validation Method',
+                                'Validation Policy', 'Provenance',
+                            ]
                             st.dataframe(pin_history[display_cols], hide_index=True, width='stretch')
 
                             # Export button for this symbol
@@ -2173,7 +2203,7 @@ with st.sidebar:
     # === LIVE STREAMING TAB ===
     # NOTE: WebSocket connections are managed by the FastAPI backend ONLY
     # Streamlit reads cached data via REST endpoints (no direct WebSocket creation)
-    with streaming_tab:
+    if market_view == "Live Streaming":
         st.info("📡 **Live data is streamed via the backend service**")
         st.caption("The FastAPI backend manages all WebSocket connections to prevent duplicate connections.")
 
@@ -2183,8 +2213,9 @@ with st.sidebar:
             "Automatic refresh is off. Values and eligibility reflect the last page "
             "update; use Refresh live status now to check the latest data."
         )
-        if st.button("Refresh live status now", type="secondary"):
-            st.rerun()
+        # A button click already reruns the script, including the shared status
+        # observation above. A second rerun would duplicate that network read.
+        st.button("Refresh live status now", type="secondary")
 
         if market_session_state == "closed":
             st.warning("ℹ️ Market closed - showing cached data from last session")
@@ -2192,10 +2223,9 @@ with st.sidebar:
             st.warning("Live session status is unavailable; current-only values remain withheld")
 
         # Show backend streaming status
-        render_backend_streaming_status()
+        render_backend_streaming_status(live_snapshot=live_status_snapshot)
         if st.session_state.data_provider == 'databento':
             render_opening_range_panel()
-        render_shadow_research_panel()
 
         def _render_sidebar_state_context(state: Any) -> None:
             observed = format_display_timestamp(
@@ -2514,7 +2544,6 @@ with st.sidebar:
                     )
             elif st.session_state.api_key and selected_indexes:
                 with st.spinner("Calculating gamma structure..."):
-                    from polygon import RESTClient
                     import numpy as np
                     from scipy.stats import norm
 
@@ -2633,8 +2662,11 @@ with st.sidebar:
             3. Streamlit polls the backend cache for latest values
             """)
 
+    if market_view == "Shadow Research":
+        render_shadow_research_panel(runtime_context=live_status_snapshot.get("pipeline") or {})
+
     # === DEBUG SNAPSHOT VIEWER TAB ===
-    with debug_snapshot_tab:
+    if market_view == "Debug Snapshot":
         st.markdown("**Raw Audit Snapshot Viewer** — Shows exact values from the latest audit JSON for debugging.")
         st.caption("When UI looks wrong, use this to prove whether backend stored wrong values or UI displayed wrong values.")
 
@@ -2775,7 +2807,7 @@ with st.sidebar:
             st.info("Select indexes in the sidebar to view debug snapshot data.")
 
     # === LIVE ADVISOR TAB ===
-    with advisor_tab:
+    if market_view == "Advisor":
         from app.services.advisor_view import render_advisor
         advisor_symbols = [INDEXES[idx] for idx in selected_indexes] if selected_indexes else ["SPX", "NDX", "VIX"]
         render_advisor(advisor_symbols)
@@ -2788,10 +2820,7 @@ with st.sidebar:
 
     # Backtesting section
     st.header("📊 Backtesting")
-    backtest_available = (
-        st.session_state.data_provider == 'polygon'
-        and bool(st.session_state.api_key.strip())
-    )
+    backtest_available = False
     run_backtest_btn = st.checkbox(
         "Enable Backtesting Mode",
         value=False,
@@ -2800,18 +2829,14 @@ with st.sidebar:
     )
     # A retained widget value must not enable a different provider's test.
     run_backtest_btn = backtest_available and run_backtest_btn
-    if st.session_state.data_provider == 'databento':
-        st.info(
-            "Historical backtesting is unavailable in this Databento dashboard. "
-            "The legacy test uses Polygon ETF prices and a different model; it "
-            "does not measure the live Databento predictions."
-        )
-        st.caption(
-            "Use Shadow Formula Research and Closing Tape evidence to review "
-            "retained research. Accuracy requires matched outcomes and validated replay."
-        )
-    elif not backtest_available:
-        st.info("Legacy backtesting requires a configured Polygon API key.")
+    st.info(
+        "Historical backtesting is unavailable in this Databento dashboard. "
+        "Retained legacy tests do not measure the live Databento predictions."
+    )
+    st.caption(
+        "Use Shadow Formula Research and Closing Tape evidence to review "
+        "retained research. Accuracy requires matched outcomes and validated replay."
+    )
 
     if run_backtest_btn:
         st.subheader("Backtest Configuration")
@@ -2855,8 +2880,10 @@ with st.sidebar:
 
 # Main content
 if st.session_state.data_provider == 'databento':
+    render_live_api_demo()
     render_forecast_research()
-    render_closing_tape_evidence()
+    render_indicator_panel()
+    render_closing_tape_evidence(runtime_context=live_status_snapshot.get("pipeline") or {})
 
 if st.session_state.data_provider == 'polygon' and not st.session_state.api_key:
     st.info("👈 Please enter your Polygon API key in the sidebar to get started, or switch Market Data Provider to Databento OPRA")
@@ -3080,6 +3107,7 @@ else:
             timeframe=st.session_state.timeframe,
             stale_after_seconds=float(os.environ.get("LIVE_DATA_STALE_AFTER_SECONDS", "30")),
             promoted_predictions=promoted_predictions,
+            indicator_loader=fetch_indicator_bars,
         )
         display_predictions = {
             index_name: predictions_by_symbol[INDEXES[index_name]]
@@ -3223,6 +3251,13 @@ else:
                         _render_sidebar_state_failure(state)
                         _render_sidebar_diagnostic_evidence(state)
                     st.error("End-of-day close estimate: Unavailable — ABSTAIN")
+                    from app.services.retained_forecasts import render_retained_forecasts
+                    render_retained_forecasts(
+                        {"symbol_status": {symbol: {"validation_failure_reasons":
+                            list(state.failure_reasons) or [state.reason]
+                            if state is not None else ["No current lifecycle state"]}}},
+                        symbols=(symbol,),
+                    )
                     parity_history = build_opra_parity_gamma_history(
                         _cached_local_snapshot_selection(
                             'exports',
@@ -3349,7 +3384,9 @@ else:
                 st.caption(f"Current: ${pred['current_price']:.2f}")
                 st.caption(_confidence_display(pred))
                 source_label = pred.get("source_label") or _prediction_source_label(pred)
-                if pred.get("is_fallback"):
+                if pred.get("provenance_warning"):
+                    st.warning(str(pred["provenance_warning"]))
+                elif pred.get("is_fallback"):
                     st.warning(f"{source_label}: not a live OPRA trade signal")
                 else:
                     st.caption(f"Source: {source_label}")
@@ -3366,6 +3403,8 @@ else:
 
                 if pred.get('confidence_calibrated') is not True:
                     st.caption("No empirical forecast-probability calibration is claimed.")
+
+                render_structural_regime(pred.get("structural_regime_prediction"))
 
                 # Display non-directional options-positioning structure if available.
                 if 'gex_data' in pred and pred['gex_data']:
@@ -3492,28 +3531,24 @@ else:
                 ]
                 if shadow_rows:
                     st.markdown("**Shadow expiration structure (exact dates)**")
+                    segment = expiration_view.get('future_expiration_capture_segment') or {}
+                    if segment.get('kind') == 'partial_session_future_expiration_context':
+                        st.caption(
+                            "Future-expiration quotes use a partial-session capture segment. "
+                            f"Request completed (UTC): {segment.get('request_completed_at_utc') or 'unconfirmed'}. "
+                            "Opening-range completeness and forecast eligibility are assessed separately."
+                        )
                     st.dataframe(
-                        pd.DataFrame(
-                            [
-                                {
-                                    'Scope': _expiration_scope_label(
-                                        row.get('expiration'), is_primary=False
-                                    ),
-                                    'Gamma Pin': _fmt_price(row.get('gamma_pin'), 0),
-                                    'Max Pain': _fmt_price(row.get('max_pain'), 0),
-                                    'Status': str(
-                                        row.get('validation_status') or 'unreported'
-                                    ).replace('_', ' '),
-                                }
-                                for row in shadow_rows
-                            ]
-                        ),
+                        pd.DataFrame(shadow_expiration_table_rows(expiration_view)),
                         hide_index=True,
                         width='stretch',
                     )
                     st.caption(
                         "SHADOW expirations are analytical comparisons only; they are not "
-                        "production close targets and do not imply direction."
+                        "production close targets and do not imply direction. Max pain can "
+                        "be available from stored open interest while live gamma is unavailable. "
+                        "The statistics cutoff is a provider query boundary, not the effective "
+                        "open-interest timestamp; that timestamp is not established here."
                     )
 
                 # Verified lifecycle/promoted close forecast remains a separate surface.
@@ -3547,15 +3582,17 @@ else:
                             if expected_value:
                                 st.markdown(f"**{bias_emoji} Expected Close:** ${expected_value:,.0f} ({float(drift):+.1f} pts drift)")
                         else:
-                            st.caption("Awaiting signals...")
-                    elif close_resp.status_code == 429:
-                        st.caption("⏳ Rate limited - signals pending...")
-                    elif close_resp.status_code == 503:
-                        st.caption("⏳ Computing signals...")
+                            st.caption("No additional close-forecast signals were published.")
                     else:
-                        st.caption("Close predictor unavailable")
+                        try:
+                            close_failure = close_resp.json()
+                        except ValueError:
+                            close_failure = None
+                        st.caption(close_overlay_unavailable_message(
+                            close_resp.status_code, close_failure
+                        ))
                 except requests.exceptions.Timeout:
-                    st.caption("⏳ Loading signals...")
+                    st.caption("Close forecast request timed out; refresh to recheck.")
                 except Exception as e:
                     st.caption(f"Close signals: {str(e)[:30]}...")
 
@@ -3608,8 +3645,12 @@ else:
                 with col3:
                     st.metric("Expected Change", f"{pred['change_pct']:.2f}%")
 
-                # AI Analysis
-                if enable_ai and latest_data is not None:
+                if st.session_state.data_provider == 'databento':
+                    render_observed_indicators(pred)
+
+                # The legacy combined AI/chart path requires matching price units.
+                # ETF context has its own labeled chart without an index target.
+                if st.session_state.data_provider != 'databento' and enable_ai and latest_data is not None:
                     with st.spinner("Getting AI analysis..."):
                         tech_indicators = {
                             'RSI': latest_data['RSI'],
@@ -3637,13 +3678,13 @@ else:
 
                         if ai_analysis:
                             st.info(f"🤖 **AI Analysis:** {ai_analysis}")
-                elif enable_ai:
+                elif st.session_state.data_provider != 'databento' and enable_ai:
                     st.info(
                         "AI technical-indicator analysis is disabled because no verified "
                         "observed intraday OHLCV bars are available."
                     )
 
-                if latest_data is not None:
+                if st.session_state.data_provider != 'databento' and latest_data is not None:
                     # Create and display a chart only from a verified observed frame.
                     fig = create_price_chart(indicator_frame, pred['predicted_price'], index_name)
                     st.plotly_chart(fig, width='stretch')
@@ -3670,7 +3711,7 @@ else:
                         st.metric("Momentum", f"{latest_data['Momentum']:.2f}")
                         mom_signal = "Positive" if latest_data['Momentum'] > 0 else "Negative"
                         st.caption(mom_signal)
-                else:
+                elif st.session_state.data_provider != 'databento':
                     indicator_reason = (
                         (pred.get('indicator_provenance') or {}).get('reason')
                         or 'Verified observed intraday OHLCV bars are unavailable.'
@@ -3784,12 +3825,19 @@ else:
                                 ),
                                 'Role': row.get('role') or 'Unreported',
                                 'Mode': row.get('mode') or 'Unreported',
-                                'Status': status_labels.get(
+                                'Gamma status': status_labels.get(
                                     str(row.get('validation_status')),
                                     str(row.get('validation_status') or 'Unreported'),
                                 ),
                                 'Gamma Pin': _fmt_price(row.get('gamma_pin'), 0),
-                                'Max Pain': _fmt_price(row.get('max_pain'), 0),
+                                'Max Pain (OI context)': _fmt_price(
+                                    row.get('max_pain') if row.get('max_pain') is not None
+                                    else (row.get('oi_max_pain_context') or {}).get('value'), 0
+                                ),
+                                'Max-pain source': (
+                                    (row.get('oi_max_pain_context') or {}).get('source')
+                                    or ('expiration profile' if row.get('max_pain') is not None else 'Unavailable')
+                                ),
                                 '1st Strike-Bucket Crossing': _fmt_price(
                                     row.get('first_strike_bucket_gex_sign_crossing'), 0
                                 ),
@@ -3838,8 +3886,9 @@ else:
                             for row in expiration_rows
                         ):
                             st.warning(
-                                "One or more subscribed expirations lack usable calculated evidence; "
-                                "unavailable fields were left as N/A."
+                                expiration_gamma_unavailable_message(
+                                    expiration_rows, live_status_snapshot
+                                )
                             )
                         malformed_entries = int(
                             expiration_view.get('invalid_profile_entries') or 0
@@ -3867,7 +3916,9 @@ else:
                             )
                         if provenance_parts:
                             st.caption("Universe provenance: " + " | ".join(provenance_parts))
-                        if provenance.get('is_fallback'):
+                        if provenance.get('warning'):
+                            st.warning(str(provenance['warning']))
+                        elif provenance.get('is_fallback'):
                             st.warning(
                                 "Universe provenance uses a fallback scaffold: "
                                 + str(provenance.get('reason') or 'reason unavailable')
@@ -3885,34 +3936,8 @@ else:
                         st.write("**Major Gamma Walls (Top Strike Levels):**")
 
                         # Format the gamma walls dataframe
-                        gamma_walls_display = normalize_gamma_walls(gex['gamma_walls'])
-
-                        if 'strike' in gamma_walls_display.columns:
-                            gamma_walls_display['strike'] = gamma_walls_display['strike'].apply(lambda x: f"${float(x):.0f}" if pd.notna(x) else "")
-                        if 'net_gex' in gamma_walls_display.columns:
-                            gamma_walls_display['net_gex'] = gamma_walls_display['net_gex'].apply(lambda x: _fmt_gex_units(x) if pd.notna(x) else "")
-                        if 'total_gex' in gamma_walls_display.columns:
-                            gamma_walls_display['total_gex'] = gamma_walls_display['total_gex'].apply(lambda x: _fmt_gex_units(x) if pd.notna(x) else "N/A")
-                        if 'days_to_expiry' in gamma_walls_display.columns:
-                            def _format_days(row):
-                                value = row.get('days_to_expiry')
-                                if not pd.notna(value):
-                                    return "N/A"
-                                label = f"{float(value):.0f} days"
-                                if pd.notna(row.get('expiration_count')) and float(row['expiration_count']) > 1:
-                                    label += " avg"
-                                return label
-                            gamma_walls_display['days_to_expiry'] = gamma_walls_display.apply(_format_days, axis=1)
-
-                        gamma_walls_display = gamma_walls_display.rename(columns={
-                            'strike': 'Strike Price',
-                            'net_gex': 'Net GEX',
-                            'total_gex': 'Total GEX',
-                            'days_to_expiry': 'Days to Expiry',
-                            'expiration_count': 'Expiries'
-                        })
-
-                        st.dataframe(gamma_walls_display.fillna('N/A'), width='stretch')
+                        gamma_walls_display = format_gamma_walls(gex['gamma_walls'], _fmt_gex_units)
+                        st.dataframe(gamma_walls_display, width='stretch')
                         st.caption("Side sums cover calculated contracts only. Missing or unverified zero sides are N/A; net values can represent partial coverage.")
 
                     # Create gamma exposure bar chart if we have strike-level data
@@ -4048,7 +4073,7 @@ else:
     backtest_model = locals().get('backtest_model', st.session_state.selected_model)
 
     if (
-        st.session_state.data_provider == 'polygon'
+        False
         and bool(st.session_state.api_key.strip())
         and run_backtest_btn
         and run_backtest_analysis
