@@ -16,6 +16,12 @@ from backend.workstation import workstation_state_store
 TEST_SUBSCRIPTION_EPOCH = "e" * 64
 
 
+@pytest.fixture(autouse=True)
+def offline_inference_device(monkeypatch):
+    """Provider contract tests must not initialize the workstation GPU."""
+    monkeypatch.setattr(health_router, "inference_device", lambda: "cpu")
+
+
 class _DummyStreamer:
     def __init__(
         self,
