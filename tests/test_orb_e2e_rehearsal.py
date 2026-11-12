@@ -582,6 +582,23 @@ def test_post_persist_cross_bucket_decision_is_retained_but_excluded_end_to_end(
     persistent_orb_journal,
     monkeypatch,
 ):
+    # This fixture advances virtual UTC across the bucket to test immutable
+    # rejection semantics. Do not also turn it into a workstation disk-latency
+    # benchmark: keep each DB budget's elapsed clock frozen while preserving
+    # its cancellation callback, including the virtual bucket/deadline checks.
+    # test_orb_persistence_budget exercises real elapsed deadlines, busy writes,
+    # cancellation and the production 250 ms negative-finalization limit.
+    real_budget = database.OrbPersistenceBudget
+
+    class SimulatedPersistenceBudget(real_budget):
+        def __init__(self, *args, **kwargs):
+            self.admitted_monotonic = time.monotonic()
+            super().__init__(*args, **kwargs)
+
+        def remaining(self):
+            return max(0.0, self.deadline_monotonic - self.admitted_monotonic)
+
+    monkeypatch.setattr(database, "OrbPersistenceBudget", SimulatedPersistenceBudget)
     journal, clock, temp_engine = persistent_orb_journal
     streamer = _build_streamer(monkeypatch, epoch="4" * 64)
     streamer.is_running = True
