@@ -20,6 +20,9 @@ TEST_SUBSCRIPTION_EPOCH = "e" * 64
 def offline_inference_device(monkeypatch):
     """Provider contract tests must not initialize the workstation GPU."""
     monkeypatch.setattr(health_router, "inference_device", lambda: "cpu")
+    monkeypatch.setattr(health_router, "runtime_control_health", lambda: {
+        "sleep_prevention": {}, "cuda_shadow_inference": {"enabled": False},
+    })
 
 
 class _DummyStreamer:
