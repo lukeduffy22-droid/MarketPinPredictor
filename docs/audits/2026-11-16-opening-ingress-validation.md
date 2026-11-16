@@ -143,7 +143,9 @@ Python 3.12.14, Databento 0.86.0 / DBN 0.69.0, NumPy 1.26.4, pandas 2.3.3,
 SciPy 1.16.3, SQLAlchemy 2.0.44 and pytest 9.0.2. The SDK and listed numerical
 dependency versions match the applicable lock entries. The new GitHub job also
 checks the focused diagnostics on Python 3.11; its remote result must be read
-separately. No repository dependency pins were changed.
+separately. Application dependency manifests were unchanged; the dedicated CI
+job pins its test dependencies to the compatible lock versions, including
+PyArrow 21.0.0.
 
 The final test stdout SHA256 is
 `b7b4c0b14ede6cfb3c3b16601cae9b1573d7d4ecf59c941b5c8f2e9569eb9d5b`.
@@ -185,6 +187,13 @@ existing NDX SQLite 250 ms persistence-budget fixture. Its unchanged 47-test
 persistence/lifecycle set passed on rerun, followed by the full combined pass.
 No persistence timeout, acceptance predicate, or inherited test was relaxed.
 Two existing dependency deprecation warnings remain in the final run.
+
+The first remote workflow, run `43951052324`, passed publication-boundary and
+offline-contract-tests, while the new opening-ingress job failed during
+collection: its unpinned PyArrow resolver selected version 26.0.1, which requires
+NumPy 2 despite the project's NumPy 1.26.4 policy. The dedicated test job now
+pins the compatible lock versions used locally. No admission logic, threshold,
+or regression assertion changed to address that environment failure.
 
 New regressions cover missing receive timestamps through the actual reader,
 all timing exclusion reasons, 49/50 samples, unsafe negative lag, immutable

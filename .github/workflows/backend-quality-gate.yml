@@ -25,7 +25,9 @@ jobs:
 
       - name: Install opening diagnostic test dependencies
         run: |
-          python -m pip install pytest 'databento==0.86.0' 'numpy<2' 'pandas<3' scipy sqlalchemy python-dotenv
+          python -m pip install 'pytest==9.0.2' 'databento==0.86.0' 'databento-dbn==0.69.0' \
+            'numpy==1.26.4' 'pandas==2.3.3' 'pyarrow==21.0.0' \
+            'scipy==1.16.3' 'sqlalchemy==2.0.44' python-dotenv
 
       - name: Verify startup, timing admission and retained evidence boundaries
         env:
