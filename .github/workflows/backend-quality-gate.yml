@@ -12,6 +12,34 @@ permissions:
   contents: read
 
 jobs:
+  opening-ingress-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install opening diagnostic test dependencies
+        run: |
+          python -m pip install pytest 'databento==0.86.0' 'numpy<2' 'pandas<3' scipy sqlalchemy python-dotenv
+
+      - name: Verify startup, timing admission and retained evidence boundaries
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: .
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_databento_iterator_startup.py \
+            tests/test_opening_queue_startup_diagnostics.py \
+            tests/test_opening_timing_admission_diagnostics.py \
+            tests/test_opening_ingress_report.py \
+            tests/test_opening_readiness_timeline.py \
+            tests/test_opening_timeline_identity.py
+
   publication-boundary:
     runs-on: ubuntu-latest
     steps:
