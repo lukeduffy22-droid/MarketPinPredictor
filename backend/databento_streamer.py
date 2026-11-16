@@ -372,15 +372,33 @@ def _install_pre_auth_transport_guard(
     return True
 
 
-def _start_live_iterator(live_client: object):
+def _start_live_iterator(live_client: object, *, on_diagnostic=None):
     """Arm the SDK consumer before start can deliver the first record batch.
 
     The installed SDK starts its session before enabling the iteration queue.
     A receive-thread turn inside start can otherwise discard initial mappings,
     replay completion, and quotes. Only a new, known SDK queue is owned here;
     iteration and transport shutdown remain the caller's existing lifecycle.
+    Diagnostics describe observed startup ordering, never provider availability.
     """
+    def observed(stage, **fields):
+        if on_diagnostic is None:
+            return
+        try:
+            on_diagnostic({
+                "stage": stage,
+                "authority": "DIAGNOSTIC_ONLY",
+                "startup_observed_at_ns": time.time_ns(),
+                "startup_observed_monotonic_ns": time.monotonic_ns(),
+                **fields,
+            })
+        except Exception:
+            # Optional instrumentation cannot turn successful SDK startup into
+            # a failure, nor obscure the original transport/contract exception.
+            pass
+
     if not isinstance(live_client, _DATABENTO_SDK_LIVE_CLASS):
+        observed("not_applicable_non_sdk_client", queue_contract_supported=False)
         return iter(live_client)
 
     from databento.live.session import DBNQueue
@@ -396,32 +414,60 @@ def _start_live_iterator(live_client: object):
             for method in ("enable", "disable", "is_enabled")
         )
     ):
+        observed("queue_contract_unavailable", queue_contract_supported=False,
+                 owned_queue=False)
         raise RuntimeError("DATABENTO_ITERATOR_QUEUE_CONTRACT_UNAVAILABLE")
-    if is_streaming() is not False or queue.is_enabled() is not False:
+    streaming_before = is_streaming()
+    # Preserve the original short circuit: do not query or alter a queue
+    # belonging to a session already reported as streaming.
+    enabled_before = queue.is_enabled() if streaming_before is False else None
+    if streaming_before is not False or enabled_before is not False:
+        observed("queue_ownership_rejected", queue_contract_supported=True,
+                 owned_queue=False,
+                 is_streaming=streaming_before if type(streaming_before) is bool else None,
+                 queue_enabled=enabled_before if type(enabled_before) is bool else None)
         # An existing consumer's queue is not ours to alter or disable.
         raise RuntimeError("DATABENTO_ITERATOR_QUEUE_ALREADY_IN_USE")
+    observed("queue_ownership_established", queue_contract_supported=True,
+             owned_queue=True, is_streaming=False, queue_enabled=False)
 
+    stage = "queue_enable"
     try:
         queue.enable()
-        if queue.is_enabled() is not True:
+        enabled_after = queue.is_enabled()
+        observed("queue_enable_returned", owned_queue=True,
+                 queue_enabled=enabled_after if type(enabled_after) is bool else None)
+        if enabled_after is not True:
             raise RuntimeError("DATABENTO_ITERATOR_QUEUE_ENABLE_FAILED")
+        stage = "iterator_start"
+        observed("queue_enabled_before_iterator_start", owned_queue=True,
+                 queue_enabled=True)
         iterator = iter(live_client)
+        observed("iterator_start_returned", owned_queue=True)
+        stage = "iterator_ownership_check"
         if (
             getattr(iterator, "_dbn_queue", None) is not queue
             or getattr(iterator, "client", None) is not live_client
         ):
             raise RuntimeError("DATABENTO_ITERATOR_QUEUE_OWNERSHIP_CHANGED")
+        observed("iterator_ownership_verified", owned_queue=True)
         return iterator
-    except BaseException:
+    except BaseException as error:
+        observed("startup_failed", owned_queue=True, failed_stage=stage,
+                 error_type=type(error).__name__)
         # Ownership was established while this queue was disabled. A partial
         # enable or failed start must not leave an unconsumed enabled queue.
         try:
             queue.disable()
         except Exception as exc:
+            observed("queue_cleanup_failed", owned_queue=True,
+                     error_type=type(exc).__name__)
             logger.warning(
                 "Databento iterator queue cleanup failed error_type=%s",
                 type(exc).__name__,
             )
+        else:
+            observed("queue_disable_returned_after_failure", owned_queue=True)
         raise
 
 
@@ -2409,33 +2455,54 @@ class DatabentoGammaStreamer:
         A rejected option price remains rejected. Duplicate intervals and replay
         cannot manufacture clock readiness; negative lag is retained as evidence.
         """
+        diagnostic_epoch = getattr(self, "subscription_epoch_id", None)
         recv = _record_timestamp_ns(record, "ts_recv")
         if recv is None:
+            self._observe_clock_admission(record, generation, processed_at_ns, "MISSING_TS_RECV", expected_epoch_id=diagnostic_epoch)
             return False
         if self.schema in CBBO_SCHEMAS:
             expected_rtype = CBBO_RTYPES[self.schema]
-            if getattr(record, "rtype", None) != expected_rtype or recv % CBBO_SCHEMAS[self.schema]:
+            if getattr(record, "rtype", None) != expected_rtype:
+                self._observe_clock_admission(record, generation, processed_at_ns, "CBBO_RTYPE_MISMATCH", expected_epoch_id=diagnostic_epoch)
+                return False
+            if recv % CBBO_SCHEMAS[self.schema]:
+                self._observe_clock_admission(record, generation, processed_at_ns, "CBBO_INTERVAL_UNALIGNED", expected_epoch_id=diagnostic_epoch)
                 return False
         lag = (processed_at_ns - recv) / 1_000_000_000
         if lag > QUOTE_FRESHNESS_SECONDS:
+            self._observe_clock_admission(record, generation, processed_at_ns, "STALE_RECEIVE_LAG", expected_epoch_id=diagnostic_epoch)
             return False
         key = (generation, getattr(record, "instrument_id", None), recv,
                getattr(record, "sequence", None))
         if key[1] is None:
+            self._observe_clock_admission(record, generation, processed_at_ns, "MISSING_INSTRUMENT_ID", expected_epoch_id=diagnostic_epoch)
             return False
         with self._clock_evidence_lock:
-            if generation != self._active_generation or self._clock_replay_pending:
-                return False
-            if key in self._clock_record_keys:
-                return False
-            self._clock_record_keys[key] = None
-            if len(self._clock_record_keys) > CLOCK_SYNC_WINDOW_RECORDS:
-                self._clock_record_keys.pop(next(iter(self._clock_record_keys)))
-            self._receive_lag_window.append(lag)
+            if generation != self._active_generation:
+                reason = "GENERATION_MISMATCH"
+            elif self._clock_replay_pending:
+                reason = "REPLAY_PENDING"
+            elif key in self._clock_record_keys:
+                reason = "DUPLICATE_RECORD"
+            else:
+                reason = "ADMITTED"
+                self._clock_record_keys[key] = None
+                if len(self._clock_record_keys) > CLOCK_SYNC_WINDOW_RECORDS:
+                    self._clock_record_keys.pop(next(iter(self._clock_record_keys)))
+                self._receive_lag_window.append(lag)
             observed_sample_count = len(self._receive_lag_window)
-            reached_sample_threshold = observed_sample_count == CLOCK_SYNC_MIN_SAMPLES
+            reached_sample_threshold = reason == "ADMITTED" and observed_sample_count == CLOCK_SYNC_MIN_SAMPLES
+        # Observe outside the clock lock. Instrumentation never participates in
+        # timing authority, and a retired reader cannot populate a new window.
+        self._observe_clock_admission(
+            record, generation, processed_at_ns, reason, sample_count=observed_sample_count,
+            expected_epoch_id=diagnostic_epoch,
+        )
+        if reason != "ADMITTED":
+            return False
         if observed_sample_count in (1, CLOCK_SYNC_MIN_SAMPLES):
-            self._opening_timeline_note("provider_timing_count", details={
+            self._opening_timeline_note("provider_timing_count",
+                expected_epoch_id=diagnostic_epoch, expected_generation=generation, details={
                 "stage": str(observed_sample_count), "sample_count": observed_sample_count,
                 "minimum_samples": CLOCK_SYNC_MIN_SAMPLES, "scope": "shared_current_generation",
             })
@@ -2444,6 +2511,31 @@ class DatabentoGammaStreamer:
             # handoff, complete pairs and persistence still pass their own gates.
             self._signal_orb_reference_readiness()
         return True
+
+    def _observe_clock_admission(self, record, generation, processed_at_ns, reason, *,
+                                 sample_count=None, expected_epoch_id=None):
+        """Bounded diagnostic evidence; exceptions cannot change clock admission."""
+        observer = getattr(self, "_opening_timeline", None)
+        if observer is None:
+            return
+        try:
+            if (observer.generation != int(self._active_generation)
+                    or observer.epoch_id != str(self.subscription_epoch_id)):
+                return
+            if expected_epoch_id is not None and observer.epoch_id != str(expected_epoch_id):
+                return
+            if reason != "GENERATION_MISMATCH" and observer.generation != int(generation):
+                # Admission may finish just before a reconnect publishes its
+                # replacement observer. Never attach that old result to it.
+                return
+            observer.timing_admission(
+                record, reason=reason, record_generation=generation,
+                sample_count=sample_count, minimum_samples=CLOCK_SYNC_MIN_SAMPLES,
+                reader_processed_at_ns=processed_at_ns,
+                observed_at_ns=time.time_ns(), observed_monotonic_ns=time.monotonic_ns(),
+            )
+        except Exception as exc:
+            self._opening_timeline_error = type(exc).__name__
 
     def _signal_orb_reference_readiness(self) -> None:
         wakeup = getattr(self, "_orb_reference_wakeup_event", None)
@@ -9812,7 +9904,15 @@ class DatabentoGammaStreamer:
                 # Databento's destructor terminates immediately and removes the
                 # protocol state needed by block_for_close().
                 self._begin_opening_timeline(live_client, next_generation)
-                live_iterator = _start_live_iterator(live_client)
+                startup_epoch = self.subscription_epoch_id
+                live_iterator = _start_live_iterator(
+                    live_client,
+                    on_diagnostic=lambda fields: self._opening_timeline_note(
+                        "sdk_iterator_startup", details=fields,
+                        expected_epoch_id=startup_epoch,
+                        expected_generation=next_generation,
+                    ),
+                )
                 for record in live_iterator:
                     if not self.is_running:
                         break
@@ -9877,8 +9977,10 @@ class DatabentoGammaStreamer:
                         )
                         if receive_lag is not None and receive_lag < 0:
                             self.negative_receive_lag_records += 1
+                        # Missing timestamps must also receive a diagnostic
+                        # exclusion reason; the timing gate still rejects them.
+                        self._record_processing_clock_sample(record, processed_at_ns=processed_at_ns, generation=next_generation)
                         if receive_lag is not None:
-                            self._record_processing_clock_sample(record, processed_at_ns=processed_at_ns, generation=next_generation)
                             if receive_lag < -CLOCK_SYNC_NEGATIVE_TOLERANCE_SECONDS:
                                 self.material_negative_receive_lag_records += 1
                         self.last_receive_to_process_lag_seconds = receive_lag

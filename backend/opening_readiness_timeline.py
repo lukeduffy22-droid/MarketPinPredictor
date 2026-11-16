@@ -13,6 +13,11 @@ import time
 
 SCHEMA = "marketpin-opening-readiness-timeline.v1"
 UNKNOWN_UPSTREAM = "UNKNOWN: socket arrival, decode start and earlier SDK handling are not observed"
+TIMING_ADMISSION_REASONS = frozenset({
+    "ADMITTED", "MISSING_TS_RECV", "CBBO_RTYPE_MISMATCH", "CBBO_INTERVAL_UNALIGNED",
+    "STALE_RECEIVE_LAG", "MISSING_INSTRUMENT_ID", "GENERATION_MISMATCH",
+    "REPLAY_PENDING", "DUPLICATE_RECORD",
+})
 
 
 def _integer(value):
@@ -249,6 +254,9 @@ class OpeningReadinessTimeline:
         self._observer_overflow = 0
         self._callback_errors = 0
         self._critical_latest = {}
+        # Fixed phase/family/reason dimensions; these count observations rather
+        # than coalesced event emissions or distinct provider records.
+        self._timing_admission_counts = Counter()
 
     def _phase(self, stamp):
         if stamp < self.open_ns - self.preopen_ns or stamp >= self.open_ns + self.postopen_ns:
@@ -264,6 +272,8 @@ class OpeningReadinessTimeline:
             return "SPX"
         if root in {"NDX", "NDXP"}:
             return "NDX"
+        if root in {"VIX", "VIXW", "RUT", "RUTW"}:
+            return "VIX" if root.startswith("VIX") else "RUT"
         return "OTHER" if root else "UNKNOWN"
 
     @staticmethod
@@ -543,8 +553,10 @@ class OpeningReadinessTimeline:
 
             def first_record_evidence():
                 values = dict(info)
-                values["bid_px_raw"] = int(getattr(record, "bid_px_00", 0))
-                values["ask_px_raw"] = int(getattr(record, "ask_px_00", 0))
+                # Invalid/missing prices are precisely the records for which a
+                # rejection observation is needed. Never lose it to int(None).
+                values["bid_px_raw"] = _integer(getattr(record, "bid_px_00", None))
+                values["ask_px_raw"] = _integer(getattr(record, "ask_px_00", None))
                 values["quote_price_units"] = "provider fixed-point 1e-9"
                 try:
                     values["raw_record_base64"] = base64.b64encode(bytes(record)).decode("ascii")
@@ -576,6 +588,42 @@ class OpeningReadinessTimeline:
             "qualified_quote_inputs", family=family, observed_at_ns=observed_at_ns,
             observed_monotonic_ns=observed_monotonic_ns, details=fields,
         )
+
+    def timing_admission(self, record, *, reason, record_generation, sample_count,
+                         minimum_samples, reader_processed_at_ns=None,
+                         observed_at_ns=None, observed_monotonic_ns=None):
+        """Observe timing-window inclusion independently of price/cache admission.
+
+        An admitted negative-lag sample can still make the clock unsafe. These
+        counters never establish synchronization or opening capture eligibility.
+        """
+        if reason not in TIMING_ADMISSION_REASONS:
+            raise ValueError("UNKNOWN_TIMING_ADMISSION_REASON")
+        wall, mono = self._stamp(observed_at_ns, observed_monotonic_ns)
+        with self._lock:
+            phase = self._phase(wall)
+            if self._retired or phase is None:
+                return
+            iid = _integer(getattr(record, "instrument_id", None))
+            family = self._mappings.get(iid, ("UNKNOWN",))[0]
+            # Do not rewrite UNKNOWN observations when a later mapping arrives.
+            if family not in {"SPX", "NDX", "VIX", "RUT", "OTHER", "UNKNOWN"}:
+                family = "OTHER"
+            self._timing_admission_counts[(phase, family, reason)] += 1
+            details = {
+                "reason": reason, "admitted": reason == "ADMITTED",
+                "record_generation": int(record_generation),
+                "sample_count": sample_count, "minimum_samples": minimum_samples,
+                "scope": "shared_timing_window_inclusion_only",
+                "semantics": "first outcome per family/reason/phase; not a complete record trace",
+            }
+            # Event deduplication bounds writes independently from the exact
+            # observation counters. Normal capacity preserves reserved capture
+            # control events; saturation remains explicit in writer/observer status.
+            return self._emit("provider_timing_admission", family, wall, mono,
+                              record=lambda: {**self._record(record),
+                                              "reader_processed_at_ns": reader_processed_at_ns},
+                              details=details, critical=False)
 
     def milestone(self, kind, *, family=None, observed_at_ns=None,
                   observed_monotonic_ns=None, details=None, allow_after_retirement=False):
@@ -614,6 +662,16 @@ class OpeningReadinessTimeline:
                 "observer_overflow": self._observer_overflow, "callback_errors": self._callback_errors,
                 "critical_latest": list(self._critical_latest.values()),
                 "upstream_timing": UNKNOWN_UPSTREAM,
+                "timing_admission_counts": [
+                    {"phase": phase, "family_at_observation": family,
+                     "reason": reason, "observation_count": count}
+                    for (phase, family, reason), count in sorted(self._timing_admission_counts.items())
+                ],
+                "timing_admission_count_semantics": (
+                    "DIAGNOSTIC_OBSERVATIONS_NOT_DISTINCT_RECORDS_OR_SYNCHRONIZATION; "
+                    "generation-owned phase/family/reason counts; UNKNOWN attribution is immutable; "
+                    "snapshot counts are not independently fsync acknowledged"
+                ),
             }
             critical_rows = list(self._critical_latest.values())
         writer_status = self.writer.status()
