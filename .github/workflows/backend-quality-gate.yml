@@ -75,7 +75,7 @@ jobs:
       - name: Install lightweight test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest fastapi pydantic sqlalchemy websockets numpy pandas requests python-dotenv databento httpx streamlit
+          python -m pip install pytest fastapi pydantic sqlalchemy websockets numpy pandas requests python-dotenv databento httpx streamlit scipy
 
       - name: Compile source entrypoints
         run: |
@@ -104,3 +104,19 @@ jobs:
             tests/test_monitor_scan_collector.py::test_collector_commit_reload_collector_uses_real_receipt \
             tests/test_databento_symbol_catalog.py \
             tests/test_inspect_opening_capture.py::test_mini_contracts_cannot_prove_rut_subscription_via_legacy_summary
+
+  windows-launch-proof:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify mocked Russell launch and recovery gates
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = [version]'3.4.0'
+          if (-not (Get-Module -ListAvailable Pester | Where-Object Version -eq $version)) {
+              Install-Module Pester -RequiredVersion $version -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          Import-Module Pester -RequiredVersion $version -Force
+          $result = Invoke-Pester -Script .\tests\market_app_fallback_recovery.Tests.ps1 -PassThru
+          if ($result.TotalCount -eq 0 -or $result.FailedCount -gt 0) { exit 1 }
