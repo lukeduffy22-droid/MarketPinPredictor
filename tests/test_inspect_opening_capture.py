@@ -1753,6 +1753,20 @@ def test_opening_evaluator_accepts_raw_option_root_aliases_without_family_summar
     assert warnings == []
 
 
+def test_mini_contracts_cannot_prove_rut_subscription_via_legacy_summary():
+    health = _health()
+    roots = health["payload"]["root_contract_counts"]
+    roots["MRUT"] = roots.pop("RUTW")
+    _state, issues, _warnings = evaluate(
+        now_ct=datetime(2026, 9, 4, 8, 20, tzinfo=CT),
+        clock={"applicable": True, "synchronized": True},
+        health=health, live={"ok": True, "payload": {}}, dashboard={"ok": True},
+        orb={"ok": True, "payload": {"configured_symbols": ["SPX", "NDX", "VIX", "RUT"], "symbols": {}}},
+        database=_database(), scheduled_tasks=_tasks(),
+    )
+    assert "SUBSCRIPTION_ROOT_MISSING:RUT" in issues
+
+
 def test_opening_evaluator_requires_rut_before_upgrade_cutoff():
     health = _health()
     health["payload"]["symbols_requested"] = ["SPX", "NDX", "VIX"]

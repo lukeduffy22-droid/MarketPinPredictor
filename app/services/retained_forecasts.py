@@ -11,6 +11,7 @@ import sqlite3
 import time
 from zoneinfo import ZoneInfo
 
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
 from backend.database_target import configured_market_database_path
 from backend.workstation import payload_has_fallback_provenance
 
@@ -73,7 +74,7 @@ def read_retained_forecasts(
 
 
 def render_retained_forecasts(
-    pipeline: dict | None = None, *, symbols: tuple = ("SPX", "NDX"),
+    pipeline: dict | None = None, *, symbols: tuple = EQUITY_INDEX_FORECAST_SYMBOLS,
     database_path: Path | None = None, now: datetime | None = None,
 ) -> None:
     """Show retained research estimates without changing any live forecast."""

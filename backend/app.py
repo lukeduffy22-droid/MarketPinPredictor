@@ -20,6 +20,7 @@ from backend.api.routers.closing_tape import (
 )
 from backend.api.routers.gex import router as gex_router
 from backend.api.routers.health import router as health_router
+from backend.api.routers.market_events import market_event_lifespan, router as market_events_router
 from backend.api.routers.orb import router as orb_router
 from backend.api.routers.predict import router as predict_router
 from backend.api.routers.passports import router as passports_router
@@ -58,7 +59,8 @@ async def lifespan(application: FastAPI):
             name="closing-tape-readiness-maintenance",
         )
         try:
-            yield
+            async with market_event_lifespan(application):
+                yield
         finally:
             readiness_maintenance.cancel()
             with suppress(asyncio.CancelledError):
@@ -91,6 +93,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(gex_router)
 app.include_router(orb_router)
+app.include_router(market_events_router)
 app.include_router(predict_router)
 app.include_router(admin_router)
 app.include_router(closing_tape_router)

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
 from backend.monitor_cadence import (
     MonitorCadenceError,
     apply_cadence_decision,
@@ -49,7 +50,7 @@ SCAN_WRAPPER_SCHEMA = 2
 
 _CHICAGO = ZoneInfo("America/Chicago")
 _UTC = ZoneInfo("UTC")
-_MONITORED_SYMBOLS = ("SPX", "NDX")
+_REQUIRED_SYMBOLS = ("SPX", "NDX")
 _POLICY_EVENT_TYPES = {
     "MAX_PAIN_CHANGE",
     "MAX_PAIN_PROVENANCE_RESET",
@@ -657,7 +658,7 @@ def with_policy_input_hashes(
     symbols = prepared.get("symbols")
     if not isinstance(symbols, Mapping) or not isinstance(policy_inputs, Mapping):
         return prepared
-    for symbol in _MONITORED_SYMBOLS:
+    for symbol in EQUITY_INDEX_FORECAST_SYMBOLS:
         symbol_payload = symbols.get(symbol)
         policy_payload = policy_inputs.get(symbol)
         if (
@@ -864,7 +865,7 @@ def validate_scan_wrapper(scan: Mapping[str, Any]) -> dict[str, Any]:
         normalized["observed_at_utc"], "observed_at_utc"
     )
     scan_session_date = str(normalized["session_date"])
-    for symbol in _MONITORED_SYMBOLS:
+    for symbol in _REQUIRED_SYMBOLS:
         if symbol not in normalized["symbols"]:
             raise MonitorScanLedgerError(f"symbols.{symbol}_required")
     eligible_monitored_symbols: list[str] = []
@@ -912,7 +913,9 @@ def validate_scan_wrapper(scan: Mapping[str, Any]) -> dict[str, Any]:
             raise MonitorScanLedgerError(
                 f"symbols.{raw_symbol}.confirmation_history_seed_candidate_required"
             )
-        if raw_symbol in _MONITORED_SYMBOLS and raw_payload["eligible"] is True:
+        if raw_symbol in EQUITY_INDEX_FORECAST_SYMBOLS and raw_payload["eligible"] is True:
+            if raw_payload.get("context_only") is True:
+                raise MonitorScanLedgerError(f"symbols.{raw_symbol}.context_only_cannot_be_eligible")
             eligible_monitored_symbols.append(raw_symbol)
             policy_observation = raw_payload.get("policy_observation")
             if not isinstance(policy_observation, Mapping):
@@ -974,7 +977,7 @@ def _validate_helper_event(event: Mapping[str, Any]) -> None:
         raise MonitorScanLedgerError("helper_event_id_must_be_canonical_sha256")
     if event.get("type") not in _POLICY_EVENT_TYPES:
         raise MonitorScanLedgerError("helper_event_type_invalid")
-    if event.get("symbol") not in _MONITORED_SYMBOLS:
+    if event.get("symbol") not in EQUITY_INDEX_FORECAST_SYMBOLS:
         raise MonitorScanLedgerError("helper_event_symbol_invalid")
     if event.get("event_identity_schema") != "marketpin-monitor-event.v3":
         raise MonitorScanLedgerError("helper_event_identity_schema_invalid")
@@ -1338,7 +1341,7 @@ def _journal_index(
 ) -> tuple[dict[str, Mapping[str, Any]], dict[str, list[dict[str, Any]]]]:
     by_id: dict[str, Mapping[str, Any]] = {}
     positions: dict[str, int] = {}
-    receipts = {symbol: [] for symbol in _MONITORED_SYMBOLS}
+    receipts = {symbol: [] for symbol in _REQUIRED_SYMBOLS}
     policy_wrappers: list[Mapping[str, Any]] = []
     commit_receipts: list[Mapping[str, Any]] = []
     notification_acks: list[Mapping[str, Any]] = []
@@ -1365,7 +1368,7 @@ def _journal_index(
         if helper_event is not None or policy_shaped:
             wrapper = _validate_alert_wrapper(record)
             policy_wrappers.append(wrapper)
-            receipts[wrapper["helper_event"]["symbol"]].append(
+            receipts.setdefault(wrapper["helper_event"]["symbol"], []).append(
                 wrapper["helper_event"]
             )
         elif (
@@ -2306,7 +2309,7 @@ def _confirmation_contract_active(
                 "candidate_policy_observation" in symbols[symbol]
                 or "prior_confirmation_scan_event_id" in symbols[symbol]
             )
-            for symbol in _MONITORED_SYMBOLS
+            for symbol in EQUITY_INDEX_FORECAST_SYMBOLS
         ):
             return True
     return False
@@ -2331,7 +2334,7 @@ def _validate_confirmation_history_contract(
     symbols = scan["symbols"]
     eligible_symbols = {
         symbol
-        for symbol in _MONITORED_SYMBOLS
+        for symbol in EQUITY_INDEX_FORECAST_SYMBOLS
         if isinstance(symbols.get(symbol), Mapping)
         and symbols[symbol].get("eligible") is True
     }
@@ -2344,9 +2347,10 @@ def _validate_confirmation_history_contract(
 
     contexts: dict[str, dict[str, Any]] = {}
     cadence_mode = str(scan["cadence"]["mode"])
-    for symbol in _MONITORED_SYMBOLS:
-        symbol_payload = symbols[symbol]
-        assert isinstance(symbol_payload, Mapping)
+    for symbol in EQUITY_INDEX_FORECAST_SYMBOLS:
+        symbol_payload = symbols.get(symbol)
+        if symbol_payload is None or symbol_payload.get("context_only") is True:
+            continue
         current_candidate = _scan_candidate(scan, symbol)
         prior_candidate = _scan_candidate(prior_scan, symbol)
         ready, reason, gap_seconds = _confirmation_candidate_pair_status(
@@ -2624,7 +2628,7 @@ def commit_monitor_scan(
             ):
                 raise MonitorScanLedgerError("scan_cadence_state_mode_mismatch")
 
-            for symbol in _MONITORED_SYMBOLS:
+            for symbol in EQUITY_INDEX_FORECAST_SYMBOLS:
                 raw_symbol_payload = normalized_scan["symbols"].get(symbol)
                 if (
                     isinstance(raw_symbol_payload, Mapping)
@@ -2846,7 +2850,7 @@ def commit_monitor_scan(
             generated_events: list[dict[str, Any]] = []
             recovered_ids: set[str] = set()
 
-            for symbol in _MONITORED_SYMBOLS:
+            for symbol in EQUITY_INDEX_FORECAST_SYMBOLS:
                 raw_symbol_payload = normalized_scan["symbols"].get(symbol)
                 eligible = bool(
                     isinstance(raw_symbol_payload, Mapping)
@@ -3182,8 +3186,9 @@ def commit_monitor_scan(
 
             result["diagnostic_symbols_retained"] = [
                 symbol
-                for symbol in _MONITORED_SYMBOLS
+                for symbol in EQUITY_INDEX_FORECAST_SYMBOLS
                 if isinstance(normalized_scan["symbols"].get(symbol), Mapping)
+                and normalized_scan["symbols"][symbol].get("context_only") is not True
                 and normalized_scan["symbols"][symbol].get("eligible") is not True
             ]
 

@@ -439,20 +439,23 @@ function Test-MarketAppCurrentDayUniversePreparationProof {
                     return $false
                 }
             }
-            elseif ($symbol -in @('SPX', 'NDX', 'RUT')) {
+            elseif ($symbol -ceq 'RUT' -and $primaryExpiration -gt $expectedDate) {
                 if (
-                    $primaryExpiration -lt $expectedDate -or
-                    [string]$market.primary_expiration_authority -cne 'primary_expiration' -or
-                    $market.primary_expiration_context_only -ne $false -or
-                    [string]$market.primary_expiration_selection_basis -cne 'earliest_live_eligible_expiration'
+                    [string]$market.primary_expiration_authority -cne 'rut_same_day_pm_expiration_unavailable' -or
+                    $market.primary_expiration_context_only -ne $true -or
+                    $market.primary_expiration_same_day_authority -ne $false -or
+                    [string]$market.primary_expiration_selection_basis -cne 'same_day_pm_series_required_for_close'
                 ) {
                     return $false
                 }
+            }
+            elseif ($symbol -in @('SPX', 'NDX', 'RUT')) {
                 if (
-                    $symbol -in @('SPX', 'NDX') -and (
-                        $primaryExpiration -ne $expectedDate -or
-                        $market.primary_expiration_same_day_authority -ne $true
-                    )
+                    $primaryExpiration -ne $expectedDate -or
+                    [string]$market.primary_expiration_authority -cne 'primary_expiration' -or
+                    $market.primary_expiration_context_only -ne $false -or
+                    $market.primary_expiration_same_day_authority -ne $true -or
+                    [string]$market.primary_expiration_selection_basis -cne 'earliest_live_eligible_expiration'
                 ) {
                     return $false
                 }

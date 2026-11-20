@@ -75,7 +75,7 @@ jobs:
       - name: Install lightweight test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest fastapi pydantic sqlalchemy websockets numpy pandas requests python-dotenv databento
+          python -m pip install pytest fastapi pydantic sqlalchemy websockets numpy pandas requests python-dotenv databento httpx streamlit
 
       - name: Compile source entrypoints
         run: |
@@ -92,4 +92,15 @@ jobs:
             tests/test_streamer_provider_selection.py \
             tests/test_closing_tape_readiness.py \
             tests/test_prediction_authority.py \
-            tests/test_validation_method_labels.py
+            tests/test_validation_method_labels.py \
+            tests/test_market_event_sources.py \
+            tests/test_market_issuer_feeds.py \
+            tests/test_market_event_estimates.py \
+            tests/test_market_event_quotes.py \
+            tests/test_market_event_proxies.py \
+            tests/test_market_event_monitor.py \
+            tests/test_market_events_view.py \
+            tests/test_rut_closing_series.py \
+            tests/test_monitor_scan_collector.py::test_collector_commit_reload_collector_uses_real_receipt \
+            tests/test_databento_symbol_catalog.py \
+            tests/test_inspect_opening_capture.py::test_mini_contracts_cannot_prove_rut_subscription_via_legacy_summary
