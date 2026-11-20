@@ -338,7 +338,7 @@ def _render_forecast_research():
                     "These are retained research estimates. Accuracy improvement has not been established. "
                     "Quality scores are uncalibrated unless a matched out-of-sample calibration artifact is explicitly shown; they are not win probabilities.")
         symbols = st.multiselect("Research markets", list(DEFAULT_TRACKED_SYMBOLS),
-                                default=["SPX", "NDX", "SPY", "QQQ"],
+                                default=["SPX", "NDX", "RUT", "SPY", "QQQ"],
                                 format_func=lambda s: f"{s} · {MARKET_UNIVERSE[s].name}")
         auto_refresh = st.toggle("Keep submitted forecasts fresh", value=True,
             help="Recheck local publication eligibility every 15 seconds. No new provider subscriptions or calculations are requested.")

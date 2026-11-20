@@ -15,6 +15,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
+
 
 CADENCE_EVIDENCE_SCHEMA = "marketpin-monitor-cadence-evidence.v1"
 CADENCE_DECISION_SCHEMA = "marketpin-monitor-cadence-decision.v1"
@@ -238,9 +240,10 @@ def validate_cadence_evidence(value: Any) -> dict[str, Any]:
             "cadence_new_data_quality_events_must_be_active"
         )
     symbols = evidence.get("symbols")
-    if not isinstance(symbols, Mapping) or set(symbols) != set(_MONITORED_SYMBOLS):
+    allowed_universes = (set(_MONITORED_SYMBOLS), set(EQUITY_INDEX_FORECAST_SYMBOLS))
+    if not isinstance(symbols, Mapping) or set(symbols) not in allowed_universes:
         raise MonitorCadenceError("cadence_evidence_symbols_invalid")
-    for symbol in _MONITORED_SYMBOLS:
+    for symbol in symbols:
         payload = symbols.get(symbol)
         if not isinstance(payload, Mapping) or set(payload) != set(
             _SYMBOL_TRIGGER_FIELDS
@@ -262,7 +265,9 @@ def _explicit_trigger_reasons(evidence: Mapping[str, Any]) -> list[str]:
         f"NEW_DATA_QUALITY_EVENT:{event_id}"
         for event_id in evidence["new_data_quality_event_ids"]
     ]
-    for symbol in _MONITORED_SYMBOLS:
+    for symbol in EQUITY_INDEX_FORECAST_SYMBOLS:
+        if symbol not in evidence["symbols"]:
+            continue
         payload = evidence["symbols"][symbol]
         for field in _SYMBOL_TRIGGER_FIELDS:
             if payload[field] is True:
@@ -280,7 +285,7 @@ def _policy_trigger_reasons(policy_events: Sequence[Mapping[str, Any]]) -> list[
         event_id = event.get("event_id")
         if event_type not in _POLICY_ALERT_TYPES:
             raise MonitorCadenceError("cadence_policy_event_type_invalid")
-        if symbol not in _MONITORED_SYMBOLS:
+        if symbol not in EQUITY_INDEX_FORECAST_SYMBOLS:
             raise MonitorCadenceError("cadence_policy_event_symbol_invalid")
         if not isinstance(event_id, str) or not event_id:
             raise MonitorCadenceError("cadence_policy_event_id_invalid")
@@ -389,7 +394,10 @@ def evaluate_cadence_transition(
         )
     )
     assert isinstance(symbols, Mapping)
-    for symbol in _MONITORED_SYMBOLS:
+    rut = symbols.get("RUT")
+    if isinstance(rut, Mapping) and rut.get("eligible") is True and "RUT" not in evidence["symbols"]:
+        raise MonitorCadenceError("cadence_evidence.RUT.required_when_eligible")
+    for symbol in evidence["symbols"]:
         symbol_eligible = (
             isinstance(symbols.get(symbol), Mapping)
             and symbols[symbol].get("eligible") is True

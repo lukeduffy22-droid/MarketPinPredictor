@@ -45,13 +45,20 @@ def fetch_databento_universe(timeout_seconds: float = 1.0) -> dict[str, Any]:
 def selectable_databento_symbols(
     universe_payload: Mapping[str, Any] | None,
 ) -> tuple[str, ...]:
-    """Expose optional symbols only when the backend selected live contracts.
+    """Keep the four tracked index panels visible through warming or outages.
 
-    The stable set remains visible while the backend is warming or unreachable.
+    Selection grants no live-data authority. Other panels require selected contracts.
     This function never changes the subscription; it only mirrors evidence from
     the existing Databento stream.
     """
-    selected = set(STABLE_LIVE_SYMBOLS)
+    return tuple(dict.fromkeys((*STABLE_LIVE_SYMBOLS, "RUT", *active_canary_symbols(universe_payload))))
+
+
+def active_canary_symbols(
+    universe_payload: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """Return only optional markets with positive backend contract selections."""
+    selected = set()
     payload = universe_payload or {}
     statuses = payload.get("market_subscription_status") or {}
     if isinstance(statuses, Mapping):
@@ -60,17 +67,8 @@ def selectable_databento_symbols(
             status = raw_status if isinstance(raw_status, Mapping) else {}
             try:
                 contract_count = int(status.get("selected_contract_count") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 contract_count = 0
             if symbol in CANARY_CANDIDATE_SYMBOLS and contract_count > 0:
                 selected.add(symbol)
-    ordered = (*STABLE_LIVE_SYMBOLS, *CANARY_CANDIDATE_SYMBOLS)
-    return tuple(symbol for symbol in ordered if symbol in selected)
-
-
-def active_canary_symbols(
-    universe_payload: Mapping[str, Any] | None,
-) -> tuple[str, ...]:
-    """Return backend-selected optional symbols in deterministic order."""
-    selectable = set(selectable_databento_symbols(universe_payload))
-    return tuple(symbol for symbol in CANARY_CANDIDATE_SYMBOLS if symbol in selectable)
+    return tuple(symbol for symbol in CANARY_CANDIDATE_SYMBOLS if symbol in selected)

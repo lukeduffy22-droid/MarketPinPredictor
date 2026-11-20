@@ -28,12 +28,13 @@ from zoneinfo import ZoneInfo
 
 from app.utils.market_calendar import market_calendar_status
 from app.utils.time_et import close_time_et, open_time_et
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
 from backend.monitor_cadence import (
     CADENCE_EVIDENCE_SCHEMA,
     CADENCE_TRIGGER_CALCULATION_VERSION,
     validate_cadence_evidence,
 )
-from backend.monitor_policy import INPUT_SCHEMA as POLICY_INPUT_SCHEMA
+from backend.monitor_policy import GAMMA_PIN_FALLBACK_POINTS, INPUT_SCHEMA as POLICY_INPUT_SCHEMA
 from backend.monitor_scan_ledger import (
     COMMIT_RECEIPT_EVENT_TYPE,
     MonitorScanLedgerError,
@@ -282,6 +283,16 @@ def _endpoint_payload(endpoint: Any) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, Mapping) else None
 
 
+def _monitored_equity_indexes(endpoint: Any) -> tuple[str, ...]:
+    """Admit Russell scans only in a backend profile explicitly requesting RUT."""
+    health = _endpoint_payload(endpoint) or {}
+    for field in ("required_symbols", "optional_symbols"):
+        symbols = health.get(field)
+        if isinstance(symbols, list) and "RUT" in symbols:
+            return EQUITY_INDEX_FORECAST_SYMBOLS
+    return MONITORED_SYMBOLS
+
+
 def _fetch_json(url: str, timeout_seconds: float) -> dict[str, Any]:
     request = Request(url, headers={"Accept": "application/json"})
     try:
@@ -527,7 +538,9 @@ def _database_evidence(
             if table in tables
         }
         symbols: dict[str, Any] = {}
-        for symbol in MONITORED_SYMBOLS:
+        for symbol in EQUITY_INDEX_FORECAST_SYMBOLS:
+            if symbol == "RUT" and symbol not in audits:
+                continue
             audit_entry = audits.get(symbol)
             audit = (
                 audit_entry.get("payload")
@@ -637,16 +650,17 @@ def acquire_live_evidence(
         time.sleep(sample)
     second = _fetch_json(base + "/health/live", timeout)
     overview = _fetch_json(base + "/health", timeout)
+    monitored = _monitored_equity_indexes(second)
     workstation = {
         symbol: _fetch_json(base + f"/v1/workstation/state/{symbol}", timeout)
-        for symbol in MONITORED_SYMBOLS
+        for symbol in monitored
     }
     gex = {
         symbol: _fetch_json(base + f"/gex/{symbol}", timeout)
-        for symbol in MONITORED_SYMBOLS
+        for symbol in monitored
     }
     orb = _fetch_json(base + "/v1/orb", timeout)
-    audits = {symbol: _latest_audit(project_root, symbol) for symbol in MONITORED_SYMBOLS}
+    audits = {symbol: _latest_audit(project_root, symbol) for symbol in monitored}
     database = _database_evidence(
         database_path,
         session_date=session_date,
@@ -2106,7 +2120,7 @@ def _trigger_matrix(previous: Mapping[str, Any], current: Mapping[str, Any], sym
     previous_pin = _positive(previous.get("gamma_pin"))
     current_pin = _positive(current.get("gamma_pin"))
     spacing = _top_spacing((previous, current))
-    fallback = 20.0 if symbol == "SPX" else 75.0
+    fallback = GAMMA_PIN_FALLBACK_POINTS.get(symbol)
     threshold = (
         max(0.0015 * spot, 2.0 * spacing)
         if spot is not None and spacing is not None
@@ -2127,6 +2141,7 @@ def _trigger_matrix(previous: Mapping[str, Any], current: Mapping[str, Any], sym
         "half_threshold_gamma_pin_move": bool(
             previous_pin is not None
             and current_pin is not None
+            and threshold is not None
             and abs(current_pin - previous_pin) >= threshold / 2.0
         ),
         "contested_pin_leadership": bool(
@@ -2284,7 +2299,8 @@ def build_commit_request(
     if transport_event is not None:
         data_quality_events.append(transport_event)
 
-    for symbol in MONITORED_SYMBOLS:
+    monitored = _monitored_equity_indexes(evidence.get("health_second"))
+    for symbol in monitored:
         candidate, source_issues, diagnostic = _candidate_observation(
             symbol,
             evidence,
@@ -2418,6 +2434,8 @@ def build_commit_request(
 
     orb_payload = _endpoint_payload(evidence.get("orb"))
     for symbol in CONTEXT_SYMBOLS:
+        if symbol in monitored:
+            continue
         symbol_payloads[symbol] = {
             "eligible": False,
             "context_only": True,
@@ -2467,7 +2485,7 @@ def build_commit_request(
         "alerts": [],
         "directional_interpretation": (
             "POLICY_CONTROLLED"
-            if any(symbol_payloads[symbol]["eligible"] for symbol in MONITORED_SYMBOLS)
+            if any(symbol_payloads[symbol]["eligible"] for symbol in monitored)
             else "ABSTAIN"
         ),
         "research_hypotheses": [],

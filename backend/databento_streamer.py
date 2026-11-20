@@ -41,7 +41,7 @@ from backend.quote_timing import (CBBO_TIMING, LEGACY_TIMING, CBBO_SCHEMAS, CBBO
                                  OPTIONAL_LAST_SALE, last_sale_policy,
                                  timing_contract, cbbo_timestamps_valid, cbbo_record_timing_valid)
 from backend.config import DATA_DIR, DATABENTO_REQUIRED_SYMBOLS, MAX_BUFFER_SIZE
-from backend.market_universe import OPTION_ETF_SYMBOLS
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS, OPTION_ETF_SYMBOLS
 from backend.optional_family_canary import (
     CanaryDecision,
     CORE_PRIMARY_PAIR_COVERAGE_RATIO,
@@ -187,6 +187,7 @@ VIX_FORWARD_CONTEXT_SELECTION_BASIS = (
     "vix_last_trading_day_precedes_settlement_date"
 )
 VIX_SETTLEMENT_INELIGIBLE_REASON = "VIX_AM_SETTLED_LAST_TRADING_DAY_PASSED"
+RUT_SETTLEMENT_INELIGIBLE_REASON = "RUT_SAME_DAY_PM_ROOT_REQUIRED"
 VIX_PRIMARY_NOT_FORWARD_REASON = "VIX_AM_SETTLED_PRIMARY_NOT_FORWARD"
 PRIMARY_MAX_STRIKE_PAIRS = max(1, int(os.getenv("DATABENTO_PRIMARY_MAX_STRIKE_PAIRS", "600")))
 SHADOW_MAX_STRIKE_PAIRS = max(1, int(os.getenv("DATABENTO_SHADOW_MAX_STRIKE_PAIRS", "200")))
@@ -537,6 +538,13 @@ def _expiration_authority_metadata(
             "context_only": True,
             "same_day_authority": False,
             "selection_basis": VIX_FORWARD_CONTEXT_SELECTION_BASIS,
+        }
+    if market == "RUT" and role == "primary" and expiration != trading_date:
+        return {
+            "authority": "rut_same_day_pm_expiration_unavailable",
+            "context_only": True,
+            "same_day_authority": False,
+            "selection_basis": "same_day_pm_series_required_for_close",
         }
     if str(role or "").strip().lower() != "primary":
         return {
@@ -1137,6 +1145,14 @@ def _option_root_from_symbol(raw_symbol: object) -> str:
     return first_token.split("-", 1)[0]
 
 
+def _rut_settlement_exclusions(frame: pd.DataFrame, trading_date: date) -> pd.Series:
+    """Only RUTW carries same-day PM settlement for the full-size RUT index."""
+    same_day = (frame["market"] == "RUT") & (frame["expiration_date"] == trading_date)
+    excluded = same_day.copy()
+    excluded.loc[same_day] = frame.loc[same_day, "symbol"].map(_option_root_from_symbol).ne("RUTW")
+    return excluded
+
+
 def _select_complete_strike_pairs(
     expiration_frame: pd.DataFrame,
     *,
@@ -1282,12 +1298,10 @@ def select_subscription_universe(
     full["open_interest"] = pd.to_numeric(full["open_interest"], errors="coerce").fillna(0.0)
     calendar_unexpired = full[full["expiration_date"] >= today].copy()
     expired_contract_count = int(len(full) - len(calendar_unexpired))
-    settlement_ineligible_mask = calendar_unexpired.apply(
-        lambda row: not _expiration_is_live_eligible(
-            row["market"], row["expiration_date"], today
-        ),
-        axis=1,
-    ).astype(bool)
+    settlement_ineligible_mask = (
+        (calendar_unexpired["market"].eq("VIX") & calendar_unexpired["expiration_date"].eq(today))
+        | _rut_settlement_exclusions(calendar_unexpired, today)
+    )
     settlement_ineligible = calendar_unexpired[settlement_ineligible_mask].copy()
     settlement_ineligible_contract_count = int(len(settlement_ineligible))
     live_eligible = calendar_unexpired[~settlement_ineligible_mask].copy()
@@ -1314,7 +1328,7 @@ def select_subscription_universe(
             {
                 "expiration": expiration.isoformat(),
                 "contracts": int(len(expiration_rows)),
-                "reason": VIX_SETTLEMENT_INELIGIBLE_REASON,
+                "reason": (RUT_SETTLEMENT_INELIGIBLE_REASON if market == "RUT" else VIX_SETTLEMENT_INELIGIBLE_REASON),
             }
             for expiration, expiration_rows in market_settlement_ineligible.groupby(
                 "expiration_date", sort=True
@@ -1341,9 +1355,9 @@ def select_subscription_universe(
                 ),
                 "settlement_ineligible_expirations": settlement_exclusions,
                 "primary_expiration_unavailable_reason": (
-                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE"
-                    if market_live_eligible.empty
-                    else "NO_ACTIVE_FORWARD_VIX_PAIRS_AVAILABLE"
+                    RUT_SETTLEMENT_INELIGIBLE_REASON if market == "RUT" else
+                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE" if market_live_eligible.empty else
+                    "NO_ACTIVE_FORWARD_VIX_PAIRS_AVAILABLE"
                 ),
                 **{
                     f"primary_expiration_{key}": value
@@ -1793,6 +1807,8 @@ def build_full_oi_analytics(
         return analytics
     for market in market_order:
         market_frame = full_universe[full_universe["market"] == market].copy()
+        if market == "RUT":
+            market_frame = market_frame[~_rut_settlement_exclusions(market_frame, as_of)]
         if market_frame.empty:
             continue
         expiration_metrics: list[dict[str, object]] = []
@@ -4393,6 +4409,9 @@ class DatabentoGammaStreamer:
         frame["_root"] = frame["symbol"].map(_option_root_from_symbol)
         frame = frame.dropna(subset=["expiration_date"])
         frame = frame[frame["market"] == market]
+        excluded_rut = _rut_settlement_exclusions(frame, trading_date)
+        had_ineligible_rut = bool(excluded_rut.any())
+        frame = frame[~excluded_rut]
         had_settlement_ineligible_vix = bool(
             market == "VIX"
             and not frame.empty
@@ -4409,9 +4428,9 @@ class DatabentoGammaStreamer:
             return {
                 "passes": False,
                 "reason": (
-                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE"
-                    if had_settlement_ineligible_vix
-                    else "NO_POSITIVE_OI_CONTRACTS"
+                    RUT_SETTLEMENT_INELIGIBLE_REASON if had_ineligible_rut else
+                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE" if had_settlement_ineligible_vix else
+                    "NO_POSITIVE_OI_CONTRACTS"
                 ),
                 "complete_pair_count": 0,
                 "primary_strike_count": 0,
@@ -5727,12 +5746,18 @@ class DatabentoGammaStreamer:
 
         planned_primary = min(primary_candidates)
         trading_date = current_market_date()
-        if market in {"SPX", "NDX"} and planned_primary != trading_date:
+        if market in EQUITY_INDEX_FORECAST_SYMBOLS and planned_primary != trading_date:
             return (
                 None,
                 "PRIMARY_EXPIRATION_NOT_SAME_DAY: "
                 f"planned={planned_primary.isoformat()} required={trading_date.isoformat()}",
             )
+        if market == "RUT" and any(
+            row["option_root"] != "RUTW"
+            for row in self._universe_records_by_market.get(market, ())
+            if row["expiration_date"] == planned_primary
+        ):
+            return None, RUT_SETTLEMENT_INELIGIBLE_REASON
         if market == "VIX" and not _expiration_is_live_eligible(
             market, planned_primary, trading_date
         ):
@@ -5929,7 +5954,7 @@ class DatabentoGammaStreamer:
             "primary_pair_coverage_strike_min": float(calculation_lower_strike),
             "primary_pair_coverage_strike_max": float(calculation_upper_strike),
         })
-        if market in {"SPX", "NDX"} and (
+        if market in EQUITY_INDEX_FORECAST_SYMBOLS and (
             primary_pair_coverage_ratio is None
             or primary_pair_coverage_ratio < MIN_LIVE_PRIMARY_PAIR_COVERAGE_RATIO
         ):
@@ -7786,6 +7811,14 @@ class DatabentoGammaStreamer:
             return None, "PLANNED_PRIMARY_EXPIRATION_INVALID"
         if market in {"SPX", "NDX"} and primary_expiration != trading_date:
             return None, "PRIMARY_EXPIRATION_NOT_SAME_DAY"
+        # A future Russell expiry may supply a separately labelled ORB context.
+        # On the trading date, only full-size PM-settled contracts are eligible.
+        if market == "RUT" and (
+            primary_expiration < trading_date
+            or any(row["option_root"] not in {"RUT", "RUTW"} for row in orb_records)
+            or (primary_expiration == trading_date and any(row["option_root"] != "RUTW" for row in orb_records))
+        ):
+            return None, RUT_SETTLEMENT_INELIGIBLE_REASON
         if market == "VIX" and not _expiration_is_live_eligible(
             market, primary_expiration, trading_date
         ):
@@ -10908,7 +10941,7 @@ class DatabentoGammaStreamer:
         root_counts = {
             str(raw_symbol).split()[0].strip().upper() for raw_symbol in self.live_symbols
         }
-        if "RUT" in self.symbols or any(root in {"RUT", "RUTW", "MRUT"} for root in root_counts):
+        if "RUT" in self.symbols or any(root in {"RUT", "RUTW"} for root in root_counts):
             return
         evidence["status"] = "confirmed"
         evidence["confirmed_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -11188,7 +11221,8 @@ class DatabentoGammaStreamer:
             "DIA": ("DIA",),
             "IWM": ("IWM",),
             "VIX": ("VIXW", "VIX"),
-            "RUT": ("RUTW", "RUT", "MRUT"),
+            "RUT": ("RUTW", "RUT"),
+            "MRUT": ("MRUT",),
         }
         core_symbol_status = {
             core: {

@@ -17,6 +17,8 @@ from statistics import median
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
+
 
 INPUT_SCHEMA = "marketpin-monitor-policy.input.v2"
 OUTPUT_SCHEMA = "marketpin-monitor-policy.result.v2"
@@ -56,7 +58,9 @@ _LEVEL_PROVENANCE_FIELDS = {
     },
 }
 _DIRECTIONS = {"bullish", "bearish"}
-_MONITORED_SYMBOLS = {"SPX", "NDX"}
+_MONITORED_SYMBOLS = EQUITY_INDEX_FORECAST_SYMBOLS
+# Russell has no validated fixed-points fallback. Require observed strike spacing.
+GAMMA_PIN_FALLBACK_POINTS = {"SPX": 20.0, "NDX": 75.0}
 _SESSION_TIMEZONE = ZoneInfo("America/Chicago")
 _FULL_OI_SOURCES = {
     "full-oi-universe",
@@ -444,7 +448,7 @@ def policy_observation_issues(
     if observation.get("provider") != "databento":
         issues.append(f"{prefix}.provider_must_be_databento")
     if observation.get("symbol") not in _MONITORED_SYMBOLS:
-        issues.append(f"{prefix}.symbol_must_be_spx_or_ndx")
+        issues.append(f"{prefix}.symbol_must_be_spx_ndx_or_rut")
     universe = observation.get("universe_sha256")
     if not isinstance(universe, str) or re.fullmatch(r"[0-9a-f]{64}", universe) is None:
         issues.append(f"{prefix}.universe_sha256_must_be_sha256")
@@ -1119,7 +1123,9 @@ def _gamma_pin_event(
     spot = spot_by_observation[-1]
     top_strikes = _top_strikes_by_observation(observations[-2:])
     spacing = _top_strike_spacing(observations[-2:])
-    fallback = 20.0 if str(current.get("symbol") or "").upper() == "SPX" else 75.0
+    fallback = GAMMA_PIN_FALLBACK_POINTS.get(current["symbol"])
+    if spacing is None and fallback is None:
+        return None, dict(prior), ["gamma_pin_observed_strike_spacing_required"]
     spot_component = abs(spot) * 0.0015 if spot is not None else 0.0
     if spacing is not None:
         components = [spot_component, 2.0 * spacing]

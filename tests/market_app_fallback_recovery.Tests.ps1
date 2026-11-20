@@ -223,6 +223,26 @@ Describe 'Same-day fallback backend adopts proven morning cache before the openi
 }
 
 Describe 'Current-day preparation proof requires every configured primary family' {
+    It 'admits a forward Russell observation only with explicit context-only authority' {
+        $symbols = @('SPX', 'NDX', 'VIX', 'RUT')
+        $prepared = New-TestCurrentDayUniversePreparation -Symbols $symbols -TradingDate '2026-09-10' -SelectedContractCount 2064
+        $rut = $prepared.Result.market_primary_readiness.RUT
+        $rut.primary_expiration = '2026-09-11'
+        $rut.primary_expiration_authority = 'rut_same_day_pm_expiration_unavailable'
+        $rut.primary_expiration_selection_basis = 'same_day_pm_series_required_for_close'
+        $rut.primary_expiration_context_only = $true
+        $rut.primary_expiration_same_day_authority = $false
+        $parameters = @{
+            Preparation = $prepared
+            ExpectedTradingDate = '2026-09-10'
+            ExpectedContractCap = 3200
+            ExpectedSymbols = $symbols
+        }
+        Test-MarketAppCurrentDayUniversePreparationProof @parameters | Should Be $true
+        $rut.primary_expiration_same_day_authority = $true
+        Test-MarketAppCurrentDayUniversePreparationProof @parameters | Should Be $false
+    }
+
     It 'accepts complete SPX NDX VIX RUT primary evidence within the launch cap' {
         $prepared = New-TestCurrentDayUniversePreparation `
             -Symbols @('SPX', 'NDX', 'VIX', 'RUT') `

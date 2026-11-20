@@ -57,7 +57,7 @@ OPTION_ROOT_ALIASES = {
     "SPX": ("SPXW", "SPX", "XSP"),
     "NDX": ("NDXP", "NDX", "XND"),
     "VIX": ("VIXW", "VIX"),
-    "RUT": ("RUTW", "RUT", "MRUT"),
+    "RUT": ("RUTW", "RUT"),
 }
 RUT_CANARY_MAX_SUBSCRIPTION_CONTRACTS = 3_200
 AUTOSTART_TASK_NAME = "MarketPinPredictor_AutoStart"
@@ -2608,7 +2608,12 @@ def evaluate(
                         )
                     except (TypeError, ValueError):
                         reported_family_count = 0
-                    if max(alias_count, reported_family_count) <= 0:
+                    # Older summaries could include mini-Russell contracts in RUT.
+                    # Prefer observed roots when the feed supplies those counts.
+                    contract_count = max(alias_count, reported_family_count)
+                    if symbol == "RUT" and root_counts:
+                        contract_count = alias_count
+                    if contract_count <= 0:
                         issues.append(f"SUBSCRIPTION_ROOT_MISSING:{symbol}")
 
                 metadata = health_payload.get("subscription_metadata") or {}
