@@ -277,19 +277,21 @@ def test_streamlit_rendered_outage_restoration_and_selection_changes(monkeypatch
     monkeypatch.setattr(view.requests, "get", requester)
     ui.selectbox(key="research_horizon_SPX").set_value(0)
     ui.selectbox(key="research_horizon_NDX").set_value(1)
+    ui.selectbox(key="research_horizon_RUT").set_value(3)
     ui.selectbox(key="research_horizon_SPY").set_value(5)
     ui.selectbox(key="research_horizon_QQQ").set_value(10)
     ui.button[0].click().run()
     assert not ui.exception and len(ui.warning) == 0
     table = ui.dataframe[0].value
-    assert list(table["Sessions ahead"]) == [0, 1, 5, 10]
+    assert list(table["Symbol"]) == ["SPX", "NDX", "RUT", "SPY", "QQQ"]
+    assert list(table["Sessions ahead"]) == [0, 1, 3, 5, 10]
     assert table.iloc[1]["Required returns"] == 60
     assert "insufficient_verified_daily_history" in table.iloc[1]["Reason"]
     assert not any("Research service unavailable" in c.value for c in ui.caption)
     ui.selectbox(key="research_horizon_NDX").set_value(2).run()
     assert not ui.dataframe and "Selections changed" in ui.info[0].value
     ui.button[0].click().run()
-    assert list(ui.dataframe[0].value["Sessions ahead"]) == [0, 2, 5, 10]
+    assert list(ui.dataframe[0].value["Sessions ahead"]) == [0, 2, 3, 5, 10]
     ui.multiselect[0].set_value(["SPX"]).run()
     assert not ui.exception and not ui.dataframe
     assert "Selections changed" in ui.info[0].value

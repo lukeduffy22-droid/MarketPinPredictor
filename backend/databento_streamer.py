@@ -41,7 +41,7 @@ from backend.quote_timing import (CBBO_TIMING, LEGACY_TIMING, CBBO_SCHEMAS, CBBO
                                  OPTIONAL_LAST_SALE, last_sale_policy,
                                  timing_contract, cbbo_timestamps_valid, cbbo_record_timing_valid)
 from backend.config import DATA_DIR, DATABENTO_REQUIRED_SYMBOLS, MAX_BUFFER_SIZE
-from backend.market_universe import OPTION_ETF_SYMBOLS
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS, OPTION_ETF_SYMBOLS
 from backend.optional_family_canary import (
     CanaryDecision,
     CORE_PRIMARY_PAIR_COVERAGE_RATIO,
@@ -187,6 +187,7 @@ VIX_FORWARD_CONTEXT_SELECTION_BASIS = (
     "vix_last_trading_day_precedes_settlement_date"
 )
 VIX_SETTLEMENT_INELIGIBLE_REASON = "VIX_AM_SETTLED_LAST_TRADING_DAY_PASSED"
+RUT_SETTLEMENT_INELIGIBLE_REASON = "RUT_SAME_DAY_PM_ROOT_REQUIRED"
 VIX_PRIMARY_NOT_FORWARD_REASON = "VIX_AM_SETTLED_PRIMARY_NOT_FORWARD"
 PRIMARY_MAX_STRIKE_PAIRS = max(1, int(os.getenv("DATABENTO_PRIMARY_MAX_STRIKE_PAIRS", "600")))
 SHADOW_MAX_STRIKE_PAIRS = max(1, int(os.getenv("DATABENTO_SHADOW_MAX_STRIKE_PAIRS", "200")))
@@ -372,15 +373,33 @@ def _install_pre_auth_transport_guard(
     return True
 
 
-def _start_live_iterator(live_client: object):
+def _start_live_iterator(live_client: object, *, on_diagnostic=None):
     """Arm the SDK consumer before start can deliver the first record batch.
 
     The installed SDK starts its session before enabling the iteration queue.
     A receive-thread turn inside start can otherwise discard initial mappings,
     replay completion, and quotes. Only a new, known SDK queue is owned here;
     iteration and transport shutdown remain the caller's existing lifecycle.
+    Diagnostics describe observed startup ordering, never provider availability.
     """
+    def observed(stage, **fields):
+        if on_diagnostic is None:
+            return
+        try:
+            on_diagnostic({
+                "stage": stage,
+                "authority": "DIAGNOSTIC_ONLY",
+                "startup_observed_at_ns": time.time_ns(),
+                "startup_observed_monotonic_ns": time.monotonic_ns(),
+                **fields,
+            })
+        except Exception:
+            # Optional instrumentation cannot turn successful SDK startup into
+            # a failure, nor obscure the original transport/contract exception.
+            pass
+
     if not isinstance(live_client, _DATABENTO_SDK_LIVE_CLASS):
+        observed("not_applicable_non_sdk_client", queue_contract_supported=False)
         return iter(live_client)
 
     from databento.live.session import DBNQueue
@@ -396,32 +415,60 @@ def _start_live_iterator(live_client: object):
             for method in ("enable", "disable", "is_enabled")
         )
     ):
+        observed("queue_contract_unavailable", queue_contract_supported=False,
+                 owned_queue=False)
         raise RuntimeError("DATABENTO_ITERATOR_QUEUE_CONTRACT_UNAVAILABLE")
-    if is_streaming() is not False or queue.is_enabled() is not False:
+    streaming_before = is_streaming()
+    # Preserve the original short circuit: do not query or alter a queue
+    # belonging to a session already reported as streaming.
+    enabled_before = queue.is_enabled() if streaming_before is False else None
+    if streaming_before is not False or enabled_before is not False:
+        observed("queue_ownership_rejected", queue_contract_supported=True,
+                 owned_queue=False,
+                 is_streaming=streaming_before if type(streaming_before) is bool else None,
+                 queue_enabled=enabled_before if type(enabled_before) is bool else None)
         # An existing consumer's queue is not ours to alter or disable.
         raise RuntimeError("DATABENTO_ITERATOR_QUEUE_ALREADY_IN_USE")
+    observed("queue_ownership_established", queue_contract_supported=True,
+             owned_queue=True, is_streaming=False, queue_enabled=False)
 
+    stage = "queue_enable"
     try:
         queue.enable()
-        if queue.is_enabled() is not True:
+        enabled_after = queue.is_enabled()
+        observed("queue_enable_returned", owned_queue=True,
+                 queue_enabled=enabled_after if type(enabled_after) is bool else None)
+        if enabled_after is not True:
             raise RuntimeError("DATABENTO_ITERATOR_QUEUE_ENABLE_FAILED")
+        stage = "iterator_start"
+        observed("queue_enabled_before_iterator_start", owned_queue=True,
+                 queue_enabled=True)
         iterator = iter(live_client)
+        observed("iterator_start_returned", owned_queue=True)
+        stage = "iterator_ownership_check"
         if (
             getattr(iterator, "_dbn_queue", None) is not queue
             or getattr(iterator, "client", None) is not live_client
         ):
             raise RuntimeError("DATABENTO_ITERATOR_QUEUE_OWNERSHIP_CHANGED")
+        observed("iterator_ownership_verified", owned_queue=True)
         return iterator
-    except BaseException:
+    except BaseException as error:
+        observed("startup_failed", owned_queue=True, failed_stage=stage,
+                 error_type=type(error).__name__)
         # Ownership was established while this queue was disabled. A partial
         # enable or failed start must not leave an unconsumed enabled queue.
         try:
             queue.disable()
         except Exception as exc:
+            observed("queue_cleanup_failed", owned_queue=True,
+                     error_type=type(exc).__name__)
             logger.warning(
                 "Databento iterator queue cleanup failed error_type=%s",
                 type(exc).__name__,
             )
+        else:
+            observed("queue_disable_returned_after_failure", owned_queue=True)
         raise
 
 
@@ -491,6 +538,13 @@ def _expiration_authority_metadata(
             "context_only": True,
             "same_day_authority": False,
             "selection_basis": VIX_FORWARD_CONTEXT_SELECTION_BASIS,
+        }
+    if market == "RUT" and role == "primary" and expiration != trading_date:
+        return {
+            "authority": "rut_same_day_pm_expiration_unavailable",
+            "context_only": True,
+            "same_day_authority": False,
+            "selection_basis": "same_day_pm_series_required_for_close",
         }
     if str(role or "").strip().lower() != "primary":
         return {
@@ -1091,6 +1145,14 @@ def _option_root_from_symbol(raw_symbol: object) -> str:
     return first_token.split("-", 1)[0]
 
 
+def _rut_settlement_exclusions(frame: pd.DataFrame, trading_date: date) -> pd.Series:
+    """Only RUTW carries same-day PM settlement for the full-size RUT index."""
+    same_day = (frame["market"] == "RUT") & (frame["expiration_date"] == trading_date)
+    excluded = same_day.copy()
+    excluded.loc[same_day] = frame.loc[same_day, "symbol"].map(_option_root_from_symbol).ne("RUTW")
+    return excluded
+
+
 def _select_complete_strike_pairs(
     expiration_frame: pd.DataFrame,
     *,
@@ -1236,12 +1298,10 @@ def select_subscription_universe(
     full["open_interest"] = pd.to_numeric(full["open_interest"], errors="coerce").fillna(0.0)
     calendar_unexpired = full[full["expiration_date"] >= today].copy()
     expired_contract_count = int(len(full) - len(calendar_unexpired))
-    settlement_ineligible_mask = calendar_unexpired.apply(
-        lambda row: not _expiration_is_live_eligible(
-            row["market"], row["expiration_date"], today
-        ),
-        axis=1,
-    ).astype(bool)
+    settlement_ineligible_mask = (
+        (calendar_unexpired["market"].eq("VIX") & calendar_unexpired["expiration_date"].eq(today))
+        | _rut_settlement_exclusions(calendar_unexpired, today)
+    )
     settlement_ineligible = calendar_unexpired[settlement_ineligible_mask].copy()
     settlement_ineligible_contract_count = int(len(settlement_ineligible))
     live_eligible = calendar_unexpired[~settlement_ineligible_mask].copy()
@@ -1268,7 +1328,7 @@ def select_subscription_universe(
             {
                 "expiration": expiration.isoformat(),
                 "contracts": int(len(expiration_rows)),
-                "reason": VIX_SETTLEMENT_INELIGIBLE_REASON,
+                "reason": (RUT_SETTLEMENT_INELIGIBLE_REASON if market == "RUT" else VIX_SETTLEMENT_INELIGIBLE_REASON),
             }
             for expiration, expiration_rows in market_settlement_ineligible.groupby(
                 "expiration_date", sort=True
@@ -1295,9 +1355,9 @@ def select_subscription_universe(
                 ),
                 "settlement_ineligible_expirations": settlement_exclusions,
                 "primary_expiration_unavailable_reason": (
-                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE"
-                    if market_live_eligible.empty
-                    else "NO_ACTIVE_FORWARD_VIX_PAIRS_AVAILABLE"
+                    RUT_SETTLEMENT_INELIGIBLE_REASON if market == "RUT" else
+                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE" if market_live_eligible.empty else
+                    "NO_ACTIVE_FORWARD_VIX_PAIRS_AVAILABLE"
                 ),
                 **{
                     f"primary_expiration_{key}": value
@@ -1747,6 +1807,8 @@ def build_full_oi_analytics(
         return analytics
     for market in market_order:
         market_frame = full_universe[full_universe["market"] == market].copy()
+        if market == "RUT":
+            market_frame = market_frame[~_rut_settlement_exclusions(market_frame, as_of)]
         if market_frame.empty:
             continue
         expiration_metrics: list[dict[str, object]] = []
@@ -2409,33 +2471,54 @@ class DatabentoGammaStreamer:
         A rejected option price remains rejected. Duplicate intervals and replay
         cannot manufacture clock readiness; negative lag is retained as evidence.
         """
+        diagnostic_epoch = getattr(self, "subscription_epoch_id", None)
         recv = _record_timestamp_ns(record, "ts_recv")
         if recv is None:
+            self._observe_clock_admission(record, generation, processed_at_ns, "MISSING_TS_RECV", expected_epoch_id=diagnostic_epoch)
             return False
         if self.schema in CBBO_SCHEMAS:
             expected_rtype = CBBO_RTYPES[self.schema]
-            if getattr(record, "rtype", None) != expected_rtype or recv % CBBO_SCHEMAS[self.schema]:
+            if getattr(record, "rtype", None) != expected_rtype:
+                self._observe_clock_admission(record, generation, processed_at_ns, "CBBO_RTYPE_MISMATCH", expected_epoch_id=diagnostic_epoch)
+                return False
+            if recv % CBBO_SCHEMAS[self.schema]:
+                self._observe_clock_admission(record, generation, processed_at_ns, "CBBO_INTERVAL_UNALIGNED", expected_epoch_id=diagnostic_epoch)
                 return False
         lag = (processed_at_ns - recv) / 1_000_000_000
         if lag > QUOTE_FRESHNESS_SECONDS:
+            self._observe_clock_admission(record, generation, processed_at_ns, "STALE_RECEIVE_LAG", expected_epoch_id=diagnostic_epoch)
             return False
         key = (generation, getattr(record, "instrument_id", None), recv,
                getattr(record, "sequence", None))
         if key[1] is None:
+            self._observe_clock_admission(record, generation, processed_at_ns, "MISSING_INSTRUMENT_ID", expected_epoch_id=diagnostic_epoch)
             return False
         with self._clock_evidence_lock:
-            if generation != self._active_generation or self._clock_replay_pending:
-                return False
-            if key in self._clock_record_keys:
-                return False
-            self._clock_record_keys[key] = None
-            if len(self._clock_record_keys) > CLOCK_SYNC_WINDOW_RECORDS:
-                self._clock_record_keys.pop(next(iter(self._clock_record_keys)))
-            self._receive_lag_window.append(lag)
+            if generation != self._active_generation:
+                reason = "GENERATION_MISMATCH"
+            elif self._clock_replay_pending:
+                reason = "REPLAY_PENDING"
+            elif key in self._clock_record_keys:
+                reason = "DUPLICATE_RECORD"
+            else:
+                reason = "ADMITTED"
+                self._clock_record_keys[key] = None
+                if len(self._clock_record_keys) > CLOCK_SYNC_WINDOW_RECORDS:
+                    self._clock_record_keys.pop(next(iter(self._clock_record_keys)))
+                self._receive_lag_window.append(lag)
             observed_sample_count = len(self._receive_lag_window)
-            reached_sample_threshold = observed_sample_count == CLOCK_SYNC_MIN_SAMPLES
+            reached_sample_threshold = reason == "ADMITTED" and observed_sample_count == CLOCK_SYNC_MIN_SAMPLES
+        # Observe outside the clock lock. Instrumentation never participates in
+        # timing authority, and a retired reader cannot populate a new window.
+        self._observe_clock_admission(
+            record, generation, processed_at_ns, reason, sample_count=observed_sample_count,
+            expected_epoch_id=diagnostic_epoch,
+        )
+        if reason != "ADMITTED":
+            return False
         if observed_sample_count in (1, CLOCK_SYNC_MIN_SAMPLES):
-            self._opening_timeline_note("provider_timing_count", details={
+            self._opening_timeline_note("provider_timing_count",
+                expected_epoch_id=diagnostic_epoch, expected_generation=generation, details={
                 "stage": str(observed_sample_count), "sample_count": observed_sample_count,
                 "minimum_samples": CLOCK_SYNC_MIN_SAMPLES, "scope": "shared_current_generation",
             })
@@ -2444,6 +2527,31 @@ class DatabentoGammaStreamer:
             # handoff, complete pairs and persistence still pass their own gates.
             self._signal_orb_reference_readiness()
         return True
+
+    def _observe_clock_admission(self, record, generation, processed_at_ns, reason, *,
+                                 sample_count=None, expected_epoch_id=None):
+        """Bounded diagnostic evidence; exceptions cannot change clock admission."""
+        observer = getattr(self, "_opening_timeline", None)
+        if observer is None:
+            return
+        try:
+            if (observer.generation != int(self._active_generation)
+                    or observer.epoch_id != str(self.subscription_epoch_id)):
+                return
+            if expected_epoch_id is not None and observer.epoch_id != str(expected_epoch_id):
+                return
+            if reason != "GENERATION_MISMATCH" and observer.generation != int(generation):
+                # Admission may finish just before a reconnect publishes its
+                # replacement observer. Never attach that old result to it.
+                return
+            observer.timing_admission(
+                record, reason=reason, record_generation=generation,
+                sample_count=sample_count, minimum_samples=CLOCK_SYNC_MIN_SAMPLES,
+                reader_processed_at_ns=processed_at_ns,
+                observed_at_ns=time.time_ns(), observed_monotonic_ns=time.monotonic_ns(),
+            )
+        except Exception as exc:
+            self._opening_timeline_error = type(exc).__name__
 
     def _signal_orb_reference_readiness(self) -> None:
         wakeup = getattr(self, "_orb_reference_wakeup_event", None)
@@ -4301,6 +4409,9 @@ class DatabentoGammaStreamer:
         frame["_root"] = frame["symbol"].map(_option_root_from_symbol)
         frame = frame.dropna(subset=["expiration_date"])
         frame = frame[frame["market"] == market]
+        excluded_rut = _rut_settlement_exclusions(frame, trading_date)
+        had_ineligible_rut = bool(excluded_rut.any())
+        frame = frame[~excluded_rut]
         had_settlement_ineligible_vix = bool(
             market == "VIX"
             and not frame.empty
@@ -4317,9 +4428,9 @@ class DatabentoGammaStreamer:
             return {
                 "passes": False,
                 "reason": (
-                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE"
-                    if had_settlement_ineligible_vix
-                    else "NO_POSITIVE_OI_CONTRACTS"
+                    RUT_SETTLEMENT_INELIGIBLE_REASON if had_ineligible_rut else
+                    "NO_FORWARD_VIX_EXPIRATION_AVAILABLE" if had_settlement_ineligible_vix else
+                    "NO_POSITIVE_OI_CONTRACTS"
                 ),
                 "complete_pair_count": 0,
                 "primary_strike_count": 0,
@@ -5635,12 +5746,18 @@ class DatabentoGammaStreamer:
 
         planned_primary = min(primary_candidates)
         trading_date = current_market_date()
-        if market in {"SPX", "NDX"} and planned_primary != trading_date:
+        if market in EQUITY_INDEX_FORECAST_SYMBOLS and planned_primary != trading_date:
             return (
                 None,
                 "PRIMARY_EXPIRATION_NOT_SAME_DAY: "
                 f"planned={planned_primary.isoformat()} required={trading_date.isoformat()}",
             )
+        if market == "RUT" and any(
+            row["option_root"] != "RUTW"
+            for row in self._universe_records_by_market.get(market, ())
+            if row["expiration_date"] == planned_primary
+        ):
+            return None, RUT_SETTLEMENT_INELIGIBLE_REASON
         if market == "VIX" and not _expiration_is_live_eligible(
             market, planned_primary, trading_date
         ):
@@ -5837,7 +5954,7 @@ class DatabentoGammaStreamer:
             "primary_pair_coverage_strike_min": float(calculation_lower_strike),
             "primary_pair_coverage_strike_max": float(calculation_upper_strike),
         })
-        if market in {"SPX", "NDX"} and (
+        if market in EQUITY_INDEX_FORECAST_SYMBOLS and (
             primary_pair_coverage_ratio is None
             or primary_pair_coverage_ratio < MIN_LIVE_PRIMARY_PAIR_COVERAGE_RATIO
         ):
@@ -7694,6 +7811,14 @@ class DatabentoGammaStreamer:
             return None, "PLANNED_PRIMARY_EXPIRATION_INVALID"
         if market in {"SPX", "NDX"} and primary_expiration != trading_date:
             return None, "PRIMARY_EXPIRATION_NOT_SAME_DAY"
+        # A future Russell expiry may supply a separately labelled ORB context.
+        # On the trading date, only full-size PM-settled contracts are eligible.
+        if market == "RUT" and (
+            primary_expiration < trading_date
+            or any(row["option_root"] not in {"RUT", "RUTW"} for row in orb_records)
+            or (primary_expiration == trading_date and any(row["option_root"] != "RUTW" for row in orb_records))
+        ):
+            return None, RUT_SETTLEMENT_INELIGIBLE_REASON
         if market == "VIX" and not _expiration_is_live_eligible(
             market, primary_expiration, trading_date
         ):
@@ -9812,7 +9937,15 @@ class DatabentoGammaStreamer:
                 # Databento's destructor terminates immediately and removes the
                 # protocol state needed by block_for_close().
                 self._begin_opening_timeline(live_client, next_generation)
-                live_iterator = _start_live_iterator(live_client)
+                startup_epoch = self.subscription_epoch_id
+                live_iterator = _start_live_iterator(
+                    live_client,
+                    on_diagnostic=lambda fields: self._opening_timeline_note(
+                        "sdk_iterator_startup", details=fields,
+                        expected_epoch_id=startup_epoch,
+                        expected_generation=next_generation,
+                    ),
+                )
                 for record in live_iterator:
                     if not self.is_running:
                         break
@@ -9877,8 +10010,10 @@ class DatabentoGammaStreamer:
                         )
                         if receive_lag is not None and receive_lag < 0:
                             self.negative_receive_lag_records += 1
+                        # Missing timestamps must also receive a diagnostic
+                        # exclusion reason; the timing gate still rejects them.
+                        self._record_processing_clock_sample(record, processed_at_ns=processed_at_ns, generation=next_generation)
                         if receive_lag is not None:
-                            self._record_processing_clock_sample(record, processed_at_ns=processed_at_ns, generation=next_generation)
                             if receive_lag < -CLOCK_SYNC_NEGATIVE_TOLERANCE_SECONDS:
                                 self.material_negative_receive_lag_records += 1
                         self.last_receive_to_process_lag_seconds = receive_lag
@@ -10806,7 +10941,7 @@ class DatabentoGammaStreamer:
         root_counts = {
             str(raw_symbol).split()[0].strip().upper() for raw_symbol in self.live_symbols
         }
-        if "RUT" in self.symbols or any(root in {"RUT", "RUTW", "MRUT"} for root in root_counts):
+        if "RUT" in self.symbols or any(root in {"RUT", "RUTW"} for root in root_counts):
             return
         evidence["status"] = "confirmed"
         evidence["confirmed_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -11086,7 +11221,8 @@ class DatabentoGammaStreamer:
             "DIA": ("DIA",),
             "IWM": ("IWM",),
             "VIX": ("VIXW", "VIX"),
-            "RUT": ("RUTW", "RUT", "MRUT"),
+            "RUT": ("RUTW", "RUT"),
+            "MRUT": ("MRUT",),
         }
         core_symbol_status = {
             core: {

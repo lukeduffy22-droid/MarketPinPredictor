@@ -1,6 +1,6 @@
 """Explicit view selection; inactive Streamlit panels perform no reads."""
 
-MARKET_VIEWS = ("Live Streaming", "Advisor", "Shadow Research", "Frozen Gamma (Audit)", "Debug Snapshot")
+MARKET_VIEWS = ("Live Streaming", "Market Events", "Advisor", "Shadow Research", "Frozen Gamma (Audit)", "Debug Snapshot")
 
 
 def select_market_view():

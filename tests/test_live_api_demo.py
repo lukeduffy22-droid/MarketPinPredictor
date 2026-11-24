@@ -20,7 +20,7 @@ def health(now=NOW):
         "symbol_status": {symbol: {**identity, "usable_for_prediction": True, "validation_is_valid": True,
             "is_stale": False, "epoch_is_current": True, "generation_is_current": True,
             "data_age_seconds": 1, "stale_after_seconds": 30, "fresh_quote_count": 150}
-            for symbol in ("SPX", "NDX")}}
+            for symbol in ("SPX", "NDX", "RUT")}}
 
 
 def payload(symbol, horizon=0, now=NOW):
@@ -43,13 +43,14 @@ def payload(symbol, horizon=0, now=NOW):
 
 
 def receipt(now=NOW):
-    return {"health_before": health(now), "health_after": health(now), "selections": {"SPX": 0, "NDX": 0},
-            "research": {s: payload(s, now=now) for s in ("SPX", "NDX")}, "failures": []}
+    return {"health_before": health(now), "health_after": health(now), "selections": {"SPX": 0, "NDX": 0, "RUT": 0},
+            "research": {s: payload(s, now=now) for s in ("SPX", "NDX", "RUT")}, "failures": []}
 
 
 def test_good_and_abstaining_candidates_are_distinct():
     rows = demo_rows(receipt(), now=NOW)
-    assert len(rows) == 2 and all(row["status"] == "RESEARCH_ONLY" for row in rows)
+    assert [row["symbol"] for row in rows] == ["SPX", "NDX", "RUT"]
+    assert all(row["status"] == "RESEARCH_ONLY" for row in rows)
     assert rows[0]["reference"] == 7000 and rows[0]["predicted_close"] == 7010
     assert rows[0]["candidates"][1]["Research estimate"] is None
 
@@ -109,7 +110,7 @@ def test_abstention_and_future_horizon_never_fall_back_to_eod():
     data["research"]["SPX"]["symbols"]["SPX"]["forecast"]["status"] = "ABSTAIN"
     data["selections"]["NDX"] = 1
     rows = demo_rows(data, now=NOW)
-    assert all(r["predicted_close"] is None for r in rows)
+    assert [row["predicted_close"] for row in rows] == [None, None, 7010]
     assert "FORECAST_HORIZON_OR_SYMBOL_MISMATCH" in rows[1]["reasons"]
 
 
@@ -178,7 +179,7 @@ def test_render_smoke_opt_in_and_stop_no_automatic_network(monkeypatch):
     ui = AppTest.from_string("from app.services.live_api_demo import render_live_api_demo\nrender_live_api_demo()").run()
     assert not ui.exception and not calls
     ui.button(key="live_api_demo_refresh").click().run()
-    assert not ui.exception and len(calls) == 1 and len(ui.metric) == 4
+    assert not ui.exception and len(calls) == 1 and len(ui.metric) == 6
     ui.toggle(key="live_api_demo_auto").set_value(True).run()
     assert not ui.exception and len(calls) == 2
     ui.toggle(key="live_api_demo_auto").set_value(False).run()
@@ -201,5 +202,5 @@ def test_baseline_is_prominent_in_main_metric(monkeypatch):
     ui = AppTest.from_string("from app.services.live_api_demo import render_live_api_demo\nrender_live_api_demo()").run()
     ui.button(key="live_api_demo_refresh").click().run()
     assert not ui.exception
-    assert sum(metric.label == "No-change baseline only (index points)" for metric in ui.metric) == 2
+    assert sum(metric.label == "No-change baseline only (index points)" for metric in ui.metric) == 3
     assert any("does not demonstrate predictive skill" in item.value for item in ui.info)

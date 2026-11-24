@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
 from backend.monitor_scan_ledger import (
     COMMIT_RECEIPT_EVENT_TYPE,
     NOTIFICATION_ACK_EVENT_TYPE,
@@ -56,7 +57,7 @@ ARMED = "armed_at_session_rollover"
 LEGACY_PRE_ACTIVATION = "legacy_pre_activation"
 
 _CHICAGO = ZoneInfo("America/Chicago")
-_MONITORED_SYMBOLS = {"SPX", "NDX"}
+_MONITORED_SYMBOLS = EQUITY_INDEX_FORECAST_SYMBOLS
 _VALID_MODES = {"NORMAL", "ELEVATED"}
 _COMMON_WRAPPER_FIELDS = {
     "schema_version",
