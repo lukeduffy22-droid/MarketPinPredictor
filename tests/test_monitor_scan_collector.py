@@ -101,6 +101,7 @@ def _eligible_evidence(
     aggregate_pipeline_ready: bool = True,
     spx_usable: bool = True,
     transport_counters: dict[str, int] | None = None,
+    include_rut: bool = False,
 ) -> dict:
     source_time = datetime.fromisoformat(source_time_utc.replace("Z", "+00:00"))
     source_ct = source_time.astimezone(_CT).isoformat()
@@ -160,7 +161,13 @@ def _eligible_evidence(
     gex: dict[str, dict] = {}
     audits: dict[str, dict] = {}
     database_symbols: dict[str, dict] = {}
-    for index, symbol in enumerate(MONITORED_SYMBOLS, start=1):
+    if include_rut:
+        health["optional_symbols"] = ["RUT", "VIX"]
+        symbol_values["RUT"] = {
+            "spot": 2500.0, "pin": 2510.0, "max_pain": 2520.0, "zero_gamma": 2490.0,
+            "positive_wall": 2550.0, "negative_wall": 2450.0,
+        }
+    for index, symbol in enumerate(symbol_values, start=1):
         values = symbol_values[symbol]
         usable = spx_usable if symbol == "SPX" else True
         calculation_id = f"calculation-{symbol.lower()}-{sequence}"
@@ -1884,7 +1891,8 @@ def test_database_evidence_rejects_truncated_gamma_input_blob(tmp_path: Path):
     )
 
 
-def test_collector_commit_reload_collector_uses_real_receipt(tmp_path: Path):
+@pytest.mark.parametrize("include_rut", [False, True])
+def test_collector_commit_reload_collector_uses_real_receipt(tmp_path: Path, include_rut: bool):
     state_path = tmp_path / "state.json"
     journal_dir = tmp_path / "journal"
     state_path.write_text(
@@ -1912,7 +1920,7 @@ def test_collector_commit_reload_collector_uses_real_receipt(tmp_path: Path):
         database_path=tmp_path / "unused.db",
         state_path=state_path,
         journal_dir=journal_dir,
-        evidence=_eligible_evidence("2026-09-08T14:30:00Z", sequence=1),
+        evidence=_eligible_evidence("2026-09-08T14:30:00Z", sequence=1, include_rut=include_rut),
     )
     first_scan = with_scan_event_id(
         with_policy_input_hashes(first["scan"], first["policy_inputs"])
@@ -1932,10 +1940,22 @@ def test_collector_commit_reload_collector_uses_real_receipt(tmp_path: Path):
         database_path=tmp_path / "unused.db",
         state_path=state_path,
         journal_dir=journal_dir,
-        evidence=_eligible_evidence("2026-09-08T14:45:00Z", sequence=2),
+        evidence=_eligible_evidence("2026-09-08T14:45:00Z", sequence=2, include_rut=include_rut),
     )
-    assert set(second["policy_inputs"]) == set(MONITORED_SYMBOLS)
+    expected = (*MONITORED_SYMBOLS, "RUT") if include_rut else MONITORED_SYMBOLS
+    assert set(second["policy_inputs"]) == set(expected)
     assert all(
         second["scan"]["symbols"][symbol]["eligible"] is True
-        for symbol in MONITORED_SYMBOLS
+        for symbol in expected
     )
+    commit_args = {
+        "scan": with_scan_event_id(with_policy_input_hashes(second["scan"], second["policy_inputs"])),
+        "policy_inputs": second["policy_inputs"], "state_path": state_path, "journal_dir": journal_dir,
+    }
+    result = commit_monitor_scan(**commit_args)
+    assert result["accepted"] is True, result
+    assert result["policy_symbols_evaluated"] == list(expected)
+    retry = commit_monitor_scan(**commit_args)
+    assert retry["action"] == "already_committed" and retry["records_appended"] == 0
+    if not include_rut:
+        assert second["scan"]["symbols"]["RUT"]["context_only"] is True

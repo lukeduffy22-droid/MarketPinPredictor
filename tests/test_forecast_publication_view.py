@@ -97,16 +97,17 @@ def test_real_backend_publication_contract_drives_both_views(failure):
     from backend.forecast_publication_gate import evaluate_publication_gate, project_publication_item
     from tests.test_forecast_publication_gate import NOW as checked, forecast, health
 
-    issued = {symbol: forecast(symbol) for symbol in ("SPX", "NDX")}
+    data = receipt(checked)
+    issued = {symbol: forecast(symbol) for symbol in data["selections"]}
     original = deepcopy(issued)
     context = health()
     context["provider"] = "databento"
+    context["symbol_status"]["RUT"] = deepcopy(context["symbol_status"]["SPX"])
     if failure == "clock":
         context["processing_clock_telemetry"]["status"] = "unknown"
     elif failure == "ndx":
         context["symbol_status"]["NDX"]["usable_for_prediction"] = False
     gate = evaluate_publication_gate(issued, context, checked_at_utc=checked)
-    data = receipt(checked)
     data.update(health_before=deepcopy(context), health_after=deepcopy(context))
     for symbol, capture in data["research"].items():
         capture["publication_gate"] = deepcopy(gate)

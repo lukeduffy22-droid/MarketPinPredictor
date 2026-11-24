@@ -8,7 +8,7 @@ from backend.databento_streamer import MARKETS
 
 
 def test_symbol_catalog_keeps_stable_set_when_backend_is_unavailable():
-    assert selectable_databento_symbols({}) == ("SPX", "NDX", "VIX")
+    assert selectable_databento_symbols({}) == ("SPX", "NDX", "VIX", "RUT")
     assert active_canary_symbols({}) == ()
 
 
@@ -31,7 +31,7 @@ def test_symbol_catalog_exposes_only_canaries_with_selected_contracts():
     }
 
     assert selectable_databento_symbols(payload) == (
-        "SPX", "NDX", "VIX", "SPY", "QQQ", "RUT"
+        "SPX", "NDX", "VIX", "RUT", "SPY", "QQQ"
     )
     assert active_canary_symbols(payload) == ("SPY", "QQQ", "RUT")
 
@@ -44,4 +44,5 @@ def test_symbol_catalog_fails_closed_on_malformed_contract_counts():
         }
     }
 
-    assert selectable_databento_symbols(payload) == ("SPX", "NDX", "VIX")
+    assert selectable_databento_symbols(payload) == ("SPX", "NDX", "VIX", "RUT")
+    assert active_canary_symbols(payload) == ()

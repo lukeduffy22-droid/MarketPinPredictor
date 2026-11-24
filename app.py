@@ -1,6 +1,7 @@
 import streamlit as st
 from app.services.forecast_research_view import render_forecast_research
 from app.services.live_api_demo import render_live_api_demo
+from app.services.market_events_view import render_market_events
 import pandas as pd
 import numpy as np
 import json
@@ -280,7 +281,7 @@ INDEX_ETFS = {
 DATABENTO_SUPPORTED_INDEXES = set(DATABENTO_INDEXES)
 
 DEFAULT_POLYGON_INDEX_SELECTION = ["S&P 500 (SPX)", "NASDAQ 100 (NDX)"]
-DEFAULT_DATABENTO_INDEX_SELECTION = ["S&P 500 (SPX)", "NASDAQ 100 (NDX)", "VIX (Volatility)"]
+DEFAULT_DATABENTO_INDEX_SELECTION = ["S&P 500 (SPX)", "NASDAQ 100 (NDX)", "Russell 2000 (RUT)", "VIX (Volatility)"]
 ETF_TICKER_SEARCH = {"SPY","QQQ","DIA","IWM","VOO","VTI","RSP","MDY","XLK","XLF","XLY","XLP","XLE","XLI","XLV","XLU","SMH","TLT","IEF","HYG","LQD"}
 PERSISTED_PROVIDERS = {"databento"}
 
@@ -1748,7 +1749,7 @@ def create_price_chart(df, predicted_price, ticker_name):
 st.title("📈 Stock Index EOD Price Predictor")
 st.markdown("Research estimates from validated option-market data. Availability and authority are shown for each symbol.")
 st.caption(
-    f"Page snapshot: {_display_clock()} · Automatic refresh is off. "
+    f"Page snapshot: {_display_clock()} · Automatic full-page refresh is off. "
     "Analyze & Predict requests new results; displayed ages describe the last check."
 )
 
@@ -1782,12 +1783,12 @@ with st.sidebar:
         ]
         active_canaries = active_canary_symbols(databento_universe)
         st.caption(
-            "SPX and NDX are required; VIX is optional context. SPY, QQQ, and other symbols "
-            "appear only after the backend selects live contracts for a canary."
+            "SPX, NDX, RUT and VIX remain selectable during capture gaps. Additional symbols "
+            "appear when the backend selects contracts for them."
         )
         with st.expander("Databento symbol coverage", expanded=False):
             st.markdown("**Required prediction set:** SPX, NDX")
-            st.markdown("**Optional context:** VIX")
+            st.markdown("**Independently gated coverage:** RUT and VIX")
             st.markdown("**Supported ETF additions:** SPY, QQQ, DIA, IWM")
             st.markdown(
                 "**Backend-active canaries:** "
@@ -1798,8 +1799,8 @@ with st.sidebar:
                 + ", ".join(CANARY_CANDIDATE_SYMBOLS)
             )
             st.caption(
-                "A canary must pass quote freshness, coverage, lineage, and persistence "
-                "checks before it becomes selectable. The UI never expands the OPRA stream."
+                "Selected contracts identify the subscription scope. Current data and forecasts "
+                "require each symbol to pass its own freshness, coverage and lineage checks."
             )
 
     active_provider = st.session_state.data_provider
@@ -2809,7 +2810,7 @@ with st.sidebar:
     # === LIVE ADVISOR TAB ===
     if market_view == "Advisor":
         from app.services.advisor_view import render_advisor
-        advisor_symbols = [INDEXES[idx] for idx in selected_indexes] if selected_indexes else ["SPX", "NDX", "VIX"]
+        advisor_symbols = [INDEXES[idx] for idx in selected_indexes] if selected_indexes else [INDEXES[name] for name in DEFAULT_DATABENTO_INDEX_SELECTION]
         render_advisor(advisor_symbols)
 
     st.divider()
@@ -2880,6 +2881,8 @@ with st.sidebar:
 
 # Main content
 if st.session_state.data_provider == 'databento':
+    if market_view == "Market Events":
+        render_market_events()
     render_live_api_demo()
     render_forecast_research()
     render_indicator_panel()
@@ -4228,7 +4231,7 @@ else:
     st.divider()
     st.header("📁 Daily Snapshot Exports")
     from app.services.closing_prices import render_closing_prices
-    render_closing_prices([INDEXES[idx] for idx in selected_indexes] if selected_indexes else ["SPX", "NDX", "VIX"])
+    render_closing_prices([INDEXES[idx] for idx in selected_indexes] if selected_indexes else [INDEXES[name] for name in DEFAULT_DATABENTO_INDEX_SELECTION])
     timezone_source = "browser" if DISPLAY_TIMEZONE.source == "browser" else "explicit UTC fallback"
     st.caption(
         "View and download stored intraday research snapshots. Calculation validation "

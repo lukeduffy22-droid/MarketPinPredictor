@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 
 import requests
 
+from backend.market_universe import EQUITY_INDEX_FORECAST_SYMBOLS
 from app.services.forecast_research_view import (
     RESEARCH_URL, ResearchSchemaError, _number,
     _validate_group, central_timestamp, forecast_kind, current_publication_projection,
 )
 
 HEALTH_URL = "http://127.0.0.1:8000/health/live"
-SYMBOLS = ("SPX", "NDX")
+SYMBOLS = EQUITY_INDEX_FORECAST_SYMBOLS
 HORIZONS = {0: "Today's close", 1: "Next trading session", 5: "Five trading sessions ahead"}
 
 
@@ -73,7 +74,7 @@ def _symbol_reason(health, symbol):
 
 
 def collect_demo(selections, *, requester=None, clock=None):
-    """Four bounded loopback GETs at most; independent symbol errors stay isolated."""
+    """At most one bounded research GET per symbol between two health GETs; independent symbol errors stay isolated."""
     requester = requester or requests.get
     clock = clock or (lambda: datetime.now(timezone.utc))
     receipt = {"schema_version": "marketpin-live-api-demo.v1", "started_at_utc": clock().isoformat(),
@@ -189,9 +190,9 @@ def _render_live_api_demo():
     import streamlit as st
     st.subheader("Live Databento forecast demonstration")
     st.caption("Databento OPRA option quotes → option-implied index reference → research forecast. "
-               "SPX/NDX references are calculated put/call parity, not observed cash-index trades. "
+               "SPX, NDX and RUT references use put/call parity in index points. "
                "Forecasts are INFERRED · RESEARCH_ONLY; accuracy is not calibrated.")
-    columns = st.columns(2)
+    columns = st.columns(len(SYMBOLS))
     selections = {}
     for column, symbol in zip(columns, SYMBOLS):
         with column:
@@ -234,7 +235,7 @@ def _render_live_api_demo():
     eligible_count = sum(row["status"] == "RESEARCH_ONLY" for row in rows)
     st.caption(f"Research API: {available_services}/{len(selections)} symbol requests returned valid responses · "
                f"Authority: research only · Currently display-eligible: {eligible_count}/{len(rows)} symbols")
-    for column, row in zip(st.columns(2), rows):
+    for column, row in zip(st.columns(len(SYMBOLS)), rows):
         with column:
             st.markdown(f"**{row['symbol']} · {row['status']}**")
             st.metric("Option-implied reference (index points)",

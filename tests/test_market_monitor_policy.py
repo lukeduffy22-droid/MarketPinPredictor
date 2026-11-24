@@ -344,7 +344,7 @@ def test_rejected_evaluation_preserves_complete_prior_state_unchanged() -> None:
 
 def test_normalized_identity_fields_must_be_exactly_canonical() -> None:
     cases = (
-        ("symbol", "ndx", "symbol_must_be_spx_or_ndx"),
+        ("symbol", "ndx", "symbol_must_be_spx_ndx_or_rut"),
         ("provider", "Databento", "provider_must_be_databento"),
         (
             "subscription_generation",

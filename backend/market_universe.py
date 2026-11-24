@@ -49,6 +49,7 @@ _ETFS = (
     ("HYG", "High Yield Corporate Bond ETF", "HYG", "high_yield_credit"),
     ("LQD", "Investment Grade Corporate Bond ETF", "LQD", "investment_grade_credit"),
 )
+EQUITY_INDEX_FORECAST_SYMBOLS = ("SPX", "NDX", "RUT")
 OPTION_ETF_SYMBOLS = ("SPY", "QQQ", "DIA", "IWM")
 EQUITY_CONTEXT_SYMBOLS = tuple(row[0] for row in _ETFS)
 MAX_EQUITY_CONTEXT_SYMBOLS = len(EQUITY_CONTEXT_SYMBOLS)
